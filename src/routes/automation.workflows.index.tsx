@@ -1,6 +1,6 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
-import { workflowDetailLink } from "@/lib/routes";
+import { workflowDetailLink, ROUTES } from "@/lib/routes";
 import { PageHeader } from "@/components/layout/app-shell";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -18,7 +18,7 @@ import {
 import {
   Plus, Search, Loader2, MoreHorizontal, Pencil,
   Trash2, Zap, TrendingUp, Workflow as WorkflowIcon, XCircle,
-  Clock, Play, Eye, Copy, CheckCircle2,
+  Clock, Play, Eye, Copy, CheckCircle2, Bell,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -61,10 +61,22 @@ function WorkflowsPage() {
   return (
     <div className="flex flex-col">
       <PageHeader
+        icon={Zap}
+        iconBg="bg-info-soft"
+        iconColor="text-info"
         title="Workflows"
         subtitle={loading ? "Loading…" : `${active} active · ${totalRuns.toLocaleString()} runs`}
         breadcrumb={["Automation", "Workflows"]}
-        actions={<NewWorkflowButton />}
+        actions={
+          <div className="flex items-center gap-2">
+            <Link to={ROUTES.TRIGGERS}>
+              <Button variant="outline" size="sm" className="h-8 gap-1.5">
+                <Bell className="h-3.5 w-3.5" /> Triggers
+              </Button>
+            </Link>
+            <NewWorkflowButton />
+          </div>
+        }
       />
 
       {/* KPIs */}

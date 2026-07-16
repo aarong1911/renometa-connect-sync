@@ -134,8 +134,21 @@ export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle:
 
   const isActive = (to: string) =>
     to === "/" ? pathname === "/" : pathname === to || pathname.startsWith(to + "/");
-  const isNavActive = (to: string) =>
-    to === "/inbox" ? pathname === "/inbox" || pathname === "/inbox/" : isActive(to);
+
+  // All real nav "to" paths (main list + favorites + settings), used below
+  // to find the single most specific match — prevents a parent hub route
+  // (e.g. "/financials") from lighting up alongside a more specific child
+  // entry that also has its own top-level nav item (e.g. "/financials/estimates").
+  const allNavPaths = [...NAV.map(n => n.to), ...favorites.map(f => f.to), "/settings"];
+
+  const isNavActive = (to: string) => {
+    if (to === "/inbox") return pathname === "/inbox" || pathname === "/inbox/";
+    if (!isActive(to)) return false;
+    const moreSpecificMatchExists = allNavPaths.some(
+      other => other !== to && other.length > to.length && isActive(other),
+    );
+    return !moreSpecificMatchExists;
+  };
 
   const unreadCount = conversations.filter(c => c.unread).length;
   const displayLogo = logoUrl || org.logoUrl;

@@ -20,6 +20,7 @@ import {
   Trash2,
   Calendar as CalendarIcon,
   Repeat,
+  CheckSquare,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -261,6 +262,9 @@ function TasksPage() {
   return (
     <>
       <PageHeader
+        icon={CheckSquare}
+        iconBg="bg-violet-soft"
+        iconColor="text-violet"
         title="Tasks"
         subtitle="Track work across every project — drag to update status."
         actions={

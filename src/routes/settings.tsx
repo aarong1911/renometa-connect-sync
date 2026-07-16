@@ -3,7 +3,7 @@ import { createFileRoute, Outlet, Link, useLocation } from "@tanstack/react-rout
 import { PageHeader } from "@/components/layout/app-shell";
 import {
   Building2, Users, Plug, CreditCard, Wand2, Palette, Key, Bell,
-  FileText, Pin, GitBranch, ShieldCheck,
+  FileText, Pin, GitBranch, ShieldCheck, Settings as SettingsIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { OrganizationSettings } from "@/components/organization/organization-settings";
@@ -30,7 +30,7 @@ function SettingsLayout() {
   const isRoot = pathname === "/settings" || pathname === "/settings/";
   return (
     <>
-      <PageHeader title="Settings" subtitle="Manage your workspace, team, integrations, and billing" />
+      <PageHeader icon={SettingsIcon} iconBg="bg-secondary" iconColor="text-foreground" title="Settings" subtitle="Manage your workspace, team, integrations, and billing" />
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[220px_1fr]">
         <nav className="space-y-0.5">
           {sections.map(s => {

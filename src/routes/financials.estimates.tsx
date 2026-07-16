@@ -1165,6 +1165,9 @@ function EstimatesPage() {
   return (
     <>
       <PageHeader
+        icon={FileText}
+        iconBg="bg-gold-soft"
+        iconColor="text-gold-hover"
         title="Estimates"
         subtitle="Proposals and bids across all clients."
         breadcrumb={["Financials", "Estimates"]}

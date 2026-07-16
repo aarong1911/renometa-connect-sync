@@ -284,7 +284,18 @@ function CalendarPage() {
   }
 
   return (
-    <div className="flex h-[calc(100vh-104px)] flex-col gap-3">
+    <div className="flex h-[calc(100vh-160px)] flex-col gap-3">
+      {/* Header */}
+      <div className="flex shrink-0 items-center gap-3">
+        <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-cyan-soft ring-1 ring-black/5">
+          <CalendarIcon className="h-4 w-4 text-cyan-soft-foreground" />
+        </div>
+        <div>
+          <h1 className="text-[17px] font-semibold leading-tight tracking-tight">Calendar</h1>
+          <p className="text-[11.5px] text-muted-foreground">Manage bookings, appointments, and your team's schedule.</p>
+        </div>
+      </div>
+
       {/* Toolbar */}
       <div className="flex flex-shrink-0 flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">

@@ -176,6 +176,9 @@ function FilesPage() {
   return (
     <>
       <PageHeader
+        icon={FolderOpen}
+        iconBg="bg-gold-soft"
+        iconColor="text-gold-hover"
         title="Files"
         subtitle="Documents, drawings, permits, photos, and shared assets"
         actions={

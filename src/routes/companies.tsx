@@ -112,6 +112,9 @@ function CompaniesPage() {
   return (
     <>
       <PageHeader
+        icon={Building2}
+        iconBg="bg-gold-soft"
+        iconColor="text-gold-hover"
         title="Companies"
         subtitle="Manage contractor accounts and client organizations."
         breadcrumb={["CRM", "Companies"]}

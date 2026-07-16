@@ -1,6 +1,6 @@
 import { createFileRoute, Outlet, Link, useLocation, Navigate } from "@tanstack/react-router";
 import { PageHeader } from "@/components/layout/app-shell";
-import { Plus, Download, Filter, FileText, Receipt, CreditCard, BarChart3 } from "lucide-react";
+import { Plus, Download, Filter, FileText, Receipt, CreditCard, BarChart3, DollarSign } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -24,6 +24,9 @@ function FinancialsLayout() {
   return (
     <>
       <PageHeader
+        icon={DollarSign}
+        iconBg="bg-success-soft"
+        iconColor="text-success"
         title="Financials"
         subtitle="Estimates, invoices, payments, and reports"
         breadcrumb={["Financials"]}

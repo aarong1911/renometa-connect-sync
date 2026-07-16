@@ -16,7 +16,7 @@ import {
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { Search, Download, MoreHorizontal, Loader2, FileText, CheckCircle2, Clock, AlertCircle, DollarSign } from "lucide-react";
+import { Search, Download, MoreHorizontal, Loader2, FileText, CheckCircle2, Clock, AlertCircle, DollarSign, Receipt } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
@@ -137,7 +137,7 @@ function InvoicesPage() {
 
   return (
     <>
-      <PageHeader title="Invoices" subtitle="Track billing across all projects." breadcrumb={["Financials", "Invoices"]}
+      <PageHeader icon={Receipt} iconBg="bg-gold-soft" iconColor="text-gold-hover" title="Invoices" subtitle="Track billing across all projects." breadcrumb={["Financials", "Invoices"]}
         actions={<Button size="sm" onClick={() => toast.info("New invoice — coming soon")}><Download className="mr-1.5 h-3.5 w-3.5" /> Export</Button>}
       />
 

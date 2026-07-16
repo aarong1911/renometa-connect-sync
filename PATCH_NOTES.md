@@ -1,22 +1,31 @@
-# Redesign against your REAL app — batch 9 (avatar set complete)
+# Redesign against your REAL app — batch 12 (sidebar active-state fix)
 
-## Files → destination
+## File → destination
+sidebar.tsx → src/components/layout/sidebar.tsx (replaces batch 7's version)
 
-| File | Destination |
-|---|---|
-| avatar-14.png, avatar-16.png, avatar-18.png, avatar-19.png, avatar-20.png | public/avatars/ (add to the folder from batch 8) |
-| avatar-catalog.ts | src/lib/avatar-catalog.ts (replaces batch 8's version) |
+## The bug
+On `/financials/estimates`, both "Estimates" AND "Financials" lit up gold
+in the sidebar. The active-check used simple prefix matching
+(`pathname.startsWith(to + "/")`), so the parent hub route
+("/financials") and the more specific child route
+("/financials/estimates") both matched simultaneously — since Estimates
+has its own dedicated top-level nav item separate from the Financials hub.
 
-## What changed
+## The fix
+The active-check now finds the single **most specific** (longest)
+matching nav path across the whole nav list, and only highlights that
+one. So:
+- On `/financials/estimates` → only "Estimates" lights up
+- On `/financials/invoices` → only "Invoices"... 
 
-All 20 avatars are now in the catalog (`AVAILABLE_AVATARS` in
-`avatar-catalog.ts` lists all 20 instead of 15). No other code changes —
-`ContactAvatar`, and everywhere it's already wired in (Leads, Contacts,
-Sidebar user block, Dashboard), automatically benefits from the fuller
-set since selection is just an index into this array.
+  wait — actually "Invoices" isn't a top-level nav item (only Estimates
+  and Financials are, per Lovable's structure) — so `/financials/invoices`
+  will correctly show only "Financials" highlighted, since there's no
+  more specific nav entry to compete with it. Only Estimates (which does
+  have its own entry) was the actual conflict case.
+- Everywhere else (Leads, Contacts, Pipeline, etc.) — unchanged behavior,
+  no regression.
 
 ## How to apply
-
-1. Drop the 5 new PNGs into `public/avatars/` alongside the 15 from batch 8.
-2. Replace `src/lib/avatar-catalog.ts` with this version.
-3. Restart `pnpm dev` — no other steps needed.
+Just replace `src/components/layout/sidebar.tsx` with this version — no
+other files affected, no restart-order dependency on other batches.

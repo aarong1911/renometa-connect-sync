@@ -21,7 +21,7 @@ import {
   MoreHorizontal, ChevronsUpDown, Check, Mail, Phone, MessageSquare, X,
   TrendingUp, Clock, PauseCircle, DollarSign, Filter, ChevronRight, Calendar,
   User, Circle, CheckCircle2, AlertCircle, FileText, Send, Trash2, Flag,
-  ExternalLink, ImageIcon, Camera,
+  ExternalLink, ImageIcon, Camera, FolderOpen,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -1241,7 +1241,7 @@ function ProjectsPage() {
 
   return (
     <div className="-mb-6 flex h-[calc(100vh-5rem)] flex-col overflow-hidden">
-      <PageHeader title="Projects" subtitle={`${counts.active} active · ${formatMoney(kpis.pipelineValue)} pipeline`}
+      <PageHeader icon={FolderOpen} iconBg="bg-info-soft" iconColor="text-info" title="Projects" subtitle={`${counts.active} active · ${formatMoney(kpis.pipelineValue)} pipeline`}
         breadcrumb={["Workspace", "Projects"]}
         actions={<>
           <Button variant="outline" size="sm" className="h-8"><Download className="mr-1.5 h-3.5 w-3.5" />Export</Button>
