@@ -1,0 +1,142 @@
+---
+name: tanstack-router-guards
+description: >
+  Patterns for TanStack Router file-based routing — createFileRoute conventions,
+  route guards, permission-based redirects, and role-aware navigation in React
+  apps. Use this skill whenever working with TanStack Router routes, adding new
+  pages, implementing auth guards, role-based access control, or fixing route
+  type errors. Also triggers for "createFileRoute", "FileRoutesByPath",
+  routeTree.gen.ts errors, or any navigation/redirect logic in the app.
+---
+
+# TanStack Router — File-based Routing & Guards Skill
+
+## File Naming → Route Mapping
+
+| File | Route |
+|---|---|
+| `src/routes/index.tsx` | `/` |
+| `src/routes/projects.index.tsx` | `/projects/` |
+| `src/routes/settings.tsx` | `/settings` (layout) |
+| `src/routes/settings.permissions.tsx` | `/settings/permissions` |
+| `src/routes/portal.tsx` | `/portal` |
+
+## createFileRoute — Correct Usage
+
+```typescript
+// ✅ Correct — string literal, no cast
+export const Route = createFileRoute("/settings/permissions")({
+  component: PermissionsPage,
+});
+
+// ❌ Wrong — "as any" breaks the router generator
+export const Route = createFileRoute("/settings/permissions" as any)({
+  component: PermissionsPage,
+});
+```
+
+**If you see `Argument of type '"/route"' is not assignable`:**
+The router plugin hasn't regenerated `routeTree.gen.ts` yet.
+Just run `pnpm dev` — the plugin auto-adds the route. Do NOT add `as any`.
+
+**Find all bad casts (PowerShell):**
+```powershell
+Select-String -Path "src/routes/*.tsx" -Pattern "createFileRoute.*as any"
+```
+
+## Route Guard Pattern (__root.tsx)
+
+```typescript
+// Public routes — no auth needed
+const PUBLIC_ROUTES = ["/signin", "/signup", "/forgot-password", "/auth/callback"];
+// Portal routes — no auth, no AppShell
+const PORTAL_ROUTES = ["/portal"];
+
+// In RootComponent:
+const isPublicRoute = PUBLIC_ROUTES.some(r => pathname.startsWith(r));
+const isPortalRoute = PORTAL_ROUTES.some(r => pathname.startsWith(r));
+
+// Auth redirect
+useEffect(() => {
+  if (!checked) return;
+  if (!session && !isPublicRoute && !isPortalRoute) navigate({ to: "/signin" });
+  else if (session && pathname === "/signin") navigate({ to: "/" });
+}, [checked, session, pathname]);
+
+// Render without AppShell for portal
+{isPortalRoute ? <Outlet /> : <AppShell><RoleGuard>...<Outlet /></RoleGuard></AppShell>}
+```
+
+## Role Guard Component
+
+```typescript
+function RoleGuard({ pathname, session, children }) {
+  const role = useCurrentUserRole(); // from src/lib/permissions.ts
+
+  useEffect(() => {
+    if (!session || !role) return;
+    // External redirect for field workers / viewers
+    const external = ROLE_EXTERNAL_REDIRECT[role];
+    if (external) { window.location.href = external; return; }
+    // Redirect to default if route not allowed
+    if (!canAccessRoute(role, pathname)) {
+      navigate({ to: ROLE_DEFAULT_ROUTE[role] ?? "/" });
+    }
+  }, [role, pathname]);
+
+  if (role && !canAccessRoute(role, pathname)) return <Spinner />;
+  return <>{children}</>;
+}
+```
+
+## Permission System (src/lib/permissions.ts)
+
+```typescript
+// Check if role can access a route
+canAccessRoute(role: Role | null, pathname: string): boolean
+
+// Filter sidebar nav groups by role
+filterNavGroups(groups, role): groups
+
+// Settings only for owner
+canAccessSettings(role: Role | null): boolean
+
+// Hook — gets logged-in user's role from team store
+useCurrentUserRole(): Role | null
+```
+
+**How useCurrentUserRole works:**
+Finds the current user in `useTeam()` by matching `session.user.id`.
+Returns `null` while loading (don't block on null — treat as allowed to avoid flash).
+
+## Adding a New Route
+
+1. Create `src/routes/my-page.tsx` (or `section.page.tsx` for nested)
+2. Add `export const Route = createFileRoute("/my-page")({ component: MyPage })`
+3. Run `pnpm dev` — router plugin auto-updates `routeTree.gen.ts`
+4. Add to `ROLE_ALLOWED_ROUTES` in `permissions.ts` for relevant roles
+5. Add nav item to `sidebar.tsx` `ALL_GROUPS` array if needed
+
+## Settings Layout Pattern
+
+```typescript
+// src/routes/settings.tsx — layout with left nav
+const sections = [
+  { to: "/settings",           label: "Organization", icon: Building2, exact: true },
+  { to: "/settings/team",      label: "Team & Roles", icon: Users },
+  { to: "/settings/permissions",label: "Permissions", icon: ShieldCheck },
+  // ... more sections
+];
+
+// Child routes: src/routes/settings.SECTION.tsx
+// Each exports: createFileRoute("/settings/SECTION")
+```
+
+## Common Errors & Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `expected route id to be a string literal` | `as any` cast on createFileRoute | Remove `as any`, run pnpm dev |
+| `not assignable to keyof FileRoutesByPath` | routeTree.gen.ts not regenerated | Run pnpm dev, let plugin regenerate |
+| Route renders inside wrong layout | Missing portal/public route exclusion | Add to `PORTAL_ROUTES` or `PUBLIC_ROUTES` in __root.tsx |
+| Role guard loops/flashes | `useCurrentUserRole` returns null before team loads | Guard with `if (!role) return` — don't redirect on null |

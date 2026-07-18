@@ -1,0 +1,300 @@
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  CreditCard,
+  Banknote,
+  Building2,
+  FileText,
+  CheckCircle2,
+  Hash,
+  Calendar,
+  BellRing,
+} from "lucide-react";
+import { formatDate, formatMoney, daysFromNow } from "@/lib/format";
+import { type Payment } from "@/lib/mock-data";
+import { useEffect, useMemo, useState } from "react";
+import { logReminder, useReminders } from "@/lib/payment-reminders";
+import { supabase } from "@/lib/supabase";
+
+export function PaymentDetailDrawer({
+  payment,
+  onOpenChange,
+}: {
+  payment: Payment | null;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const open = payment !== null;
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent side="right" className="w-full p-0 sm:max-w-xl">
+        {payment && <Body payment={payment} onClose={() => onOpenChange(false)} />}
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+type LinkedInvoice = { id: string; invoice_number: string; client_name: string; total_amount: number; status: string; due_date: string };
+
+function Body({ payment, onClose }: { payment: Payment; onClose: () => void }) {
+  const [linkedInvoice, setLinkedInvoice] = useState<LinkedInvoice | null | undefined>(undefined);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLinkedInvoice(undefined);
+    supabase
+      .from("invoices")
+      .select(`id, invoice_number, total_amount, status, due_date, contacts!client_id(full_name)`)
+      .eq("invoice_number", payment.invoice)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (cancelled) return;
+        setLinkedInvoice(
+          data
+            ? {
+                id: data.id,
+                invoice_number: data.invoice_number,
+                client_name: (data as any).contacts?.full_name ?? "—",
+                total_amount: Number(data.total_amount ?? 0),
+                status: data.status ?? "—",
+                due_date: data.due_date,
+              }
+            : null,
+        );
+      });
+    return () => { cancelled = true; };
+  }, [payment.invoice]);
+
+  const methodMeta = getMethodMeta(payment.method);
+
+  const isScheduled = payment.status === "Scheduled";
+  const isPastDue =
+    isScheduled && daysFromNow(payment.dueDate ?? payment.receivedAt) < 0;
+  const allReminders = useReminders();
+  const reminders = useMemo(
+    () => allReminders.filter((r) => r.paymentId === payment.id),
+    [allReminders, payment.id],
+  );
+  const handleSendReminder = () => {
+    logReminder(payment.id);
+  };
+  return (
+    <div className="flex h-full flex-col">
+      <SheetHeader className="space-y-0 border-b border-border px-5 py-4">
+        <div className="flex items-center gap-2">
+          <Badge
+            variant="secondary"
+            className="h-5 rounded px-1.5 text-[10px] font-medium uppercase tracking-wide"
+          >
+            {isScheduled ? "Scheduled" : "Payment"}
+          </Badge>
+          <span className="font-mono text-xs text-muted-foreground">{payment.id}</span>
+          <Badge
+            variant="secondary"
+            className={`ml-auto h-5 rounded px-1.5 text-[10px] ${
+              isScheduled ? "bg-primary-soft text-primary" : "bg-success/15 text-success"
+            }`}
+          >
+            {isScheduled ? "Scheduled" : "Received"}
+          </Badge>
+        </div>
+        <SheetTitle className="mt-2 text-lg font-semibold">{payment.client}</SheetTitle>
+        {isScheduled && payment.milestoneLabel && (
+          <div className="mt-0.5 text-xs text-muted-foreground">{payment.milestoneLabel}</div>
+        )}
+        <div className="mt-0.5 flex items-baseline justify-between">
+          <div className={`text-2xl font-semibold tabular-nums ${isScheduled ? "text-primary" : "text-success"}`}>
+            {isScheduled ? "" : "+"}
+            {formatMoney(payment.amount)}
+          </div>
+          <div className="text-[11px] text-muted-foreground">
+            {isScheduled
+              ? `Expected ${formatDate(payment.dueDate ?? payment.receivedAt)}`
+              : `Received ${formatDate(payment.receivedAt)}`}
+          </div>
+        </div>
+      </SheetHeader>
+
+      <ScrollArea className="flex-1">
+        <div className="space-y-5 px-5 py-4">
+          {/* Linked invoice */}
+          <Section title="Linked invoice">
+            {linkedInvoice === undefined ? (
+              <div className="rounded-md border border-dashed border-border p-3 text-xs text-muted-foreground">Loading…</div>
+            ) : linkedInvoice ? (
+              <div className="rounded-md border border-border p-3">
+                <div className="flex items-center gap-2">
+                  <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary-soft text-primary">
+                    <FileText className="h-4 w-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="font-mono text-xs text-muted-foreground">{linkedInvoice.invoice_number}</div>
+                    <div className="truncate text-sm font-medium">{linkedInvoice.client_name}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-sm font-semibold tabular-nums">
+                      {formatMoney(linkedInvoice.total_amount)}
+                    </div>
+                    <Badge
+                      variant="secondary"
+                      className="mt-0.5 h-4 rounded px-1.5 text-[10px] bg-success/15 text-success capitalize"
+                    >
+                      {linkedInvoice.status}
+                    </Badge>
+                  </div>
+                </div>
+                <div className="mt-3 flex items-center gap-3 border-t border-border pt-2 text-[11px] text-muted-foreground">
+                  {linkedInvoice.due_date && (
+                    <span className="inline-flex items-center gap-1">
+                      <Calendar className="h-3 w-3" /> Due {formatDate(linkedInvoice.due_date)}
+                    </span>
+                  )}
+                  <span className="inline-flex items-center gap-1">
+                    <Hash className="h-3 w-3" /> {linkedInvoice.id}
+                  </span>
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-md border border-dashed border-border p-3 text-xs text-muted-foreground">
+                Invoice {payment.invoice} not found.
+              </div>
+            )}
+          </Section>
+
+          {/* Payment method */}
+          <Section title="Payment method">
+            <div className="rounded-md border border-border p-3">
+              <div className="flex items-center gap-2">
+                <div className={`flex h-8 w-8 items-center justify-center rounded-md ${methodMeta.tone}`}>
+                  <methodMeta.icon className="h-4 w-4" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-medium">{methodMeta.title}</div>
+                  <div className="text-[11px] text-muted-foreground">{methodMeta.subtitle}</div>
+                </div>
+              </div>
+            </div>
+          </Section>
+
+          {/* Activity */}
+          <Section title="Activity">
+            <ol className="relative space-y-3 border-l border-border pl-4">
+              {isScheduled ? (
+                <Activity
+                  title={`Milestone scheduled · ${formatMoney(payment.amount)}`}
+                  actor="System"
+                  at={payment.receivedAt}
+                  icon={Calendar}
+                  tone="text-primary"
+                />
+              ) : (
+                <Activity
+                  title={`Payment received · ${formatMoney(payment.amount)}`}
+                  actor={payment.client}
+                  at={payment.receivedAt}
+                  icon={CheckCircle2}
+                  tone="text-success"
+                />
+              )}
+              {reminders.map((r, i) => (
+                <Activity
+                  key={i}
+                  title="Payment reminder sent"
+                  actor={r.actor}
+                  at={r.sentAt}
+                  icon={BellRing}
+                  tone="text-warning"
+                />
+              ))}
+            </ol>
+          </Section>
+        </div>
+      </ScrollArea>
+
+      <div className="flex flex-wrap items-center gap-2 border-t border-border bg-background px-5 py-3">
+        {isScheduled && (
+          <Button
+            size="sm"
+            variant={isPastDue ? "default" : "outline"}
+            className="h-8 gap-1.5"
+            onClick={handleSendReminder}
+          >
+            <BellRing className="h-3.5 w-3.5" />
+            Send reminder
+          </Button>
+        )}
+        <div className="ml-auto">
+          <Button size="sm" variant="ghost" className="h-8" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section>
+      <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+        {title}
+      </h3>
+      {children}
+    </section>
+  );
+}
+
+function Activity({
+  title,
+  actor,
+  at,
+  icon: Icon,
+  tone,
+}: {
+  title: string;
+  actor: string;
+  at: string;
+  icon: React.ComponentType<{ className?: string }>;
+  tone: string;
+}) {
+  return (
+    <li className="relative">
+      <span
+        className={`absolute -left-[21px] top-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full border border-border bg-background ${tone}`}
+      >
+        <Icon className="h-2 w-2" />
+      </span>
+      <div className="text-xs font-medium">{title}</div>
+      <div className="text-[11px] text-muted-foreground">
+        {actor} · {formatDate(at)}
+      </div>
+    </li>
+  );
+}
+
+type MethodMeta = {
+  icon: React.ComponentType<{ className?: string }>;
+  tone: string;
+  title: string;
+  subtitle: string;
+};
+
+// No payment processor is integrated for per-transaction detail (card
+// brand/last4, ACH routing/trace IDs, etc.) — this previously fabricated
+// realistic-looking values seeded from the payment ID. Only the real
+// method label is shown now.
+function getMethodMeta(method: Payment["method"]): MethodMeta {
+  switch (method) {
+    case "Card":
+      return { icon: CreditCard, tone: "bg-primary-soft text-primary", title: "Card", subtitle: "Payment method on file" };
+    case "ACH":
+      return { icon: Building2, tone: "bg-chart-2/15 text-chart-2", title: "ACH bank transfer", subtitle: "Payment method on file" };
+    case "Check":
+      return { icon: FileText, tone: "bg-secondary text-secondary-foreground", title: "Check", subtitle: "Manual deposit" };
+    case "Wire":
+      return { icon: Banknote, tone: "bg-chart-5/15 text-chart-5", title: "Wire transfer", subtitle: "Domestic wire" };
+    default:
+      return { icon: Banknote, tone: "bg-muted text-muted-foreground", title: "Payment method not tracked", subtitle: "" };
+  }
+}

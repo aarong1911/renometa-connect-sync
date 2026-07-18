@@ -1,0 +1,217 @@
+---
+name: renometa-stack
+description: >
+  Full project context for RenoMeta Connect — a CRM/project management SaaS for
+  home improvement contractors. Covers the complete stack, all Supabase identifiers,
+  env vars, deployment URLs, database schema, storage buckets, Netlify functions,
+  Voice AI (Vapi) patterns, portal architecture, role/permission system, OAuth token
+  decryption, Make.com automations, and every critical gotcha from 12+ months of
+  development sessions. Use at the START of any session involving RenoMeta Connect,
+  the client portal, field app, marketing site, or any feature in the platform.
+  Also triggers on: home-service-hub, connect.renometa.com, portal.renometa.com,
+  tbtonsdemrcqtfhoocop, Vapi Voice AI, portal invites, invoices, projects drawer,
+  team members, permissions matrix, Meta Ads integration.
+---
+
+# RenoMeta Connect — Full Stack Reference
+
+## Project Identifiers
+
+```
+Supabase:     tbtonsdemrcqtfhoocop
+Supabase URL: https://tbtonsdemrcqtfhoocop.supabase.co
+Org ID:       d7963ad6-4bfe-4cc2-b9c2-949a02a3fa72
+Owner user:   f4ec461f-9df6-4a2f-b2e1-1b421df475c1
+Connect:      https://connect.renometa.com
+Portal:       https://portal.renometa.com  (portalreno.netlify.app)
+Field app:    https://field.renometa.com
+Marketing:    https://renometa.com  (aarong1911/renometa-website-v5)
+Repo:         github.com/aarong1911/home-service-hub
+Local:        C:\Users\info\OneDrive\Desktop\RenoMeta Apps\home-service-hub
+GCP project:  549459729443  (Google Calendar API)
+Vapi phone:   9a024622-c69e-4035-93fa-ffb6b8a3ca00
+```
+
+## Stack
+
+- React 18 + TypeScript + Vite 7
+- TanStack Router (file-based) + TanStack Query
+- Supabase (auth, DB, storage, realtime)
+- Netlify (hosting + serverless functions)
+- shadcn/ui + Tailwind + Lucide + Sonner
+- **pnpm only** — never npm/yarn
+
+## Commands
+
+```bash
+pnpm dev        # Vite :5173
+netlify dev     # :9999 (Node 20 required — crashes on Node 24)
+pnpm build
+pnpm tsc
+```
+
+## Environment Variables
+
+```
+SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY
+SMTP_USER=support@renometa.com
+SMTP_PASSWORD              # Gmail app password (NOT SMTP_PASS)
+STRIPE_SECRET_KEY
+TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
+TWILIO_PHONE_NUMBER, NOTIFY_PHONE_NUMBER
+VAPI_API_KEY               # Server-side
+VITE_VAPI_PUBLIC_KEY       # Client-side browser test calls
+VITE_GOOGLE_PLACES_API_KEY
+ENCRYPTION_KEY             # AES-256-GCM for OAuth token decryption
+```
+
+## Key Netlify Functions
+
+| Function | Purpose |
+|---|---|
+| `invite-member.ts` | Team invite (no project_id) |
+| `accept-invite.ts` | Accept team invitation |
+| `update-user-by-id.ts` | Update auth user metadata |
+| `portal-invite.ts` | Client portal invite → slug URL |
+| `portal-action.ts` | Portal: message + Twilio SMS, approve, Stripe pay |
+| `portal-data.ts` | Token → project data |
+| `vapi-webhook.ts` | Vapi Voice AI webhook |
+| `vapi-proxy.ts` | Vapi API proxy + Supabase sync |
+| `assign-voice-number.ts` | Patch phone to serverUrl mode |
+| `gcal-sync.ts` | Google Calendar sync |
+| `gmail-sync.ts` | Gmail sync |
+| `ai-tool-run.mjs` | AI Tools runner |
+| `meta-oauth-start/callback.ts` | Meta Ads OAuth |
+| `generate-ad-variations.ts` | AI ad generation |
+
+## Database Tables
+
+```
+profiles, organizations, org_memberships, invitations
+projects, project_notes, project_files, contacts, leads
+invoices, invoice_items, estimates, appointments, tasks
+voice_agents, voice_calls, voice_call_tools
+meta_connections, ad_drafts
+member_permissions    ← per-member action overrides (owner only)
+
+KEY: invitations.project_id
+  NULL  = team invite (show in team list)
+  SET   = portal invite (hide from team list — use .is("project_id", null))
+```
+
+## Storage Buckets
+
+```
+project-photos  PUBLIC  ← project photos (NOT project-files)
+project-files   Auth    ← documents
+org-assets      Public  ← logos
+proposal-pdfs   Auth
+```
+
+## Role System
+
+```
+owner          → all pages + settings (exclusive)
+admin          → all except settings
+office_manager → ops (no automation/insights/settings)
+estimator      → leads + estimates + inbox/templates
+sales          → leads + estimates + pipeline + broadcasts
+project_manager→ projects + tasks + calendar + files + contacts
+field_worker   → redirect https://field.renometa.com
+accountant     → financials + analytics only
+viewer         → redirect https://portal.renometa.com
+```
+
+See `src/lib/permissions.ts` for full `ROLE_ALLOWED_ROUTES` map.
+`member_permissions` table stores per-member overrides with `feature` + `action` + `granted`.
+
+## Portal Architecture
+
+```
+portal.renometa.com/p/{slug}      ← pretty URL (e.g. michael-chen-a1b2)
+portal.renometa.com/portal?token= ← legacy token URL
+
+Invite flow:
+  portal-invite.ts → invitations row (role:viewer + project_id + portal_slug)
+  Email: portal.renometa.com/p/{slug}
+
+Data: Supabase RPC get_portal_data(p_token?, p_slug?)
+Actions: portal-action.ts
+  send_message  → project_notes (is_client_message:true) + Twilio SMS
+  approve_estimate → estimates update
+  create_payment → Stripe Checkout (apiVersion: "2026-04-22.dahlia")
+```
+
+## Voice AI (Vapi) — Critical Patterns
+
+```typescript
+// Phone numbers: MUST send assistantId:null explicitly (not just omit)
+{ serverUrl: WEBHOOK_URL, assistantId: null }
+
+// Events: handle BOTH formats (Vapi renamed kebab→dot-notation)
+"call-started" | "assistant.started"
+"call-ended"   | "call.ended"
+
+// fn.arguments: plain OBJECT (not JSON string)
+const args = typeof fn.arguments === "string"
+  ? JSON.parse(fn.arguments) : fn.arguments;
+
+// Vapi Web SDK: window singleton (static imports → Krisp duplicate warning)
+if (!window.__vapiInstance) {
+  const { default: Vapi } = await import("@vapi-ai/web");
+  window.__vapiInstance = new Vapi(process.env.VITE_VAPI_PUBLIC_KEY);
+}
+
+// Google Calendar ISO strings: must include explicit UTC offset
+// Netlify = UTC server → use getUTC* methods
+"2026-04-13T14:00:00-04:00"  // CORRECT
+"2026-04-13T14:00:00"        // WRONG — treated as UTC
+
+// Billing: $0.35/min ceiling-rounded shown to users; raw in cost_usd
+```
+
+## OAuth Token Decryption
+
+```typescript
+// Supabase stores tokens as bytea: "\x{hex}"
+// Used in gcal-sync.ts and gmail-sync.ts
+function parseToken(raw: string): Buffer {
+  if (raw.startsWith("\\x")) return Buffer.from(raw.slice(2), "hex");
+  return Buffer.from(raw, "base64");
+}
+// Chain: hex → UTF-8 → base64-decode → Buffer → AES-256-GCM (ENCRYPTION_KEY)
+```
+
+## TanStack Router Rules
+
+```typescript
+// NEVER use "as any" — breaks router generator
+export const Route = createFileRoute("/your-path")({ component: Page });
+// Run pnpm dev → routeTree.gen.ts auto-regenerates
+
+// Find bad casts (PowerShell):
+Select-String -Path "src/routes/*.tsx" -Pattern "createFileRoute.*as any"
+```
+
+## All Gotchas
+
+| Issue | Fix |
+|---|---|
+| Node 24 + netlify dev | Use Node 20 |
+| `as any` on routes | Remove, run pnpm dev |
+| `SMTP_PASSWORD` | NOT `SMTP_PASS` |
+| `message` variable | Conflicts DOM global → `clientMessage` |
+| `body` variable in fn | Conflicts response field → `reqBody` |
+| Portal invites in team | `.is("project_id", null)` filter |
+| Photo bucket name | `project-photos` NOT `project-files` |
+| Stripe API version | `"2026-04-22.dahlia"` |
+| Vapi `assistantId` | Send `null` explicitly |
+| Vapi `fn.arguments` | Object, not JSON string |
+| Calendar ISO | Must include UTC offset, use `getUTC*` |
+| OAuth bytea tokens | Use `parseToken()` before decrypt |
+| `ENCRYPTION_KEY` | Required for gcal/gmail sync |
+| GCP Calendar API | Enable in project `549459729443` |
+| contacts unique | `(org_id, phone)` constraint |
+| DALL-E deprecated | Use `gpt-image-1` (May 2026) |
+| pnpm only | Never npm/yarn |
