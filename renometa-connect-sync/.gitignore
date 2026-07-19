@@ -1,0 +1,121 @@
+# =========================================================
+# RenoMeta Connect
+# React / Vite / TanStack / Netlify / Supabase
+# =========================================================
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+build/
+.output/
+.vinxi/
+.tanstack/**
+.nitro/
+
+# Test and coverage output
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+*.local
+
+# Netlify local state
+.netlify/
+
+# Cloudflare / Wrangler local state
+.wrangler/
+.dev.vars
+
+# Supabase local runtime files
+# Keep supabase/config.toml, migrations, functions, and seeds tracked.
+supabase/.branches/
+supabase/.temp/
+supabase/.cache/
+supabase/.env
+supabase/.env.*
+supabase/functions/.env
+supabase/functions/.env.*
+
+# Local history
+.history/
+
+# Temporary files and caches
+.cache/
+.tmp/
+tmp/
+temp/
+*.tmp
+*.temp
+
+# TypeScript build cache
+*.tsbuildinfo
+
+# ESLint / tooling cache
+.eslintcache
+.stylelintcache
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Visual Studio files
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.user
+
+# Package-manager artifacts
+.pnpm-store/
+.yarn/
+.yarn-cache/
+.yarn-integrity
+
+# Optional local certificates and keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Local database files
+*.sqlite
+*.sqlite3
+*.db
+
+# Local backups and archives
+*.bak
+*.backup
+*.zip
+*.tar
+*.tar.gz
+
+# Miscellaneous generated files
+*.pid
+*.seed
+*.pid.lock

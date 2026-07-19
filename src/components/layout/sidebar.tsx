@@ -31,16 +31,16 @@ type NavItem = { to: string; label: string; icon: React.ComponentType<{ classNam
 // Integrations stay owner-only automatically since "/settings/..." only
 // passes the filter when "/settings" is in that role's allowed list.
 const NAV: NavItem[] = [
-  { to: "/",                     label: "Command Center", icon: LayoutDashboard },
-  { to: "/leads",                label: "Leads",           icon: Target },
-  { to: "/inbox",                label: "Inbox",           icon: Inbox, badgeKey: "inbox" },
+  { to: "/",                      label: "Command Center", icon: LayoutDashboard },
+  { to: "/leads",                 label: "Leads",           icon: Target },
+  { to: "/inbox",                 label: "Inbox",           icon: Inbox, badgeKey: "inbox" },
   { to: "/calendar",              label: "Calendar",        icon: Calendar },
   { to: "/sales/pipeline",        label: "Pipeline",        icon: TrendingUp },
-  { to: "/estimates",  label: "Estimates",       icon: FileText },
+  { to: "/estimates",             label: "Estimates",       icon: FileText },
   { to: "/projects",              label: "Projects",        icon: Briefcase },
   { to: "/tasks",                 label: "Tasks",           icon: ListTodo },
   { to: "/contacts",              label: "Contacts",        icon: Users },
-  { to: "/companies",             label: "Companies",       icon: Building2 },
+  { to: "/companies",             label: "Accounts",        icon: Building2 },
   { to: ROUTES.AI_CENTER,         label: "AI Center",       icon: Bot },
   { to: ROUTES.WORKFLOWS,         label: "Workflows",       icon: Workflow },
   { to: "/marketing",             label: "Marketing",       icon: Megaphone },

@@ -106,6 +106,7 @@ export async function addContact(contact: Omit<Contact, "id">): Promise<Contact 
       address: contact.address || null,
       source: "manual",
       labels: contact.tags ?? [],
+      owner: contact.owner && contact.owner !== "—" ? contact.owner : null,
     })
     .select()
     .single();
@@ -121,30 +122,33 @@ export async function addContact(contact: Omit<Contact, "id">): Promise<Contact 
   return mapped;
 }
 
-export async function updateContact(id: string, patch: Partial<Contact>): Promise<void> {
+export async function updateContact(id: string, patch: Partial<Contact>): Promise<Contact | null> {
   const update: Record<string, any> = {};
   if (patch.name !== undefined) update.full_name = patch.name;
-  if (patch.email !== undefined) update.email = patch.email;
-  if (patch.phone !== undefined) update.phone = patch.phone;
-  if (patch.address !== undefined) update.address = patch.address;
-  if (patch.company !== undefined) update.company = patch.company;
+  if (patch.email !== undefined) update.email = patch.email || null;
+  if (patch.phone !== undefined) update.phone = patch.phone || null;
+  if (patch.address !== undefined) update.address = patch.address || null;
+  if (patch.company !== undefined) update.company = patch.company || null;
+  if (patch.owner !== undefined) update.owner = patch.owner && patch.owner !== "—" ? patch.owner : null;
   if (patch.tags !== undefined) update.labels = patch.tags;
   if (patch.avatar_key !== undefined) update.avatar_key = patch.avatar_key;
 
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from("contacts")
     .update(update)
-    .eq("id", id);
+    .eq("id", id)
+    .select()
+    .single();
 
   if (error) {
     console.error("[contacts-store] update failed:", error);
-    return;
+    return null;
   }
 
-  contacts = contacts.map((c) =>
-    c.id === id ? { ...c, ...patch, lastActivity: new Date().toISOString() } : c
-  );
+  const mapped = mapRow(data);
+  contacts = contacts.map((c) => c.id === id ? mapped : c);
   emit();
+  return mapped;
 }
 
 export async function deleteContact(id: string): Promise<void> {

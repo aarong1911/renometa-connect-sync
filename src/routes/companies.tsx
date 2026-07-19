@@ -1,40 +1,154 @@
 // src/routes/companies.tsx
-import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { PageHeader } from "@/components/layout/app-shell";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Card } from "@/components/ui/card";
-import { MetricCard } from "@/components/ui/metric-card";
-import { Badge } from "@/components/ui/badge";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
-import { Separator } from "@/components/ui/separator";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import {
-  Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription,
-} from "@/components/ui/sheet";
+  ChangeEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { formatDistanceToNow } from "date-fns";
 import {
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
-} from "@/components/ui/dialog";
-import {
-  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator,
-} from "@/components/ui/dropdown-menu";
-import {
-  Plus, Search, Globe, Phone, Mail, MapPin, MoreHorizontal, Loader2, Pencil, Trash2, Building2, Users,
+  Building2,
+  Camera,
+  Check,
+  ChevronDown,
+  Globe,
+  Mail,
+  MapPin,
+  MoreHorizontal,
+  Pencil,
+  Phone,
+  Plus,
+  Search,
+  Trash2,
+  Upload,
+  UserPlus,
+  Users,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
+
+import { PageHeader } from "@/components/layout/app-shell";
+import { AddressAutocomplete } from "@/components/ui/address-autocomplete";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { MetricCard } from "@/components/ui/metric-card";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Textarea } from "@/components/ui/textarea";
 import { supabase } from "@/lib/supabase";
-import { formatDistanceToNow } from "date-fns";
 import { useTopbarAction } from "@/lib/topbar-action";
 
-export const Route = createFileRoute("/companies")({ component: CompaniesPage });
+export const Route = createFileRoute("/companies")({
+  component: AccountsPage,
+});
+
+const ACCOUNT_TYPES = [
+  "Customer",
+  "Prospect",
+  "Vendor",
+  "Partner",
+  "Builder",
+  "Property Manager",
+  "Architect",
+  "Designer",
+  "Supplier",
+  "Subcontractor",
+  "Other",
+] as const;
+
+const ACCOUNT_STATUSES = ["Active", "Inactive", "Archived"] as const;
+
+const INDUSTRIES = [
+  "Construction",
+  "General Contractor",
+  "Remodeling",
+  "Home Builder",
+  "Property Management",
+  "Architecture",
+  "Interior Design",
+  "Engineering",
+  "Roofing",
+  "HVAC",
+  "Electrical",
+  "Plumbing",
+  "Painting",
+  "Flooring",
+  "Landscaping",
+  "Concrete",
+  "Cabinets",
+  "Windows & Doors",
+  "Supplier",
+  "Manufacturer",
+  "Distributor",
+  "Real Estate",
+  "Commercial",
+  "Residential",
+  "Other",
+] as const;
+
+const DEFAULT_TAGS = [
+  "Commercial",
+  "Residential",
+  "High Value",
+  "VIP",
+  "Referral Partner",
+  "Builder",
+  "Property Manager",
+  "Vendor",
+  "Supplier",
+  "Active Customer",
+  "Prospect",
+  "Remodeling",
+  "HOA",
+  "Government",
+] as const;
+
+type AccountType = (typeof ACCOUNT_TYPES)[number];
+type AccountStatus = (typeof ACCOUNT_STATUSES)[number];
 
 type Company = {
   id: string;
   org_id: string;
+  slug: string;
   name: string;
+  account_type: AccountType;
+  status: AccountStatus;
   industry: string | null;
   website: string | null;
   phone: string | null;
@@ -44,78 +158,328 @@ type Company = {
   state: string | null;
   zip: string | null;
   country: string;
+  owner_name: string | null;
+  logo_url: string | null;
+  tags: string[];
   notes: string | null;
   created_at: string;
   updated_at: string;
 };
 
-// ── Phone formatter ──
-function fmtPhone(raw: string): string {
-  const digits = raw.replace(/\D/g, "").slice(0, 10);
-  if (digits.length <= 3) return digits;
-  if (digits.length <= 6) return `${digits.slice(0,3)}-${digits.slice(3)}`;
-  return `${digits.slice(0,3)}-${digits.slice(3,6)}-${digits.slice(6)}`;
-}
+type TeamMember = {
+  id: string;
+  name: string;
+  email: string | null;
+};
+
+type ContactOption = {
+  id: string;
+  full_name: string;
+  email: string | null;
+  phone: string | null;
+};
+
+type PrimaryContactMode = "none" | "existing" | "new";
+
+type CompanyForm = {
+  name: string;
+  account_type: AccountType;
+  status: AccountStatus;
+  industry: string;
+  owner_name: string;
+  email: string;
+  phone: string;
+  website: string;
+  address: string;
+  city: string;
+  state: string;
+  zip: string;
+  country: string;
+  tags: string[];
+  notes: string;
+  logo_url: string;
+  primary_contact_mode: PrimaryContactMode;
+  existing_contact_id: string;
+  contact_name: string;
+  contact_title: string;
+  contact_email: string;
+  contact_phone: string;
+};
+
+const EMPTY_FORM: CompanyForm = {
+  name: "",
+  account_type: "Prospect",
+  status: "Active",
+  industry: "",
+  owner_name: "",
+  email: "",
+  phone: "",
+  website: "",
+  address: "",
+  city: "",
+  state: "",
+  zip: "",
+  country: "United States",
+  tags: [],
+  notes: "",
+  logo_url: "",
+  primary_contact_mode: "none",
+  existing_contact_id: "",
+  contact_name: "",
+  contact_title: "",
+  contact_email: "",
+  contact_phone: "",
+};
 
 async function getOrgId(): Promise<string | null> {
-  const { data: { user } } = await supabase.auth.getUser();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
   if (!user) return null;
-  const { data: p } = await supabase.from("profiles").select("organization_id").eq("id", user.id).maybeSingle();
-  if (p?.organization_id) return p.organization_id;
-  const { data: m } = await supabase.from("org_memberships").select("org_id").eq("member_id", user.id).maybeSingle();
-  return m?.org_id ?? null;
+
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("organization_id")
+    .eq("id", user.id)
+    .maybeSingle();
+
+  if (profile?.organization_id) return profile.organization_id;
+
+  const { data: membership } = await supabase
+    .from("org_memberships")
+    .select("org_id")
+    .eq("member_id", user.id)
+    .maybeSingle();
+
+  return membership?.org_id ?? null;
 }
 
-function CompaniesPage() {
+function formatPhoneInput(value: string): string {
+  const digits = value.replace(/\D/g, "").slice(0, 10);
+  if (!digits) return "";
+  if (digits.length < 4) return `(${digits}`;
+  if (digits.length < 7) return `(${digits.slice(0, 3)}) ${digits.slice(3)}`;
+  return `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
+}
+
+function ensureHttpsWhileTyping(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return `https://${trimmed.replace(/^\/+/, "")}`;
+}
+
+function slugifyAccountName(name: string): string {
+  const slug = name
+    .trim()
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return slug || "account";
+}
+
+async function createUniqueAccountSlug(
+  orgId: string,
+  accountName: string,
+): Promise<string> {
+  const baseSlug = slugifyAccountName(accountName);
+  let candidate = baseSlug;
+  let suffix = 2;
+
+  while (true) {
+    const { data, error } = await supabase
+      .from("companies")
+      .select("id")
+      .eq("org_id", orgId)
+      .eq("slug", candidate)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) return candidate;
+
+    candidate = `${baseSlug}-${suffix}`;
+    suffix += 1;
+  }
+}
+
+function initials(name: string): string {
+  return name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0])
+    .join("")
+    .toUpperCase();
+}
+
+function accountTypeClass(type: AccountType): string {
+  const classes: Record<AccountType, string> = {
+    Customer: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    Prospect: "border-blue-200 bg-blue-50 text-blue-700",
+    Vendor: "border-amber-200 bg-amber-50 text-amber-700",
+    Partner: "border-violet-200 bg-violet-50 text-violet-700",
+    Builder: "border-orange-200 bg-orange-50 text-orange-700",
+    "Property Manager": "border-cyan-200 bg-cyan-50 text-cyan-700",
+    Architect: "border-indigo-200 bg-indigo-50 text-indigo-700",
+    Designer: "border-pink-200 bg-pink-50 text-pink-700",
+    Supplier: "border-yellow-200 bg-yellow-50 text-yellow-700",
+    Subcontractor: "border-slate-200 bg-slate-100 text-slate-700",
+    Other: "border-gray-200 bg-gray-50 text-gray-700",
+  };
+  return classes[type];
+}
+
+function companyToForm(company: Company): CompanyForm {
+  return {
+    ...EMPTY_FORM,
+    name: company.name,
+    account_type: company.account_type,
+    status: company.status,
+    industry: company.industry ?? "",
+    owner_name: company.owner_name ?? "",
+    email: company.email ?? "",
+    phone: formatPhoneInput(company.phone ?? ""),
+    website: company.website ?? "",
+    address: company.address ?? "",
+    city: company.city ?? "",
+    state: company.state ?? "",
+    zip: company.zip ?? "",
+    country: company.country || "United States",
+    tags: company.tags ?? [],
+    notes: company.notes ?? "",
+    logo_url: company.logo_url ?? "",
+  };
+}
+
+function companyPayload(form: CompanyForm) {
+  return {
+    name: form.name.trim(),
+    account_type: form.account_type,
+    status: form.status,
+    industry: form.industry || null,
+    owner_name: form.owner_name || null,
+    email: form.email.trim() || null,
+    phone: form.phone.replace(/\D/g, "") || null,
+    website: form.website.trim() || null,
+    address: form.address.trim() || null,
+    city: form.city.trim() || null,
+    state: form.state.trim() || null,
+    zip: form.zip.trim() || null,
+    country: form.country.trim() || "United States",
+    tags: form.tags,
+    notes: form.notes.trim() || null,
+    logo_url: form.logo_url || null,
+  };
+}
+
+function AccountsPage() {
   const [companies, setCompanies] = useState<Company[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
+  const [typeFilter, setTypeFilter] = useState("All");
+  const [statusFilter, setStatusFilter] = useState("Active");
   const [selected, setSelected] = useState<Company | null>(null);
-  const [addOpen, setAddOpen] = useState(false);
-  const [editOpen, setEditOpen] = useState(false);
+  const [formOpen, setFormOpen] = useState(false);
+  const [editing, setEditing] = useState<Company | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Company | null>(null);
 
-  const load = useCallback(async () => {
+  const loadCompanies = useCallback(async () => {
+    setLoading(true);
     const orgId = await getOrgId();
-    if (!orgId) { setLoading(false); return; }
+    if (!orgId) {
+      toast.error("Could not determine your workspace.");
+      setLoading(false);
+      return;
+    }
+
     const { data, error } = await supabase
-      .from("companies").select("*").eq("org_id", orgId).order("name");
-    if (error) { console.error("[companies]", error); setLoading(false); return; }
-    setCompanies(data ?? []);
+      .from("companies")
+      .select("*")
+      .eq("org_id", orgId)
+      .order("name");
+
+    if (error) {
+      console.error("[accounts]", error);
+      toast.error("Could not load accounts.");
+    } else {
+      setCompanies((data ?? []) as Company[]);
+    }
     setLoading(false);
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    void loadCompanies();
+  }, [loadCompanies]);
 
   const filtered = useMemo(() => {
-    const q = search.toLowerCase();
-    if (!q) return companies;
-    return companies.filter(c =>
-      c.name.toLowerCase().includes(q) ||
-      (c.industry ?? "").toLowerCase().includes(q) ||
-      (c.city ?? "").toLowerCase().includes(q)
-    );
-  }, [companies, search]);
+    const query = search.trim().toLowerCase();
+    return companies.filter((company) => {
+      const matchesSearch =
+        !query ||
+        company.name.toLowerCase().includes(query) ||
+        (company.industry ?? "").toLowerCase().includes(query) ||
+        (company.city ?? "").toLowerCase().includes(query) ||
+        (company.email ?? "").toLowerCase().includes(query) ||
+        (company.tags ?? []).some((tag) => tag.toLowerCase().includes(query));
 
-  const handleDelete = async (id: string, name: string) => {
-    const { error } = await supabase.from("companies").delete().eq("id", id);
-    if (error) { toast.error("Failed to delete"); return; }
-    toast.success(`${name} deleted`);
-    setSelected(null);
-    load();
+      return (
+        matchesSearch &&
+        (typeFilter === "All" || company.account_type === typeFilter) &&
+        (statusFilter === "All" || company.status === statusFilter)
+      );
+    });
+  }, [companies, search, typeFilter, statusFilter]);
+
+  const openCreate = () => {
+    setEditing(null);
+    setFormOpen(true);
   };
 
-  // Refresh selected company after edit
-  const handleEdited = async (updated: Company) => {
-    setSelected(updated);
-    await load();
-    setEditOpen(false);
+  const openEdit = (company: Company) => {
+    setEditing(company);
+    setFormOpen(true);
+  };
+
+  const deleteCompany = async () => {
+    if (!deleteTarget) return;
+
+    const { error } = await supabase
+      .from("companies")
+      .delete()
+      .eq("id", deleteTarget.id)
+      .eq("org_id", deleteTarget.org_id);
+
+    if (error) {
+      toast.error("Could not delete the account.");
+      return;
+    }
+
+    toast.success(`${deleteTarget.name} deleted.`);
+    if (selected?.id === deleteTarget.id) setSelected(null);
+    setDeleteTarget(null);
+    await loadCompanies();
   };
 
   useTopbarAction(
-    <Button size="sm" onClick={() => setAddOpen(true)}>
-      <Plus className="mr-1.5 h-3.5 w-3.5" /> Add Company
+    <Button size="sm" onClick={openCreate}>
+      <Plus className="mr-1.5 h-3.5 w-3.5" />
+      Add Account
     </Button>,
   );
+
+  const customers = companies.filter(
+    (c) => c.account_type === "Customer",
+  ).length;
+  const prospects = companies.filter(
+    (c) => c.account_type === "Prospect",
+  ).length;
+  const partners = companies.filter((c) =>
+    ["Vendor", "Partner", "Supplier", "Subcontractor"].includes(c.account_type),
+  ).length;
 
   return (
     <>
@@ -123,469 +487,1268 @@ function CompaniesPage() {
         icon={Building2}
         iconBg="bg-gold-soft"
         iconColor="text-gold-hover"
-        title="Companies"
-        subtitle="Manage contractor accounts and client organizations."
-        breadcrumb={["CRM", "Companies"]}
+        title="Accounts"
+        subtitle="Manage commercial customers, prospects, vendors, partners, and trade relationships."
+        breadcrumb={["CRM", "Accounts"]}
       />
 
-      {/* Stats */}
       <div className="mb-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <MetricCard label="Total companies" value={companies.length} icon={Building2} tone="info" />
-        <MetricCard label="With website" value={companies.filter(c => c.website).length} icon={Globe} tone="violet" />
-        <MetricCard label="With email" value={companies.filter(c => c.email).length} icon={Mail} tone="success" />
-        <MetricCard label="With phone" value={companies.filter(c => c.phone).length} icon={Phone} tone="gold" />
+        <MetricCard
+          label="Total accounts"
+          value={companies.length}
+          icon={Building2}
+          tone="info"
+        />
+        <MetricCard
+          label="Customers"
+          value={customers}
+          icon={Users}
+          tone="success"
+        />
+        <MetricCard
+          label="Prospects"
+          value={prospects}
+          icon={UserPlus}
+          tone="violet"
+        />
+        <MetricCard
+          label="Partners & vendors"
+          value={partners}
+          icon={Globe}
+          tone="gold"
+        />
       </div>
 
-      {/* Search */}
-      <Card className="mb-3 p-2.5">
-        <div className="relative max-w-sm">
-          <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <Input placeholder="Search companies…" value={search} onChange={e => setSearch(e.target.value)} className="h-8 pl-8 text-sm" />
+      <Card className="mb-3 p-3">
+        <div className="flex flex-col gap-2 md:flex-row md:items-center">
+          <div className="relative min-w-0 flex-1">
+            <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search accounts, industries, cities, email, or tags…"
+              className="h-9 pl-9"
+            />
+          </div>
+
+          <Select value={typeFilter} onValueChange={setTypeFilter}>
+            <SelectTrigger className="h-9 w-full md:w-48">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="All">All account types</SelectItem>
+              {ACCOUNT_TYPES.map((type) => (
+                <SelectItem key={type} value={type}>
+                  {type}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          <Select value={statusFilter} onValueChange={setStatusFilter}>
+            <SelectTrigger className="h-9 w-full md:w-40">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="All">All statuses</SelectItem>
+              {ACCOUNT_STATUSES.map((status) => (
+                <SelectItem key={status} value={status}>
+                  {status}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
       </Card>
 
-      {/* Table */}
       <Card className="overflow-hidden p-0">
-        <table className="w-full text-sm">
-          <thead className="bg-secondary/60 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-            <tr className="border-b border-border">
-              <th className="py-2.5 pl-4 pr-3 text-left">Company</th>
-              <th className="py-2.5 pr-4 text-left">Industry</th>
-              <th className="py-2.5 pr-4 text-left">Location</th>
-              <th className="py-2.5 pr-4 text-left">Contact</th>
-              <th className="py-2.5 pr-4 text-left">Added</th>
-              <th className="w-10 py-2.5 pr-3" />
-            </tr>
-          </thead>
-          <tbody>
-            {loading && Array.from({ length: 5 }).map((_, i) => (
-              <tr key={i} className="border-b border-border">
-                {Array.from({ length: 5 }).map((_, j) => <td key={j} className="py-3 pr-4"><Skeleton className="h-4 w-28" /></td>)}
-                <td />
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[920px] text-sm">
+            <thead className="bg-secondary/60 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+              <tr className="border-b border-border">
+                <th className="py-2.5 pl-4 pr-3 text-left">Account</th>
+                <th className="py-2.5 pr-4 text-left">Type</th>
+                <th className="py-2.5 pr-4 text-left">Industry</th>
+                <th className="py-2.5 pr-4 text-left">Location</th>
+                <th className="py-2.5 pr-4 text-left">Owner</th>
+                <th className="py-2.5 pr-4 text-left">Status</th>
+                <th className="py-2.5 pr-4 text-left">Updated</th>
+                <th className="w-10 py-2.5 pr-3" />
               </tr>
-            ))}
-            {!loading && filtered.length === 0 && (
-              <tr><td colSpan={6} className="py-12 text-center text-sm text-muted-foreground">
-                {search ? "No companies match your search." : "No companies yet — add one to get started."}
-              </td></tr>
-            )}
-            {!loading && filtered.map(c => (
-              <tr key={c.id} onClick={() => setSelected(c)} className="cursor-pointer border-b border-border hover:bg-secondary/30">
-                <td className="py-2.5 pl-4 pr-3">
-                  <div className="flex items-center gap-2.5">
-                    <Avatar className="h-8 w-8">
-                      <AvatarFallback className="bg-primary-soft text-[11px] font-semibold text-primary">{c.name.slice(0, 2).toUpperCase()}</AvatarFallback>
-                    </Avatar>
-                    <span className="font-medium">{c.name}</span>
-                  </div>
-                </td>
-                <td className="py-2.5 pr-4 text-muted-foreground">{c.industry || "—"}</td>
-                <td className="py-2.5 pr-4 text-muted-foreground">{[c.city, c.state].filter(Boolean).join(", ") || "—"}</td>
-                <td className="py-2.5 pr-4">
-                  <div className="flex items-center gap-2">
-                    {c.email && <a href={`mailto:${c.email}`} className="text-muted-foreground hover:text-foreground" onClick={e => e.stopPropagation()}><Mail className="h-3.5 w-3.5" /></a>}
-                    {c.phone && <a href={`tel:${c.phone}`} className="text-muted-foreground hover:text-foreground" onClick={e => e.stopPropagation()}><Phone className="h-3.5 w-3.5" /></a>}
-                    {c.website && <a href={c.website} target="_blank" rel="noopener noreferrer" className="text-muted-foreground hover:text-foreground" onClick={e => e.stopPropagation()}><Globe className="h-3.5 w-3.5" /></a>}
-                    {!c.email && !c.phone && !c.website && <span className="text-[11px] text-muted-foreground">—</span>}
-                  </div>
-                </td>
-                <td className="py-2.5 pr-4 text-[11px] text-muted-foreground">{formatDistanceToNow(new Date(c.created_at), { addSuffix: true })}</td>
-                <td className="py-2.5 pr-3" onClick={e => e.stopPropagation()}>
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild><Button variant="ghost" size="icon" className="h-7 w-7"><MoreHorizontal className="h-3.5 w-3.5" /></Button></DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem onClick={() => { setSelected(c); setEditOpen(true); }}><Pencil className="mr-2 h-3.5 w-3.5" />Edit</DropdownMenuItem>
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem className="text-destructive" onClick={() => handleDelete(c.id, c.name)}><Trash2 className="mr-2 h-3.5 w-3.5" />Delete</DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {loading &&
+                Array.from({ length: 5 }).map((_, index) => (
+                  <tr key={index} className="border-b border-border">
+                    {Array.from({ length: 7 }).map((__, column) => (
+                      <td key={column} className="py-3 pr-4">
+                        <Skeleton className="h-4 w-24" />
+                      </td>
+                    ))}
+                    <td />
+                  </tr>
+                ))}
+
+              {!loading && filtered.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={8}
+                    className="py-14 text-center text-muted-foreground"
+                  >
+                    No accounts match the current filters.
+                  </td>
+                </tr>
+              )}
+
+              {!loading &&
+                filtered.map((company) => (
+                  <tr
+                    key={company.id}
+                    onClick={() => setSelected(company)}
+                    className="cursor-pointer border-b border-border transition-colors hover:bg-secondary/30"
+                  >
+                    <td className="py-2.5 pl-4 pr-3">
+                      <div className="flex items-center gap-2.5">
+                        <Avatar className="h-9 w-9">
+                          <AvatarImage
+                            src={company.logo_url || undefined}
+                            alt=""
+                          />
+                          <AvatarFallback className="bg-primary-soft text-xs font-semibold text-primary">
+                            {initials(company.name)}
+                          </AvatarFallback>
+                        </Avatar>
+                        <div className="min-w-0">
+                          <div className="truncate font-medium">
+                            {company.name}
+                          </div>
+                          <div className="truncate text-xs text-muted-foreground">
+                            {company.email ||
+                              company.website ||
+                              "No contact details"}
+                          </div>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="py-2.5 pr-4">
+                      <Badge
+                        variant="outline"
+                        className={accountTypeClass(company.account_type)}
+                      >
+                        {company.account_type}
+                      </Badge>
+                    </td>
+                    <td className="py-2.5 pr-4 text-muted-foreground">
+                      {company.industry || "—"}
+                    </td>
+                    <td className="py-2.5 pr-4 text-muted-foreground">
+                      {[company.city, company.state]
+                        .filter(Boolean)
+                        .join(", ") || "—"}
+                    </td>
+                    <td className="py-2.5 pr-4 text-muted-foreground">
+                      {company.owner_name || "Unassigned"}
+                    </td>
+                    <td className="py-2.5 pr-4">
+                      <Badge variant="outline">{company.status}</Badge>
+                    </td>
+                    <td className="py-2.5 pr-4 text-xs text-muted-foreground">
+                      {formatDistanceToNow(new Date(company.updated_at), {
+                        addSuffix: true,
+                      })}
+                    </td>
+                    <td
+                      className="py-2.5 pr-3"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8"
+                          >
+                            <MoreHorizontal className="h-4 w-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem onClick={() => openEdit(company)}>
+                            <Pencil className="mr-2 h-4 w-4" /> Edit
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            className="text-destructive"
+                            onClick={() => setDeleteTarget(company)}
+                          >
+                            <Trash2 className="mr-2 h-4 w-4" /> Delete
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
       </Card>
 
-      {/* Detail drawer */}
-      <Sheet open={!!selected} onOpenChange={o => !o && setSelected(null)}>
-        <SheetContent className="w-full overflow-y-auto sm:max-w-md">
+      <Sheet
+        open={Boolean(selected)}
+        onOpenChange={(open) => !open && setSelected(null)}
+      >
+        <SheetContent className="w-full overflow-y-auto sm:max-w-lg">
           {selected && (
             <>
               <SheetHeader className="border-b border-border pb-4">
-                <div className="flex items-center gap-3">
+                <div className="flex items-start gap-3 pr-8">
                   <Avatar className="h-12 w-12">
-                    <AvatarFallback className="bg-primary-soft text-sm font-semibold text-primary">{selected.name.slice(0,2).toUpperCase()}</AvatarFallback>
+                    <AvatarImage src={selected.logo_url || undefined} alt="" />
+                    <AvatarFallback>{initials(selected.name)}</AvatarFallback>
                   </Avatar>
                   <div className="min-w-0 flex-1">
-                    <SheetTitle className="text-base">{selected.name}</SheetTitle>
-                    <SheetDescription className="text-xs">{selected.industry || "No industry set"}</SheetDescription>
+                    <SheetTitle>{selected.name}</SheetTitle>
+                    <div className="mt-1 flex gap-1.5">
+                      <Badge
+                        variant="outline"
+                        className={accountTypeClass(selected.account_type)}
+                      >
+                        {selected.account_type}
+                      </Badge>
+                      <Badge variant="outline">{selected.status}</Badge>
+                    </div>
                   </div>
                 </div>
-                <div className="flex gap-2 pt-2">
-                  <Button size="sm" variant="outline" className="flex-1 h-8" onClick={() => setEditOpen(true)}>
-                    <Pencil className="h-3.5 w-3.5 mr-1.5" />Edit
+                <div className="grid grid-cols-2 gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => openEdit(selected)}
+                  >
+                    <Pencil className="mr-1.5 h-3.5 w-3.5" /> Edit
                   </Button>
-                  {selected.email && <a href={`mailto:${selected.email}`} className="flex-1"><Button size="sm" variant="outline" className="w-full h-8"><Mail className="h-3.5 w-3.5 mr-1.5" />Email</Button></a>}
-                  {selected.phone && <a href={`tel:${selected.phone}`} className="flex-1"><Button size="sm" variant="outline" className="w-full h-8"><Phone className="h-3.5 w-3.5 mr-1.5" />Call</Button></a>}
+                  <Button asChild size="sm">
+                    <Link
+                      to="/accounts/$accountSlug"
+                      params={{ accountSlug: selected.slug }}
+                      onClick={() => setSelected(null)}
+                    >
+                      View Full Account
+                    </Link>
+                  </Button>
                 </div>
               </SheetHeader>
-              <div className="mt-4 space-y-4 text-sm">
-                {selected.phone && (
-                  <div><div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Phone</div>
-                    <a href={`tel:${selected.phone}`} className="flex items-center gap-1.5 text-foreground hover:text-primary"><Phone className="h-3.5 w-3.5 text-muted-foreground" />{selected.phone}</a>
-                  </div>
-                )}
+
+              <div className="space-y-5 py-5 text-sm">
+                <div className="grid grid-cols-2 gap-4 rounded-lg border p-4">
+                  <Detail label="Account type" value={selected.account_type} />
+                  <Detail
+                    label="Owner"
+                    value={selected.owner_name || "Unassigned"}
+                  />
+                  <Detail
+                    label="Industry"
+                    value={selected.industry || "Not set"}
+                  />
+                  <Detail label="Status" value={selected.status} />
+                </div>
+
                 {selected.email && (
-                  <div><div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Email</div>
-                    <a href={`mailto:${selected.email}`} className="flex items-center gap-1.5 text-foreground hover:text-primary"><Mail className="h-3.5 w-3.5 text-muted-foreground" />{selected.email}</a>
-                  </div>
+                  <LinkRow
+                    icon={Mail}
+                    href={`mailto:${selected.email}`}
+                    text={selected.email}
+                  />
+                )}
+                {selected.phone && (
+                  <LinkRow
+                    icon={Phone}
+                    href={`tel:${selected.phone}`}
+                    text={formatPhoneInput(selected.phone)}
+                  />
                 )}
                 {selected.website && (
-                  <div><div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Website</div>
-                    <a href={selected.website} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1.5 text-primary hover:underline"><Globe className="h-3.5 w-3.5" />{selected.website}</a>
-                  </div>
+                  <LinkRow
+                    icon={Globe}
+                    href={selected.website}
+                    text={selected.website}
+                    external
+                  />
                 )}
+
                 {(selected.address || selected.city) && (
-                  <div><div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Address</div>
-                    <a href={`https://maps.google.com/?q=${encodeURIComponent([selected.address, selected.city, selected.state, selected.zip].filter(Boolean).join(", "))}`} target="_blank" rel="noopener noreferrer" className="flex items-start gap-1.5 text-muted-foreground hover:text-foreground">
-                      <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                      <span>{[selected.address, selected.city, selected.state, selected.zip].filter(Boolean).join(", ")}</span>
-                    </a>
+                  <LinkRow
+                    icon={MapPin}
+                    href={`https://maps.google.com/?q=${encodeURIComponent(
+                      [
+                        selected.address,
+                        selected.city,
+                        selected.state,
+                        selected.zip,
+                        selected.country,
+                      ]
+                        .filter(Boolean)
+                        .join(", "),
+                    )}`}
+                    text={[
+                      selected.address,
+                      selected.city,
+                      selected.state,
+                      selected.zip,
+                    ]
+                      .filter(Boolean)
+                      .join(", ")}
+                    external
+                  />
+                )}
+
+                {selected.tags?.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {selected.tags.map((tag) => (
+                      <Badge key={tag} variant="secondary">
+                        {tag}
+                      </Badge>
+                    ))}
                   </div>
                 )}
+
                 {selected.notes && (
-                  <div><div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Notes</div>
-                    <p className="text-muted-foreground whitespace-pre-wrap">{selected.notes}</p>
-                  </div>
+                  <p className="whitespace-pre-wrap rounded-lg border bg-secondary/20 p-3 text-muted-foreground">
+                    {selected.notes}
+                  </p>
                 )}
-                <Separator />
-                <div className="rounded-md border border-border bg-secondary/40 p-3 text-xs text-muted-foreground">
-                  Added {formatDistanceToNow(new Date(selected.created_at), { addSuffix: true })} · Updated {formatDistanceToNow(new Date(selected.updated_at), { addSuffix: true })}
-                </div>
-                <Button variant="destructive" size="sm" className="w-full" onClick={() => handleDelete(selected.id, selected.name)}>
-                  <Trash2 className="mr-1.5 h-3.5 w-3.5" /> Delete Company
-                </Button>
               </div>
             </>
           )}
         </SheetContent>
       </Sheet>
 
-      <AddCompanyDialog open={addOpen} onClose={() => setAddOpen(false)} onSaved={() => { setAddOpen(false); load(); }} />
-      {selected && (
-        <EditCompanyDialog open={editOpen} company={selected} onClose={() => setEditOpen(false)} onSaved={handleEdited} />
-      )}
+      <AccountFormDialog
+        open={formOpen}
+        company={editing}
+        onClose={() => setFormOpen(false)}
+        onLogoSaved={async (saved) => {
+          setEditing(saved);
+          setSelected((current) =>
+            current?.id === saved.id ? saved : current,
+          );
+          await loadCompanies();
+        }}
+        onSaved={async (saved) => {
+          setFormOpen(false);
+          setSelected(saved);
+          await loadCompanies();
+        }}
+      />
+
+      <Dialog
+        open={Boolean(deleteTarget)}
+        onOpenChange={(open) => !open && setDeleteTarget(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete account?</DialogTitle>
+            <DialogDescription>
+              This deletes {deleteTarget?.name}. Linked contacts remain in
+              Contacts.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteTarget(null)}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={() => void deleteCompany()}>
+              Delete Account
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }
 
-// ── Nominatim address autocomplete ───────────────────────────────────────────
-
-type NominatimResult = {
-  place_id: number;
-  display_name: string;
-  address: {
-    house_number?: string;
-    road?: string;
-    city?: string;
-    town?: string;
-    village?: string;
-    state?: string;
-    postcode?: string;
-  };
-};
-
-const STATE_ABBR: Record<string, string> = {
-  Alabama: "AL", Alaska: "AK", Arizona: "AZ", Arkansas: "AR", California: "CA",
-  Colorado: "CO", Connecticut: "CT", Delaware: "DE", Florida: "FL", Georgia: "GA",
-  Hawaii: "HI", Idaho: "ID", Illinois: "IL", Indiana: "IN", Iowa: "IA",
-  Kansas: "KS", Kentucky: "KY", Louisiana: "LA", Maine: "ME", Maryland: "MD",
-  Massachusetts: "MA", Michigan: "MI", Minnesota: "MN", Mississippi: "MS",
-  Missouri: "MO", Montana: "MT", Nebraska: "NE", Nevada: "NV",
-  "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY",
-  "North Carolina": "NC", "North Dakota": "ND", Ohio: "OH", Oklahoma: "OK",
-  Oregon: "OR", Pennsylvania: "PA", "Rhode Island": "RI", "South Carolina": "SC",
-  "South Dakota": "SD", Tennessee: "TN", Texas: "TX", Utah: "UT",
-  Vermont: "VT", Virginia: "VA", Washington: "WA", "West Virginia": "WV",
-  Wisconsin: "WI", Wyoming: "WY",
-};
-
-type AddressFields = { address: string; city: string; state: string; zip: string };
-
-function CompanyAddressInput({
-  value,
-  onChange,
-  onSelect,
+function AccountFormDialog({
+  open,
+  company,
+  onClose,
+  onLogoSaved,
+  onSaved,
 }: {
-  value: string;
-  onChange: (v: string) => void;
-  onSelect: (fields: AddressFields) => void;
+  open: boolean;
+  company: Company | null;
+  onClose: () => void;
+  onLogoSaved: (company: Company) => void | Promise<void>;
+  onSaved: (company: Company) => void;
 }) {
-  const [suggestions, setSuggestions] = useState<NominatimResult[]>([]);
-  const [open, setOpen] = useState(false);
-  const [fetching, setFetching] = useState(false);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
+  const [form, setForm] = useState<CompanyForm>(EMPTY_FORM);
+  const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
+  const [contacts, setContacts] = useState<ContactOption[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [uploadingLogo, setUploadingLogo] = useState(false);
+  const [selectedLogoFile, setSelectedLogoFile] = useState<File | null>(null);
+  const [logoPreviewUrl, setLogoPreviewUrl] = useState("");
+  const [newTag, setNewTag] = useState("");
+  const logoInputRef = useRef<HTMLInputElement>(null);
 
-  const search = useCallback(async (q: string) => {
-    if (q.length < 4) { setSuggestions([]); setOpen(false); return; }
-    setFetching(true);
-    try {
-      const res = await fetch(
-        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&addressdetails=1&countrycodes=us&limit=5`,
-        { headers: { "Accept-Language": "en" } },
-      );
-      if (!res.ok) throw new Error("Network error");
-      const data: NominatimResult[] = await res.json();
-      setSuggestions(data);
-      setOpen(data.length > 0);
-    } catch {
-      setSuggestions([]);
-      setOpen(false);
-    } finally {
-      setFetching(false);
-    }
-  }, []);
-
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = e.target.value;
-    onChange(val);
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => search(val), 400);
-  };
-
-  const handleSelect = (r: NominatimResult) => {
-    const a = r.address;
-    const street = [a.house_number ?? "", a.road ?? ""].filter(Boolean).join(" ");
-    const city = a.city ?? a.town ?? a.village ?? "";
-    const state = a.state ? (STATE_ABBR[a.state] ?? a.state) : "";
-    const zip = a.postcode ?? "";
-    onSelect({ address: street, city, state, zip });
-    setSuggestions([]);
-    setOpen(false);
+  const update = <K extends keyof CompanyForm>(
+    key: K,
+    value: CompanyForm[K],
+  ) => {
+    setForm((current) => ({ ...current, [key]: value }));
   };
 
   useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
+    setForm(company ? companyToForm(company) : EMPTY_FORM);
+    setSelectedLogoFile(null);
+    setLogoPreviewUrl((current) => {
+      if (current) URL.revokeObjectURL(current);
+      return "";
+    });
+    setNewTag("");
+  }, [company, open]);
+
+  useEffect(() => {
+    return () => {
+      if (logoPreviewUrl) URL.revokeObjectURL(logoPreviewUrl);
     };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, []);
+  }, [logoPreviewUrl]);
 
-  return (
-    <div ref={containerRef} className="relative">
-      <div className="relative">
-        <MapPin className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground pointer-events-none" />
-        <Input
-          value={value}
-          onChange={handleChange}
-          placeholder="123 Main St"
-          className="pl-8"
-          autoComplete="off"
-        />
-        {fetching && (
-          <Loader2 className="absolute right-2.5 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-muted-foreground" />
-        )}
-      </div>
-      {open && suggestions.length > 0 && (
-        <div className="absolute z-50 mt-1 w-full rounded-md border border-border bg-popover shadow-lg">
-          <ul className="py-1 text-sm">
-            {suggestions.map((r) => (
-              <li
-                key={r.place_id}
-                className="flex cursor-pointer items-center gap-2 px-3 py-2 hover:bg-accent hover:text-accent-foreground"
-                onMouseDown={(e) => { e.preventDefault(); handleSelect(r); }}
-              >
-                <MapPin className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                <span className="truncate">{r.display_name}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-    </div>
-  );
-}
+  useEffect(() => {
+    if (!open) return;
 
-// ── Shared form fields ────────────────────────────────────────────────────────
+    void (async () => {
+      const orgId = await getOrgId();
+      if (!orgId) return;
 
-type CompanyForm = {
-  name: string; industry: string; website: string; phone: string; email: string;
-  address: string; city: string; state: string; zip: string; notes: string;
-  contact_name: string; contact_email: string; contact_phone: string;
-};
+      const [{ data: profiles }, { data: contactRows }] = await Promise.all([
+        supabase
+          .from("profiles")
+          .select("id, first_name, last_name, email")
+          .eq("organization_id", orgId)
+          .order("first_name"),
+        supabase
+          .from("contacts")
+          .select("id, full_name, email, phone")
+          .eq("org_id", orgId)
+          .order("full_name"),
+      ]);
 
-function blankForm(): CompanyForm {
-  return { name: "", industry: "", website: "", phone: "", email: "", address: "", city: "", state: "", zip: "", notes: "", contact_name: "", contact_email: "", contact_phone: "" };
-}
+      setTeamMembers(
+        (profiles ?? []).map((profile: any) => ({
+          id: profile.id,
+          name:
+            [profile.first_name, profile.last_name].filter(Boolean).join(" ") ||
+            profile.email ||
+            "Unnamed user",
+          email: profile.email ?? null,
+        })),
+      );
 
-function formFromCompany(c: Company): CompanyForm {
-  return { name: c.name, industry: c.industry ?? "", website: c.website ?? "", phone: c.phone ?? "", email: c.email ?? "", address: c.address ?? "", city: c.city ?? "", state: c.state ?? "", zip: c.zip ?? "", notes: c.notes ?? "", contact_name: "", contact_email: "", contact_phone: "" };
-}
+      setContacts((contactRows ?? []) as ContactOption[]);
+    })();
+  }, [open]);
 
-function CompanyFormFields({ form, setForm }: { form: CompanyForm; setForm: (f: CompanyForm) => void }) {
-  const set = (k: keyof CompanyForm) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
-    setForm({ ...form, [k]: e.target.value });
+  const toggleTag = (tag: string) => {
+    update(
+      "tags",
+      form.tags.includes(tag)
+        ? form.tags.filter((existing) => existing !== tag)
+        : [...form.tags, tag],
+    );
+  };
 
-  const handlePhone = (e: React.ChangeEvent<HTMLInputElement>) =>
-    setForm({ ...form, phone: fmtPhone(e.target.value) });
+  const addCustomTag = () => {
+    const value = newTag.trim();
+    if (!value) return;
+    if (!form.tags.includes(value)) update("tags", [...form.tags, value]);
+    setNewTag("");
+  };
 
-  const handleContactPhone = (e: React.ChangeEvent<HTMLInputElement>) =>
-    setForm({ ...form, contact_phone: fmtPhone(e.target.value) });
+  const handleLogoUpload = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
 
-  return (
-    <div className="space-y-4">
-      {/* Company info */}
-      <div>
-        <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Company Info</div>
-        <div className="grid grid-cols-2 gap-3">
-          <div className="col-span-2 space-y-1"><Label className="text-xs">Company name *</Label><Input value={form.name} onChange={set("name")} placeholder="Acme Contractors" /></div>
-          <div className="space-y-1"><Label className="text-xs">Industry</Label><Input value={form.industry} onChange={set("industry")} placeholder="General Contracting" /></div>
-          <div className="space-y-1"><Label className="text-xs">Website</Label><Input value={form.website} onChange={set("website")} placeholder="https://acme.com" /></div>
-          <div className="space-y-1"><Label className="text-xs">Phone</Label>
-            <Input value={form.phone} onChange={handlePhone} placeholder="555-123-4567" inputMode="tel" />
-          </div>
-          <div className="space-y-1"><Label className="text-xs">Email</Label><Input value={form.email} onChange={set("email")} placeholder="info@acme.com" type="email" /></div>
-        </div>
-      </div>
-
-      {/* Address with native autocomplete */}
-      <div>
-        <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Address</div>
-        <div className="grid grid-cols-2 gap-3">
-          <div className="col-span-2 space-y-1">
-            <Label className="text-xs">Street address</Label>
-            <CompanyAddressInput
-              value={form.address}
-              onChange={(v) => setForm({ ...form, address: v })}
-              onSelect={(fields) => setForm({ ...form, ...fields })}
-            />
-          </div>
-          <div className="space-y-1"><Label className="text-xs">City</Label><Input value={form.city} onChange={set("city")} placeholder="Miami" autoComplete="address-level2" /></div>
-          <div className="space-y-1"><Label className="text-xs">State</Label><Input value={form.state} onChange={set("state")} placeholder="FL" autoComplete="address-level1" /></div>
-          <div className="space-y-1"><Label className="text-xs">ZIP</Label><Input value={form.zip} onChange={set("zip")} placeholder="33101" autoComplete="postal-code" /></div>
-        </div>
-      </div>
-
-      {/* Primary contact */}
-      <div>
-        <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Primary Contact</div>
-        <div className="grid grid-cols-2 gap-3">
-          <div className="col-span-2 space-y-1"><Label className="text-xs">Contact name</Label><Input value={form.contact_name} onChange={set("contact_name")} placeholder="John Smith" autoComplete="name" /></div>
-          <div className="space-y-1"><Label className="text-xs">Contact email</Label><Input value={form.contact_email} onChange={set("contact_email")} placeholder="john@acme.com" type="email" /></div>
-          <div className="space-y-1"><Label className="text-xs">Contact phone</Label>
-            <Input value={form.contact_phone} onChange={handleContactPhone} placeholder="555-123-4567" inputMode="tel" />
-          </div>
-        </div>
-      </div>
-
-      {/* Notes */}
-      <div className="space-y-1"><Label className="text-xs">Notes</Label><Textarea value={form.notes} onChange={set("notes")} rows={2} placeholder="Internal notes…" /></div>
-    </div>
-  );
-}
-
-// ── Add dialog ────────────────────────────────────────────────────────────────
-
-function AddCompanyDialog({ open, onClose, onSaved }: { open: boolean; onClose: () => void; onSaved: () => void }) {
-  const [saving, setSaving] = useState(false);
-  const [form, setForm] = useState<CompanyForm>(blankForm());
-
-  const handleSave = async () => {
-    if (!form.name.trim()) { toast.error("Company name is required"); return; }
-    setSaving(true);
-    const orgId = await getOrgId();
-    if (!orgId) { toast.error("Could not determine organization"); setSaving(false); return; }
-
-    const { data: company, error } = await supabase.from("companies").insert({
-      org_id: orgId,
-      name: form.name.trim(),
-      industry: form.industry || null,
-      website: form.website || null,
-      phone: form.phone || null,
-      email: form.email || null,
-      address: form.address || null,
-      city: form.city || null,
-      state: form.state || null,
-      zip: form.zip || null,
-      notes: form.notes || null,
-    }).select("id").single();
-
-    // If contact name provided, create a contact linked to the company
-    if (!error && company && form.contact_name.trim()) {
-      await supabase.from("contacts").insert({
-        org_id: orgId,
-        full_name: form.contact_name.trim(),
-        email: form.contact_email || null,
-        phone: form.contact_phone || null,
-        labels: ["Company Contact"],
-      });
+    if (!file.type.startsWith("image/")) {
+      toast.error("Choose an image file.");
+      return;
     }
 
-    setSaving(false);
-    if (error) { toast.error("Failed to save: " + error.message); return; }
-    toast.success("Company added");
-    setForm(blankForm());
-    onSaved();
+    if (file.size > 3 * 1024 * 1024) {
+      toast.error("Logo must be smaller than 3 MB.");
+      return;
+    }
+
+    const previewUrl = URL.createObjectURL(file);
+    setLogoPreviewUrl((current) => {
+      if (current) URL.revokeObjectURL(current);
+      return previewUrl;
+    });
+
+    // A new account does not have a company ID yet, so keep the file until
+    // Create Account is clicked. Existing accounts can save immediately.
+    if (!company) {
+      setSelectedLogoFile(file);
+      toast.success("Logo selected. Create the account to save it.");
+      return;
+    }
+
+    try {
+      const orgId = await getOrgId();
+      if (!orgId) throw new Error("Could not determine workspace.");
+
+      const updatedCompany = await uploadAndPersistCompanyLogo({
+        orgId,
+        companyId: company.id,
+        file,
+      });
+
+      setSelectedLogoFile(null);
+      setForm((current) => ({
+        ...current,
+        logo_url: updatedCompany.logo_url ?? "",
+      }));
+      setLogoPreviewUrl((current) => {
+        if (current) URL.revokeObjectURL(current);
+        return "";
+      });
+
+      await onLogoSaved(updatedCompany);
+      toast.success("Logo uploaded and saved.");
+    } catch (error) {
+      console.error("[account-logo]", error);
+      setLogoPreviewUrl((current) => {
+        if (current) URL.revokeObjectURL(current);
+        return "";
+      });
+      toast.error(
+        error instanceof Error ? error.message : "Could not save the logo.",
+      );
+    }
+  };
+
+  const uploadAndPersistCompanyLogo = async ({
+    orgId,
+    companyId,
+    file,
+  }: {
+    orgId: string;
+    companyId: string;
+    file: File;
+  }): Promise<Company> => {
+    setUploadingLogo(true);
+
+    const extension =
+      file.name
+        .split(".")
+        .pop()
+        ?.toLowerCase()
+        .replace(/[^a-z0-9]/g, "") ||
+      file.type.split("/").pop()?.toLowerCase() ||
+      "png";
+    const storagePath = `${orgId}/${companyId}/logo-${Date.now()}-${crypto.randomUUID()}.${extension}`;
+
+    try {
+      const { error: uploadError } = await supabase.storage
+        .from("account-logos")
+        .upload(storagePath, file, {
+          cacheControl: "3600",
+          contentType: file.type,
+          upsert: false,
+        });
+
+      if (uploadError) throw uploadError;
+
+      const { data: publicUrlData } = supabase.storage
+        .from("account-logos")
+        .getPublicUrl(storagePath);
+
+      const publicUrl = publicUrlData.publicUrl;
+      if (!publicUrl) {
+        await supabase.storage.from("account-logos").remove([storagePath]);
+        throw new Error("Supabase did not return a public logo URL.");
+      }
+
+      const { data: updatedCompany, error: updateError } = await supabase
+        .from("companies")
+        .update({
+          logo_url: publicUrl,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", companyId)
+        .eq("org_id", orgId)
+        .select("*")
+        .single();
+
+      if (updateError) {
+        await supabase.storage.from("account-logos").remove([storagePath]);
+        throw updateError;
+      }
+
+      if (!updatedCompany?.logo_url) {
+        await supabase.storage.from("account-logos").remove([storagePath]);
+        throw new Error(
+          "The logo uploaded, but companies.logo_url was not updated.",
+        );
+      }
+
+      return updatedCompany as Company;
+    } finally {
+      setUploadingLogo(false);
+    }
+  };
+
+  const createOrLinkPrimaryContact = async (
+    orgId: string,
+    companyId: string,
+  ): Promise<void> => {
+    if (form.primary_contact_mode === "none") return;
+
+    let contactId = form.existing_contact_id;
+
+    if (form.primary_contact_mode === "new") {
+      if (!form.contact_name.trim()) {
+        throw new Error("Primary contact name is required.");
+      }
+
+      const { data: createdContact, error: contactError } = await supabase
+        .from("contacts")
+        .insert({
+          org_id: orgId,
+          full_name: form.contact_name.trim(),
+          email: form.contact_email.trim() || null,
+          phone: form.contact_phone.replace(/\D/g, "") || null,
+          company: form.name.trim(),
+          source: "account",
+          labels: [],
+        })
+        .select("id")
+        .single();
+
+      if (contactError) throw contactError;
+      contactId = createdContact.id;
+    }
+
+    if (!contactId) return;
+
+    await supabase
+      .from("company_contacts")
+      .update({ is_primary: false })
+      .eq("company_id", companyId)
+      .eq("org_id", orgId);
+
+    const { error: linkError } = await supabase.from("company_contacts").upsert(
+      {
+        org_id: orgId,
+        company_id: companyId,
+        contact_id: contactId,
+        relationship_title: form.contact_title.trim() || null,
+        is_primary: true,
+      },
+      { onConflict: "company_id,contact_id" },
+    );
+
+    if (linkError) throw linkError;
+  };
+
+  const save = async () => {
+    if (!form.name.trim()) {
+      toast.error("Account name is required.");
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const orgId = await getOrgId();
+      if (!orgId) throw new Error("Could not determine workspace.");
+
+      let savedCompany: Company;
+
+      if (company) {
+        const updatePayload = {
+          ...companyPayload(form),
+          ...(!company.slug
+            ? {
+                slug: await createUniqueAccountSlug(
+                  orgId,
+                  form.name.trim(),
+                ),
+              }
+            : {}),
+        };
+
+        const { data, error } = await supabase
+          .from("companies")
+          .update(updatePayload)
+          .eq("id", company.id)
+          .eq("org_id", orgId)
+          .select("*")
+          .single();
+
+        if (error) throw error;
+        savedCompany = data as Company;
+      } else {
+        const slug = await createUniqueAccountSlug(
+          orgId,
+          form.name.trim(),
+        );
+
+        const { data, error } = await supabase
+          .from("companies")
+          .insert({
+            ...companyPayload(form),
+            org_id: orgId,
+            slug,
+          })
+          .select("*")
+          .single();
+
+        if (error) throw error;
+        savedCompany = data as Company;
+      }
+
+      if (selectedLogoFile) {
+        savedCompany = await uploadAndPersistCompanyLogo({
+          orgId,
+          companyId: savedCompany.id,
+          file: selectedLogoFile,
+        });
+      }
+
+      await createOrLinkPrimaryContact(orgId, savedCompany.id);
+
+      setSelectedLogoFile(null);
+      setLogoPreviewUrl((current) => {
+        if (current) URL.revokeObjectURL(current);
+        return "";
+      });
+
+      toast.success(company ? "Account updated." : "Account created.");
+      onSaved(savedCompany);
+    } catch (error) {
+      console.error("[account-save]", error);
+      toast.error(
+        error instanceof Error ? error.message : "Could not save the account.",
+      );
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
-    <Dialog open={open} onOpenChange={o => !o && onClose()}>
-      <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-y-auto">
-        <DialogHeader><DialogTitle>New Company</DialogTitle><DialogDescription>Add a contractor or client company.</DialogDescription></DialogHeader>
-        <CompanyFormFields form={form} setForm={setForm} />
-        <DialogFooter className="pt-2">
-          <Button variant="outline" onClick={onClose}>Cancel</Button>
-          <Button onClick={handleSave} disabled={saving}>{saving ? <Loader2 className="h-4 w-4 animate-spin" /> : "Save Company"}</Button>
+    <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}>
+      <DialogContent className="max-h-[92vh] max-w-3xl overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>{company ? "Edit Account" : "Add Account"}</DialogTitle>
+          <DialogDescription>
+            Accounts are commercial customers, prospects, vendors, partners,
+            builders, and other organizations.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-6 py-2">
+          <section className="flex flex-col gap-4 rounded-lg border p-4 sm:flex-row sm:items-center">
+            <Avatar className="h-20 w-20 rounded-xl">
+              <AvatarImage
+                src={logoPreviewUrl || form.logo_url || undefined}
+                alt=""
+                className="object-cover"
+              />
+              <AvatarFallback className="rounded-xl text-lg">
+                {form.name ? (
+                  initials(form.name)
+                ) : (
+                  <Building2 className="h-7 w-7" />
+                )}
+              </AvatarFallback>
+            </Avatar>
+
+            <div className="flex-1">
+              <h3 className="font-medium">Account logo</h3>
+              <p className="mb-3 text-xs text-muted-foreground">
+                PNG, JPG, or WebP. Maximum 3 MB.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <input
+                  ref={logoInputRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp"
+                  className="hidden"
+                  onChange={(event) => void handleLogoUpload(event)}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={uploadingLogo}
+                  onClick={() => logoInputRef.current?.click()}
+                >
+                  {uploadingLogo ? (
+                    "Uploading…"
+                  ) : (
+                    <>
+                      <Upload className="mr-1.5 h-3.5 w-3.5" /> Upload Logo
+                    </>
+                  )}
+                </Button>
+                {(logoPreviewUrl || form.logo_url) && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      setSelectedLogoFile(null);
+                      setLogoPreviewUrl((current) => {
+                        if (current) URL.revokeObjectURL(current);
+                        return "";
+                      });
+                      update("logo_url", "");
+                    }}
+                  >
+                    <X className="mr-1.5 h-3.5 w-3.5" /> Remove
+                  </Button>
+                )}
+              </div>
+            </div>
+          </section>
+
+          <section>
+            <SectionTitle>Account information</SectionTitle>
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <Field label="Account name *" className="md:col-span-2">
+                <Input
+                  value={form.name}
+                  onChange={(event) => update("name", event.target.value)}
+                  placeholder="ABC Property Management"
+                />
+              </Field>
+
+              <Field label="Account type">
+                <Select
+                  value={form.account_type}
+                  onValueChange={(value) =>
+                    update("account_type", value as AccountType)
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {ACCOUNT_TYPES.map((type) => (
+                      <SelectItem key={type} value={type}>
+                        {type}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+
+              <Field label="Status">
+                <Select
+                  value={form.status}
+                  onValueChange={(value) =>
+                    update("status", value as AccountStatus)
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {ACCOUNT_STATUSES.map((status) => (
+                      <SelectItem key={status} value={status}>
+                        {status}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+
+              <Field label="Industry">
+                <Select
+                  value={form.industry || undefined}
+                  onValueChange={(value) => update("industry", value)}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select industry" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {INDUSTRIES.map((industry) => (
+                      <SelectItem key={industry} value={industry}>
+                        {industry}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+
+              <Field label="Owner">
+                <Select
+                  value={form.owner_name || "__unassigned__"}
+                  onValueChange={(value) =>
+                    update(
+                      "owner_name",
+                      value === "__unassigned__" ? "" : value,
+                    )
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="Unassigned" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__unassigned__">Unassigned</SelectItem>
+                    {teamMembers.map((member) => (
+                      <SelectItem key={member.id} value={member.name}>
+                        {member.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+
+              <Field label="Email">
+                <Input
+                  type="email"
+                  value={form.email}
+                  onChange={(event) => update("email", event.target.value)}
+                  placeholder="info@company.com"
+                />
+              </Field>
+
+              <Field label="Phone">
+                <Input
+                  inputMode="tel"
+                  value={form.phone}
+                  onChange={(event) =>
+                    update("phone", formatPhoneInput(event.target.value))
+                  }
+                  placeholder="(555) 123-4567"
+                />
+              </Field>
+
+              <Field label="Website" className="md:col-span-2">
+                <Input
+                  value={form.website}
+                  onChange={(event) =>
+                    update(
+                      "website",
+                      ensureHttpsWhileTyping(event.target.value),
+                    )
+                  }
+                  placeholder="https://company.com"
+                />
+              </Field>
+            </div>
+          </section>
+
+          <section>
+            <SectionTitle>Address</SectionTitle>
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <Field label="Street address" className="md:col-span-2">
+                <AddressAutocomplete
+                  value={form.address}
+                  onChange={(value) => update("address", value)}
+                  onSelect={(parts) =>
+                    setForm((current) => ({
+                      ...current,
+                      address: parts.street,
+                      city: parts.city,
+                      state: parts.state,
+                      zip: parts.zip,
+                      country: "United States",
+                    }))
+                  }
+                  placeholder="Start typing an address"
+                />
+              </Field>
+
+              <Field label="City">
+                <Input
+                  value={form.city}
+                  onChange={(event) => update("city", event.target.value)}
+                />
+              </Field>
+              <Field label="State">
+                <Input
+                  value={form.state}
+                  onChange={(event) => update("state", event.target.value)}
+                />
+              </Field>
+              <Field label="ZIP">
+                <Input
+                  value={form.zip}
+                  onChange={(event) => update("zip", event.target.value)}
+                />
+              </Field>
+              <Field label="Country">
+                <Input
+                  value={form.country}
+                  onChange={(event) => update("country", event.target.value)}
+                />
+              </Field>
+            </div>
+          </section>
+
+          <section>
+            <SectionTitle>Tags</SectionTitle>
+            <div className="space-y-3">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="w-full justify-between"
+                  >
+                    <span>
+                      {form.tags.length
+                        ? `${form.tags.length} tag${form.tags.length === 1 ? "" : "s"} selected`
+                        : "Select tags"}
+                    </span>
+                    <ChevronDown className="h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent className="w-[var(--radix-dropdown-menu-trigger-width)]">
+                  <DropdownMenuLabel>Account tags</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  {DEFAULT_TAGS.map((tag) => (
+                    <DropdownMenuCheckboxItem
+                      key={tag}
+                      checked={form.tags.includes(tag)}
+                      onCheckedChange={() => toggleTag(tag)}
+                      onSelect={(event) => event.preventDefault()}
+                    >
+                      {tag}
+                    </DropdownMenuCheckboxItem>
+                  ))}
+                  <DropdownMenuSeparator />
+                  <div className="flex gap-2 p-2">
+                    <Input
+                      value={newTag}
+                      onChange={(event) => setNewTag(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          addCustomTag();
+                        }
+                      }}
+                      placeholder="Create tag"
+                      className="h-8"
+                    />
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="h-8"
+                      onClick={addCustomTag}
+                    >
+                      Add
+                    </Button>
+                  </div>
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              {form.tags.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {form.tags.map((tag) => (
+                    <Badge key={tag} variant="secondary" className="gap-1">
+                      {tag}
+                      <button
+                        type="button"
+                        onClick={() => toggleTag(tag)}
+                        aria-label={`Remove ${tag}`}
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </Badge>
+                  ))}
+                </div>
+              )}
+            </div>
+          </section>
+
+          <section>
+            <SectionTitle>Primary contact</SectionTitle>
+            <div className="space-y-4 rounded-lg border p-4">
+              <Select
+                value={form.primary_contact_mode}
+                onValueChange={(value) =>
+                  update("primary_contact_mode", value as PrimaryContactMode)
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">No primary contact</SelectItem>
+                  <SelectItem value="existing">
+                    Select an existing contact
+                  </SelectItem>
+                  <SelectItem value="new">Create a new contact</SelectItem>
+                </SelectContent>
+              </Select>
+
+              {form.primary_contact_mode === "existing" && (
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  <Field label="Contact">
+                    <Select
+                      value={form.existing_contact_id || undefined}
+                      onValueChange={(value) =>
+                        update("existing_contact_id", value)
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select contact" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {contacts.map((contact) => (
+                          <SelectItem key={contact.id} value={contact.id}>
+                            {contact.full_name}
+                            {contact.email ? ` — ${contact.email}` : ""}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                  <Field label="Title / relationship">
+                    <Input
+                      value={form.contact_title}
+                      onChange={(event) =>
+                        update("contact_title", event.target.value)
+                      }
+                      placeholder="Property Manager"
+                    />
+                  </Field>
+                </div>
+              )}
+
+              {form.primary_contact_mode === "new" && (
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  <Field label="Contact name *" className="md:col-span-2">
+                    <Input
+                      value={form.contact_name}
+                      onChange={(event) =>
+                        update("contact_name", event.target.value)
+                      }
+                      placeholder="John Smith"
+                    />
+                  </Field>
+                  <Field label="Title">
+                    <Input
+                      value={form.contact_title}
+                      onChange={(event) =>
+                        update("contact_title", event.target.value)
+                      }
+                      placeholder="Property Manager"
+                    />
+                  </Field>
+                  <Field label="Email">
+                    <Input
+                      type="email"
+                      value={form.contact_email}
+                      onChange={(event) =>
+                        update("contact_email", event.target.value)
+                      }
+                      placeholder="john@company.com"
+                    />
+                  </Field>
+                  <Field label="Phone">
+                    <Input
+                      inputMode="tel"
+                      value={form.contact_phone}
+                      onChange={(event) =>
+                        update(
+                          "contact_phone",
+                          formatPhoneInput(event.target.value),
+                        )
+                      }
+                      placeholder="(555) 123-4567"
+                    />
+                  </Field>
+                </div>
+              )}
+            </div>
+          </section>
+
+          <section>
+            <SectionTitle>Notes</SectionTitle>
+            <Textarea
+              value={form.notes}
+              onChange={(event) => update("notes", event.target.value)}
+              rows={4}
+              placeholder="Internal account notes…"
+            />
+          </section>
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={saving}>
+            Cancel
+          </Button>
+          <Button
+            onClick={() => void save()}
+            disabled={saving || uploadingLogo}
+          >
+            {saving ? "Saving…" : company ? "Save Changes" : "Create Account"}
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
   );
 }
 
-// ── Edit dialog ───────────────────────────────────────────────────────────────
-
-function EditCompanyDialog({ open, company, onClose, onSaved }: { open: boolean; company: Company; onClose: () => void; onSaved: (c: Company) => void }) {
-  const [saving, setSaving] = useState(false);
-  const [form, setForm] = useState<CompanyForm>(() => formFromCompany(company));
-
-  useEffect(() => { if (open) setForm(formFromCompany(company)); }, [open, company]);
-
-  const handleSave = async () => {
-    if (!form.name.trim()) { toast.error("Company name is required"); return; }
-    setSaving(true);
-    const { data, error } = await supabase.from("companies").update({
-      name: form.name.trim(),
-      industry: form.industry || null,
-      website: form.website || null,
-      phone: form.phone || null,
-      email: form.email || null,
-      address: form.address || null,
-      city: form.city || null,
-      state: form.state || null,
-      zip: form.zip || null,
-      notes: form.notes || null,
-      updated_at: new Date().toISOString(),
-    }).eq("id", company.id).select().single();
-    setSaving(false);
-    if (error) { toast.error("Failed to save: " + error.message); return; }
-    toast.success("Company updated");
-    onSaved(data as Company);
-  };
-
+function SectionTitle({ children }: { children: React.ReactNode }) {
   return (
-    <Dialog open={open} onOpenChange={o => !o && onClose()}>
-      <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-y-auto">
-        <DialogHeader><DialogTitle>Edit Company</DialogTitle><DialogDescription>Update company details.</DialogDescription></DialogHeader>
-        <CompanyFormFields form={form} setForm={setForm} />
-        <DialogFooter className="pt-2">
-          <Button variant="outline" onClick={onClose}>Cancel</Button>
-          <Button onClick={handleSave} disabled={saving}>{saving ? <Loader2 className="h-4 w-4 animate-spin" /> : "Save Changes"}</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+      {children}
+    </h3>
+  );
+}
+
+function Field({
+  label,
+  children,
+  className = "",
+}: {
+  label: string;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={`space-y-1.5 ${className}`}>
+      <Label>{label}</Label>
+      {children}
+    </div>
+  );
+}
+
+function Detail({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+        {label}
+      </div>
+      <div>{value}</div>
+    </div>
+  );
+}
+
+function LinkRow({
+  icon: Icon,
+  href,
+  text,
+  external = false,
+}: {
+  icon: typeof Mail;
+  href: string;
+  text: string;
+  external?: boolean;
+}) {
+  return (
+    <a
+      href={href}
+      target={external ? "_blank" : undefined}
+      rel={external ? "noreferrer" : undefined}
+      className="flex items-start gap-2 text-muted-foreground hover:text-foreground"
+    >
+      <Icon className="mt-0.5 h-4 w-4 shrink-0" />
+      <span className="break-all">{text}</span>
+    </a>
   );
 }

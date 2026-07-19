@@ -9,11 +9,13 @@ import {
 } from "@/components/ui/dialog";
 import { AddressAutocomplete } from "@/components/ui/address-autocomplete";
 import { Loader2 } from "lucide-react";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { useTeam } from "@/lib/organization";
 import { addContact } from "@/lib/contacts-store";
 import { formatPhone } from "@/lib/format";
 import type { Contact } from "@/lib/mock-data";
 
-const BLANK_FORM = { name: "", email: "", phone: "", address: "", company: "", tags: "" };
+const BLANK_FORM = { name: "", email: "", phone: "", address: "", company: "", tags: "", owner: "" };
 
 /**
  * Shared "New Contact" dialog — used by the Contacts page and reused from
@@ -31,6 +33,7 @@ export function NewContactDialog({
 }) {
   const [form, setForm] = useState(BLANK_FORM);
   const [saving, setSaving] = useState(false);
+  const teamMembers = useTeam();
 
   function close() {
     onOpenChange(false);
@@ -48,7 +51,7 @@ export function NewContactDialog({
       company: form.company.trim(),
       address: form.address.trim(),
       tags,
-      owner: "—",
+      owner: form.owner || "—",
       lastActivity: new Date().toISOString(),
       createdAt: new Date().toISOString(),
     });
@@ -125,6 +128,32 @@ export function NewContactDialog({
                 onChange={(e) => setForm((f) => ({ ...f, tags: e.target.value }))}
                 placeholder="Homeowner, VIP…"
               />
+            </div>
+            <div className="col-span-2 grid gap-1.5">
+              <Label>Owner</Label>
+              <Select
+                value={form.owner || "__unassigned__"}
+                onValueChange={(value) =>
+                  setForm((f) => ({
+                    ...f,
+                    owner: value === "__unassigned__" ? "" : value,
+                  }))
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Assign owner" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__unassigned__">Unassigned</SelectItem>
+                  {teamMembers
+                    .filter((member) => member.status === "active")
+                    .map((member) => (
+                      <SelectItem key={member.id} value={member.name}>
+                        {member.name}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
             </div>
             <div className="col-span-2 grid gap-1.5">
               <Label>Address</Label>

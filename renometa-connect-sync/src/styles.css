@@ -1,0 +1,287 @@
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * RenoMeta Connect — Enterprise SaaS design system.
+ * Calm, neutral, single-accent (deep blue).
+ * All colors in oklch. Use semantic tokens — never hex in components.
+ */
+
+@theme inline {
+  --font-sans:
+    Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 2px);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-canvas: var(--canvas);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-soft: var(--primary-soft);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-active: var(--sidebar-active);
+  --color-sidebar-active-foreground: var(--sidebar-active-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  /* Extended status/category tokens — additive, for icon tiles, badges,
+     and category accents used across restyled pages. Primary blue-accent
+     system above is untouched; these are supplementary. */
+  --color-primary-soft-foreground: var(--primary-soft-foreground);
+  --color-destructive-soft: var(--destructive-soft);
+  --color-destructive-soft-foreground: var(--destructive-soft-foreground);
+  --color-success-soft: var(--success-soft);
+  --color-success-soft-foreground: var(--success-soft-foreground);
+  --color-warning-soft: var(--warning-soft);
+  --color-warning-soft-foreground: var(--warning-soft-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-info-soft: var(--info-soft);
+  --color-info-soft-foreground: var(--info-soft-foreground);
+  --color-gold: var(--gold);
+  --color-gold-hover: var(--gold-hover);
+  --color-gold-soft: var(--gold-soft);
+  --color-gold-soft-foreground: var(--gold-soft-foreground);
+  --color-orange: var(--orange);
+  --color-orange-foreground: var(--orange-foreground);
+  --color-orange-soft: var(--orange-soft);
+  --color-orange-soft-foreground: var(--orange-soft-foreground);
+  --color-violet: var(--violet);
+  --color-violet-foreground: var(--violet-foreground);
+  --color-violet-soft: var(--violet-soft);
+  --color-violet-soft-foreground: var(--violet-soft-foreground);
+  --color-cyan: var(--cyan);
+  --color-cyan-foreground: var(--cyan-foreground);
+  --color-cyan-soft: var(--cyan-soft);
+  --color-cyan-soft-foreground: var(--cyan-soft-foreground);
+  --color-emerald: var(--emerald);
+  --color-emerald-soft: var(--emerald-soft);
+  --color-rose: var(--rose);
+  --color-chat-surface: var(--chat-surface);
+  --color-bubble-in: var(--bubble-in);
+  --color-bubble-out: var(--bubble-out);
+
+  --shadow-elev-1: 0 1px 2px 0 oklch(0.2 0.02 250 / 0.04);
+  --shadow-elev-2: 0 2px 8px -2px oklch(0.2 0.02 250 / 0.08), 0 1px 2px 0 oklch(0.2 0.02 250 / 0.04);
+}
+
+:root {
+  --radius: 0.625rem;
+
+  --background: oklch(0.985 0.002 250);     /* #FAFAFA-ish app canvas */
+  --foreground: oklch(0.21 0.03 256);        /* slate-900 */
+  --canvas: oklch(0.985 0.002 250);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.21 0.03 256);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.21 0.03 256);
+
+  --primary: oklch(0.55 0.205 262);          /* blue-600 #2563EB */
+  --primary-foreground: oklch(0.99 0 0);
+  --primary-soft: oklch(0.96 0.025 256);     /* blue-50 */
+
+  --secondary: oklch(0.967 0.005 256);       /* slate-100 */
+  --secondary-foreground: oklch(0.28 0.03 256);
+
+  --muted: oklch(0.967 0.005 256);
+  --muted-foreground: oklch(0.55 0.022 257); /* slate-500 */
+
+  --accent: oklch(0.96 0.025 256);
+  --accent-foreground: oklch(0.28 0.05 262);
+
+  --destructive: oklch(0.577 0.245 27);
+  --destructive-foreground: oklch(0.99 0 0);
+  --success: oklch(0.62 0.16 152);
+  --success-foreground: oklch(0.99 0 0);
+  --warning: oklch(0.74 0.16 70);
+  --warning-foreground: oklch(0.21 0.03 256);
+
+  --border: oklch(0.922 0.008 256);          /* slate-200 */
+  --border-strong: oklch(0.86 0.012 256);
+  --input: oklch(0.922 0.008 256);
+  --ring: oklch(0.55 0.205 262);
+
+  --sidebar: oklch(1 0 0);
+  --sidebar-foreground: oklch(0.35 0.02 256);
+  --sidebar-active: oklch(0.96 0.025 256);
+  --sidebar-active-foreground: oklch(0.4 0.18 262);
+  --sidebar-border: oklch(0.922 0.008 256);
+
+  --chart-1: oklch(0.55 0.205 262);
+  --chart-2: oklch(0.65 0.16 220);
+  --chart-3: oklch(0.62 0.16 152);
+  --chart-4: oklch(0.74 0.16 70);
+  --chart-5: oklch(0.55 0.18 300);
+
+  /* Extended status/category tokens (light) */
+  --primary-soft-foreground: #1D4ED8;
+  --destructive-soft: #FDECEC;
+  --destructive-soft-foreground: #B91C1C;
+  --success-soft: #E6F7EC;
+  --success-soft-foreground: #0F7A38;
+  --warning-soft: #FEF1E0;
+  --warning-soft-foreground: #B45309;
+  --info: #2F6FE4;
+  --info-foreground: #FFFFFF;
+  --info-soft: #E7F0FE;
+  --info-soft-foreground: #1D4ED8;
+  --orange: #EA580C;
+  --orange-foreground: #FFFFFF;
+  --orange-soft: #FFEEE3;
+  --orange-soft-foreground: #B4410C;
+  --violet: #7C5CFC;
+  --violet-foreground: #FFFFFF;
+  --violet-soft: #F1EEFF;
+  --violet-soft-foreground: #5B3FD1;
+  --cyan: #0891B2;
+  --cyan-foreground: #FFFFFF;
+  --cyan-soft: #E1F5FA;
+  --cyan-soft-foreground: #0E6B82;
+  --emerald: #059669;
+  --emerald-soft: #E1F7EE;
+  --rose: #E11D48;
+  --gold: #D9AB57;
+  --gold-hover: #C99A45;
+  --gold-soft: #FAF3E4;
+  --gold-soft-foreground: #8A6423;
+  --chat-surface: #FAFBFC;
+  --bubble-in: #F3F6FA;
+  --bubble-out: #FFF7E6;
+}
+
+.dark {
+  --background: oklch(0.18 0.018 256);
+  --foreground: oklch(0.96 0.005 256);
+  --canvas: oklch(0.16 0.018 256);
+  --card: oklch(0.215 0.02 256);
+  --card-foreground: oklch(0.96 0.005 256);
+  --popover: oklch(0.215 0.02 256);
+  --popover-foreground: oklch(0.96 0.005 256);
+
+  --primary: oklch(0.65 0.19 262);
+  --primary-foreground: oklch(0.99 0 0);
+  --primary-soft: oklch(0.3 0.08 262);
+
+  --secondary: oklch(0.27 0.022 256);
+  --secondary-foreground: oklch(0.96 0.005 256);
+  --muted: oklch(0.27 0.022 256);
+  --muted-foreground: oklch(0.7 0.02 256);
+  --accent: oklch(0.3 0.05 262);
+  --accent-foreground: oklch(0.96 0.005 256);
+
+  --destructive: oklch(0.65 0.2 27);
+  --destructive-foreground: oklch(0.99 0 0);
+  --success: oklch(0.7 0.16 152);
+  --warning: oklch(0.78 0.16 70);
+
+  --border: oklch(1 0 0 / 10%);
+  --border-strong: oklch(1 0 0 / 18%);
+  --input: oklch(1 0 0 / 14%);
+  --ring: oklch(0.65 0.19 262);
+
+  --sidebar: oklch(0.2 0.02 256);
+  --sidebar-foreground: oklch(0.78 0.012 256);
+  --sidebar-active: oklch(0.3 0.05 262);
+  --sidebar-active-foreground: oklch(0.85 0.1 262);
+  --sidebar-border: oklch(1 0 0 / 8%);
+
+  /* Extended status/category tokens (dark) */
+  --primary-soft-foreground: #93B4F5;
+  --destructive-soft: #3A1E1D;
+  --destructive-soft-foreground: #F3A29C;
+  --success-soft: #17301F;
+  --success-soft-foreground: #8FDBAE;
+  --warning-soft: #352A15;
+  --warning-soft-foreground: #F0C482;
+  --info: #6C97F0;
+  --info-foreground: #12151B;
+  --info-soft: #1C2C4A;
+  --info-soft-foreground: #A9C2F5;
+  --orange: #F0763C;
+  --orange-foreground: #12151B;
+  --orange-soft: #3A2617;
+  --orange-soft-foreground: #F5B68C;
+  --violet: #A78BFC;
+  --violet-foreground: #12151B;
+  --violet-soft: #2A2247;
+  --violet-soft-foreground: #C9B8FE;
+  --cyan: #38BCDA;
+  --cyan-foreground: #12151B;
+  --cyan-soft: #17313A;
+  --cyan-soft-foreground: #8FDCEE;
+  --emerald: #2FD196;
+  --emerald-soft: #123A2E;
+  --rose: #FB7185;
+  --gold: #D9AB57;
+  --gold-hover: #E8C888;
+  --gold-soft: #3A2F1D;
+  --gold-soft-foreground: #E8C888;
+  --chat-surface: #15181F;
+  --bubble-in: #1B2029;
+  --bubble-out: #2C2416;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  html, body {
+    height: 100%;
+  }
+
+  body {
+    background-color: var(--color-canvas);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background-color: color-mix(in oklab, var(--primary) 25%, transparent);
+  }
+}
+
+/* Scrollbar tuned for the app shell */
+@layer utilities {
+  .scrollbar-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: color-mix(in oklab, var(--foreground) 18%, transparent);
+    border-radius: 8px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+}

@@ -1,0 +1,169 @@
+---
+name: netlify-supabase-functions
+description: >
+  Patterns and boilerplate for writing Netlify serverless functions that use
+  Supabase — including auth validation, service role client setup, CORS headers,
+  error handling, and common query patterns. Use this skill whenever writing or
+  editing any file in netlify/functions/ that interacts with Supabase, handles
+  webhooks, sends email via nodemailer/SMTP, processes Stripe payments, or sends
+  SMS via Twilio. Also triggers for portal-action, portal-invite, invite-member,
+  or any similar serverless function pattern.
+---
+
+# Netlify + Supabase Functions Skill
+
+## Standard Function Template
+
+```typescript
+/// <reference types="node" />
+import type { Handler } from "@netlify/functions";
+import { createClient } from "@supabase/supabase-js";
+
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  { auth: { autoRefreshToken: false, persistSession: false } }
+);
+
+export const handler: Handler = async (event) => {
+  const headers = {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  };
+
+  // Handle CORS preflight
+  if (event.httpMethod === "OPTIONS") return { statusCode: 200, headers, body: "" };
+  if (event.httpMethod !== "POST") return { statusCode: 405, headers, body: "Method Not Allowed" };
+
+  // Parse body — use a variable name that doesn't conflict with DOM globals
+  let reqBody: { /* typed fields */ };
+  try { reqBody = JSON.parse(event.body ?? "{}"); }
+  catch { return { statusCode: 400, headers, body: JSON.stringify({ error: "Invalid JSON" }) }; }
+
+  return { statusCode: 200, headers, body: JSON.stringify({ success: true }) };
+};
+```
+
+## Auth Validation Pattern
+
+```typescript
+// Validate caller is authenticated
+const authToken = event.headers.authorization?.slice(7);
+if (!authToken) return { statusCode: 401, headers, body: JSON.stringify({ error: "Unauthorized" }) };
+
+const { data: { user }, error: authErr } = await supabaseAdmin.auth.getUser(authToken);
+if (authErr || !user) return { statusCode: 401, headers, body: JSON.stringify({ error: "Invalid token" }) };
+
+// Get caller's org
+const { data: callerProfile } = await supabaseAdmin
+  .from("profiles").select("organization_id").eq("id", user.id).maybeSingle();
+const orgId = callerProfile?.organization_id;
+if (!orgId) return { statusCode: 400, headers, body: JSON.stringify({ error: "No organization found" }) };
+```
+
+## Portal Token Validation (token OR slug)
+
+```typescript
+let inv: any = null;
+if (token) {
+  const { data } = await supabaseAdmin
+    .from("invitations").select("*").eq("token", token)
+    .in("status", ["pending", "roster_only", "accepted"]).maybeSingle();
+  inv = data;
+}
+if (!inv && reqBody.slug) {
+  const { data } = await supabaseAdmin
+    .from("invitations").select("*").eq("portal_slug", reqBody.slug)
+    .in("status", ["pending", "roster_only", "accepted"]).maybeSingle();
+  inv = data;
+}
+if (!inv || inv.role !== "viewer")
+  return { statusCode: 403, headers, body: JSON.stringify({ error: "Access denied" }) };
+```
+
+## Email via Nodemailer (Gmail SMTP)
+
+```typescript
+import nodemailer from "nodemailer";
+
+const transporter = nodemailer.createTransport({
+  host: "smtp.gmail.com", port: 587, secure: false,
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
+  // Note: env var is SMTP_PASSWORD not SMTP_PASS
+});
+await transporter.sendMail({
+  from: `"${orgName}" <${process.env.SMTP_USER}>`,
+  to: email, subject, html: emailHtml,
+});
+```
+
+## Stripe Checkout
+
+```typescript
+import Stripe from "stripe";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2026-04-22.dahlia", // always use latest
+});
+const session = await stripe.checkout.sessions.create({
+  payment_method_types: ["card"],
+  line_items: [{ price_data: { currency: "usd", product_data: { name }, unit_amount: amountInCents }, quantity: 1 }],
+  mode: "payment",
+  success_url: `${PORTAL_URL}/portal?token=${token}&paid=1`,
+  cancel_url:  `${PORTAL_URL}/portal?token=${token}`,
+  metadata: { invoiceId, token },
+});
+return { statusCode: 200, headers, body: JSON.stringify({ checkoutUrl: session.url }) };
+```
+
+## Twilio SMS
+
+```typescript
+const twilioSid  = process.env.TWILIO_ACCOUNT_SID;
+const twilioAuth = process.env.TWILIO_AUTH_TOKEN;
+const twilioFrom = process.env.TWILIO_PHONE_NUMBER;
+const twilioTo   = process.env.NOTIFY_PHONE_NUMBER;
+
+if (twilioSid && twilioAuth && twilioFrom && twilioTo) {
+  try {
+    await fetch(`https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Messages.json`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Basic ${Buffer.from(`${twilioSid}:${twilioAuth}`).toString("base64")}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ From: twilioFrom, To: twilioTo, Body: smsBody }).toString(),
+    });
+  } catch (err) { console.warn("[fn] Twilio failed:", err); }
+}
+```
+
+## Common Gotchas
+
+| Issue | Fix |
+|---|---|
+| `message` variable name | Conflicts with DOM `onmessage` global — use `clientMessage`, `msgText`, etc. |
+| `body` variable name | Conflicts with Netlify response `body` field — use `reqBody` for parsed request |
+| SMTP env var | Is `SMTP_PASSWORD`, NOT `SMTP_PASS` |
+| Stripe API version | Use `"2026-04-22.dahlia"` (current) |
+| `project_id` FK | Portal invites always have `project_id` set; team invites have it null |
+| Storage bucket | Project photos = `project-photos` (public), docs = `project-files` |
+| Supabase service role | Never use anon key in functions — always service role for admin operations |
+| CORS for portal | Portal is on different domain — always include `Access-Control-Allow-Origin: *` |
+
+## Response Patterns
+
+```typescript
+// Success
+return { statusCode: 200, headers, body: JSON.stringify({ success: true, data }) };
+
+// Partial success (saved but email failed)
+return { statusCode: 207, headers, body: JSON.stringify({ success: false, error: "..." }) };
+
+// Not found
+return { statusCode: 404, headers, body: JSON.stringify({ error: "Not found" }) };
+
+// Auth error
+return { statusCode: 403, headers, body: JSON.stringify({ error: "Access denied" }) };
+```

@@ -38,13 +38,14 @@ import { supabase } from "@/lib/supabase";
 // `template`/`clientName` are accepted (but not yet consumed) for the
 // pre-existing "Create estimate from template" link on the Leads page —
 // preserved here as passthrough so that link keeps type-checking.
-type EstimatesSearch = { openNew?: boolean; template?: string; clientName?: string };
+type EstimatesSearch = { openNew?: boolean; template?: string; clientName?: string; leadId?: string };
 
 export const Route = createFileRoute("/estimates")({
   validateSearch: (raw: Record<string, unknown>): EstimatesSearch => ({
     openNew: raw.openNew === true || raw.openNew === "1" ? true : undefined,
     template: typeof raw.template === "string" ? raw.template : undefined,
     clientName: typeof raw.clientName === "string" ? raw.clientName : undefined,
+    leadId: typeof raw.leadId === "string" ? raw.leadId : undefined,
   }),
   component: EstimatesPage,
 });
@@ -179,13 +180,14 @@ function itemToForm(i: EstimateItem): FormItem {
 }
 
 function EstimateFormSheet({
-  open, onClose, orgId, onSaved, estimate,
+  open, onClose, orgId, onSaved, estimate, initialLead,
 }: {
   open: boolean;
   onClose: () => void;
   orgId: string;
   onSaved: () => void;
   estimate?: Estimate; // undefined = create mode
+  initialLead?: { contactId: string; name: string; projectType: string; budget: number; notes: string } | null;
 }) {
   const isEdit = !!estimate;
 
@@ -207,9 +209,20 @@ function EstimateFormSheet({
       setNotes(estimate.notes ?? "");
       setItems(estimate.estimate_items.length ? estimate.estimate_items.map(itemToForm) : [{ ...EMPTY_ITEM }]);
     } else {
-      setTitle(""); setClientId(""); setValidUntil(""); setNotes(""); setItems([{ ...EMPTY_ITEM }]);
+      setTitle(initialLead?.projectType ? `${initialLead.projectType} Estimate` : "");
+      setClientId(initialLead?.contactId ?? "");
+      setValidUntil("");
+      setNotes(initialLead?.notes ?? "");
+      setItems(initialLead?.budget ? [{
+        ...EMPTY_ITEM,
+        category: "Labor",
+        name: initialLead.projectType || "Project estimate",
+        description: `Estimate prepared for ${initialLead.name}`,
+        unit: "ls",
+        unit_price: String(initialLead.budget),
+      }] : [{ ...EMPTY_ITEM }]);
     }
-  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open, initialLead]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!open) return;
@@ -1034,7 +1047,7 @@ function EstimateDetailSheet({
 // ── Main Page ─────────────────────────────────────────────────────────────────
 
 function EstimatesPage() {
-  const { openNew } = useSearch({ from: "/estimates" });
+  const { openNew, leadId } = useSearch({ from: "/estimates" });
   const navigate = useNavigate({ from: "/estimates" });
   const [estimates, setEstimates] = useState<Estimate[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1047,6 +1060,7 @@ function EstimatesPage() {
   const [newOpen, setNewOpen] = useState(false);
   const [orgId, setOrgId] = useState<string | null>(null);
   const [orgInfo, setOrgInfo] = useState<OrgInfo | null>(null);
+  const [initialLead, setInitialLead] = useState<{ contactId: string; name: string; projectType: string; budget: number; notes: string } | null>(null);
 
   useEffect(() => { getOrgId().then(setOrgId); }, []);
 
@@ -1054,9 +1068,43 @@ function EstimatesPage() {
   // ?openNew=1 instead of duplicating this form, so it opens the same sheet.
   useEffect(() => {
     if (!openNew || !orgId) return;
-    setNewOpen(true);
-    navigate({ search: (s) => ({ ...s, openNew: undefined }), replace: true });
-  }, [openNew, orgId, navigate]);
+
+    const openForLead = async () => {
+      if (leadId) {
+        const { data: leadRow } = await supabase
+          .from("leads")
+          .select("contact_id, estimated_value, notes, custom_fields")
+          .eq("id", leadId)
+          .maybeSingle();
+
+        if (leadRow) {
+          let name = "Lead";
+          if (leadRow.contact_id) {
+            const { data: contact } = await supabase
+              .from("contacts")
+              .select("full_name")
+              .eq("id", leadRow.contact_id)
+              .maybeSingle();
+            name = contact?.full_name ?? leadRow.custom_fields?.name ?? "Lead";
+          }
+          setInitialLead({
+            contactId: leadRow.contact_id ?? "",
+            name,
+            projectType: leadRow.custom_fields?.service ?? "",
+            budget: Number(leadRow.estimated_value ?? 0),
+            notes: leadRow.notes ?? "",
+          });
+        }
+      } else {
+        setInitialLead(null);
+      }
+
+      setNewOpen(true);
+      navigate({ search: (s) => ({ ...s, openNew: undefined, leadId: undefined }), replace: true });
+    };
+
+    void openForLead();
+  }, [openNew, leadId, orgId, navigate]);
 
   useTopbarAction(
     <Button

@@ -1,8 +1,10 @@
+// src/routes/leads.tsx
 import { createFileRoute, useNavigate, useSearch, Link } from "@tanstack/react-router";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { PageHeader } from "@/components/layout/app-shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { AddressAutocomplete } from "@/components/ui/address-autocomplete";
 import { Badge } from "@/components/ui/badge";
 import { ContactAvatar } from "@/components/ui/contact-avatar";
 import { Card } from "@/components/ui/card";
@@ -26,7 +28,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   Plus, Search, Mail, Phone, MapPin, Target, Flame, Thermometer, Snowflake,
   ArrowRight, MoreHorizontal, DollarSign, Calendar, User, Building2,
-  ExternalLink, SlidersHorizontal, FileText, Sparkles,
+  ExternalLink, SlidersHorizontal, FileText, Sparkles, Users, CheckCircle2 as CheckCircleIcon,
 } from "lucide-react";
 import { Download, Upload } from "lucide-react";
 import { AlertTriangle, CheckCircle2 } from "lucide-react";
@@ -105,6 +107,7 @@ function LeadsPage() {
   const [statusFilter, setStatusFilter] = useState<string>("All statuses");
   const [scoreFilter, setScoreFilter] = useState<string>("All scores");
   const [selected, setSelected] = useState<Lead | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [addOpen, setAddOpen] = useState(false);
   const [mapOpen, setMapOpen] = useState(false);
   const [csvRaw, setCsvRaw] = useState("");
@@ -289,6 +292,56 @@ function LeadsPage() {
     return { validCount: parsed.length, errors };
   }, [colMapping, csvRaw]);
 
+
+  const hasActiveFilters = search !== "" || sourceFilter !== "All sources" || statusFilter !== "All statuses" || scoreFilter !== "All scores";
+  const allVisibleSelected = filtered.length > 0 && filtered.every((lead) => selectedIds.has(lead.id));
+
+  const toggleLeadSelection = (id: string) => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAllVisible = () => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (allVisibleSelected) filtered.forEach((lead) => next.delete(lead.id));
+      else filtered.forEach((lead) => next.add(lead.id));
+      return next;
+    });
+  };
+
+  const clearFilters = () => {
+    setSearch("");
+    setSourceFilter("All sources");
+    setStatusFilter("All statuses");
+    setScoreFilter("All scores");
+  };
+
+  const exportSelected = () => {
+    const selectedLeads = leads.filter((lead) => selectedIds.has(lead.id));
+    if (!selectedLeads.length) return;
+    downloadCSV(leadsToCSV(selectedLeads), `selected-leads-${new Date().toISOString().slice(0, 10)}.csv`);
+    toast.success(`Exported ${selectedLeads.length} selected lead${selectedLeads.length === 1 ? "" : "s"}`);
+  };
+
+  const dailySeries = useMemo(() => {
+    const today = new Date();
+    return Array.from({ length: 30 }, (_, index) => {
+      const day = new Date(today);
+      day.setHours(0, 0, 0, 0);
+      day.setDate(today.getDate() - (29 - index));
+      const nextDay = new Date(day);
+      nextDay.setDate(day.getDate() + 1);
+      return leads.filter((lead) => {
+        const created = new Date(lead.createdAt);
+        return created >= day && created < nextDay;
+      }).length;
+    });
+  }, [leads]);
+
   useTopbarAction(
     <Button size="sm" onClick={() => setAddOpen(true)}>
       <Plus className="mr-1.5 h-3.5 w-3.5" /> Add Lead
@@ -302,114 +355,194 @@ function LeadsPage() {
         iconBg="bg-info-soft"
         iconColor="text-info"
         title="Leads"
-        subtitle="Track and qualify inbound leads"
+        subtitle="Track, qualify, and convert every inbound opportunity"
         actions={
-        <div className="flex items-center gap-2">
-          <Button size="sm" variant="outline" onClick={handleExport}>
-            <Download className="mr-1.5 h-3.5 w-3.5" /> Export
-          </Button>
-          <Button size="sm" variant="outline" className="relative" asChild>
-            <label className="cursor-pointer">
-              <Upload className="mr-1.5 h-3.5 w-3.5" /> Import
-              <input type="file" accept=".csv" className="sr-only" onChange={handleImportFile} />
-            </label>
-          </Button>
-        </div>
-      } />
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant="outline" onClick={handleExport}>
+              <Download className="mr-1.5 h-3.5 w-3.5" /> Export
+            </Button>
+            <Button size="sm" variant="outline" className="relative" asChild>
+              <label className="cursor-pointer">
+                <Upload className="mr-1.5 h-3.5 w-3.5" /> Import
+                <input type="file" accept=".csv" className="sr-only" onChange={handleImportFile} />
+              </label>
+            </Button>
+          </div>
+        }
+      />
 
-      {/* KPIs */}
-      <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <MetricCard label="Total Leads" value={stats.total} icon={Target} tone="info" />
-        <MetricCard label="New" value={stats.newCount} icon={Plus} tone="violet" />
-        <MetricCard label="Hot Leads" value={stats.hot} icon={Flame} tone="danger" />
-        <MetricCard label="Converted" value={stats.converted} icon={ArrowRight} tone="success" />
+      <div className="mb-6 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <LeadMetricCard label="Total Leads" value={stats.total} icon={Users} tone="blue" series={dailySeries} />
+        <LeadMetricCard label="New Leads" value={stats.newCount} icon={Plus} tone="violet" series={dailySeries} />
+        <LeadMetricCard label="Hot Leads" value={stats.hot} icon={Flame} tone="red" series={dailySeries} />
+        <LeadMetricCard label="Converted" value={stats.converted} icon={CheckCircleIcon} tone="green" series={dailySeries} />
       </div>
 
-      {/* Filters */}
-      <div className="mb-4 flex flex-wrap items-center gap-2">
-        <div className="relative flex-1 sm:max-w-xs">
-          <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            placeholder="Search leads…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="h-8 pl-8 text-sm"
-          />
-        </div>
-        <FilterSelect value={sourceFilter} onChange={setSourceFilter} options={SOURCE_FILTERS as unknown as string[]} />
-        <FilterSelect value={statusFilter} onChange={setStatusFilter} options={STATUS_FILTERS as unknown as string[]} />
-        <FilterSelect value={scoreFilter} onChange={setScoreFilter} options={SCORE_FILTERS as unknown as string[]} />
-      </div>
-
-      {/* Table */}
       <Card className="overflow-hidden">
+        <div className="flex min-h-[56px] flex-wrap items-center justify-between gap-3 border-b border-[#E5E7EB] bg-[#FAF3E4] px-4 py-3 sm:px-5">
+          <div className="flex items-center gap-2.5">
+            <div className="grid h-8 w-8 place-items-center rounded-lg bg-amber-500/10 text-amber-700">
+              <Users className="h-4 w-4" />
+            </div>
+            <div>
+              <h2 className="text-sm font-semibold text-foreground">Leads ({filtered.length})</h2>
+              <p className="text-[11px] text-muted-foreground">{filtered.length === leads.length ? "All active lead records" : `Filtered from ${leads.length} total leads`}</p>
+            </div>
+          </div>
+
+          {selectedIds.size > 0 && (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="rounded-md border border-amber-200 bg-white/70 px-2.5 py-1.5 text-xs font-medium text-amber-900">
+                {selectedIds.size} selected
+              </span>
+              <Button size="sm" variant="outline" onClick={exportSelected}>
+                <Download className="mr-1.5 h-3.5 w-3.5" /> Export selected
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setSelectedIds(new Set())}>Clear</Button>
+            </div>
+          )}
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 border-b border-[#E5E7EB] bg-white px-4 py-3 sm:px-5">
+          <div className="relative min-w-[220px] flex-1 lg:max-w-sm">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              placeholder="Search by name, email, phone, or project…"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="h-9 pl-9 text-sm"
+            />
+          </div>
+          <FilterSelect value={sourceFilter} onChange={setSourceFilter} options={SOURCE_FILTERS as unknown as string[]} />
+          <FilterSelect value={statusFilter} onChange={setStatusFilter} options={STATUS_FILTERS as unknown as string[]} />
+          <FilterSelect value={scoreFilter} onChange={setScoreFilter} options={SCORE_FILTERS as unknown as string[]} />
+          {hasActiveFilters && (
+            <Button size="sm" variant="ghost" className="h-9 text-xs" onClick={clearFilters}>Clear filters</Button>
+          )}
+          <Button size="icon" variant="outline" className="ml-auto h-9 w-9" aria-label="More filters">
+            <SlidersHorizontal className="h-4 w-4" />
+          </Button>
+        </div>
+
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+          <table className="w-full min-w-[1040px] text-sm">
             <thead>
-              <tr className="border-b border-border bg-muted/40 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                <th className="px-4 py-2.5">Lead</th>
-                <th className="px-4 py-2.5">Score</th>
-                <th className="px-4 py-2.5">Status</th>
-                <th className="hidden px-4 py-2.5 md:table-cell">Source</th>
-                <th className="hidden px-4 py-2.5 lg:table-cell">Project</th>
-                <th className="hidden px-4 py-2.5 sm:table-cell">Budget</th>
-                <th className="hidden px-4 py-2.5 lg:table-cell">Owner</th>
-                <th className="px-4 py-2.5 text-right">Activity</th>
+              <tr className="border-b border-[#E5E7EB] bg-[#F8FAFC] text-left text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                <th className="w-12 px-4 py-3">
+                  <input
+                    type="checkbox"
+                    checked={allVisibleSelected}
+                    onChange={toggleAllVisible}
+                    aria-label="Select all visible leads"
+                    className="h-4 w-4 rounded border-border accent-primary"
+                  />
+                </th>
+                <th className="px-3 py-3">Lead</th>
+                <th className="px-3 py-3">Project</th>
+                <th className="px-3 py-3">Budget</th>
+                <th className="px-3 py-3">Status</th>
+                <th className="px-3 py-3">Score</th>
+                <th className="px-3 py-3">Owner</th>
+                <th className="px-3 py-3">Last activity</th>
+                <th className="w-14 px-3 py-3 text-right">Actions</th>
               </tr>
             </thead>
             <tbody>
               {filtered.map((lead) => {
                 const { Icon: ScoreIcon, className: scoreCls } = scoreIcon(lead.score);
+                const isSelected = selectedIds.has(lead.id);
                 return (
                   <tr
                     key={lead.id}
-                    className="cursor-pointer border-b border-border transition-colors last:border-0 hover:bg-muted/30"
-                    onClick={() => openLead(lead)}
+                    className={cn(
+                      "border-b border-[#E5E7EB] transition-colors last:border-0 hover:bg-slate-50/80",
+                      isSelected && "bg-blue-50/40",
+                    )}
                   >
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-3">
+                    <td className="px-4 py-3.5">
+                      <input
+                        type="checkbox"
+                        checked={isSelected}
+                        onChange={() => toggleLeadSelection(lead.id)}
+                        aria-label={`Select ${lead.name}`}
+                        className="h-4 w-4 rounded border-border accent-primary"
+                      />
+                    </td>
+                    <td className="cursor-pointer px-3 py-3.5" onClick={() => openLead(lead)}>
+                      <div className="flex min-w-[210px] items-center gap-3">
                         <ContactAvatar id={lead.id} name={lead.name} size="sm" />
                         <div className="min-w-0">
-                          <div className="truncate font-medium">{lead.name}</div>
-                          <div className="truncate text-[11px] text-muted-foreground">{lead.email}</div>
+                          <div className="truncate font-medium text-foreground">{lead.name || "Unknown"}</div>
+                          <div className="truncate text-xs text-muted-foreground">{lead.email || "No email"}</div>
+                          {lead.phone && <div className="truncate text-[11px] text-muted-foreground/80">{lead.phone}</div>}
                         </div>
                       </div>
                     </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-1">
-                        <ScoreIcon className={`h-3.5 w-3.5 ${scoreCls}`} />
-                        <span className="text-xs capitalize">{lead.score}</span>
-                      </div>
+                    <td className="px-3 py-3.5">
+                      <div className="max-w-[190px] truncate text-xs font-medium">{lead.projectType || "Not specified"}</div>
+                      <div className="mt-0.5 text-[11px] text-muted-foreground">{lead.source}</div>
                     </td>
-                    <td className="px-4 py-3">
-                      <Badge variant={statusBadgeVariant(lead.status)} className="text-[10px]">
+                    <td className="px-3 py-3.5 text-xs font-medium tabular-nums">{formatMoney(lead.estimatedBudget)}</td>
+                    <td className="px-3 py-3.5">
+                      <Badge variant={statusBadgeVariant(lead.status)} className="text-[10px] font-medium">
                         {STATUS_LABELS[lead.status]}
                       </Badge>
                     </td>
-                    <td className="hidden px-4 py-3 text-xs text-muted-foreground md:table-cell">{lead.source}</td>
-                    <td className="hidden px-4 py-3 text-xs lg:table-cell">{lead.projectType}</td>
-                    <td className="hidden px-4 py-3 text-xs tabular-nums sm:table-cell">{formatMoney(lead.estimatedBudget)}</td>
-                    <td className="hidden px-4 py-3 lg:table-cell">
-                      <div className="flex items-center gap-1.5">
-                        <ContactAvatar id={lead.owner} name={lead.owner} size="xs" />
-                        <span className="text-xs">{lead.owner}</span>
+                    <td className="px-3 py-3.5">
+                      <span className="inline-flex items-center gap-1.5 rounded-md border border-border/70 bg-white px-2 py-1 text-[11px] font-medium capitalize">
+                        <ScoreIcon className={`h-3.5 w-3.5 ${scoreCls}`} />
+                        {lead.score}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3.5">
+                      <div className="flex min-w-[130px] items-center gap-2">
+                        <ContactAvatar id={lead.owner || "unassigned"} name={lead.owner || "Unassigned"} size="xs" />
+                        <span className="truncate text-xs">{lead.owner || "Unassigned"}</span>
                       </div>
                     </td>
-                    <td className="px-4 py-3 text-right text-[11px] text-muted-foreground">
+                    <td className="px-3 py-3.5 text-xs text-muted-foreground">
                       {formatDistanceToNow(new Date(lead.lastActivity), { addSuffix: true })}
+                    </td>
+                    <td className="px-3 py-3.5 text-right">
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button size="icon" variant="ghost" className="h-8 w-8" aria-label={`Actions for ${lead.name}`}>
+                            <MoreHorizontal className="h-4 w-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end" className="w-48">
+                          <DropdownMenuItem onClick={() => openLead(lead)}>View details</DropdownMenuItem>
+                          <DropdownMenuItem asChild>
+                            <Link to="/estimates" search={{ template: "open", clientName: lead.name }}>Create estimate</Link>
+                          </DropdownMenuItem>
+                          {lead.status !== "converted" && lead.status !== "lost" && (
+                            <DropdownMenuItem onClick={() => handleConvertToDeal(lead)}>Convert to deal</DropdownMenuItem>
+                          )}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                     </td>
                   </tr>
                 );
               })}
               {filtered.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="px-4 py-12 text-center text-sm text-muted-foreground">
-                    No leads match your filters.
+                  <td colSpan={9} className="px-6 py-16 text-center">
+                    <div className="mx-auto grid h-11 w-11 place-items-center rounded-xl bg-info-soft text-info">
+                      <Search className="h-5 w-5" />
+                    </div>
+                    <div className="mt-3 text-sm font-medium">No leads found</div>
+                    <div className="mt-1 text-xs text-muted-foreground">Try adjusting your search or filters.</div>
+                    {hasActiveFilters && <Button size="sm" variant="outline" className="mt-4" onClick={clearFilters}>Clear filters</Button>}
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#E5E7EB] bg-white px-4 py-3 text-xs text-muted-foreground sm:px-5">
+          <span>Showing {filtered.length} of {leads.length} leads</span>
+          <span>Click a lead to open the full record</span>
         </div>
       </Card>
 
@@ -425,7 +558,13 @@ function LeadsPage() {
 
       {/* Add lead dialog */}
       <Dialog open={addOpen} onOpenChange={setAddOpen}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent
+          className="sm:max-w-lg"
+          onInteractOutside={(e) => {
+            const target = ((e as CustomEvent).detail?.originalEvent?.target ?? e.target) as HTMLElement | null;
+            if (target?.closest?.(".pac-container")) e.preventDefault();
+          }}
+        >
           <DialogHeader>
             <DialogTitle>Add Lead</DialogTitle>
             <DialogDescription>Create a new lead and start qualifying.</DialogDescription>
@@ -445,7 +584,19 @@ function LeadsPage() {
             </div>
             <div className="space-y-1.5 sm:col-span-2">
               <Label>Address</Label>
-              <Input value={newLead.address} onChange={(e) => setNewLead((p) => ({ ...p, address: e.target.value }))} placeholder="123 Main St" />
+              <AddressAutocomplete
+                value={newLead.address}
+                onChange={(value) => setNewLead((p) => ({ ...p, address: value }))}
+                onSelect={(parts) =>
+                  setNewLead((p) => ({
+                    ...p,
+                    address: [parts.street, parts.city, `${parts.state} ${parts.zip}`]
+                      .filter(Boolean)
+                      .join(", "),
+                  }))
+                }
+                placeholder="123 Main St, City, ST"
+              />
             </div>
             <div className="space-y-1.5">
               <Label>Source</Label>
@@ -670,10 +821,53 @@ class DialogErrorBoundary extends React.Component<
   }
 }
 
+type LeadMetricTone = "blue" | "violet" | "red" | "green";
+
+function LeadMetricCard({
+  label, value, icon: Icon, tone, series,
+}: {
+  label: string; value: number; icon: React.ComponentType<{ className?: string }>; tone: LeadMetricTone; series: number[];
+}) {
+  const tones: Record<LeadMetricTone, { icon: string; tile: string; stroke: string; fill: string }> = {
+    blue: { icon: "text-blue-600", tile: "bg-blue-50", stroke: "#3B82F6", fill: "rgba(59,130,246,.10)" },
+    violet: { icon: "text-violet-600", tile: "bg-violet-50", stroke: "#8B5CF6", fill: "rgba(139,92,246,.10)" },
+    red: { icon: "text-red-500", tile: "bg-red-50", stroke: "#EF4444", fill: "rgba(239,68,68,.08)" },
+    green: { icon: "text-emerald-600", tile: "bg-emerald-50", stroke: "#10B981", fill: "rgba(16,185,129,.10)" },
+  };
+  const palette = tones[tone];
+  const max = Math.max(...series, 1);
+  const min = Math.min(...series, 0);
+  const range = Math.max(max - min, 1);
+  const points = series.map((point, index) => {
+    const x = (index / Math.max(series.length - 1, 1)) * 100;
+    const y = 28 - ((point - min) / range) * 22;
+    return `${x},${y}`;
+  }).join(" ");
+  const area = `0,32 ${points} 100,32`;
+
+  return (
+    <div className="flex min-h-[132px] flex-col rounded-2xl border border-[#E2E8F0] bg-white p-4 shadow-[0_1px_3px_rgba(15,23,42,0.04)]">
+      <div className="flex items-center gap-3">
+        <div className={cn("grid h-9 w-9 place-items-center rounded-xl", palette.tile)}>
+          <Icon className={cn("h-4 w-4", palette.icon)} />
+        </div>
+        <span className="text-[11px] font-medium uppercase tracking-[0.06em] text-muted-foreground">{label}</span>
+      </div>
+      <div className="mt-3 text-2xl font-semibold tracking-tight tabular-nums">{value}</div>
+      <div className="mt-auto h-8 pt-2" aria-hidden="true">
+        <svg viewBox="0 0 100 32" preserveAspectRatio="none" className="h-full w-full overflow-visible">
+          <polygon points={area} fill={palette.fill} />
+          <polyline points={points} fill="none" stroke={palette.stroke} strokeWidth="1.7" vectorEffect="non-scaling-stroke" />
+        </svg>
+      </div>
+    </div>
+  );
+}
+
 function FilterSelect({ value, onChange, options }: { value: string; onChange: (v: string) => void; options: string[] }) {
   return (
     <Select value={value} onValueChange={onChange}>
-      <SelectTrigger className="h-8 w-auto min-w-[120px] text-xs">
+      <SelectTrigger className="h-9 w-auto min-w-[128px] text-xs">
         <SelectValue />
       </SelectTrigger>
       <SelectContent>

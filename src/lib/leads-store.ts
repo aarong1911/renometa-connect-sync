@@ -57,8 +57,8 @@ function mapRow(row: any, contactMap: Record<string, any>): Lead {
     projectType: cf.service ?? "",
     estimatedBudget: budget,
     notes: row.notes ?? "",
-    owner: "—",
-    ownerInitials: "—",
+    owner: cf.owner ?? "—",
+    ownerInitials: (cf.owner ?? "—").split(" ").map((p: string) => p[0]).join(""),
     createdAt: row.created_at ?? new Date().toISOString(),
     lastActivity: row.updated_at ?? row.created_at ?? new Date().toISOString(),
     convertedDealId: row.converted_to_deal_id ?? undefined,
@@ -187,6 +187,69 @@ export async function addLead(lead: Omit<Lead, "id">): Promise<Lead> {
   leads = [next, ...leads];
   emit();
   return next;
+}
+
+export async function updateLead(
+  id: string,
+  updates: Partial<Pick<Lead, "name" | "email" | "phone" | "address" | "source" | "projectType" | "estimatedBudget" | "owner" | "notes">>,
+): Promise<void> {
+  const current = leads.find((lead) => lead.id === id);
+  if (!current) return;
+
+  const next = { ...current, ...updates, lastActivity: new Date().toISOString() };
+  const { data: leadRow, error: readError } = await supabase
+    .from("leads")
+    .select("contact_id, custom_fields")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (readError) {
+    console.error("[leads-store] lead read failed:", readError);
+  }
+
+  if (leadRow?.contact_id) {
+    const { error: contactError } = await supabase
+      .from("contacts")
+      .update({
+        full_name: next.name || "Unknown",
+        email: next.email || null,
+        phone: next.phone || null,
+        address: next.address || null,
+      })
+      .eq("id", leadRow.contact_id);
+
+    if (contactError) console.error("[leads-store] contact update failed:", contactError);
+  }
+
+  const customFields = {
+    ...(leadRow?.custom_fields ?? {}),
+    name: next.name || null,
+    email: next.email || null,
+    phone: next.phone || null,
+    address: next.address || null,
+    service: next.projectType || null,
+    budget: next.estimatedBudget ? String(next.estimatedBudget) : null,
+    owner: next.owner || null,
+  };
+
+  const { error } = await supabase
+    .from("leads")
+    .update({
+      source: next.source || "Website",
+      estimated_value: next.estimatedBudget || 0,
+      notes: next.notes || null,
+      custom_fields: customFields,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", id);
+
+  if (error) {
+    console.error("[leads-store] lead update failed:", error);
+    throw error;
+  }
+
+  leads = leads.map((lead) => lead.id === id ? next : lead);
+  emit();
 }
 
 export async function updateLeadStatus(id: string, status: LeadStatus): Promise<void> {

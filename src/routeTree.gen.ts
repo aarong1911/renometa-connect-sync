@@ -54,6 +54,7 @@ import { Route as AutomationTriggersRouteImport } from './routes/automation.trig
 import { Route as AutomationCallLogsRouteImport } from './routes/automation.call-logs'
 import { Route as AutomationAgentsRouteImport } from './routes/automation.agents'
 import { Route as AuthCallbackRouteImport } from './routes/auth.callback'
+import { Route as AccountsAccountSlugRouteImport } from './routes/accounts_.$accountSlug'
 import { Route as AutomationWorkflowsIndexRouteImport } from './routes/automation.workflows.index'
 import { Route as AutomationWorkflowsWorkflowIdRouteImport } from './routes/automation.workflows.$workflowId'
 
@@ -282,6 +283,11 @@ const AuthCallbackRoute = AuthCallbackRouteImport.update({
   path: '/auth/callback',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AccountsAccountSlugRoute = AccountsAccountSlugRouteImport.update({
+  id: '/accounts_/$accountSlug',
+  path: '/accounts/$accountSlug',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AutomationWorkflowsIndexRoute =
   AutomationWorkflowsIndexRouteImport.update({
     id: '/',
@@ -314,6 +320,7 @@ export interface FileRoutesByFullPath {
   '/signin': typeof SigninRoute
   '/signup': typeof SignupRoute
   '/tasks': typeof TasksRoute
+  '/accounts/$accountSlug': typeof AccountsAccountSlugRoute
   '/auth/callback': typeof AuthCallbackRoute
   '/automation/agents': typeof AutomationAgentsRoute
   '/automation/call-logs': typeof AutomationCallLogsRoute
@@ -363,6 +370,7 @@ export interface FileRoutesByTo {
   '/signin': typeof SigninRoute
   '/signup': typeof SignupRoute
   '/tasks': typeof TasksRoute
+  '/accounts/$accountSlug': typeof AccountsAccountSlugRoute
   '/auth/callback': typeof AuthCallbackRoute
   '/automation/agents': typeof AutomationAgentsRoute
   '/automation/call-logs': typeof AutomationCallLogsRoute
@@ -412,6 +420,7 @@ export interface FileRoutesById {
   '/signin': typeof SigninRoute
   '/signup': typeof SignupRoute
   '/tasks': typeof TasksRoute
+  '/accounts_/$accountSlug': typeof AccountsAccountSlugRoute
   '/auth/callback': typeof AuthCallbackRoute
   '/automation/agents': typeof AutomationAgentsRoute
   '/automation/call-logs': typeof AutomationCallLogsRoute
@@ -463,6 +472,7 @@ export interface FileRouteTypes {
     | '/signin'
     | '/signup'
     | '/tasks'
+    | '/accounts/$accountSlug'
     | '/auth/callback'
     | '/automation/agents'
     | '/automation/call-logs'
@@ -512,6 +522,7 @@ export interface FileRouteTypes {
     | '/signin'
     | '/signup'
     | '/tasks'
+    | '/accounts/$accountSlug'
     | '/auth/callback'
     | '/automation/agents'
     | '/automation/call-logs'
@@ -560,6 +571,7 @@ export interface FileRouteTypes {
     | '/signin'
     | '/signup'
     | '/tasks'
+    | '/accounts_/$accountSlug'
     | '/auth/callback'
     | '/automation/agents'
     | '/automation/call-logs'
@@ -610,6 +622,7 @@ export interface RootRouteChildren {
   SigninRoute: typeof SigninRoute
   SignupRoute: typeof SignupRoute
   TasksRoute: typeof TasksRoute
+  AccountsAccountSlugRoute: typeof AccountsAccountSlugRoute
   AuthCallbackRoute: typeof AuthCallbackRoute
   AutomationAgentsRoute: typeof AutomationAgentsRoute
   AutomationCallLogsRoute: typeof AutomationCallLogsRoute
@@ -939,6 +952,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthCallbackRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/accounts_/$accountSlug': {
+      id: '/accounts_/$accountSlug'
+      path: '/accounts/$accountSlug'
+      fullPath: '/accounts/$accountSlug'
+      preLoaderRoute: typeof AccountsAccountSlugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/automation/workflows/': {
       id: '/automation/workflows/'
       path: '/'
@@ -1050,6 +1070,7 @@ const rootRouteChildren: RootRouteChildren = {
   SigninRoute: SigninRoute,
   SignupRoute: SignupRoute,
   TasksRoute: TasksRoute,
+  AccountsAccountSlugRoute: AccountsAccountSlugRoute,
   AuthCallbackRoute: AuthCallbackRoute,
   AutomationAgentsRoute: AutomationAgentsRoute,
   AutomationCallLogsRoute: AutomationCallLogsRoute,
