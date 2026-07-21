@@ -32,6 +32,7 @@ import { toast } from "sonner";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { ContactAvatar } from "@/components/ui/contact-avatar";
 import { NewDealDialog } from "@/components/sales/new-deal-dialog";
+import { AccountRelatedDeals } from "@/components/accounts/account-related-deals";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -206,12 +207,9 @@ function formatPhone(value: string | null): string {
 
 function accountTypeClass(type: string): string {
   const key = type.toLowerCase();
-  if (key.includes("customer"))
-    return "border-emerald-200 bg-emerald-50 text-emerald-700";
-  if (key.includes("prospect"))
-    return "border-blue-200 bg-blue-50 text-blue-700";
-  if (key.includes("property"))
-    return "border-cyan-200 bg-cyan-50 text-cyan-700";
+  if (key.includes("customer")) return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  if (key.includes("prospect")) return "border-blue-200 bg-blue-50 text-blue-700";
+  if (key.includes("property")) return "border-cyan-200 bg-cyan-50 text-cyan-700";
   if (key.includes("vendor") || key.includes("supplier"))
     return "border-amber-200 bg-amber-50 text-amber-700";
   return "border-slate-200 bg-slate-50 text-slate-700";
@@ -292,45 +290,42 @@ function AccountDetailsPage() {
 
     setCompany(loadedCompany);
 
-    const [contactsResult, optionsResult, notesResult, activitiesResult] =
-      await Promise.all([
-        supabase
-          .from("company_contacts")
-          .select(
-            "id, contact_id, relationship_title, is_primary, contact:contacts(id, full_name, email, phone, avatar_url, avatar_key)",
-          )
-          .eq("company_id", resolvedCompanyId)
-          .eq("org_id", orgId)
-          .order("is_primary", { ascending: false }),
-        supabase
-          .from("contacts")
-          .select("id, full_name, email, phone, avatar_url, avatar_key")
-          .eq("org_id", orgId)
-          .order("full_name"),
-        supabase
-          .from("company_notes")
-          .select("*")
-          .eq("company_id", resolvedCompanyId)
-          .eq("org_id", orgId)
-          .order("is_pinned", { ascending: false })
-          .order("created_at", { ascending: false })
-          .limit(50),
-        supabase
-          .from("company_activities")
-          .select("*")
-          .eq("company_id", resolvedCompanyId)
-          .eq("org_id", orgId)
-          .order("occurred_at", { ascending: false, nullsFirst: false })
-          .limit(50),
-      ]);
+    const [contactsResult, optionsResult, notesResult, activitiesResult] = await Promise.all([
+      supabase
+        .from("company_contacts")
+        .select(
+          "id, contact_id, relationship_title, is_primary, contact:contacts(id, full_name, email, phone, avatar_url, avatar_key)",
+        )
+        .eq("company_id", resolvedCompanyId)
+        .eq("org_id", orgId)
+        .order("is_primary", { ascending: false }),
+      supabase
+        .from("contacts")
+        .select("id, full_name, email, phone, avatar_url, avatar_key")
+        .eq("org_id", orgId)
+        .order("full_name"),
+      supabase
+        .from("company_notes")
+        .select("*")
+        .eq("company_id", resolvedCompanyId)
+        .eq("org_id", orgId)
+        .order("is_pinned", { ascending: false })
+        .order("created_at", { ascending: false })
+        .limit(50),
+      supabase
+        .from("company_activities")
+        .select("*")
+        .eq("company_id", resolvedCompanyId)
+        .eq("org_id", orgId)
+        .order("occurred_at", { ascending: false, nullsFirst: false })
+        .limit(50),
+    ]);
 
     if (!contactsResult.error)
       setContacts((contactsResult.data ?? []) as unknown as LinkedContact[]);
-    if (!optionsResult.error)
-      setContactOptions((optionsResult.data ?? []) as ContactOption[]);
+    if (!optionsResult.error) setContactOptions((optionsResult.data ?? []) as ContactOption[]);
     if (!notesResult.error) setNotes((notesResult.data ?? []) as CompanyNote[]);
-    if (!activitiesResult.error)
-      setActivities((activitiesResult.data ?? []) as CompanyActivity[]);
+    if (!activitiesResult.error) setActivities((activitiesResult.data ?? []) as CompanyActivity[]);
 
     setLoading(false);
   }, [accountSlug]);
@@ -349,10 +344,7 @@ function AccountDetailsPage() {
     () => contacts.find((item) => item.is_primary) ?? contacts[0] ?? null,
     [contacts],
   );
-  const pinnedNotes = useMemo(
-    () => notes.filter((note) => note.is_pinned).slice(0, 3),
-    [notes],
-  );
+  const pinnedNotes = useMemo(() => notes.filter((note) => note.is_pinned).slice(0, 3), [notes]);
   const recentActivity = activities.slice(0, 5);
 
   const openAddNote = () => {
@@ -365,9 +357,7 @@ function AccountDetailsPage() {
     setNoteOpen(true);
   };
 
-  const navigateToModule = async (
-    to: "/sales/pipeline" | "/projects" | "/calendar" | "/files",
-  ) => {
+  const navigateToModule = async (to: "/sales/pipeline" | "/projects" | "/calendar" | "/files") => {
     if (company) {
       sessionStorage.setItem(
         "renometa:selectedAccount",
@@ -397,9 +387,7 @@ function AccountDetailsPage() {
         .eq("org_id", company.org_id);
 
       if (error) throw error;
-      toast.success(
-        `${item.contact?.full_name ?? "Contact"} is now the primary contact.`,
-      );
+      toast.success(`${item.contact?.full_name ?? "Contact"} is now the primary contact.`);
       await loadAccount();
     } catch (error) {
       console.error("[make-primary]", error);
@@ -490,9 +478,7 @@ function AccountDetailsPage() {
           Accounts
         </Link>
         <span>/</span>
-        <span className="max-w-56 truncate text-foreground">
-          {company.name}
-        </span>
+        <span className="max-w-56 truncate text-foreground">{company.name}</span>
       </div>
 
       <Card className="overflow-hidden p-0">
@@ -511,13 +497,8 @@ function AccountDetailsPage() {
 
             <div className="min-w-0 pt-0.5">
               <div className="flex flex-wrap items-center gap-2">
-                <h1 className="truncate text-2xl font-semibold tracking-tight">
-                  {company.name}
-                </h1>
-                <Badge
-                  variant="outline"
-                  className={accountTypeClass(company.account_type)}
-                >
+                <h1 className="truncate text-2xl font-semibold tracking-tight">{company.name}</h1>
+                <Badge variant="outline" className={accountTypeClass(company.account_type)}>
                   {company.account_type}
                 </Badge>
                 <Badge
@@ -590,9 +571,7 @@ function AccountDetailsPage() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem
-                  onClick={() => void navigator.clipboard.writeText(company.id)}
-                >
+                <DropdownMenuItem onClick={() => void navigator.clipboard.writeText(company.id)}>
                   Copy account ID
                 </DropdownMenuItem>
                 {company.website && (
@@ -607,10 +586,7 @@ function AccountDetailsPage() {
           </div>
         </div>
 
-        <Tabs
-          value={activeTab}
-          onValueChange={(value) => setActiveTab(value as TabValue)}
-        >
+        <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as TabValue)}>
           <div className="border-t border-border px-3">
             <TabsList className="h-auto w-full justify-start gap-1 overflow-x-auto rounded-none bg-transparent p-0">
               {TAB_ITEMS.map(({ value, label, icon: Icon }) => (
@@ -625,10 +601,7 @@ function AccountDetailsPage() {
             </TabsList>
           </div>
 
-          <TabsContent
-            value="overview"
-            className="m-0 border-t border-border bg-canvas p-3"
-          >
+          <TabsContent value="overview" className="m-0 border-t border-border bg-canvas p-3">
             <OverviewTab
               company={company}
               primaryContact={primaryContact}
@@ -645,10 +618,7 @@ function AccountDetailsPage() {
             />
           </TabsContent>
 
-          <TabsContent
-            value="contacts"
-            className="m-0 border-t border-border bg-canvas p-3"
-          >
+          <TabsContent value="contacts" className="m-0 border-t border-border bg-canvas p-3">
             <ContactsTab
               contacts={contacts}
               onAdd={() => setContactOpen(true)}
@@ -657,17 +627,11 @@ function AccountDetailsPage() {
             />
           </TabsContent>
 
-          <TabsContent
-            value="activity"
-            className="m-0 border-t border-border bg-canvas p-3"
-          >
+          <TabsContent value="activity" className="m-0 border-t border-border bg-canvas p-3">
             <ActivityTab activities={activities} onAddNote={openAddNote} />
           </TabsContent>
 
-          <TabsContent
-            value="notes"
-            className="m-0 border-t border-border bg-canvas p-3"
-          >
+          <TabsContent value="notes" className="m-0 border-t border-border bg-canvas p-3">
             <NotesTab
               notes={notes}
               onAdd={openAddNote}
@@ -677,41 +641,23 @@ function AccountDetailsPage() {
             />
           </TabsContent>
 
-          <TabsContent
-            value="opportunities"
-            className="m-0 border-t border-border bg-canvas p-3"
-          >
-            <ModuleEmptyState
-              tab="opportunities"
-              onOpen={() => setNewDealOpen(true)}
-            />
+          <TabsContent value="opportunities" className="m-0 border-t border-border bg-canvas p-3">
+            <Card className="p-5">
+              <AccountRelatedDeals companyId={company.id} />
+            </Card>
           </TabsContent>
-          <TabsContent
-            value="projects"
-            className="m-0 border-t border-border bg-canvas p-3"
-          >
-            <ModuleEmptyState
-              tab="projects"
-              onOpen={() => void navigateToModule("/projects")}
-            />
+
+          <TabsContent value="projects" className="m-0 border-t border-border bg-canvas p-3">
+            <ModuleEmptyState tab="projects" onOpen={() => void navigateToModule("/projects")} />
           </TabsContent>
-          <TabsContent
-            value="financials"
-            className="m-0 border-t border-border bg-canvas p-3"
-          >
+          <TabsContent value="financials" className="m-0 border-t border-border bg-canvas p-3">
             <ModuleEmptyState
               tab="financials"
               onOpen={() => void navigate({ to: "/financials" })}
             />
           </TabsContent>
-          <TabsContent
-            value="files"
-            className="m-0 border-t border-border bg-canvas p-3"
-          >
-            <ModuleEmptyState
-              tab="files"
-              onOpen={() => void navigateToModule("/files")}
-            />
+          <TabsContent value="files" className="m-0 border-t border-border bg-canvas p-3">
+            <ModuleEmptyState tab="files" onOpen={() => void navigateToModule("/files")} />
           </TabsContent>
         </Tabs>
       </Card>
@@ -723,9 +669,7 @@ function AccountDetailsPage() {
           name: `${company.name} Deal`,
           contactName: primaryContact?.contact?.full_name ?? "",
           email: primaryContact?.contact?.email ?? "",
-          phone: primaryContact?.contact?.phone
-            ? formatPhone(primaryContact.contact.phone)
-            : "",
+          phone: primaryContact?.contact?.phone ? formatPhone(primaryContact.contact.phone) : "",
           address,
         }}
         onCreated={() => {
@@ -786,9 +730,7 @@ function OverviewTab({
   onNewDeal: () => void;
   onShowActivity: () => void;
   onShowNotes: () => void;
-  onNavigate: (
-    to: "/sales/pipeline" | "/projects" | "/calendar" | "/files",
-  ) => Promise<void>;
+  onNavigate: (to: "/sales/pipeline" | "/projects" | "/calendar" | "/files") => Promise<void>;
 }) {
   return (
     <div className="grid gap-3 xl:grid-cols-[minmax(0,1.8fr)_minmax(320px,0.9fr)]">
@@ -806,64 +748,62 @@ function OverviewTab({
           />
           <div className="p-5">
             <div className="grid gap-5 md:grid-cols-2">
-            <div className="grid grid-cols-[120px_1fr] gap-x-4 gap-y-3 text-sm">
-              <InfoLabel>Account Type</InfoLabel>
-              <span>{company.account_type}</span>
-              <InfoLabel>Industry</InfoLabel>
-              <span>{company.industry || "—"}</span>
-              <InfoLabel>Status</InfoLabel>
-              <Badge
-                variant="outline"
-                className="w-fit border-emerald-200 bg-emerald-50 text-emerald-700"
-              >
-                {company.status}
-              </Badge>
-              <InfoLabel>Owner</InfoLabel>
-              <span>{company.owner_name || "Unassigned"}</span>
-            </div>
-            <div className="space-y-3 border-t pt-4 text-sm md:border-l md:border-t-0 md:pl-6 md:pt-0">
-              <ContactLine
-                icon={Mail}
-                label="Email"
-                value={company.email}
-                href={company.email ? `mailto:${company.email}` : undefined}
-              />
-              <ContactLine
-                icon={Phone}
-                label="Phone"
-                value={formatPhone(company.phone)}
-                href={company.phone ? `tel:${company.phone}` : undefined}
-              />
-              <ContactLine
-                icon={Globe}
-                label="Website"
-                value={company.website}
-                href={company.website || undefined}
-                external
-              />
-              <ContactLine
-                icon={MapPin}
-                label="Address"
-                value={address || "—"}
-                href={
-                  address
-                    ? `https://maps.google.com/?q=${encodeURIComponent(address)}`
-                    : undefined
-                }
-                external
-              />
-            </div>
-          </div>
-            <div className="mt-5 flex items-center gap-3 border-t pt-4">
-              <span className="text-xs font-medium text-muted-foreground">
-                Tags
-              </span>
-              <div className="flex flex-wrap gap-1.5">
-              {(company.tags ?? []).map((tag) => (
-                <Badge key={tag} variant="secondary">
-                  {tag}
+              <div className="grid grid-cols-[120px_1fr] gap-x-4 gap-y-3 text-sm">
+                <InfoLabel>Account Type</InfoLabel>
+                <span>{company.account_type}</span>
+                <InfoLabel>Industry</InfoLabel>
+                <span>{company.industry || "—"}</span>
+                <InfoLabel>Status</InfoLabel>
+                <Badge
+                  variant="outline"
+                  className="w-fit border-emerald-200 bg-emerald-50 text-emerald-700"
+                >
+                  {company.status}
                 </Badge>
-              ))}
+                <InfoLabel>Owner</InfoLabel>
+                <span>{company.owner_name || "Unassigned"}</span>
+              </div>
+              <div className="space-y-3 border-t pt-4 text-sm md:border-l md:border-t-0 md:pl-6 md:pt-0">
+                <ContactLine
+                  icon={Mail}
+                  label="Email"
+                  value={company.email}
+                  href={company.email ? `mailto:${company.email}` : undefined}
+                />
+                <ContactLine
+                  icon={Phone}
+                  label="Phone"
+                  value={formatPhone(company.phone)}
+                  href={company.phone ? `tel:${company.phone}` : undefined}
+                />
+                <ContactLine
+                  icon={Globe}
+                  label="Website"
+                  value={company.website}
+                  href={company.website || undefined}
+                  external
+                />
+                <ContactLine
+                  icon={MapPin}
+                  label="Address"
+                  value={address || "—"}
+                  href={
+                    address
+                      ? `https://maps.google.com/?q=${encodeURIComponent(address)}`
+                      : undefined
+                  }
+                  external
+                />
+              </div>
+            </div>
+            <div className="mt-5 flex items-center gap-3 border-t pt-4">
+              <span className="text-xs font-medium text-muted-foreground">Tags</span>
+              <div className="flex flex-wrap gap-1.5">
+                {(company.tags ?? []).map((tag) => (
+                  <Badge key={tag} variant="secondary">
+                    {tag}
+                  </Badge>
+                ))}
                 {(company.tags ?? []).length === 0 && (
                   <span className="text-sm text-muted-foreground">No tags</span>
                 )}
@@ -876,57 +816,55 @@ function OverviewTab({
           <CardHeaderBar icon={Users} title="Primary Contact" />
           <div className="p-5">
             {primaryContact?.contact ? (
-            <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
-              <AccountContactAvatar
-                contact={primaryContact.contact}
-                className="h-16 w-16"
-                size="lg"
-              />
-              <div className="min-w-0 flex-1">
-                <div className="font-medium">
-                  {primaryContact.contact.full_name}
-                </div>
-                <div className="text-sm text-muted-foreground">
-                  {primaryContact.relationship_title || "Primary contact"}
-                </div>
-                {primaryContact.contact.email && (
-                  <a
-                    href={`mailto:${primaryContact.contact.email}`}
-                    className="mt-2 block text-sm text-primary hover:underline"
-                  >
-                    {primaryContact.contact.email}
-                  </a>
-                )}
-                {primaryContact.contact.phone && (
-                  <a
-                    href={`tel:${primaryContact.contact.phone}`}
-                    className="mt-1 block text-sm text-primary hover:underline"
-                  >
-                    {formatPhone(primaryContact.contact.phone)}
-                  </a>
-                )}
-              </div>
-              <div className="flex gap-2">
-                <Button variant="outline" size="sm" asChild>
-                  <Link to="/contacts">View Contact</Link>
-                </Button>
-                {primaryContact.contact.email && (
-                  <Button variant="outline" size="sm" asChild>
-                    <a href={`mailto:${primaryContact.contact.email}`}>
-                      <Mail className="mr-1.5 h-3.5 w-3.5" />
-                      Send Email
+              <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
+                <AccountContactAvatar
+                  contact={primaryContact.contact}
+                  className="h-16 w-16"
+                  size="lg"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="font-medium">{primaryContact.contact.full_name}</div>
+                  <div className="text-sm text-muted-foreground">
+                    {primaryContact.relationship_title || "Primary contact"}
+                  </div>
+                  {primaryContact.contact.email && (
+                    <a
+                      href={`mailto:${primaryContact.contact.email}`}
+                      className="mt-2 block text-sm text-primary hover:underline"
+                    >
+                      {primaryContact.contact.email}
                     </a>
+                  )}
+                  {primaryContact.contact.phone && (
+                    <a
+                      href={`tel:${primaryContact.contact.phone}`}
+                      className="mt-1 block text-sm text-primary hover:underline"
+                    >
+                      {formatPhone(primaryContact.contact.phone)}
+                    </a>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  <Button variant="outline" size="sm" asChild>
+                    <Link to="/contacts">View Contact</Link>
                   </Button>
-                )}
+                  {primaryContact.contact.email && (
+                    <Button variant="outline" size="sm" asChild>
+                      <a href={`mailto:${primaryContact.contact.email}`}>
+                        <Mail className="mr-1.5 h-3.5 w-3.5" />
+                        Send Email
+                      </a>
+                    </Button>
+                  )}
+                </div>
               </div>
-            </div>
-          ) : (
-            <EmptyInline
-              icon={Users}
-              text="No primary contact is linked to this account."
-              action="Add Contact"
-              onAction={onAddContact}
-            />
+            ) : (
+              <EmptyInline
+                icon={Users}
+                text="No primary contact is linked to this account."
+                action="Add Contact"
+                onAction={onAddContact}
+              />
             )}
           </div>
         </Card>
@@ -942,11 +880,7 @@ function OverviewTab({
             }
           />
           <div className="p-5">
-            <ActivityList
-            activities={recentActivity}
-            compact
-              onAddNote={onAddNote}
-            />
+            <ActivityList activities={recentActivity} compact onAddNote={onAddNote} />
           </div>
         </Card>
       </div>
@@ -955,18 +889,8 @@ function OverviewTab({
         <Card className="overflow-hidden p-0">
           <CardHeaderBar icon={Plus} title="Quick Actions" />
           <div className="grid grid-cols-2 gap-2 p-4">
-            <QuickAction
-              icon={UserPlus}
-              label="Add Contact"
-              tone="blue"
-              onClick={onAddContact}
-            />
-            <QuickAction
-              icon={StickyNote}
-              label="Add Note"
-              tone="gold"
-              onClick={onAddNote}
-            />
+            <QuickAction icon={UserPlus} label="Add Contact" tone="blue" onClick={onAddContact} />
+            <QuickAction icon={StickyNote} label="Add Note" tone="gold" onClick={onAddNote} />
             <QuickAction
               icon={CircleDollarSign}
               label="New Deal"
@@ -998,9 +922,9 @@ function OverviewTab({
           <CardHeaderBar icon={Activity} title="Account Summary" />
           <div className="px-4 pb-2">
             <SummaryRow label="Open Opportunities" value="—" />
-          <SummaryRow label="Pipeline Value" value="—" />
-          <SummaryRow label="Active Projects" value="—" />
-          <SummaryRow label="Outstanding Balance" value="—" />
+            <SummaryRow label="Pipeline Value" value="—" />
+            <SummaryRow label="Active Projects" value="—" />
+            <SummaryRow label="Outstanding Balance" value="—" />
             <SummaryRow label="Lifetime Revenue" value="—" last />
           </div>
         </Card>
@@ -1017,36 +941,34 @@ function OverviewTab({
           />
           <div className="p-4">
             {pinnedNotes.length > 0 ? (
-            <div className="space-y-2">
-              {pinnedNotes.map((note) => (
-                <div
-                  key={note.id}
-                  className="rounded-lg border border-amber-200 bg-amber-50/60 p-3"
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="text-sm font-medium">
-                      {note.title || "Pinned note"}
+              <div className="space-y-2">
+                {pinnedNotes.map((note) => (
+                  <div
+                    key={note.id}
+                    className="rounded-lg border border-amber-200 bg-amber-50/60 p-3"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="text-sm font-medium">{note.title || "Pinned note"}</div>
+                      <Pin className="h-3.5 w-3.5 text-amber-600" />
                     </div>
-                    <Pin className="h-3.5 w-3.5 text-amber-600" />
+                    <p className="mt-1 line-clamp-3 text-sm text-muted-foreground">
+                      {noteText(note)}
+                    </p>
+                    <div className="mt-2 text-[11px] text-muted-foreground">
+                      {format(new Date(note.created_at), "MMM d, yyyy")}
+                    </div>
                   </div>
-                  <p className="mt-1 line-clamp-3 text-sm text-muted-foreground">
-                    {noteText(note)}
-                  </p>
-                  <div className="mt-2 text-[11px] text-muted-foreground">
-                    {format(new Date(note.created_at), "MMM d, yyyy")}
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : company.notes ? (
-            <div className="rounded-lg border border-amber-200 bg-amber-50/60 p-3 text-sm text-muted-foreground">
-              {company.notes}
-            </div>
-          ) : (
-            <EmptyInline
-              icon={Pin}
-              text="No important notes yet."
-              action="Add Note"
+                ))}
+              </div>
+            ) : company.notes ? (
+              <div className="rounded-lg border border-amber-200 bg-amber-50/60 p-3 text-sm text-muted-foreground">
+                {company.notes}
+              </div>
+            ) : (
+              <EmptyInline
+                icon={Pin}
+                text="No important notes yet."
+                action="Add Note"
                 onAction={onAddNote}
               />
             )}
@@ -1054,8 +976,7 @@ function OverviewTab({
         </Card>
 
         <div className="px-1 text-[11px] text-muted-foreground">
-          Created {format(new Date(company.created_at), "MMM d, yyyy")} ·
-          Updated{" "}
+          Created {format(new Date(company.created_at), "MMM d, yyyy")} · Updated{" "}
           {formatDistanceToNow(new Date(company.updated_at), {
             addSuffix: true,
           })}
@@ -1081,9 +1002,7 @@ function ContactsTab({
       <div className="mb-4 flex items-center justify-between">
         <div>
           <h2 className="font-semibold">Account Contacts</h2>
-          <p className="text-sm text-muted-foreground">
-            People connected to this account.
-          </p>
+          <p className="text-sm text-muted-foreground">People connected to this account.</p>
         </div>
         <Button size="sm" onClick={onAdd}>
           <UserPlus className="mr-1.5 h-3.5 w-3.5" />
@@ -1100,30 +1019,20 @@ function ContactsTab({
       ) : (
         <div className="divide-y rounded-lg border">
           {contacts.map((item) => (
-            <div
-              key={item.id}
-              className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center"
-            >
-              <AccountContactAvatar
-                contact={item.contact}
-                size="md"
-              />
+            <div key={item.id} className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center">
+              <AccountContactAvatar contact={item.contact} size="md" />
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="font-medium">
                     {item.contact?.full_name || "Unknown contact"}
                   </span>
-                  {item.is_primary && (
-                    <Badge variant="secondary">Primary</Badge>
-                  )}
+                  {item.is_primary && <Badge variant="secondary">Primary</Badge>}
                 </div>
                 <div className="text-sm text-muted-foreground">
                   {item.relationship_title || "Contact"}
                 </div>
               </div>
-              <div className="text-sm text-muted-foreground">
-                {item.contact?.email || "—"}
-              </div>
+              <div className="text-sm text-muted-foreground">{item.contact?.email || "—"}</div>
               <div className="text-sm text-muted-foreground">
                 {formatPhone(item.contact?.phone || null) || "—"}
               </div>
@@ -1194,9 +1103,7 @@ function NotesTab({
       <div className="mb-4 flex items-center justify-between">
         <div>
           <h2 className="font-semibold">Account Notes</h2>
-          <p className="text-sm text-muted-foreground">
-            Internal notes shared with your team.
-          </p>
+          <p className="text-sm text-muted-foreground">Internal notes shared with your team.</p>
         </div>
         <Button size="sm" onClick={onAdd}>
           <Plus className="mr-1.5 h-3.5 w-3.5" />
@@ -1250,9 +1157,7 @@ function NotesTab({
                   {note.author_name || "Team member"} ·{" "}
                   {format(new Date(note.created_at), "MMM d, yyyy")}
                 </span>
-                {note.is_pinned && (
-                  <Pin className="h-3.5 w-3.5 text-gold-hover" />
-                )}
+                {note.is_pinned && <Pin className="h-3.5 w-3.5 text-gold-hover" />}
               </div>
             </div>
           ))}
@@ -1288,10 +1193,7 @@ function ActivityList({
         const activityDate = item.occurred_at || item.created_at;
 
         return (
-          <div
-            key={item.id}
-            className="grid grid-cols-[32px_1fr_auto] gap-3 py-2"
-          >
+          <div key={item.id} className="grid grid-cols-[32px_1fr_auto] gap-3 py-2">
             <span className="grid h-8 w-8 place-items-center rounded-full bg-blue-50 text-blue-700">
               <MessageSquareText className="h-4 w-4" />
             </span>
@@ -1351,15 +1253,13 @@ function ModuleEmptyState({
     financials: {
       icon: WalletCards,
       title: "Account financials",
-      description:
-        "Estimates, invoices, payments, and balances will appear here.",
+      description: "Estimates, invoices, payments, and balances will appear here.",
       action: "Open Financials",
     },
     files: {
       icon: FileText,
       title: "Account files",
-      description:
-        "Contracts, proposals, photos, and other documents will appear here.",
+      description: "Contracts, proposals, photos, and other documents will appear here.",
       action: "Open Files",
     },
   }[tab];
@@ -1387,9 +1287,7 @@ function EditAccountDialog({
   onClose: () => void;
   onSaved: () => Promise<void>;
 }) {
-  const [form, setForm] = useState<EditCompanyForm>(() =>
-    companyToEditForm(company),
-  );
+  const [form, setForm] = useState<EditCompanyForm>(() => companyToEditForm(company));
   const [saving, setSaving] = useState(false);
   useEffect(() => {
     if (open) setForm(companyToEditForm(company));
@@ -1435,16 +1333,11 @@ function EditAccountDialog({
       <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Edit Account</DialogTitle>
-          <DialogDescription>
-            Update the core account information.
-          </DialogDescription>
+          <DialogDescription>Update the core account information.</DialogDescription>
         </DialogHeader>
         <div className="grid gap-4 py-2 md:grid-cols-2">
           <Field label="Account name" className="md:col-span-2">
-            <Input
-              value={form.name}
-              onChange={(e) => update("name", e.target.value)}
-            />
+            <Input value={form.name} onChange={(e) => update("name", e.target.value)} />
           </Field>
           <Field label="Account type">
             <Input
@@ -1453,10 +1346,7 @@ function EditAccountDialog({
             />
           </Field>
           <Field label="Status">
-            <Select
-              value={form.status}
-              onValueChange={(v) => update("status", v)}
-            >
+            <Select value={form.status} onValueChange={(v) => update("status", v)}>
               <SelectTrigger>
                 <SelectValue />
               </SelectTrigger>
@@ -1468,16 +1358,10 @@ function EditAccountDialog({
             </Select>
           </Field>
           <Field label="Industry">
-            <Input
-              value={form.industry}
-              onChange={(e) => update("industry", e.target.value)}
-            />
+            <Input value={form.industry} onChange={(e) => update("industry", e.target.value)} />
           </Field>
           <Field label="Owner">
-            <Input
-              value={form.owner_name}
-              onChange={(e) => update("owner_name", e.target.value)}
-            />
+            <Input value={form.owner_name} onChange={(e) => update("owner_name", e.target.value)} />
           </Field>
           <Field label="Email">
             <Input
@@ -1487,46 +1371,25 @@ function EditAccountDialog({
             />
           </Field>
           <Field label="Phone">
-            <Input
-              value={form.phone}
-              onChange={(e) => update("phone", e.target.value)}
-            />
+            <Input value={form.phone} onChange={(e) => update("phone", e.target.value)} />
           </Field>
           <Field label="Website" className="md:col-span-2">
-            <Input
-              value={form.website}
-              onChange={(e) => update("website", e.target.value)}
-            />
+            <Input value={form.website} onChange={(e) => update("website", e.target.value)} />
           </Field>
           <Field label="Street address" className="md:col-span-2">
-            <Input
-              value={form.address}
-              onChange={(e) => update("address", e.target.value)}
-            />
+            <Input value={form.address} onChange={(e) => update("address", e.target.value)} />
           </Field>
           <Field label="City">
-            <Input
-              value={form.city}
-              onChange={(e) => update("city", e.target.value)}
-            />
+            <Input value={form.city} onChange={(e) => update("city", e.target.value)} />
           </Field>
           <Field label="State">
-            <Input
-              value={form.state}
-              onChange={(e) => update("state", e.target.value)}
-            />
+            <Input value={form.state} onChange={(e) => update("state", e.target.value)} />
           </Field>
           <Field label="ZIP">
-            <Input
-              value={form.zip}
-              onChange={(e) => update("zip", e.target.value)}
-            />
+            <Input value={form.zip} onChange={(e) => update("zip", e.target.value)} />
           </Field>
           <Field label="Country">
-            <Input
-              value={form.country}
-              onChange={(e) => update("country", e.target.value)}
-            />
+            <Input value={form.country} onChange={(e) => update("country", e.target.value)} />
           </Field>
         </div>
         <DialogFooter>
@@ -1565,9 +1428,7 @@ function AddContactDialog({
   const [title, setTitle] = useState("");
   const [primary, setPrimary] = useState(false);
   const [saving, setSaving] = useState(false);
-  const available = options.filter(
-    (option) => !linkedContactIds.includes(option.id),
-  );
+  const available = options.filter((option) => !linkedContactIds.includes(option.id));
   useEffect(() => {
     if (open) {
       setMode("existing");
@@ -1624,9 +1485,7 @@ function AddContactDialog({
       await onSaved();
     } catch (error) {
       console.error("[add-contact]", error);
-      toast.error(
-        error instanceof Error ? error.message : "Could not add the contact.",
-      );
+      toast.error(error instanceof Error ? error.message : "Could not add the contact.");
     } finally {
       setSaving(false);
     }
@@ -1642,10 +1501,7 @@ function AddContactDialog({
         </DialogHeader>
         <div className="space-y-4 py-2">
           <Field label="Contact source">
-            <Select
-              value={mode}
-              onValueChange={(v) => setMode(v as AddContactMode)}
-            >
+            <Select value={mode} onValueChange={(v) => setMode(v as AddContactMode)}>
               <SelectTrigger>
                 <SelectValue />
               </SelectTrigger>
@@ -1657,10 +1513,7 @@ function AddContactDialog({
           </Field>
           {mode === "existing" ? (
             <Field label="Contact">
-              <Select
-                value={existingId || undefined}
-                onValueChange={setExistingId}
-              >
+              <Select value={existingId || undefined} onValueChange={setExistingId}>
                 <SelectTrigger>
                   <SelectValue placeholder="Select contact" />
                 </SelectTrigger>
@@ -1681,17 +1534,10 @@ function AddContactDialog({
               </Field>
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label="Email">
-                  <Input
-                    type="email"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                  />
+                  <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
                 </Field>
                 <Field label="Phone">
-                  <Input
-                    value={phone}
-                    onChange={(e) => setPhone(e.target.value)}
-                  />
+                  <Input value={phone} onChange={(e) => setPhone(e.target.value)} />
                 </Field>
               </div>
             </>
@@ -1816,9 +1662,7 @@ function NoteDialog({
       <DialogContent className="max-w-lg">
         <DialogHeader>
           <DialogTitle>{note ? "Edit Note" : "Add Note"}</DialogTitle>
-          <DialogDescription>
-            Save an internal note for {company.name}.
-          </DialogDescription>
+          <DialogDescription>Save an internal note for {company.name}.</DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-2">
           <Field label="Title">
@@ -1837,11 +1681,7 @@ function NoteDialog({
             />
           </Field>
           <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={pinned}
-              onChange={(e) => setPinned(e.target.checked)}
-            />
+            <input type="checkbox" checked={pinned} onChange={(e) => setPinned(e.target.checked)} />
             Pin as important
           </label>
         </div>
@@ -1877,11 +1717,7 @@ function AccountContactAvatar({
   if (contact?.avatar_url) {
     return (
       <Avatar className={`${sizeClasses[size]} shrink-0 ${className ?? ""}`}>
-        <AvatarImage
-          src={contact.avatar_url}
-          alt={name}
-          className="object-cover"
-        />
+        <AvatarImage src={contact.avatar_url} alt={name} className="object-cover" />
         <AvatarFallback>{initials(name)}</AvatarFallback>
       </Avatar>
     );
@@ -2016,9 +1852,7 @@ function SummaryRow({
   last?: boolean;
 }) {
   return (
-    <div
-      className={`flex items-center justify-between py-2.5 text-sm ${last ? "" : "border-b"}`}
-    >
+    <div className={`flex items-center justify-between py-2.5 text-sm ${last ? "" : "border-b"}`}>
       <span className="text-muted-foreground">{label}</span>
       <span className="font-medium">{value}</span>
     </div>
