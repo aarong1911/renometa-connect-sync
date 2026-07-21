@@ -1,45 +1,124 @@
 // src/lib/contact-activity.ts
-// Fetches real activity timeline for a contact from Supabase.
-// Replaces the mock buildActivity() function in contacts.tsx.
+// Builds a Contact timeline from real Supabase records, including detailed
+// Deal activity entries created from the Deal drawer.
 
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
+
 import { supabase } from "@/lib/supabase";
 
-export type ActivityKind = "email-out" | "email-in" | "sms-out" | "sms-in" | "call" | "note" | "deal" | "invoice" | "appointment" | "lead";
+export type ActivityKind =
+  | "email-out"
+  | "email-in"
+  | "sms-out"
+  | "sms-in"
+  | "call"
+  | "note"
+  | "deal"
+  | "invoice"
+  | "appointment"
+  | "lead";
 
 export type ActivityItem = {
   id: string;
   kind: ActivityKind;
   title: string;
   body: string;
-  at: string; // ISO
+  at: string;
   by: string;
 };
 
+type DealRow = {
+  id: string;
+  title: string;
+  value: number | null;
+  status: string | null;
+  created_at: string;
+  pipeline_stages:
+    | { name: string | null }
+    | Array<{ name: string | null }>
+    | null;
+};
+
+type DealActivityRow = {
+  id: string;
+  deal_id: string;
+  activity_type: string;
+  title: string;
+  description: string | null;
+  actor_name: string | null;
+  occurred_at: string;
+  metadata: Record<string, unknown> | null;
+};
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 async function getOrgId(): Promise<string | null> {
-  const { data: { user } } = await supabase.auth.getUser();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
   if (!user) return null;
+
   const { data: profile } = await supabase
     .from("profiles")
     .select("organization_id")
     .eq("id", user.id)
     .maybeSingle();
-  if (profile?.organization_id) return profile.organization_id;
+
+  if (profile?.organization_id) {
+    return profile.organization_id;
+  }
+
   const { data: membership } = await supabase
     .from("org_memberships")
     .select("org_id")
     .eq("member_id", user.id)
     .maybeSingle();
+
   return membership?.org_id ?? null;
 }
 
-function formatDuration(sec: number | null): string {
-  if (!sec || sec <= 0) return "";
-  const m = Math.floor(sec / 60);
-  return ` · ${m} min`;
+function formatDuration(seconds: number | null): string {
+  if (!seconds || seconds <= 0) return "";
+
+  const minutes = Math.floor(seconds / 60);
+  return ` · ${minutes} min`;
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function relatedStageName(row: DealRow): string {
+  if (Array.isArray(row.pipeline_stages)) {
+    return row.pipeline_stages[0]?.name || row.status || "New";
+  }
+
+  return row.pipeline_stages?.name || row.status || "New";
+}
+
+function dealActivityKind(type: string): ActivityKind {
+  if (type === "note_added") return "note";
+  return "deal";
+}
+
+function dealActivityBody(activity: DealActivityRow): string {
+  if (activity.description?.trim()) {
+    return activity.description.trim();
+  }
+
+  const metadata = activity.metadata ?? {};
+  const field = metadata.field_label;
+  const previous = metadata.previous_value;
+  const next = metadata.new_value;
+
+  if (
+    typeof field === "string" &&
+    previous !== undefined &&
+    next !== undefined
+  ) {
+    return `${field}: ${String(previous)} → ${String(next)}`;
+  }
+
+  return "Deal activity recorded.";
+}
 
 export function useContactActivity(contactId: string | null): {
   items: ActivityItem[];
@@ -56,9 +135,12 @@ export function useContactActivity(contactId: string | null): {
     }
 
     let cancelled = false;
+    let activeDealIds: string[] = [];
+    let orgId: string | null = null;
 
-    (async () => {
-      const orgId = await getOrgId();
+    async function loadActivity() {
+      orgId = await getOrgId();
+
       if (!orgId || cancelled) {
         setLoading(false);
         return;
@@ -66,139 +148,251 @@ export function useContactActivity(contactId: string | null): {
 
       const activity: ActivityItem[] = [];
 
-      // ── Voice calls ──
-      const { data: calls } = await supabase
-        .from("voice_calls")
-        .select("id, started_at, duration_sec, summary, direction, voice_agents(name)")
-        .eq("contact_id", contactId)
-        .eq("tenant_id", orgId)
-        .order("started_at", { ascending: false })
-        .limit(20);
+      const [
+        { data: calls },
+        { data: dealRows },
+        { data: leads },
+        { data: appointments },
+        { data: estimates },
+      ] = await Promise.all([
+        supabase
+          .from("voice_calls")
+          .select(
+            "id, started_at, duration_sec, summary, direction, " +
+              "voice_agents(name)",
+          )
+          .eq("contact_id", contactId)
+          .eq("tenant_id", orgId)
+          .order("started_at", { ascending: false })
+          .limit(20),
+
+        supabase
+          .from("deals")
+          .select(
+            "id, title, value, status, created_at, pipeline_stages(name)",
+          )
+          .eq("contact_id", contactId)
+          .eq("org_id", orgId)
+          .order("created_at", { ascending: false })
+          .limit(25),
+
+        supabase
+          .from("leads")
+          .select(
+            "id, source, status, notes, estimated_value, " +
+              "custom_fields, created_at",
+          )
+          .eq("contact_id", contactId)
+          .eq("org_id", orgId)
+          .order("created_at", { ascending: false })
+          .limit(10),
+
+        supabase
+          .from("appointments")
+          .select(
+            "id, service, scheduled_at, status, source, " +
+              "duration_min, created_at",
+          )
+          .eq("contact_id", contactId)
+          .eq("org_id", orgId)
+          .order("created_at", { ascending: false })
+          .limit(10),
+
+        supabase
+          .from("estimates")
+          .select("id, title, number, status, total, created_at")
+          .eq("client_id", contactId)
+          .eq("org_id", orgId)
+          .order("created_at", { ascending: false })
+          .limit(10),
+      ]);
 
       if (calls) {
-        for (const c of calls as any[]) {
-          const dir = c.direction === "outbound" ? "Outbound" : "Inbound";
+        for (const call of calls as Array<Record<string, any>>) {
+          const direction =
+            call.direction === "outbound" ? "Outbound" : "Inbound";
+
           activity.push({
-            id: `call-${c.id}`,
+            id: `call-${call.id}`,
             kind: "call",
-            title: `${dir} call${formatDuration(c.duration_sec)}`,
-            body: c.summary || "Voice call completed.",
-            at: c.started_at,
-            by: c.voice_agents?.name || "Voice AI",
+            title: `${direction} call${formatDuration(
+              call.duration_sec,
+            )}`,
+            body: call.summary || "Voice call completed.",
+            at: call.started_at,
+            by: call.voice_agents?.name || "Voice AI",
           });
         }
       }
 
-      // ── Deals ──
-      const { data: deals } = await supabase
-        .from("deals")
-        .select("id, title, value, status, created_at, pipeline_stages(name)")
-        .eq("contact_id", contactId)
-        .eq("org_id", orgId)
-        .order("created_at", { ascending: false })
-        .limit(10);
+      const deals = (dealRows as DealRow[] | null) ?? [];
+      activeDealIds = deals.map((deal) => deal.id);
 
-      if (deals) {
-        for (const d of deals as any[]) {
-          const stage = d.pipeline_stages?.name || d.status || "New";
-          const value = d.value ? ` · $${Number(d.value).toLocaleString()}` : "";
+      for (const deal of deals) {
+        const amount = deal.value
+          ? ` · $${Number(deal.value).toLocaleString()}`
+          : "";
+
+        activity.push({
+          id: `deal-${deal.id}`,
+          kind: "deal",
+          title: "Deal created",
+          body: `${deal.title}${amount} — Stage: ${relatedStageName(deal)}`,
+          at: deal.created_at,
+          by: "System",
+        });
+      }
+
+      if (activeDealIds.length > 0) {
+        const { data: detailedDealActivity } = await supabase
+          .from("deal_activities")
+          .select(
+            "id, deal_id, activity_type, title, description, " +
+              "actor_name, occurred_at, metadata",
+          )
+          .eq("org_id", orgId)
+          .in("deal_id", activeDealIds)
+          .order("occurred_at", { ascending: false })
+          .limit(100);
+
+        for (
+          const dealActivity of
+            (detailedDealActivity as DealActivityRow[] | null) ?? []
+        ) {
           activity.push({
-            id: `deal-${d.id}`,
-            kind: "deal",
-            title: `Deal created`,
-            body: `${d.title}${value} — Stage: ${stage}`,
-            at: d.created_at,
-            by: "System",
+            id: `deal-activity-${dealActivity.id}`,
+            kind: dealActivityKind(dealActivity.activity_type),
+            title: dealActivity.title,
+            body: dealActivityBody(dealActivity),
+            at: dealActivity.occurred_at,
+            by: dealActivity.actor_name || "System",
           });
         }
       }
-
-      // ── Leads ──
-      const { data: leads } = await supabase
-        .from("leads")
-        .select("id, source, status, notes, estimated_value, custom_fields, created_at")
-        .eq("contact_id", contactId)
-        .eq("org_id", orgId)
-        .order("created_at", { ascending: false })
-        .limit(10);
 
       if (leads) {
-        for (const l of leads as any[]) {
-          const service = l.custom_fields?.service || "";
-          const value = l.estimated_value ? ` · $${Number(l.estimated_value).toLocaleString()}` : "";
+        for (const lead of leads as Array<Record<string, any>>) {
+          const service = lead.custom_fields?.service || "";
+          const amount = lead.estimated_value
+            ? ` · $${Number(lead.estimated_value).toLocaleString()}`
+            : "";
+
           activity.push({
-            id: `lead-${l.id}`,
+            id: `lead-${lead.id}`,
             kind: "lead",
-            title: `Lead captured`,
-            body: `Source: ${l.source || "—"}${service ? ` · ${service}` : ""}${value}`,
-            at: l.created_at,
+            title: "Lead captured",
+            body:
+              `Source: ${lead.source || "—"}` +
+              `${service ? ` · ${service}` : ""}${amount}`,
+            at: lead.created_at,
             by: "System",
           });
         }
       }
 
-      // ── Appointments ──
-      const { data: appointments } = await supabase
-        .from("appointments")
-        .select("id, service, scheduled_at, status, source, duration_min, created_at")
-        .eq("contact_id", contactId)
-        .eq("org_id", orgId)
-        .order("created_at", { ascending: false })
-        .limit(10);
-
       if (appointments) {
-        for (const a of appointments as any[]) {
-          const dateStr = new Date(a.scheduled_at).toLocaleDateString("en-US", {
+        for (
+          const appointment of
+            appointments as Array<Record<string, any>>
+        ) {
+          const date = new Date(
+            appointment.scheduled_at,
+          ).toLocaleDateString("en-US", {
             weekday: "short",
             month: "short",
             day: "numeric",
             hour: "numeric",
             minute: "2-digit",
           });
+
           activity.push({
-            id: `appt-${a.id}`,
+            id: `appointment-${appointment.id}`,
             kind: "appointment",
-            title: `Appointment ${a.status === "scheduled" ? "booked" : a.status}`,
-            body: `${a.service || "Consultation"} — ${dateStr}`,
-            at: a.created_at,
-            by: a.source || "—",
+            title:
+              appointment.status === "scheduled"
+                ? "Appointment booked"
+                : `Appointment ${appointment.status}`,
+            body: `${appointment.service || "Consultation"} — ${date}`,
+            at: appointment.created_at,
+            by: appointment.source || "System",
           });
         }
       }
 
-      // ── Estimates (client_id is the FK to contacts) ──
-      const { data: estimates } = await supabase
-        .from("estimates")
-        .select("id, title, number, status, total, created_at")
-        .eq("client_id", contactId)
-        .eq("org_id", orgId)
-        .order("created_at", { ascending: false })
-        .limit(10);
-
       if (estimates) {
-        for (const e of estimates as any[]) {
-          const amount = e.total ? ` · $${Number(e.total).toLocaleString()}` : "";
+        for (const estimate of estimates as Array<Record<string, any>>) {
+          const amount = estimate.total
+            ? ` · $${Number(estimate.total).toLocaleString()}`
+            : "";
+
           activity.push({
-            id: `est-${e.id}`,
-            kind: "invoice" as ActivityKind,
-            title: `Estimate ${e.status || "created"}`,
-            body: `${e.title || e.number || "Estimate"}${amount}`,
-            at: e.created_at,
+            id: `estimate-${estimate.id}`,
+            kind: "invoice",
+            title: `Estimate ${estimate.status || "created"}`,
+            body:
+              `${estimate.title || estimate.number || "Estimate"}` +
+              amount,
+            at: estimate.created_at,
             by: "System",
           });
         }
       }
 
-      // Sort all by date descending
-      activity.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+      activity.sort((a, b) => {
+        return new Date(b.at).getTime() - new Date(a.at).getTime();
+      });
 
       if (!cancelled) {
         setItems(activity);
         setLoading(false);
       }
-    })();
+    }
 
-    return () => { cancelled = true; };
+    setLoading(true);
+    void loadActivity();
+
+    const channel = supabase
+      .channel(`contact-activity-${contactId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "deal_activities",
+        },
+        (payload) => {
+          const row = (payload.new || payload.old) as {
+            deal_id?: string;
+            org_id?: string;
+          };
+
+          if (
+            row.org_id === orgId &&
+            row.deal_id &&
+            activeDealIds.includes(row.deal_id)
+          ) {
+            void loadActivity();
+          }
+        },
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "deals",
+          filter: `contact_id=eq.${contactId}`,
+        },
+        () => {
+          void loadActivity();
+        },
+      )
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      void supabase.removeChannel(channel);
+    };
   }, [contactId]);
 
   return { items, loading };
