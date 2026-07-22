@@ -1,7 +1,9 @@
 // src/routes/inbox.tsx
 import { createFileRoute, Link, Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { PageHeader } from "@/components/layout/app-shell";
 import { Button } from "@/components/ui/button";
+import { ContactAvatar } from "@/components/ui/contact-avatar";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -125,7 +127,7 @@ type LocalMessage = Omit<Message, "channel"> & {
 };
 
 const folders: { id: FolderId; label: string; icon: typeof InboxIcon }[] = [
-  { id: "all", label: "All", icon: InboxIcon },
+  { id: "all", label: "Inbox", icon: InboxIcon },
   { id: "unread", label: "Unread", icon: Circle },
   { id: "assigned", label: "Assigned to me", icon: CheckCheck },
   { id: "mentions", label: "Mentions", icon: AtSign },
@@ -773,34 +775,33 @@ function InboxPage() {
   return (
     <>
     <div className="-m-6 flex h-[calc(100vh-3.5rem)] flex-col overflow-hidden">
-      {/* Inline header — same text sizes as PageHeader, vertically centered */}
-      <div className="flex shrink-0 items-center justify-between gap-4 border-b border-border bg-background pl-5 pr-6 py-4">
-        <div>
-          <div className="mb-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-            <span>Workspace</span>
-            <span className="text-border-strong">/</span>
-            <span>Inbox</span>
-          </div>
-          <h1 className="text-2xl font-semibold tracking-tight text-foreground">Inbox</h1>
-          <p className="mt-0.5 text-sm text-muted-foreground">Unified email, SMS, voice, and internal notes across every contact</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" className="h-8">
-            <Filter className="mr-1.5 h-3.5 w-3.5" /> Filters
-          </Button>
-          <Button size="sm" className="h-8" onClick={() => setNewConvOpen(true)}>
-            <Plus className="mr-1.5 h-3.5 w-3.5" /> New Conversation
-          </Button>
-        </div>
+      <div className="shrink-0 border-b border-border bg-background px-6 pt-5">
+        <PageHeader
+          icon={MessageSquare}
+          iconBg="bg-cyan-soft"
+          iconColor="text-cyan"
+          title="Conversations"
+          subtitle="Manage every customer conversation across email, SMS, voice, and messaging channels."
+          actions={
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" className="h-8">
+                <Filter className="mr-1.5 h-3.5 w-3.5" /> Filters
+              </Button>
+              <Button size="sm" className="h-8" onClick={() => setNewConvOpen(true)}>
+                <Plus className="mr-1.5 h-3.5 w-3.5" /> New Conversation
+              </Button>
+            </div>
+          }
+        />
       </div>
 
-      <div className="grid min-h-0 flex-1 grid-cols-[210px_340px_1fr_300px] overflow-hidden border-t border-border">
-        {/* PANE 1 — Folders */}
-        <aside className="flex min-h-0 flex-col border-r border-border bg-secondary/30">
-          <div className="px-3 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+      <div className="grid min-h-0 flex-1 grid-cols-[280px_1fr] overflow-hidden lg:grid-cols-[210px_280px_1fr] xl:grid-cols-[210px_340px_1fr_300px]">
+        {/* PANE 1 — Folders (collapses below lg to keep the conversation list + composer usable) */}
+        <aside className="hidden min-h-0 flex-col border-r border-border bg-background lg:flex">
+          <div className="px-3 pb-1.5 pt-4 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
             Folders
           </div>
-          <nav className="flex flex-col gap-0.5 px-2">
+          <nav className="flex flex-col gap-1 px-2">
             {folders.map((f) => {
               const Icon = f.icon;
               const isActive = folder === f.id;
@@ -809,8 +810,8 @@ function InboxPage() {
                 <button
                   key={f.id}
                   onClick={() => setFolder(f.id)}
-                  className={`flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-[13px] font-medium transition-colors ${
-                    isActive ? "bg-primary-soft text-primary" : "text-foreground hover:bg-secondary"
+                  className={`flex w-full items-center justify-between rounded-md px-2.5 py-2 text-[13px] font-medium transition-colors ${
+                    isActive ? "bg-gold-soft text-gold-soft-foreground" : "text-foreground hover:bg-secondary"
                   }`}
                 >
                   <span className="flex items-center gap-2">
@@ -818,7 +819,7 @@ function InboxPage() {
                     {f.label}
                   </span>
                   {count > 0 && (
-                    <span className={`text-[10px] tabular-nums ${isActive ? "text-primary" : "text-muted-foreground"}`}>
+                    <span className={`text-[10px] tabular-nums ${isActive ? "text-gold-soft-foreground" : "text-muted-foreground"}`}>
                       {count}
                     </span>
                   )}
@@ -827,10 +828,10 @@ function InboxPage() {
             })}
           </nav>
 
-          <div className="mt-4 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <div className="mt-5 px-3 pb-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
             Tags
           </div>
-          <div className="flex flex-col gap-0.5 px-2">
+          <div className="flex flex-col gap-1 px-2">
             {[
               { label: "VIP", count: 4 },
               { label: "New Lead", count: 7 },
@@ -839,7 +840,7 @@ function InboxPage() {
             ].map((t, i) => (
               <button
                 key={t.label}
-                className="flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-[13px] font-medium text-foreground hover:bg-secondary"
+                className="flex w-full items-center justify-between rounded-md px-2.5 py-2 text-[13px] font-medium text-foreground hover:bg-secondary"
               >
                 <span className="flex items-center gap-2">
                   <span className={`h-2 w-2 rounded-full ${["bg-amber-400","bg-emerald-400","bg-rose-400","bg-sky-400"][i]}`} />
@@ -848,12 +849,15 @@ function InboxPage() {
                 <span className="text-[10px] text-muted-foreground">{t.count}</span>
               </button>
             ))}
+            <button className="mt-0.5 flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-[12px] text-muted-foreground hover:bg-secondary hover:text-foreground">
+              <Tag className="h-3.5 w-3.5" /> Manage tags
+            </button>
           </div>
 
           <div className="mt-auto border-t border-border p-3">
-            <div className="rounded-lg border border-border bg-card p-2.5">
-              <div className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold">
-                <Sparkles className="h-3 w-3 text-primary" /> AI Assistant
+            <div className="rounded-lg border border-gold-soft bg-gold-soft/40 p-2.5">
+              <div className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold text-gold-soft-foreground">
+                <Sparkles className="h-3 w-3" /> AI Assistant
               </div>
               <p className="text-[11px] text-muted-foreground">
                 Drafting & summarizing replies. {folderCounts.unread} unread to triage.
@@ -864,7 +868,7 @@ function InboxPage() {
 
         {/* PANE 2 — Conversation list */}
         <section className="flex min-h-0 flex-col border-r border-border">
-          <div className="flex flex-wrap items-center gap-1 border-b border-border bg-card px-2 py-1.5">
+          <div className="flex flex-wrap items-center gap-1 overflow-x-auto border-b border-border bg-background px-2 py-2">
             {channelTabs.map((t) => {
               const Icon = t.icon;
               const isActive = channelFilter === t.id;
@@ -872,8 +876,10 @@ function InboxPage() {
                 <button
                   key={t.id}
                   onClick={() => setChannelFilter(t.id)}
-                  className={`flex items-center gap-1 whitespace-nowrap rounded px-1.5 py-1 text-[11px] font-medium transition-colors ${
-                    isActive ? "bg-primary-soft text-primary" : "text-muted-foreground hover:bg-secondary"
+                  className={`flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                    isActive
+                      ? "border-gold-soft bg-gold-soft text-gold-soft-foreground"
+                      : "border-transparent text-muted-foreground hover:bg-secondary"
                   }`}
                 >
                   <Icon className="h-3 w-3" />
@@ -882,18 +888,18 @@ function InboxPage() {
               );
             })}
           </div>
-          <div className="border-b border-border p-2">
+          <div className="border-b border-border p-2.5">
             <div className="relative">
-              <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <Input
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search conversations…"
-                className="h-8 pl-7 text-xs"
+                placeholder="Search conversations..."
+                className="h-8 pl-8 text-xs"
               />
             </div>
           </div>
-          <div className="flex items-center justify-between border-b border-border bg-secondary/40 px-3 py-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">
+          <div className="flex items-center justify-between border-b border-border px-3 py-2 text-[10px] uppercase tracking-wider text-muted-foreground">
             <span>{conversations.length} conversations</span>
             <button className="flex items-center gap-1 hover:text-foreground">
               Newest <ChevronDown className="h-3 w-3" />
@@ -916,16 +922,12 @@ function InboxPage() {
         </section>
 
         {/* PANE 3 — Thread */}
-        <section className="flex min-h-0 flex-col bg-secondary/10">
+        <section className="flex min-h-0 flex-col bg-background">
           {active && contact ? (
             <>
-              <div className="flex items-center justify-between border-b border-border bg-card px-4 py-2.5">
+              <div className="flex items-center justify-between border-b border-border bg-background px-4 py-3">
                 <div className="flex items-center gap-3">
-                  <Avatar className="h-9 w-9">
-                    <AvatarFallback className="bg-primary-soft text-xs font-semibold text-primary">
-                      {initials(active.contactName)}
-                    </AvatarFallback>
-                  </Avatar>
+                  <ContactAvatar id={active.contactId} name={active.contactName} size="md" className="h-9 w-9" />
                   <div>
                     <div className="flex items-center gap-2 text-sm font-semibold">
                       {active.contactName}
@@ -1019,7 +1021,7 @@ function InboxPage() {
                 </div>
               </div>
 
-              <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-5">
+              <div className="min-h-0 flex-1 space-y-4 overflow-y-auto bg-secondary/20 px-6 py-5">
                 {groupByDay(thread).map((group) => (
                   <div key={group.day}>
                     <div className="mb-3 flex items-center gap-2">
@@ -1037,12 +1039,32 @@ function InboxPage() {
                   </div>
                 ))}
                 {thread.length === 0 && (
-                  <div className="py-12 text-center text-xs text-muted-foreground">No messages yet</div>
+                  <div className="flex h-full flex-col items-center justify-center py-12 text-center">
+                    <div className="mb-3 flex h-14 w-14 items-center justify-center rounded-full bg-gold-soft">
+                      <MessageSquare className="h-6 w-6 text-gold-soft-foreground" />
+                    </div>
+                    <p className="text-sm font-semibold text-foreground">No conversation history yet</p>
+                    <p className="mt-1 max-w-xs text-xs text-muted-foreground">
+                      Start the conversation by sending an email, SMS, or placing a call.
+                    </p>
+                    <div className="mt-4 flex items-center gap-2">
+                      <Button variant="outline" size="sm" className="h-8" onClick={() => setComposeChannel("email")}>
+                        <Mail className="mr-1.5 h-3.5 w-3.5" /> Email
+                      </Button>
+                      <Button variant="outline" size="sm" className="h-8" onClick={() => setComposeChannel("sms")}>
+                        <MessageSquare className="mr-1.5 h-3.5 w-3.5" /> SMS
+                      </Button>
+                      <Button variant="outline" size="sm" className="h-8" onClick={() => toast.info(`Calling ${contact?.phone ?? ""}…`)}>
+                        <PhoneCall className="mr-1.5 h-3.5 w-3.5" /> Call
+                      </Button>
+                    </div>
+                  </div>
                 )}
               </div>
 
               {/* Composer */}
-              <div className="border-t border-border bg-card p-3">
+              <div className="border-t border-border bg-background p-3">
+              <div className="rounded-xl border border-border bg-card p-3 shadow-sm">
                 <div className="mb-2 flex items-center gap-1">
                   <div className="flex h-7 items-center gap-0.5 rounded-md border border-border bg-background p-0.5">
                     <ComposeTab id="sms" current={composeChannel} onSelect={setComposeChannel} icon={MessageSquare} label="SMS" />
@@ -1281,29 +1303,38 @@ function InboxPage() {
                   </div>
                 )}
               </div>
+              </div>
             </>
           ) : (
-            <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-              Select a conversation
+            <div className="flex h-full flex-col items-center justify-center text-center">
+              <div className="mb-3 flex h-14 w-14 items-center justify-center rounded-full bg-gold-soft">
+                <MessageSquare className="h-6 w-6 text-gold-soft-foreground" />
+              </div>
+              <p className="text-sm font-medium text-muted-foreground">Select a conversation to get started</p>
             </div>
           )}
         </section>
 
-        {/* PANE 4 — Contact context */}
-        <aside className="flex min-h-0 flex-col border-l border-border bg-card">
+        {/* PANE 4 — Contact context (collapses below xl to keep more room for the thread) */}
+        <aside className="hidden min-h-0 flex-col border-l border-border bg-card xl:flex">
           {active && contact ? (
             <div className="min-h-0 flex-1 overflow-y-auto">
               <div className="border-b border-border p-4">
                 <div className="flex items-start gap-3">
-                  <Avatar className="h-12 w-12">
-                    <AvatarFallback className="bg-primary-soft text-sm font-semibold text-primary">
-                      {initials(contact.name)}
-                    </AvatarFallback>
-                  </Avatar>
+                  <ContactAvatar id={active.contactId} name={contact.name} size="lg" className="h-12 w-12" />
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-sm font-semibold">{contact.name}</div>
                     <div className="truncate text-[11px] text-muted-foreground">{contact.email}</div>
                     <div className="truncate text-[11px] text-muted-foreground">{contact.phone}</div>
+                    {activeContactHasRealId && (
+                      <Link
+                        to="/contacts"
+                        search={{ contactId: active.contactId }}
+                        className="mt-1 inline-block text-[11px] font-medium text-gold hover:underline"
+                      >
+                        View full contact
+                      </Link>
+                    )}
                   </div>
                 </div>
                 <div className="mt-3 grid grid-cols-3 gap-1.5">
@@ -1367,28 +1398,63 @@ function InboxPage() {
                 </div>
               </ContextSection>
 
-              <ContextSection title={`Open Deals (${sbDeals.length})`}>
+              <div className="border-b border-border p-4">
+                <div className="mb-2 flex items-center justify-between">
+                  <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    Open Deals ({sbDeals.length})
+                  </div>
+                  {sbDeals.length > 0 && (
+                    <button className="text-[10px] font-medium text-muted-foreground hover:text-foreground">View all</button>
+                  )}
+                </div>
+
                 {sbDeals.length === 0 ? (
-                  <div className="text-[11px] text-muted-foreground">No open deals</div>
-                ) : (
-                  <div className="space-y-1.5">
-                    {sbDeals.slice(0, 3).map((d) => (
-                      <button
-                        key={d.id}
-                        type="button"
-                        onClick={() => setDealDrawerId(d.id)}
-                        className="flex w-full items-center justify-between rounded-md border border-border bg-background px-2 py-1.5 text-left hover:bg-secondary/40"
+                  <div className="space-y-2">
+                    <p className="text-[11px] text-muted-foreground">No open deals for this contact yet.</p>
+                    {activeContactHasRealId && (
+                      <Button
+                        size="sm"
+                        className="h-8 w-full border border-gold-soft bg-gold-soft text-gold-soft-foreground hover:bg-gold-soft/80"
+                        onClick={() => setDealDialogOpen(true)}
                       >
-                        <div className="min-w-0">
-                          <div className="truncate text-[11px] font-medium">{d.name}</div>
-                          <div className="text-[10px] capitalize text-muted-foreground">{d.status}</div>
-                        </div>
-                        <div className="text-[10px] tabular-nums text-muted-foreground">${d.value.toLocaleString()}</div>
-                      </button>
-                    ))}
+                        <Plus className="mr-1.5 h-3.5 w-3.5" /> Create Deal
+                      </Button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <div className="space-y-1.5">
+                      {sbDeals.slice(0, 3).map((d) => (
+                        <button
+                          key={d.id}
+                          type="button"
+                          onClick={() => setDealDrawerId(d.id)}
+                          className="flex w-full items-center justify-between rounded-md border border-border bg-background px-2.5 py-2 text-left hover:border-gold-soft hover:bg-gold-soft/30"
+                        >
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${d.status === "open" ? "bg-info" : d.status === "won" ? "bg-success" : "bg-destructive"}`} />
+                            <div className="min-w-0">
+                              <div className="truncate text-[11px] font-medium">{d.name}</div>
+                              <div className="text-[10px] capitalize text-muted-foreground">{d.status}</div>
+                            </div>
+                          </div>
+                          <div className="shrink-0 text-[10px] tabular-nums text-muted-foreground">${d.value.toLocaleString()}</div>
+                        </button>
+                      ))}
+                    </div>
+                    {activeContactHasRealId && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 w-full border-gold-soft bg-gold-soft/40 text-[11px] text-gold-soft-foreground hover:bg-gold-soft/70"
+                        onClick={() => setDealDialogOpen(true)}
+                      >
+                        <Plus className="mr-1 h-3 w-3" /> Create Deal
+                      </Button>
+                    )}
                   </div>
                 )}
-              </ContextSection>
+              </div>
 
               <ContextSection title="Upcoming Appointments">
                 {sbAppointments.length === 0 ? (
@@ -1574,7 +1640,7 @@ function ComposeTab({
         isActive
           ? id === "note"
             ? "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
-            : "bg-primary text-primary-foreground"
+            : "bg-gold-soft text-gold-soft-foreground"
           : "text-muted-foreground hover:bg-secondary"
       }`}
     >
@@ -1597,13 +1663,11 @@ function ConversationRow({ conv, active, starred, onClick }: { conv: Conversatio
     <button
       onClick={onClick}
       className={`flex w-full items-start gap-3 border-b border-border px-3 py-3 text-left transition-colors ${
-        active ? "bg-primary-soft/50" : "hover:bg-secondary/40"
+        active ? "bg-gold-soft/60" : "hover:bg-secondary/40"
       }`}
     >
-      <div className="relative">
-        <Avatar className="h-9 w-9">
-          <AvatarFallback className="bg-secondary text-[11px] font-semibold">{initials(conv.contactName)}</AvatarFallback>
-        </Avatar>
+      <div className="relative shrink-0">
+        <ContactAvatar id={conv.contactId} name={conv.contactName} size="sm" className="h-9 w-9" />
         <span className="absolute -bottom-0.5 -right-0.5 flex h-4 w-4 items-center justify-center rounded-full border-2 border-background bg-card">
           <ChannelGlyph channel={conv.channel} />
         </span>
@@ -1630,7 +1694,8 @@ function ConversationRow({ conv, active, starred, onClick }: { conv: Conversatio
           )}
         </div>
       </div>
-      {active && <span className="mt-2 h-2 w-2 shrink-0 rounded-full bg-primary" />}
+      {active && !conv.unread && <span className="mt-2 h-2 w-2 shrink-0 rounded-full bg-gold" />}
+      {conv.unread && <span className="mt-2 h-2 w-2 shrink-0 rounded-full bg-info" />}
     </button>
   );
 }
@@ -1673,9 +1738,9 @@ function MessageBubble({ msg }: { msg: LocalMessage }) {
         <div
           className={`rounded-2xl px-3.5 py-2 text-sm leading-relaxed ${
             msg.isScheduled
-              ? "rounded-br-sm border border-dashed border-primary/50 bg-primary/10 text-foreground"
+              ? "rounded-br-sm border border-dashed border-gold bg-gold-soft/50 text-foreground"
               : isOut
-                ? "rounded-br-sm bg-primary text-primary-foreground"
+                ? "rounded-br-sm border border-gold-soft bg-gold-soft text-gold-soft-foreground"
                 : "rounded-bl-sm border border-border bg-card text-foreground"
           }`}
         >
@@ -1687,13 +1752,13 @@ function MessageBubble({ msg }: { msg: LocalMessage }) {
           {msg.isScheduled ? (
             <>
               <span>·</span>
-              <Clock className="h-3 w-3 text-primary/70" />
-              <span className="text-primary/80">Scheduled</span>
+              <Clock className="h-3 w-3 text-gold" />
+              <span className="text-gold-soft-foreground">Scheduled</span>
             </>
           ) : isOut ? (
             <>
               <span>·</span>
-              <CheckCheck className="h-3 w-3 text-primary/70" />
+              <CheckCheck className="h-3 w-3 text-gold" />
               <span>Delivered</span>
             </>
           ) : null}

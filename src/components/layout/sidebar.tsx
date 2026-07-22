@@ -33,7 +33,7 @@ type NavItem = { to: string; label: string; icon: React.ComponentType<{ classNam
 const NAV: NavItem[] = [
   { to: "/",                      label: "Command Center", icon: LayoutDashboard },
   { to: "/leads",                 label: "Leads",           icon: Target },
-  { to: "/inbox",                 label: "Inbox",           icon: Inbox, badgeKey: "inbox" },
+  { to: "/inbox",                 label: "Conversations",   icon: Inbox, badgeKey: "inbox" },
   { to: "/calendar",              label: "Calendar",        icon: Calendar },
   { to: "/sales/pipeline",        label: "Pipeline",        icon: TrendingUp },
   { to: "/estimates",             label: "Estimates",       icon: FileText },
