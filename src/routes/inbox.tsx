@@ -1,6 +1,5 @@
 // src/routes/inbox.tsx
 import { createFileRoute, Link, Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { ROUTES } from "@/lib/routes";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -64,9 +63,16 @@ import {
   usePersistentInsertLog,
 } from "@/lib/message-templates";
 import { recordTemplateUse } from "@/lib/recent-templates";
-import { useOrganization } from "@/lib/organization";
+import { useOrganization, useTeam } from "@/lib/organization";
 import { useContacts } from "@/lib/contacts-store";
 import { useContactActivity } from "@/lib/contact-activity";
+import { NewDealDialog } from "@/components/sales/new-deal-dialog";
+import { DealDetailDrawer } from "@/components/sales/deal-detail-drawer";
+import {
+  deleteDeal as storeDeleteDeal, updateDeal as storeUpdateDeal,
+  useDeals, usePipelineStages,
+} from "@/lib/deals-store";
+import type { Deal, LostReason } from "@/lib/sales/types";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from "@/components/ui/sheet";
 import { TemplatePicker } from "@/components/inbox/template-picker";
@@ -85,6 +91,8 @@ import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
 import { useVoiceConversations } from "@/lib/voice-conversations";
 import { useSmsMetaConversations } from "@/lib/sms-meta-conversations";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type InboxSearch = { templateId?: string };
 
@@ -200,6 +208,11 @@ function InboxPage() {
   const [pendingTemplate, setPendingTemplate] = useState<SharedMessageTemplate | null>(null);
   const [insertLog, appendInsertLog, clearInsertLog] = usePersistentInsertLog("inbox");
   const [showInsertLog, setShowInsertLog] = useState(false);
+  const [dealDialogOpen, setDealDialogOpen] = useState(false);
+  const [dealDrawerId, setDealDrawerId] = useState<string | null>(null);
+  const teamMembers = useTeam();
+  const pipelineStages = usePipelineStages();
+  const deals = useDeals();
   // Voice calls from Supabase — merged into conversations when Voice tab is active
   const { conversations: voiceConvs, messages: voiceMsgs } = useVoiceConversations();
   // SMS/WhatsApp/Messenger/Instagram from sms_meta_messages — no mock
@@ -341,12 +354,12 @@ function InboxPage() {
   const [sbProjects, setSbProjects] = useState<{ id: string; name: string; status: string; budget_total: number; completion_percentage: number }[]>([]);
   const [sbInvoiceTotal, setSbInvoiceTotal] = useState(0);
   const [sbInvoiceCount, setSbInvoiceCount] = useState(0);
-  const [sbDeals, setSbDeals] = useState<{ id: string; name: string; value: number; stage: string }[]>([]);
+  const [sbDeals, setSbDeals] = useState<{ id: string; name: string; value: number; status: string }[]>([]);
   const [sbAppointments, setSbAppointments] = useState<{ id: string; service: string | null; scheduled_at: string }[]>([]);
+  const [contactCompanyId, setContactCompanyId] = useState<string | null>(null);
   useEffect(() => {
     const contactId = active?.contactId;
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    if (!contactId || !UUID_RE.test(contactId)) { setSbProjects([]); setSbInvoiceTotal(0); setSbInvoiceCount(0); setSbDeals([]); setSbAppointments([]); return; }
+    if (!contactId || !UUID_RE.test(contactId)) { setSbProjects([]); setSbInvoiceTotal(0); setSbInvoiceCount(0); setSbDeals([]); setSbAppointments([]); setContactCompanyId(null); return; }
     let cancelled = false;
     (async () => {
       const { data: { user } } = await supabase.auth.getUser();
@@ -368,10 +381,16 @@ function InboxPage() {
 
       const { data: dealsRows } = await supabase
         .from("deals")
-        .select("id, name, value, stage")
+        .select("id, title, value, status")
         .eq("contact_id", contactId).eq("org_id", orgId)
-        .not("stage", "in", "(won,lost)")
+        .eq("status", "open")
         .order("created_at", { ascending: false });
+
+      const { data: contactRow } = await supabase
+        .from("contacts")
+        .select("company_id")
+        .eq("id", contactId).eq("org_id", orgId)
+        .maybeSingle();
 
       const nowIso = new Date().toISOString();
       const { data: apptRows } = await supabase
@@ -388,8 +407,9 @@ function InboxPage() {
       const paid = (invs ?? []).filter((i: any) => i.status === "paid");
       setSbInvoiceTotal(paid.reduce((s: number, i: any) => s + (i.total_amount ?? 0), 0));
       setSbInvoiceCount((invs ?? []).length);
-      setSbDeals(((dealsRows ?? []) as any[]).map((d) => ({ id: d.id, name: d.name, value: Number(d.value ?? 0), stage: d.stage })));
+      setSbDeals(((dealsRows ?? []) as any[]).map((d) => ({ id: d.id, name: d.title, value: Number(d.value ?? 0), status: d.status })));
       setSbAppointments(((apptRows ?? []) as any[]).map((a) => ({ id: a.id, service: a.service, scheduled_at: a.scheduled_at })));
+      setContactCompanyId(contactRow?.company_id ?? null);
     })();
     return () => { cancelled = true; };
   }, [active?.contactId]);
@@ -588,6 +608,72 @@ function InboxPage() {
     });
     navigator.clipboard.writeText([header, ...lines].join("\n\n"));
     toast.success("Conversation copied to clipboard");
+  };
+
+  // ── Create Deal from this conversation's contact ────────────────────────────
+  const activeContactHasRealId = !!active?.contactId && UUID_RE.test(active.contactId);
+
+  const dealPrefill = useMemo(() => {
+    if (!active || !contact) return undefined;
+    return {
+      contactId: activeContactHasRealId ? active.contactId : "",
+      contactName: contact.name ?? "",
+      email: contact.email ?? "",
+      phone: contact.phone ?? "",
+      companyId: contactCompanyId ?? "",
+      source: "Inbox",
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active?.contactId, contact?.name, contact?.email, contact?.phone, contactCompanyId, activeContactHasRealId]);
+
+  const handleDealCreated = (deal: Deal) => {
+    setSbDeals((current) => [{ id: deal.id, name: deal.name, value: deal.value, status: deal.status }, ...current]);
+    setDealDrawerId(deal.id);
+  };
+
+  const dealDrawerDeal = useMemo(
+    () => (dealDrawerId ? (deals.find((d) => d.id === dealDrawerId) ?? null) : null),
+    [dealDrawerId, deals],
+  );
+
+  const handleDealStageChange = async (dealId: string, newStage: string) => {
+    try {
+      await storeUpdateDeal(dealId, { stage: newStage } as Partial<Deal>);
+    } catch (error) {
+      console.error("[inbox] deal stage change failed:", error);
+      toast.error("Failed to update the deal stage.");
+    }
+  };
+
+  const handleDealMarkLost = async (dealId: string, reason: LostReason, notes: string) => {
+    try {
+      await storeUpdateDeal(dealId, { stage: "lost", status: "lost", lostReason: reason, notes: notes || undefined });
+    } catch (error) {
+      console.error("[inbox] mark lost failed:", error);
+      toast.error("Failed to mark the deal as lost.");
+    }
+  };
+
+  const handleDealUpdate = async (dealId: string, patch: Partial<Deal>) => {
+    try {
+      await storeUpdateDeal(dealId, patch);
+    } catch (error) {
+      console.error("[inbox] deal update failed:", error);
+      toast.error("Failed to save the deal.");
+      throw error;
+    }
+  };
+
+  const handleDealDelete = async (dealId: string) => {
+    try {
+      await storeDeleteDeal(dealId);
+      setDealDrawerId(null);
+      setSbDeals((current) => current.filter((d) => d.id !== dealId));
+    } catch (error) {
+      console.error("[inbox] delete deal failed:", error);
+      toast.error("Failed to delete the deal.");
+      throw error;
+    }
   };
 
   const visibleTemplates = useMemo(() => {
@@ -920,6 +1006,9 @@ function InboxPage() {
                     <DropdownMenuContent align="end">
                       <DropdownMenuItem onClick={() => toast.success("Marked as read")}>Mark as read</DropdownMenuItem>
                       <DropdownMenuItem onClick={() => toast.success("Conversation assigned")}>Assign to me</DropdownMenuItem>
+                      {activeContactHasRealId && (
+                        <DropdownMenuItem onClick={() => setDealDialogOpen(true)}>Create Deal</DropdownMenuItem>
+                      )}
                       <DropdownMenuSeparator />
                       <DropdownMenuItem className="text-destructive focus:text-destructive"
                         onClick={() => toast.success("Conversation archived")}>
@@ -1284,13 +1373,18 @@ function InboxPage() {
                 ) : (
                   <div className="space-y-1.5">
                     {sbDeals.slice(0, 3).map((d) => (
-                      <Link key={d.id} to={ROUTES.PIPELINE} className="flex items-center justify-between rounded-md border border-border bg-background px-2 py-1.5 hover:bg-secondary/40">
+                      <button
+                        key={d.id}
+                        type="button"
+                        onClick={() => setDealDrawerId(d.id)}
+                        className="flex w-full items-center justify-between rounded-md border border-border bg-background px-2 py-1.5 text-left hover:bg-secondary/40"
+                      >
                         <div className="min-w-0">
                           <div className="truncate text-[11px] font-medium">{d.name}</div>
-                          <div className="text-[10px] capitalize text-muted-foreground">{d.stage}</div>
+                          <div className="text-[10px] capitalize text-muted-foreground">{d.status}</div>
                         </div>
                         <div className="text-[10px] tabular-nums text-muted-foreground">${d.value.toLocaleString()}</div>
-                      </Link>
+                      </button>
                     ))}
                   </div>
                 )}
@@ -1437,6 +1531,24 @@ function InboxPage() {
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
+
+    <NewDealDialog
+      open={dealDialogOpen}
+      onOpenChange={setDealDialogOpen}
+      initialValues={dealPrefill}
+      onCreated={handleDealCreated}
+    />
+
+    <DealDetailDrawer
+      deal={dealDrawerDeal}
+      onOpenChange={(open) => { if (!open) setDealDrawerId(null); }}
+      onStageChange={handleDealStageChange}
+      onMarkLost={handleDealMarkLost}
+      onDealUpdate={handleDealUpdate}
+      onDelete={handleDealDelete}
+      stages={pipelineStages}
+      teamMembers={teamMembers.map((m) => ({ id: m.id, name: m.name }))}
+    />
     </>
   );
 }
