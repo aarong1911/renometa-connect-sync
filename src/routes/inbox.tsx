@@ -1345,13 +1345,13 @@ function InboxPage() {
               {contact.owner && contact.owner !== "—" && (
                 <ContextSection title="Assignment">
                   <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <Avatar className="h-6 w-6">
-                        <AvatarFallback className="bg-primary-soft text-[9px] font-semibold text-primary">
+                    <div className="flex items-center gap-2.5">
+                      <Avatar className="h-7 w-7">
+                        <AvatarFallback className="bg-primary-soft text-[10px] font-semibold text-primary">
                           {initials(contact.owner)}
                         </AvatarFallback>
                       </Avatar>
-                      <span className="text-xs font-medium">{contact.owner}</span>
+                      <span className="text-sm font-medium">{contact.owner}</span>
                     </div>
                   </div>
                 </ContextSection>
@@ -1359,9 +1359,9 @@ function InboxPage() {
 
               {contact.tags && contact.tags.length > 0 && (
                 <ContextSection title="Tags">
-                  <div className="flex flex-wrap gap-1">
+                  <div className="flex flex-wrap gap-1.5">
                     {contact.tags.map((t) => (
-                      <Badge key={t} variant="outline" className="h-5 px-1.5 text-[10px]">{t}</Badge>
+                      <Badge key={t} variant="outline" className="h-6 px-2 text-[11px]">{t}</Badge>
                     ))}
                   </div>
                 </ContextSection>
@@ -1369,16 +1369,16 @@ function InboxPage() {
 
               <ContextSection title={`Active Projects (${sbProjects.length})`}>
                 {sbProjects.length === 0 ? (
-                  <div className="text-[11px] text-muted-foreground">No active projects</div>
+                  <div className="text-xs text-muted-foreground">No active projects</div>
                 ) : (
-                  <div className="space-y-1.5">
+                  <div className="space-y-2">
                     {sbProjects.slice(0, 3).map((p) => (
-                      <div key={p.id} className="flex items-center justify-between rounded-md border border-border bg-background px-2 py-1.5">
+                      <div key={p.id} className="flex items-center justify-between rounded-lg border border-border bg-background px-3 py-2.5">
                         <div className="min-w-0">
-                          <div className="truncate text-[11px] font-medium">{p.name}</div>
-                          <div className="text-[10px] text-muted-foreground capitalize">{p.status.replace(/_/g, " ")}</div>
+                          <div className="truncate text-[13px] font-medium">{p.name}</div>
+                          <div className="text-[11px] text-muted-foreground capitalize">{p.status.replace(/_/g, " ")}</div>
                         </div>
-                        <div className="text-[10px] text-muted-foreground tabular-nums">{p.completion_percentage}%</div>
+                        <div className="text-[11px] text-muted-foreground tabular-nums">{p.completion_percentage}%</div>
                       </div>
                     ))}
                   </div>
@@ -1387,11 +1387,11 @@ function InboxPage() {
 
               <ContextSection title="Lifetime Value">
                 <div className="flex items-baseline gap-2">
-                  <span className="text-lg font-semibold tabular-nums">
+                  <span className="text-xl font-semibold tabular-nums">
                     ${sbInvoiceTotal.toLocaleString()}
                   </span>
                 </div>
-                <div className="mt-1 text-[10px] text-muted-foreground">
+                <div className="mt-1.5 text-xs text-muted-foreground">
                   {sbProjects.length} project{sbProjects.length !== 1 ? "s" : ""} · {sbInvoiceCount} invoice{sbInvoiceCount !== 1 ? "s" : ""}
                 </div>
               </ContextSection>
@@ -1456,13 +1456,13 @@ function InboxPage() {
 
               <ContextSection title="Upcoming Appointments">
                 {sbAppointments.length === 0 ? (
-                  <div className="text-[11px] text-muted-foreground">No upcoming appointments</div>
+                  <div className="text-xs text-muted-foreground">No upcoming appointments</div>
                 ) : (
-                  <div className="space-y-1.5">
+                  <div className="space-y-2">
                     {sbAppointments.map((a) => (
-                      <div key={a.id} className="rounded-md border border-border bg-background px-2 py-1.5">
-                        <div className="truncate text-[11px] font-medium">{a.service || "Appointment"}</div>
-                        <div className="text-[10px] text-muted-foreground">
+                      <div key={a.id} className="rounded-lg border border-border bg-background px-3 py-2.5">
+                        <div className="truncate text-[13px] font-medium">{a.service || "Appointment"}</div>
+                        <div className="mt-0.5 text-[11px] text-muted-foreground">
                           {new Date(a.scheduled_at).toLocaleDateString("en-US", { month: "short", day: "numeric" })} · {new Date(a.scheduled_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
                         </div>
                       </div>
@@ -1473,15 +1473,15 @@ function InboxPage() {
 
               <ContextSection title="Recent Activity">
                 {contactActivity.length === 0 ? (
-                  <div className="text-[11px] text-muted-foreground">No activity yet</div>
+                  <div className="text-xs text-muted-foreground">No activity yet</div>
                 ) : (
-                  <ul className="space-y-2 text-[11px]">
+                  <ul className="space-y-3 text-xs">
                     {contactActivity.slice(0, 5).map((item) => (
-                      <li key={item.id} className="flex gap-2">
-                        <div className="mt-0.5 h-3 w-3 shrink-0 rounded-full bg-muted-foreground/30" />
+                      <li key={item.id} className="flex gap-2.5">
+                        <div className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-gold" />
                         <div>
-                          <div className="font-medium">{item.title}</div>
-                          <div className="text-muted-foreground">
+                          <div className="font-medium text-foreground">{item.title}</div>
+                          <div className="mt-0.5 text-[11px] text-muted-foreground">
                             {new Date(item.at).toLocaleDateString("en-US", { month: "short", day: "numeric" })}
                           </div>
                         </div>
