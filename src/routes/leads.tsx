@@ -41,12 +41,17 @@ import { useTopbarAction } from "@/lib/topbar-action";
 import { useTeam } from "@/lib/organization";
 import {
   useLeads, addLead as storeAddLead, updateLeadStatus as storeUpdateStatus,
-  updateLeadScore as storeUpdateScore, convertLead as storeConvertLead, importLeads,
+  updateLeadScore as storeUpdateScore, importLeads,
 } from "@/lib/leads-store";
 import { useLeadNotes, addLeadNote } from "@/lib/leads-store";
 import { updateLeadNote } from "@/lib/leads-store";
-import { addDeal as storeAddDeal } from "@/lib/deals-store";
-import { useActivePipelineId, usePipelines } from "@/lib/pipelines";
+import { ConvertLeadDialog } from "@/components/leads/convert-lead-dialog";
+import { DealDetailDrawer } from "@/components/sales/deal-detail-drawer";
+import {
+  deleteDeal as storeDeleteDeal, updateDeal as storeUpdateDeal,
+  useDeals, usePipelineStages,
+} from "@/lib/deals-store";
+import type { Deal, LostReason } from "@/lib/sales/types";
 import {
   leadsToCSV, downloadCSV, parseCSVPreview, autoMapHeaders, applyMappingToLeads,
   LEAD_FIELDS, type ColumnMapping, type LeadFieldKey, type TemplateType,
@@ -95,12 +100,8 @@ function LeadsPage() {
   const { leadId } = useSearch({ from: "/leads" });
   const navigate = useNavigate({ from: "/leads" });
   const teamMembers = useTeam();
-  const pipelines = usePipelines();
-  const activePipelineId = useActivePipelineId();
-  const activePipeline = useMemo(
-    () => pipelines.find((p) => p.id === activePipelineId) ?? null,
-    [pipelines, activePipelineId],
-  );
+  const pipelineStages = usePipelineStages();
+  const deals = useDeals();
   const leads = useLeads();
   const [search, setSearch] = useState("");
   const [sourceFilter, setSourceFilter] = useState<string>("All sources");
@@ -108,6 +109,9 @@ function LeadsPage() {
   const [scoreFilter, setScoreFilter] = useState<string>("All scores");
   const [selected, setSelected] = useState<Lead | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [convertLead, setConvertLead] = useState<Lead | null>(null);
+  const [convertOpen, setConvertOpen] = useState(false);
+  const [dealDrawerId, setDealDrawerId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [mapOpen, setMapOpen] = useState(false);
   const [csvRaw, setCsvRaw] = useState("");
@@ -170,26 +174,57 @@ function LeadsPage() {
   };
 
   const handleConvertToDeal = (lead: Lead) => {
-    if (lead.status === "converted") {
-      toast.error("Lead already converted");
-      return;
+    if (lead.status === "converted" || lead.status === "lost") return;
+    setConvertLead(lead);
+    setConvertOpen(true);
+  };
+
+  const handleDealConverted = (deal: Deal) => {
+    setDealDrawerId(deal.id);
+  };
+
+  const dealDrawerDeal = useMemo(
+    () => (dealDrawerId ? (deals.find((d) => d.id === dealDrawerId) ?? null) : null),
+    [dealDrawerId, deals],
+  );
+
+  const handleDealStageChange = async (dealId: string, newStage: string) => {
+    try {
+      await storeUpdateDeal(dealId, { stage: newStage } as Partial<Deal>);
+    } catch (error) {
+      console.error("[leads] deal stage change failed:", error);
+      toast.error("Failed to update the deal stage.");
     }
-    storeConvertLead(lead.id);
-    storeAddDeal({
-      name: lead.name,
-      contactName: lead.name,
-      email: lead.email ?? "",
-      phone: lead.phone ?? "",
-      address: lead.address ?? "",
-      value: lead.estimatedBudget ?? 0,
-      stage: activePipeline?.stages[0]?.id ?? "new",
-      ownerId: "",
-      ownerName: lead.owner ?? "Unassigned",
-    }).catch(() => {
-      toast.error("Failed to create deal from lead.");
-    });
-    toast.success(`${lead.name} converted to deal`, { description: "A new deal has been created in the pipeline." });
-    navigate({ search: { leadId: undefined }, replace: true });
+  };
+
+  const handleDealMarkLost = async (dealId: string, reason: LostReason, notes: string) => {
+    try {
+      await storeUpdateDeal(dealId, { stage: "lost", status: "lost", lostReason: reason, notes: notes || undefined });
+    } catch (error) {
+      console.error("[leads] mark lost failed:", error);
+      toast.error("Failed to mark the deal as lost.");
+    }
+  };
+
+  const handleDealUpdate = async (dealId: string, patch: Partial<Deal>) => {
+    try {
+      await storeUpdateDeal(dealId, patch);
+    } catch (error) {
+      console.error("[leads] deal update failed:", error);
+      toast.error("Failed to save the deal.");
+      throw error;
+    }
+  };
+
+  const handleDealDelete = async (dealId: string) => {
+    try {
+      await storeDeleteDeal(dealId);
+      setDealDrawerId(null);
+    } catch (error) {
+      console.error("[leads] delete deal failed:", error);
+      toast.error("Failed to delete the deal.");
+      throw error;
+    }
   };
 
   const handleAddLead = () => {
@@ -553,6 +588,25 @@ function LeadsPage() {
         onStatusChange={handleStatusChange}
         onScoreChange={handleScoreChange}
         onConvert={handleConvertToDeal}
+        onOpenConvertedDeal={(dealId) => setDealDrawerId(dealId)}
+        teamMembers={teamMembers.map((m) => ({ id: m.id, name: m.name }))}
+      />
+
+      <ConvertLeadDialog
+        lead={convertLead}
+        open={convertOpen}
+        onOpenChange={setConvertOpen}
+        onConverted={handleDealConverted}
+      />
+
+      <DealDetailDrawer
+        deal={dealDrawerDeal}
+        onOpenChange={(open) => { if (!open) setDealDrawerId(null); }}
+        onStageChange={handleDealStageChange}
+        onMarkLost={handleDealMarkLost}
+        onDealUpdate={handleDealUpdate}
+        onDelete={handleDealDelete}
+        stages={pipelineStages}
         teamMembers={teamMembers.map((m) => ({ id: m.id, name: m.name }))}
       />
 
@@ -888,6 +942,7 @@ function LeadDetailDrawer({
   onStatusChange,
   onScoreChange,
   onConvert,
+  onOpenConvertedDeal,
   teamMembers,
 }: {
   lead: Lead | null;
@@ -895,10 +950,14 @@ function LeadDetailDrawer({
   onStatusChange: (id: string, status: LeadStatus) => void;
   onScoreChange: (id: string, score: LeadScore) => void;
   onConvert: (lead: Lead) => void;
+  onOpenConvertedDeal: (dealId: string) => void;
   teamMembers: { id: string; name: string }[];
 }) {
+  const allDeals = useDeals();
+
   if (!lead) return <Sheet open={false} onOpenChange={onOpenChange}><SheetContent className="hidden" /></Sheet>;
 
+  const convertedDeal = lead.convertedDealId ? allDeals.find((d) => d.id === lead.convertedDealId) ?? null : null;
   const { Icon: ScoreIcon, className: scoreCls } = scoreIcon(lead.score);
   const nextStatuses: LeadStatus[] = (() => {
     switch (lead.status) {
@@ -1041,10 +1100,24 @@ function LeadDetailDrawer({
               <Separator />
               <section>
                 <div className="mb-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Converted Deal</div>
-                <div className="flex items-center gap-2 rounded-md border border-border bg-card p-3 text-sm">
-                  <ExternalLink className="h-3.5 w-3.5 text-muted-foreground" />
-                  <span className="text-muted-foreground">Deal ID: {lead.convertedDealId}</span>
-                </div>
+                {convertedDeal ? (
+                  <button
+                    type="button"
+                    onClick={() => onOpenConvertedDeal(convertedDeal.id)}
+                    className="flex w-full items-center justify-between gap-2 rounded-md border border-border bg-card p-3 text-left text-sm transition-colors hover:border-[#EADFC8] hover:bg-[#FAF3E4]/50"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate font-medium">{convertedDeal.name}</p>
+                      <p className="text-xs text-muted-foreground">{convertedDeal.stageName} · {formatMoney(convertedDeal.value)}</p>
+                    </div>
+                    <ExternalLink className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  </button>
+                ) : (
+                  <div className="flex items-center gap-2 rounded-md border border-dashed border-border bg-card p-3 text-sm text-muted-foreground">
+                    <ExternalLink className="h-3.5 w-3.5" />
+                    <span>Linked deal is unavailable — it may have been deleted.</span>
+                  </div>
+                )}
               </section>
             </>
           )}

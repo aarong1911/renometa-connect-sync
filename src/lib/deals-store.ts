@@ -19,7 +19,7 @@ import type {
   UpdateDealInput,
 } from "@/lib/sales/types";
 
-type SupabaseDealRow = {
+export type SupabaseDealRow = {
   id: string;
   org_id: string;
   lead_id: string | null;
@@ -51,7 +51,7 @@ type SupabaseDealRow = {
   tags: string[] | null;
 };
 
-type ContactRow = {
+export type ContactRow = {
   id: string;
   full_name: string;
   email: string | null;
@@ -63,7 +63,7 @@ type ContactRow = {
   avatar_url: string | null;
 };
 
-type CompanyRow = {
+export type CompanyRow = {
   id: string;
   name: string;
   slug: string;
@@ -75,7 +75,7 @@ type CompanyRow = {
   state: string | null;
 };
 
-type ProfileRow = {
+export type ProfileRow = {
   id: string;
   first_name: string | null;
   last_name: string | null;
@@ -222,7 +222,7 @@ function mapPipeline(row: any): SalesPipeline {
   };
 }
 
-function mapStage(row: any): SalesPipelineStage {
+export function mapStage(row: any): SalesPipelineStage {
   return {
     id: row.id,
     pipelineId: row.pipeline_id,
@@ -236,7 +236,7 @@ function mapStage(row: any): SalesPipelineStage {
   };
 }
 
-function mapDeal(args: {
+export function mapDeal(args: {
   row: SupabaseDealRow;
   contactsById: Record<string, ContactRow>;
   companiesById: Record<string, CompanyRow>;
@@ -776,6 +776,44 @@ export async function deleteDeal(id: string): Promise<void> {
     emitDeals();
     throw error;
   }
+}
+
+// Reflects a canonical Deal — plus the raw Contact/Company/Stage/Owner rows
+// that came back alongside it (e.g. from the convert_lead_to_deal RPC) —
+// into the reactive store without a second fetch. Reuses the exact same
+// mapDeal()/mapStage() logic every other read path already trusts, so the
+// resulting Deal is identical in shape to one loaded through fetchSalesData.
+export function upsertDealFromCanonical(args: {
+  deal: SupabaseDealRow;
+  contact: ContactRow | null;
+  company: CompanyRow | null;
+  stage: any;
+  ownerProfile: ProfileRow | null;
+}): Deal {
+  const mappedStage = mapStage(args.stage);
+  const stagesById: Record<string, SalesPipelineStage> = { [mappedStage.id]: mappedStage };
+  const contactsById: Record<string, ContactRow> = args.contact ? { [args.contact.id]: args.contact } : {};
+  const companiesById: Record<string, CompanyRow> = args.company ? { [args.company.id]: args.company } : {};
+  const profilesById: Record<string, ProfileRow> = args.ownerProfile ? { [args.ownerProfile.id]: args.ownerProfile } : {};
+
+  const mapped = mapDeal({ row: args.deal, contactsById, companiesById, profilesById, stagesById });
+
+  // Stage is upserted into the reactive store BEFORE the deals emit fires,
+  // so anything re-rendering off useDeals() (e.g. Pipeline board columns
+  // filtered by stage) never observes the new Deal one tick ahead of the
+  // stage it belongs to.
+  if (!stages.some((s) => s.id === mappedStage.id)) {
+    stages = [...stages, mappedStage];
+    emitStages();
+  }
+
+  const existingIndex = deals.findIndex((d) => d.id === mapped.id);
+  deals = existingIndex >= 0
+    ? deals.map((d, i) => (i === existingIndex ? mapped : d))
+    : [mapped, ...deals];
+  emitDeals();
+
+  return mapped;
 }
 
 export async function refreshDeals() {

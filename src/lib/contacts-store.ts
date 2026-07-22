@@ -91,6 +91,17 @@ export function useContactsLoading(): boolean {
   return !loaded;
 }
 
+// Reflects a canonical Contact row (e.g. returned by the convert_lead_to_deal
+// RPC) into the reactive store without a refetch — inserts if new, replaces
+// if already known.
+export function upsertContactFromRow(row: any): Contact {
+  const mapped = mapRow(row);
+  const idx = contacts.findIndex((c) => c.id === mapped.id);
+  contacts = idx >= 0 ? contacts.map((c, i) => (i === idx ? mapped : c)) : [mapped, ...contacts];
+  emit();
+  return mapped;
+}
+
 export async function addContact(contact: Omit<Contact, "id">): Promise<Contact | null> {
   const orgId = await getOrgId();
   if (!orgId) return null;

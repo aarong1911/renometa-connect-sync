@@ -272,27 +272,88 @@ export async function updateLeadScore(id: string, score: LeadScore): Promise<voi
   emit();
 }
 
-export async function convertLead(id: string): Promise<string> {
-  const dealId = `d_converted_${id}`;
+// ── Transactional conversion (convert_lead_to_deal RPC) ──
 
-  const { error } = await supabase
-    .from("leads")
-    .update({
-      status: "converted",
-      converted_to_deal_id: dealId,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", id);
+export type ConvertLeadPayload = {
+  leadId: string;
+  idempotencyKey: string;
+  contactId?: string | null;
+  newContact?: { full_name: string; email?: string | null; phone?: string | null; address?: string | null } | null;
+  companyId?: string | null;
+  newCompany?: { name: string } | null;
+  companyContactRelationship?: { relationship_title?: string | null; department?: string | null; is_primary?: boolean } | null;
+  pipelineId?: string | null;
+  stageId?: string | null;
+  title?: string | null;
+  value?: number | null;
+  ownerId?: string | null;
+  expectedCloseDate?: string | null;
+  serviceType?: string | null;
+  projectAddress?: string | null;
+  migratedNotes?: string | null;
+  notesHash?: string | null;
+};
 
-  if (error) console.error("[leads-store] convert failed:", error);
+export type ConvertLeadResult = {
+  lead: any;
+  contact: any;
+  account: any;
+  deal: any;
+  stage: any;
+  pipeline: any;
+  ownerProfile: any;
+  conversionState: {
+    created: boolean;
+    reusedExisting: boolean;
+    notesMigrated: boolean;
+  };
+};
 
-  leads = leads.map((l) =>
-    l.id === id
-      ? { ...l, status: "converted" as LeadStatus, convertedDealId: dealId, lastActivity: new Date().toISOString() }
-      : l
-  );
+export async function convertLeadToDeal(payload: ConvertLeadPayload): Promise<ConvertLeadResult> {
+  const { data, error } = await supabase.rpc("convert_lead_to_deal", {
+    p_lead_id: payload.leadId,
+    p_idempotency_key: payload.idempotencyKey,
+    p_contact_id: payload.contactId ?? null,
+    p_new_contact: payload.newContact ?? null,
+    p_company_id: payload.companyId ?? null,
+    p_new_company: payload.newCompany ?? null,
+    p_company_contact_relationship: payload.companyContactRelationship ?? null,
+    p_pipeline_id: payload.pipelineId ?? null,
+    p_stage_id: payload.stageId ?? null,
+    p_title: payload.title ?? null,
+    p_value: payload.value ?? null,
+    p_owner_id: payload.ownerId ?? null,
+    p_expected_close_date: payload.expectedCloseDate ?? null,
+    p_service_type: payload.serviceType ?? null,
+    p_project_address: payload.projectAddress ?? null,
+    p_migrated_notes: payload.migratedNotes ?? null,
+    p_notes_hash: payload.notesHash ?? null,
+  });
+
+  if (error) throw error;
+
+  const result = data as any;
+  const leadRow = result.lead;
+
+  // Reflect the canonical Lead state locally — no refetch needed.
+  const contactMap = leadRow?.contact_id && result.contact ? { [leadRow.contact_id]: result.contact } : {};
+  leads = leads.map((l) => (l.id === leadRow.id ? mapRow(leadRow, contactMap) : l));
   emit();
-  return dealId;
+
+  return {
+    lead: result.lead,
+    contact: result.contact,
+    account: result.account,
+    deal: result.deal,
+    stage: result.stage,
+    pipeline: result.pipeline,
+    ownerProfile: result.owner_profile,
+    conversionState: {
+      created: result.conversion_state.created,
+      reusedExisting: result.conversion_state.reused_existing,
+      notesMigrated: result.conversion_state.notes_migrated,
+    },
+  };
 }
 
 export function importLeads(newLeads: Omit<Lead, "id">[]): number {
@@ -363,6 +424,17 @@ export function updateLeadNote(leadId: string, noteId: string, text: string) {
   const list = notesMap[leadId];
   if (!list) return;
   notesMap = { ...notesMap, [leadId]: list.map((n) => (n.id === noteId ? { ...n, text } : n)) };
+  persistNotes();
+  emitNotes();
+}
+
+// Only call this after a conversion response confirms notes_migrated === true
+// — never speculatively, and never before the RPC's response is in hand.
+export function clearLeadNotes(leadId: string) {
+  if (!(leadId in notesMap)) return;
+  const next = { ...notesMap };
+  delete next[leadId];
+  notesMap = next;
   persistNotes();
   emitNotes();
 }
