@@ -775,7 +775,7 @@ function InboxPage() {
   return (
     <>
     <div className="-m-6 flex h-[calc(100vh-3.5rem)] flex-col overflow-hidden">
-      <div className="shrink-0 border-b border-border bg-background px-6 pt-5">
+      <div className="shrink-0 border-b border-border bg-background px-6 py-5">
         <PageHeader
           icon={MessageSquare}
           iconBg="bg-cyan-soft"
@@ -784,10 +784,10 @@ function InboxPage() {
           subtitle="Manage every customer conversation across email, SMS, voice, and messaging channels."
           actions={
             <div className="flex items-center gap-2">
-              <Button variant="outline" size="sm" className="h-8">
+              <Button variant="outline" size="sm" className="h-9">
                 <Filter className="mr-1.5 h-3.5 w-3.5" /> Filters
               </Button>
-              <Button size="sm" className="h-8" onClick={() => setNewConvOpen(true)}>
+              <Button size="sm" className="h-9" onClick={() => setNewConvOpen(true)}>
                 <Plus className="mr-1.5 h-3.5 w-3.5" /> New Conversation
               </Button>
             </div>
@@ -795,13 +795,13 @@ function InboxPage() {
         />
       </div>
 
-      <div className="grid min-h-0 flex-1 grid-cols-[280px_1fr] overflow-hidden lg:grid-cols-[210px_280px_1fr] xl:grid-cols-[210px_340px_1fr_300px]">
+      <div className="grid min-h-0 flex-1 grid-cols-[340px_1fr] overflow-hidden lg:grid-cols-[172px_340px_1fr] xl:grid-cols-[172px_340px_1fr_296px]">
         {/* PANE 1 — Folders (collapses below lg to keep the conversation list + composer usable) */}
         <aside className="hidden min-h-0 flex-col border-r border-border bg-background lg:flex">
-          <div className="px-3 pb-1.5 pt-4 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <div className="px-3.5 pb-2 pt-5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
             Folders
           </div>
-          <nav className="flex flex-col gap-1 px-2">
+          <nav className="flex flex-col gap-1 px-2.5">
             {folders.map((f) => {
               const Icon = f.icon;
               const isActive = folder === f.id;
@@ -810,16 +810,16 @@ function InboxPage() {
                 <button
                   key={f.id}
                   onClick={() => setFolder(f.id)}
-                  className={`flex w-full items-center justify-between rounded-md px-2.5 py-2 text-[13px] font-medium transition-colors ${
+                  className={`flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
                     isActive ? "bg-gold-soft text-gold-soft-foreground" : "text-foreground hover:bg-secondary"
                   }`}
                 >
-                  <span className="flex items-center gap-2">
-                    <Icon className="h-3.5 w-3.5" />
+                  <span className="flex items-center gap-2.5">
+                    <Icon className="h-4 w-4" />
                     {f.label}
                   </span>
                   {count > 0 && (
-                    <span className={`text-[10px] tabular-nums ${isActive ? "text-gold-soft-foreground" : "text-muted-foreground"}`}>
+                    <span className={`text-[11px] tabular-nums ${isActive ? "text-gold-soft-foreground" : "text-muted-foreground"}`}>
                       {count}
                     </span>
                   )}
@@ -828,10 +828,10 @@ function InboxPage() {
             })}
           </nav>
 
-          <div className="mt-5 px-3 pb-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <div className="mt-6 px-3.5 pb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
             Tags
           </div>
-          <div className="flex flex-col gap-1 px-2">
+          <div className="flex flex-col gap-1 px-2.5">
             {[
               { label: "VIP", count: 4 },
               { label: "New Lead", count: 7 },
@@ -840,26 +840,26 @@ function InboxPage() {
             ].map((t, i) => (
               <button
                 key={t.label}
-                className="flex w-full items-center justify-between rounded-md px-2.5 py-2 text-[13px] font-medium text-foreground hover:bg-secondary"
+                className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm font-medium text-foreground hover:bg-secondary"
               >
-                <span className="flex items-center gap-2">
+                <span className="flex items-center gap-2.5">
                   <span className={`h-2 w-2 rounded-full ${["bg-amber-400","bg-emerald-400","bg-rose-400","bg-sky-400"][i]}`} />
                   {t.label}
                 </span>
-                <span className="text-[10px] text-muted-foreground">{t.count}</span>
+                <span className="text-[11px] text-muted-foreground">{t.count}</span>
               </button>
             ))}
-            <button className="mt-0.5 flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-[12px] text-muted-foreground hover:bg-secondary hover:text-foreground">
-              <Tag className="h-3.5 w-3.5" /> Manage tags
+            <button className="mt-0.5 flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-[13px] text-muted-foreground hover:bg-secondary hover:text-foreground">
+              <Tag className="h-4 w-4" /> Manage tags
             </button>
           </div>
 
-          <div className="mt-auto border-t border-border p-3">
-            <div className="rounded-lg border border-gold-soft bg-gold-soft/40 p-2.5">
+          <div className="mt-auto border-t border-border p-3.5">
+            <div className="rounded-lg border border-gold-soft bg-gold-soft/50 p-3">
               <div className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold text-gold-soft-foreground">
                 <Sparkles className="h-3 w-3" /> AI Assistant
               </div>
-              <p className="text-[11px] text-muted-foreground">
+              <p className="text-[11px] leading-relaxed text-muted-foreground">
                 Drafting & summarizing replies. {folderCounts.unread} unread to triage.
               </p>
             </div>
@@ -868,7 +868,7 @@ function InboxPage() {
 
         {/* PANE 2 — Conversation list */}
         <section className="flex min-h-0 flex-col border-r border-border">
-          <div className="flex flex-wrap items-center gap-1 overflow-x-auto border-b border-border bg-background px-2 py-2">
+          <div className="flex flex-wrap items-center gap-1.5 overflow-x-auto border-b border-border bg-background px-3 py-2.5">
             {channelTabs.map((t) => {
               const Icon = t.icon;
               const isActive = channelFilter === t.id;
@@ -876,7 +876,7 @@ function InboxPage() {
                 <button
                   key={t.id}
                   onClick={() => setChannelFilter(t.id)}
-                  className={`flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                  className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border px-3 py-1.5 text-[11px] font-medium transition-colors ${
                     isActive
                       ? "border-gold-soft bg-gold-soft text-gold-soft-foreground"
                       : "border-transparent text-muted-foreground hover:bg-secondary"
@@ -888,18 +888,18 @@ function InboxPage() {
               );
             })}
           </div>
-          <div className="border-b border-border p-2.5">
+          <div className="border-b border-border p-3">
             <div className="relative">
               <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <Input
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder="Search conversations..."
-                className="h-8 pl-8 text-xs"
+                className="h-9 pl-8 text-sm"
               />
             </div>
           </div>
-          <div className="flex items-center justify-between border-b border-border px-3 py-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+          <div className="flex items-center justify-between border-b border-border px-3.5 py-2.5 text-[10px] uppercase tracking-wider text-muted-foreground">
             <span>{conversations.length} conversations</span>
             <button className="flex items-center gap-1 hover:text-foreground">
               Newest <ChevronDown className="h-3 w-3" />
@@ -925,17 +925,17 @@ function InboxPage() {
         <section className="flex min-h-0 flex-col bg-background">
           {active && contact ? (
             <>
-              <div className="flex items-center justify-between border-b border-border bg-background px-4 py-3">
-                <div className="flex items-center gap-3">
-                  <ContactAvatar id={active.contactId} name={active.contactName} size="md" className="h-9 w-9" />
-                  <div>
-                    <div className="flex items-center gap-2 text-sm font-semibold">
-                      {active.contactName}
-                      <Badge variant="outline" className="h-4 px-1.5 text-[9px] uppercase">
+              <div className="flex items-center justify-between border-b border-border bg-background px-5 py-4">
+                <div className="flex min-w-0 items-center gap-3">
+                  <ContactAvatar id={active.contactId} name={active.contactName} size="md" className="h-10 w-10" />
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 text-[15px] font-semibold">
+                      <span className="truncate">{active.contactName}</span>
+                      <Badge variant="outline" className="h-4.5 shrink-0 px-1.5 text-[9px] uppercase">
                         {contact.tags?.[0] ?? "Customer"}
                       </Badge>
                     </div>
-                    <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                    <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
                       <span className="flex items-center gap-1">
                         <Mail className="h-3 w-3" /> {contact.email}
                       </span>
@@ -946,63 +946,36 @@ function InboxPage() {
                     </div>
                   </div>
                 </div>
-                <div className="flex items-center gap-1">
-                  <Button variant="ghost" size="sm" className="h-7 px-2" title="WhatsApp"
+                <div className="flex shrink-0 items-center gap-1">
+                  <Button variant="ghost" size="sm" className="h-8 px-2" title="WhatsApp"
                     onClick={() => setComposeChannel("whatsapp")}>
-                    <MessageSquare className={`h-3.5 w-3.5 ${composeChannel === "whatsapp" ? "text-primary" : ""}`} />
+                    <MessageSquare className={`h-4 w-4 ${composeChannel === "whatsapp" ? "text-primary" : ""}`} />
                   </Button>
                   {contact?.messenger_psid && (
-                    <Button variant="ghost" size="sm" className="h-7 px-2" title="Messenger"
+                    <Button variant="ghost" size="sm" className="h-8 px-2" title="Messenger"
                       onClick={() => setComposeChannel("messenger")}>
-                      <MessageSquare className={`h-3.5 w-3.5 ${composeChannel === "messenger" ? "text-primary" : ""}`} />
+                      <MessageSquare className={`h-4 w-4 ${composeChannel === "messenger" ? "text-primary" : ""}`} />
                     </Button>
                   )}
                   {contact?.instagram_igsid && (
-                    <Button variant="ghost" size="sm" className="h-7 px-2" title="Instagram"
+                    <Button variant="ghost" size="sm" className="h-8 px-2" title="Instagram"
                       onClick={() => setComposeChannel("instagram")}>
-                      <AtSign className={`h-3.5 w-3.5 ${composeChannel === "instagram" ? "text-primary" : ""}`} />
+                      <AtSign className={`h-4 w-4 ${composeChannel === "instagram" ? "text-primary" : ""}`} />
                     </Button>
                   )}
-                  <Button variant="ghost" size="sm" className="h-7 px-2" title="Call"
+                  <Button variant="ghost" size="sm" className="h-8 px-2" title="Call"
                     onClick={() => toast.info(`Calling ${contact?.phone ?? ""}…`)}>
-                    <PhoneCall className="h-3.5 w-3.5" />
+                    <PhoneCall className="h-4 w-4" />
                   </Button>
-                  <Button variant="ghost" size="sm" className="h-7 px-2" title="Video"
+                  <Button variant="ghost" size="sm" className="h-8 px-2" title="Video"
                     onClick={() => toast.info("Video calling coming soon")}>
-                    <Video className="h-3.5 w-3.5" />
+                    <Video className="h-4 w-4" />
                   </Button>
-                  <Button
-                    variant="ghost" size="sm" className="h-7 px-2" title="Star"
-                    onClick={() => {
-                      setStarredIds((prev) => {
-                        const next = new Set(prev);
-                        next.has(active.id) ? next.delete(active.id) : next.add(active.id);
-                        return next;
-                      });
-                    }}
-                  >
-                    <Star className={`h-3.5 w-3.5 ${checkStarred(active.id) ? "fill-amber-400 text-amber-400" : ""}`} />
-                  </Button>
-                  <Button
-                    variant="ghost" size="sm" className="h-7 px-2" title="Pin"
-                    onClick={() => {
-                      setPinnedIds((prev) => {
-                        const next = new Set(prev);
-                        next.has(active.id) ? next.delete(active.id) : next.add(active.id);
-                        toast.success(next.has(active.id) ? "Conversation pinned" : "Conversation unpinned");
-                        return next;
-                      });
-                    }}
-                  >
-                    <Pin className={`h-3.5 w-3.5 ${pinnedIds.has(active.id) ? "fill-primary text-primary" : ""}`} />
-                  </Button>
-                  <Button variant="ghost" size="sm" className="h-7 px-2" title="Copy conversation" onClick={handleCopyThread}>
-                    <Copy className="h-3.5 w-3.5" />
-                  </Button>
+                  <span className="mx-1 h-5 w-px bg-border" />
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
-                      <Button variant="ghost" size="sm" className="h-7 px-2" title="More">
-                        <MoreHorizontal className="h-3.5 w-3.5" />
+                      <Button variant="ghost" size="sm" className="h-8 px-2" title="More">
+                        <MoreHorizontal className="h-4 w-4" />
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
@@ -1011,6 +984,31 @@ function InboxPage() {
                       {activeContactHasRealId && (
                         <DropdownMenuItem onClick={() => setDealDialogOpen(true)}>Create Deal</DropdownMenuItem>
                       )}
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        onClick={() => {
+                          setStarredIds((prev) => {
+                            const next = new Set(prev);
+                            next.has(active.id) ? next.delete(active.id) : next.add(active.id);
+                            return next;
+                          });
+                        }}
+                      >
+                        {checkStarred(active.id) ? "Unstar conversation" : "Star conversation"}
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onClick={() => {
+                          setPinnedIds((prev) => {
+                            const next = new Set(prev);
+                            next.has(active.id) ? next.delete(active.id) : next.add(active.id);
+                            toast.success(next.has(active.id) ? "Conversation pinned" : "Conversation unpinned");
+                            return next;
+                          });
+                        }}
+                      >
+                        {pinnedIds.has(active.id) ? "Unpin conversation" : "Pin conversation"}
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onClick={handleCopyThread}>Copy conversation</DropdownMenuItem>
                       <DropdownMenuSeparator />
                       <DropdownMenuItem className="text-destructive focus:text-destructive"
                         onClick={() => toast.success("Conversation archived")}>
@@ -1021,17 +1019,17 @@ function InboxPage() {
                 </div>
               </div>
 
-              <div className="min-h-0 flex-1 space-y-4 overflow-y-auto bg-secondary/20 px-6 py-5">
+              <div className="min-h-0 flex-1 space-y-6 overflow-y-auto bg-secondary/20 px-8 py-6">
                 {groupByDay(thread).map((group) => (
                   <div key={group.day}>
-                    <div className="mb-3 flex items-center gap-2">
+                    <div className="mb-4 flex items-center gap-3">
                       <div className="h-px flex-1 bg-border" />
                       <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
                         {group.day}
                       </span>
                       <div className="h-px flex-1 bg-border" />
                     </div>
-                    <div className="space-y-3">
+                    <div className="space-y-4">
                       {group.messages.map((m) => (
                         <MessageBubble key={m.id} msg={m} />
                       ))}
@@ -1063,10 +1061,10 @@ function InboxPage() {
               </div>
 
               {/* Composer */}
-              <div className="border-t border-border bg-background p-3">
-              <div className="rounded-xl border border-border bg-card p-3 shadow-sm">
-                <div className="mb-2 flex items-center gap-1">
-                  <div className="flex h-7 items-center gap-0.5 rounded-md border border-border bg-background p-0.5">
+              <div className="border-t border-border bg-background p-4">
+              <div className="rounded-xl border border-border bg-card p-4 shadow-sm">
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  <div className="flex h-8 items-center gap-0.5 rounded-md border border-border bg-background p-0.5">
                     <ComposeTab id="sms" current={composeChannel} onSelect={setComposeChannel} icon={MessageSquare} label="SMS" />
                     <ComposeTab id="whatsapp" current={composeChannel} onSelect={setComposeChannel} icon={MessageSquare} label="WhatsApp" />
                     <ComposeTab id="email" current={composeChannel} onSelect={setComposeChannel} icon={Mail} label="Email" />
@@ -1214,10 +1212,10 @@ function InboxPage() {
                     }
                     value={draft}
                     onChange={(e) => setDraft(e.target.value)}
-                    className="min-h-18 resize-none border-0 bg-transparent text-sm focus-visible:ring-0"
+                    className="min-h-24 resize-none border-0 bg-transparent px-3 py-2.5 text-sm focus-visible:ring-0"
                   />
                 </div>
-                <div className="mt-2 flex items-center justify-between">
+                <div className="mt-3 flex items-center justify-between">
                   <div className="text-[10px] text-muted-foreground">
                     {composeChannel === "sms" && `${draft.length}/160 chars · 1 segment`}
                     {composeChannel === "email" && "Will reply from sales@yourco.com"}
@@ -1319,28 +1317,28 @@ function InboxPage() {
         <aside className="hidden min-h-0 flex-col border-l border-border bg-card xl:flex">
           {active && contact ? (
             <div className="min-h-0 flex-1 overflow-y-auto">
-              <div className="border-b border-border p-4">
+              <div className="border-b border-border p-5">
                 <div className="flex items-start gap-3">
                   <ContactAvatar id={active.contactId} name={contact.name} size="lg" className="h-12 w-12" />
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm font-semibold">{contact.name}</div>
-                    <div className="truncate text-[11px] text-muted-foreground">{contact.email}</div>
-                    <div className="truncate text-[11px] text-muted-foreground">{contact.phone}</div>
+                    <div className="truncate text-[15px] font-semibold">{contact.name}</div>
+                    <div className="mt-1 truncate text-xs text-muted-foreground">{contact.email}</div>
+                    <div className="mt-0.5 truncate text-xs text-muted-foreground">{contact.phone}</div>
                     {activeContactHasRealId && (
                       <Link
                         to="/contacts"
                         search={{ contactId: active.contactId }}
-                        className="mt-1 inline-block text-[11px] font-medium text-gold hover:underline"
+                        className="mt-1.5 inline-block text-xs font-medium text-gold hover:underline"
                       >
                         View full contact
                       </Link>
                     )}
                   </div>
                 </div>
-                <div className="mt-3 grid grid-cols-3 gap-1.5">
-                  <Button variant="outline" size="sm" className="h-7 text-[11px]"><Mail className="mr-1 h-3 w-3" /> Email</Button>
-                  <Button variant="outline" size="sm" className="h-7 text-[11px]"><MessageSquare className="mr-1 h-3 w-3" /> SMS</Button>
-                  <Button variant="outline" size="sm" className="h-7 text-[11px]"><PhoneIcon className="mr-1 h-3 w-3" /> Call</Button>
+                <div className="mt-4 grid grid-cols-3 gap-2">
+                  <Button variant="outline" size="sm" className="h-8 text-xs"><Mail className="mr-1 h-3 w-3" /> Email</Button>
+                  <Button variant="outline" size="sm" className="h-8 text-xs"><MessageSquare className="mr-1 h-3 w-3" /> SMS</Button>
+                  <Button variant="outline" size="sm" className="h-8 text-xs"><PhoneIcon className="mr-1 h-3 w-3" /> Call</Button>
                 </div>
               </div>
 
@@ -1398,23 +1396,23 @@ function InboxPage() {
                 </div>
               </ContextSection>
 
-              <div className="border-b border-border p-4">
-                <div className="mb-2 flex items-center justify-between">
+              <div className="border-b border-border p-5">
+                <div className="mb-3 flex items-center justify-between">
                   <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
                     Open Deals ({sbDeals.length})
                   </div>
                   {sbDeals.length > 0 && (
-                    <button className="text-[10px] font-medium text-muted-foreground hover:text-foreground">View all</button>
+                    <button className="text-xs font-medium text-muted-foreground hover:text-foreground">View all</button>
                   )}
                 </div>
 
                 {sbDeals.length === 0 ? (
-                  <div className="space-y-2">
-                    <p className="text-[11px] text-muted-foreground">No open deals for this contact yet.</p>
+                  <div className="space-y-3 rounded-lg border border-dashed border-border p-3.5">
+                    <p className="text-xs text-muted-foreground">No open deals for this contact yet.</p>
                     {activeContactHasRealId && (
                       <Button
                         size="sm"
-                        className="h-8 w-full border border-gold-soft bg-gold-soft text-gold-soft-foreground hover:bg-gold-soft/80"
+                        className="h-9 w-full border border-gold-soft bg-gold-soft text-gold-soft-foreground hover:bg-gold-soft/80"
                         onClick={() => setDealDialogOpen(true)}
                       >
                         <Plus className="mr-1.5 h-3.5 w-3.5" /> Create Deal
@@ -1422,23 +1420,23 @@ function InboxPage() {
                     )}
                   </div>
                 ) : (
-                  <div className="space-y-2">
-                    <div className="space-y-1.5">
+                  <div className="space-y-2.5">
+                    <div className="space-y-2">
                       {sbDeals.slice(0, 3).map((d) => (
                         <button
                           key={d.id}
                           type="button"
                           onClick={() => setDealDrawerId(d.id)}
-                          className="flex w-full items-center justify-between rounded-md border border-border bg-background px-2.5 py-2 text-left hover:border-gold-soft hover:bg-gold-soft/30"
+                          className="w-full rounded-lg border border-border bg-background px-3 py-2.5 text-left shadow-sm transition-colors hover:border-gold-soft hover:bg-gold-soft/30"
                         >
-                          <div className="flex min-w-0 items-center gap-2">
-                            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${d.status === "open" ? "bg-info" : d.status === "won" ? "bg-success" : "bg-destructive"}`} />
-                            <div className="min-w-0">
-                              <div className="truncate text-[11px] font-medium">{d.name}</div>
-                              <div className="text-[10px] capitalize text-muted-foreground">{d.status}</div>
-                            </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="truncate text-[13px] font-medium">{d.name}</span>
+                            <span className="shrink-0 text-[13px] font-semibold tabular-nums">${d.value.toLocaleString()}</span>
                           </div>
-                          <div className="shrink-0 text-[10px] tabular-nums text-muted-foreground">${d.value.toLocaleString()}</div>
+                          <div className="mt-1 flex items-center gap-1.5">
+                            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${d.status === "open" ? "bg-info" : d.status === "won" ? "bg-success" : "bg-destructive"}`} />
+                            <span className="text-[11px] capitalize text-muted-foreground">{d.status}</span>
+                          </div>
                         </button>
                       ))}
                     </div>
@@ -1446,7 +1444,7 @@ function InboxPage() {
                       <Button
                         variant="outline"
                         size="sm"
-                        className="h-7 w-full border-gold-soft bg-gold-soft/40 text-[11px] text-gold-soft-foreground hover:bg-gold-soft/70"
+                        className="h-8 w-full border-gold-soft bg-gold-soft/40 text-xs text-gold-soft-foreground hover:bg-gold-soft/70"
                         onClick={() => setDealDialogOpen(true)}
                       >
                         <Plus className="mr-1 h-3 w-3" /> Create Deal
@@ -1651,8 +1649,8 @@ function ComposeTab({
 
 function ContextSection({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="border-b border-border p-4">
-      <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{title}</div>
+    <div className="border-b border-border p-5">
+      <div className="mb-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{title}</div>
       {children}
     </div>
   );
@@ -1662,33 +1660,33 @@ function ConversationRow({ conv, active, starred, onClick }: { conv: Conversatio
   return (
     <button
       onClick={onClick}
-      className={`flex w-full items-start gap-3 border-b border-border px-3 py-3 text-left transition-colors ${
-        active ? "bg-gold-soft/60" : "hover:bg-secondary/40"
+      className={`flex w-full items-start gap-3 border-b border-border px-3.5 py-3.5 text-left transition-colors ${
+        active ? "bg-gold-soft" : "hover:bg-secondary/40"
       }`}
     >
       <div className="relative shrink-0">
-        <ContactAvatar id={conv.contactId} name={conv.contactName} size="sm" className="h-9 w-9" />
+        <ContactAvatar id={conv.contactId} name={conv.contactName} size="sm" className="h-10 w-10" />
         <span className="absolute -bottom-0.5 -right-0.5 flex h-4 w-4 items-center justify-center rounded-full border-2 border-background bg-card">
           <ChannelGlyph channel={conv.channel} />
         </span>
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex items-center justify-between gap-2">
-          <span className={`truncate text-[13px] ${conv.unread ? "font-semibold text-foreground" : "font-medium text-foreground/90"}`}>
+          <span className={`truncate text-sm ${conv.unread ? "font-semibold text-foreground" : "font-medium text-foreground/90"} ${active ? "text-gold-soft-foreground" : ""}`}>
             {conv.contactName}
           </span>
-          <span className="shrink-0 text-[10px] text-muted-foreground">{relativeShort(conv.lastAt)}</span>
+          <span className="shrink-0 text-[11px] text-muted-foreground">{relativeShort(conv.lastAt)}</span>
         </div>
-        <div className="mt-0.5 truncate text-[11px] text-muted-foreground">{conv.preview}</div>
-        <div className="mt-1.5 flex items-center gap-1">
-          {starred && <Star className="h-2.5 w-2.5 fill-amber-400 text-amber-400" />}
+        <div className="mt-1 line-clamp-2 text-[12.5px] leading-snug text-muted-foreground">{conv.preview}</div>
+        <div className="mt-1.5 flex items-center gap-1.5">
+          {starred && <Star className="h-3 w-3 fill-amber-400 text-amber-400" />}
           {hasMention(conv.id) && (
-            <Badge variant="outline" className="h-4 border-violet-300 bg-violet-50 px-1 text-[9px] text-violet-700 dark:border-violet-800 dark:bg-violet-950 dark:text-violet-300">
+            <Badge variant="outline" className="h-4.5 border-violet-300 bg-violet-50 px-1.5 text-[9px] text-violet-700 dark:border-violet-800 dark:bg-violet-950 dark:text-violet-300">
               @mention
             </Badge>
           )}
           {isUnassigned(conv.id) && (
-            <Badge variant="outline" className="h-4 border-amber-300 bg-amber-50 px-1 text-[9px] text-amber-700 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300">
+            <Badge variant="outline" className="h-4.5 border-amber-300 bg-amber-50 px-1.5 text-[9px] text-amber-700 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300">
               unassigned
             </Badge>
           )}
@@ -1734,7 +1732,7 @@ function MessageBubble({ msg }: { msg: LocalMessage }) {
   // SMS / Email (+ scheduled variant)
   return (
     <div className={`flex ${isOut ? "justify-end" : "justify-start"}`}>
-      <div className={`flex max-w-[72%] flex-col gap-1 ${isOut ? "items-end" : "items-start"}`}>
+      <div className={`flex max-w-[72%] flex-col gap-1 sm:max-w-md lg:max-w-lg ${isOut ? "items-end" : "items-start"}`}>
         <div
           className={`rounded-2xl px-3.5 py-2 text-sm leading-relaxed ${
             msg.isScheduled
