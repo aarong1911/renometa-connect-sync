@@ -1,0 +1,157 @@
+/* Conversations workspace — route-scoped visual parity styles */
+.conversations-page {
+  --conversation-gold: #c88d22;
+  --conversation-gold-hover: #b77e18;
+  --conversation-gold-soft: #faf3e4;
+  --conversation-gold-border: #e8d4aa;
+  --conversation-ink: #273142;
+  --conversation-muted: #8a94a6;
+  --conversation-line: #e5e7eb;
+  --conversation-canvas: #fbfcfe;
+  color: var(--conversation-ink);
+}
+
+.conversations-page-header {
+  min-height: 104px;
+  display: flex;
+  align-items: center;
+}
+
+.conversations-page-header > div {
+  width: 100%;
+  margin-bottom: 0 !important;
+}
+
+.conversation-channel-tabs {
+  min-height: 64px;
+  scrollbar-width: none;
+}
+
+.conversation-channel-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.conversation-channel-tab {
+  min-width: max-content;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.conversation-channel-tab.is-active {
+  box-shadow: 0 1px 2px rgba(154, 104, 33, 0.08);
+}
+
+.conversation-thread-body {
+  background: var(--conversation-canvas);
+}
+
+.conversation-message-bubble {
+  max-width: 100%;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.conversation-message-meta {
+  line-height: 1.25rem;
+}
+
+.conversation-composer-wrap {
+  background: var(--conversation-canvas);
+}
+
+.conversation-composer {
+  min-height: 190px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+}
+
+.conversation-compose-tabs {
+  width: fit-content;
+}
+
+.conversation-compose-tab {
+  white-space: nowrap;
+}
+
+.conversation-composer-bottom button {
+  min-height: 40px;
+}
+
+.conversation-send {
+  min-width: 96px;
+  border: 1px solid #bd811b !important;
+  background: var(--conversation-gold) !important;
+  color: #fff !important;
+}
+
+.conversation-send:hover {
+  background: var(--conversation-gold-hover) !important;
+}
+
+@media (max-width: 1535px) {
+  .conversations-grid {
+    grid-template-columns: 188px 330px minmax(520px, 1fr) 292px !important;
+  }
+}
+
+@media (max-width: 1279px) {
+  .conversations-grid {
+    grid-template-columns: 188px 330px minmax(520px, 1fr) !important;
+  }
+}
+
+@media (max-width: 1023px) {
+  .conversations-grid {
+    grid-template-columns: 320px minmax(480px, 1fr) !important;
+  }
+}
+
+
+/* Final parity pass: the reference places channel filters above both the
+   conversation list and the message thread, not inside the list column. */
+.conversations-grid {
+  position: relative;
+}
+
+.conversation-channel-tabs {
+  position: absolute;
+  z-index: 20;
+  top: 0;
+  left: 196px;
+  right: 310px;
+  height: 64px;
+  min-height: 64px;
+  overflow-x: auto;
+  background: #fff;
+}
+
+.conversation-list-pane,
+.conversation-thread-pane {
+  padding-top: 64px;
+}
+
+.conversation-composer {
+  min-height: 170px;
+}
+
+.conversation-composer textarea {
+  min-height: 86px !important;
+}
+
+@media (max-width: 1535px) {
+  .conversation-channel-tabs {
+    left: 188px;
+    right: 292px;
+  }
+}
+
+@media (max-width: 1279px) {
+  .conversation-channel-tabs {
+    left: 188px;
+    right: 0;
+  }
+}
+
+@media (max-width: 1023px) {
+  .conversation-channel-tabs {
+    left: 0;
+    right: 0;
+  }
+}

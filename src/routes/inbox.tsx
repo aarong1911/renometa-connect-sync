@@ -1,6 +1,9 @@
 // src/routes/inbox.tsx
 import { createFileRoute, Link, Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { ComponentType } from "react";
+import { FaFacebookMessenger, FaInstagram, FaWhatsapp } from "react-icons/fa";
+import "./inbox.css";
 import { PageHeader } from "@/components/layout/app-shell";
 import { Button } from "@/components/ui/button";
 import { ContactAvatar } from "@/components/ui/contact-avatar";
@@ -42,6 +45,7 @@ import {
   Calendar,
   Plus,
   Loader2,
+  Trash2,
 } from "lucide-react";
 import {
   DropdownMenu,
@@ -66,7 +70,7 @@ import {
 } from "@/lib/message-templates";
 import { recordTemplateUse } from "@/lib/recent-templates";
 import { useOrganization, useTeam } from "@/lib/organization";
-import { useContacts } from "@/lib/contacts-store";
+import { updateContact, useContacts } from "@/lib/contacts-store";
 import { useContactActivity } from "@/lib/contact-activity";
 import { NewDealDialog } from "@/components/sales/new-deal-dialog";
 import { DealDetailDrawer } from "@/components/sales/deal-detail-drawer";
@@ -95,6 +99,8 @@ import { useVoiceConversations } from "@/lib/voice-conversations";
 import { useSmsMetaConversations } from "@/lib/sms-meta-conversations";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+type ChannelIcon = ComponentType<{ className?: string }>;
 
 type InboxSearch = { templateId?: string };
 
@@ -136,14 +142,19 @@ const folders: { id: FolderId; label: string; icon: typeof InboxIcon }[] = [
   { id: "archived", label: "Archived", icon: Archive },
 ];
 
-const channelTabs: { id: ChannelFilter; label: string; icon: typeof Mail }[] = [
+const channelTabs: {
+  id: ChannelFilter;
+  label: string;
+  icon: ChannelIcon;
+  iconClass?: string;
+}[] = [
   { id: "all", label: "All", icon: InboxIcon },
   { id: "email", label: "Email", icon: Mail },
   { id: "sms", label: "SMS", icon: MessageSquare },
   { id: "voice", label: "Voice", icon: Phone },
-  { id: "whatsapp", label: "WhatsApp", icon: MessageSquare },
-  { id: "messenger", label: "Messenger", icon: MessageSquare },
-  { id: "instagram", label: "Instagram", icon: AtSign },
+  { id: "whatsapp", label: "WhatsApp", icon: FaWhatsapp, iconClass: "text-[#25D366]" },
+  { id: "messenger", label: "Messenger", icon: FaFacebookMessenger, iconClass: "text-[#0084FF]" },
+  { id: "instagram", label: "Instagram", icon: FaInstagram, iconClass: "text-[#E4405F]" },
 ];
 
 const NOW = Date.now();
@@ -186,6 +197,39 @@ function InboxPage() {
   const [tplOpen, setTplOpen] = useState(false);
   const [tplSearch, setTplSearch] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [contactDrawerOpen, setContactDrawerOpen] = useState(false);
+  const [tagManagerOpen, setTagManagerOpen] = useState(false);
+  const [newTagName, setNewTagName] = useState("");
+  const [managedTags, setManagedTags] = useState<{ label: string; color: string }[]>(() => {
+    const defaults = [
+      { label: "VIP", color: "bg-amber-400" },
+      { label: "New Lead", color: "bg-emerald-400" },
+      { label: "Needs Reply", color: "bg-rose-400" },
+      { label: "Follow Up", color: "bg-sky-400" },
+      { label: "Estimate Sent", color: "bg-violet-400" },
+      { label: "Hot", color: "bg-orange-400" },
+    ];
+
+    try {
+      const saved = JSON.parse(localStorage.getItem("inbox-managed-tags") ?? "[]") as {
+        label: string;
+        color: string;
+      }[];
+
+      if (Array.isArray(saved) && saved.length > 0) {
+        const merged = [...saved];
+        for (const tag of defaults) {
+          if (!merged.some((item) => item.label.toLowerCase() === tag.label.toLowerCase())) {
+            merged.push(tag);
+          }
+        }
+        return merged;
+      }
+    } catch {}
+
+    return defaults;
+  });
+  const [contactTagOverrides, setContactTagOverrides] = useState<Record<string, string[]>>({});
   const [localMessages, setLocalMessages] = useState<LocalMessage[]>(() => {
     try { return JSON.parse(localStorage.getItem("inbox-messages") ?? "[]"); } catch { return []; }
   });
@@ -198,6 +242,9 @@ function InboxPage() {
   useEffect(() => {
     try { localStorage.setItem("inbox-conversations", JSON.stringify(localConversations)); } catch {}
   }, [localConversations]);
+  useEffect(() => {
+    try { localStorage.setItem("inbox-managed-tags", JSON.stringify(managedTags)); } catch {}
+  }, [managedTags]);
 
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduleDateTime, setScheduleDateTime] = useState("");
@@ -339,6 +386,65 @@ function InboxPage() {
           ?? { name: active.contactName, email: "", phone: active.callerPhone ?? "", tags: [], owner: "", messenger_psid: undefined, instagram_igsid: undefined })
     : undefined;
   const contactProjects = contact ? mockProjects.filter((p) => p.client === contact.name) : [];
+  const activeContactTags = active
+    ? (contactTagOverrides[active.contactId] ?? contact?.tags ?? [])
+    : [];
+
+  const getTagColor = (tagName: string) =>
+    managedTags.find((tag) => tag.label.toLowerCase() === tagName.toLowerCase())?.color ??
+    "bg-slate-400";
+
+  const getTagBorderColor = (tagName: string) => {
+    const color = getTagColor(tagName);
+
+    const borderByBackground: Record<string, string> = {
+      "bg-amber-400": "border-amber-400",
+      "bg-emerald-400": "border-emerald-400",
+      "bg-rose-400": "border-rose-400",
+      "bg-sky-400": "border-sky-400",
+      "bg-violet-400": "border-violet-400",
+      "bg-orange-400": "border-orange-400",
+      "bg-fuchsia-400": "border-fuchsia-400",
+      "bg-cyan-400": "border-cyan-400",
+      "bg-lime-400": "border-lime-400",
+      "bg-slate-400": "border-slate-400",
+    };
+
+    return borderByBackground[color] ?? "border-slate-400";
+  };
+
+  const handleToggleContactTag = async (tag: string) => {
+    if (!active || !activeContactHasRealId) {
+      toast.error("This contact must be saved before assigning tags");
+      return;
+    }
+
+    const previous = activeContactTags;
+    const next = previous.some((item) => item.toLowerCase() === tag.toLowerCase())
+      ? previous.filter((item) => item.toLowerCase() !== tag.toLowerCase())
+      : [...previous, tag];
+
+    setContactTagOverrides((current) => ({
+      ...current,
+      [active.contactId]: next,
+    }));
+
+    try {
+      await updateContact(active.contactId, { tags: next });
+      toast.success(
+        next.some((item) => item.toLowerCase() === tag.toLowerCase())
+          ? `${tag} assigned`
+          : `${tag} removed`,
+      );
+    } catch (error) {
+      setContactTagOverrides((current) => ({
+        ...current,
+        [active.contactId]: previous,
+      }));
+      console.error("[inbox] failed to update contact labels:", error);
+      toast.error("Could not update contact tags");
+    }
+  };
 
   // If the active conversation changes to a contact who doesn't have a
   // Messenger/Instagram identifier on file, but composeChannel is still set
@@ -774,8 +880,8 @@ function InboxPage() {
 
   return (
     <>
-    <div className="-m-6 flex h-[calc(100vh-3.5rem)] flex-col overflow-hidden">
-      <div className="shrink-0 border-b border-border bg-background px-6 py-5">
+    <div className="conversations-page -m-6 flex h-[calc(100vh-3.5rem)] flex-col overflow-hidden">
+      <div className="conversations-page-header shrink-0 border-b border-border bg-background px-6 py-5">
         <PageHeader
           icon={MessageSquare}
           iconBg="bg-cyan-soft"
@@ -787,7 +893,7 @@ function InboxPage() {
               <Button variant="outline" size="sm" className="h-9">
                 <Filter className="mr-1.5 h-3.5 w-3.5" /> Filters
               </Button>
-              <Button size="sm" className="h-9" onClick={() => setNewConvOpen(true)}>
+              <Button size="sm" className="h-9 bg-[#C88D22] text-white hover:bg-[#B77E18]" onClick={() => setNewConvOpen(true)}>
                 <Plus className="mr-1.5 h-3.5 w-3.5" /> New Conversation
               </Button>
             </div>
@@ -795,7 +901,7 @@ function InboxPage() {
         />
       </div>
 
-      <div className="grid min-h-0 flex-1 grid-cols-[340px_1fr] overflow-hidden lg:grid-cols-[172px_340px_1fr] xl:grid-cols-[172px_340px_1fr_296px]">
+      <div className="conversations-grid grid min-h-0 flex-1 grid-cols-[340px_1fr] overflow-hidden lg:grid-cols-[196px_350px_1fr] xl:grid-cols-[196px_350px_1fr_310px]">
         {/* PANE 1 — Folders (collapses below lg to keep the conversation list + composer usable) */}
         <aside className="hidden min-h-0 flex-col border-r border-border bg-background lg:flex">
           <div className="px-3.5 pb-2 pt-5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
@@ -814,12 +920,12 @@ function InboxPage() {
                     isActive ? "bg-gold-soft text-gold-soft-foreground" : "text-foreground hover:bg-secondary"
                   }`}
                 >
-                  <span className="flex items-center gap-2.5">
-                    <Icon className="h-4 w-4" />
-                    {f.label}
+                  <span className="flex min-w-0 items-center gap-2">
+                    <Icon className="h-4 w-4 shrink-0" />
+                    <span className="whitespace-nowrap">{f.label}</span>
                   </span>
                   {count > 0 && (
-                    <span className={`text-[11px] tabular-nums ${isActive ? "text-gold-soft-foreground" : "text-muted-foreground"}`}>
+                    <span className={`ml-2 shrink-0 text-[11px] tabular-nums ${isActive ? "text-gold-soft-foreground" : "text-muted-foreground"}`}>
                       {count}
                     </span>
                   )}
@@ -832,43 +938,39 @@ function InboxPage() {
             Tags
           </div>
           <div className="flex flex-col gap-1 px-2.5">
-            {[
-              { label: "VIP", count: 4 },
-              { label: "New Lead", count: 7 },
-              { label: "Hot", count: 3 },
-              { label: "Punch List", count: 2 },
-            ].map((t, i) => (
-              <button
-                key={t.label}
-                className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm font-medium text-foreground hover:bg-secondary"
-              >
-                <span className="flex items-center gap-2.5">
-                  <span className={`h-2 w-2 rounded-full ${["bg-amber-400","bg-emerald-400","bg-rose-400","bg-sky-400"][i]}`} />
-                  {t.label}
-                </span>
-                <span className="text-[11px] text-muted-foreground">{t.count}</span>
-              </button>
-            ))}
-            <button className="mt-0.5 flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-[13px] text-muted-foreground hover:bg-secondary hover:text-foreground">
+            {managedTags.map((t) => {
+              const count = allStoreContacts.filter((c) =>
+                (c.tags ?? []).some((tag) => tag.toLowerCase() === t.label.toLowerCase())
+              ).length;
+              return (
+                <button
+                  key={t.label}
+                  type="button"
+                  onClick={() => setSearch(t.label)}
+                  className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm font-medium text-foreground hover:bg-secondary"
+                >
+                  <span className="flex items-center gap-2.5">
+                    <span className={`h-2 w-2 rounded-full ${t.color}`} />
+                    {t.label}
+                  </span>
+                  <span className="text-[11px] text-muted-foreground">{count}</span>
+                </button>
+              );
+            })}
+            <button
+              type="button"
+              onClick={() => setTagManagerOpen(true)}
+              className="mt-0.5 flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-[13px] text-muted-foreground hover:bg-secondary hover:text-foreground"
+            >
               <Tag className="h-4 w-4" /> Manage tags
             </button>
           </div>
 
-          <div className="mt-auto border-t border-border p-3.5">
-            <div className="rounded-lg border border-gold-soft bg-gold-soft/50 p-3">
-              <div className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold text-gold-soft-foreground">
-                <Sparkles className="h-3 w-3" /> AI Assistant
-              </div>
-              <p className="text-[11px] leading-relaxed text-muted-foreground">
-                Drafting & summarizing replies. {folderCounts.unread} unread to triage.
-              </p>
-            </div>
-          </div>
         </aside>
 
         {/* PANE 2 — Conversation list */}
-        <section className="flex min-h-0 flex-col border-r border-border">
-          <div className="flex flex-wrap items-center gap-1.5 overflow-x-auto border-b border-border bg-background px-3 py-2.5">
+        <section className="conversation-list-pane flex min-h-0 flex-col border-r border-border">
+          <div className="conversation-channel-tabs flex items-center gap-2 overflow-x-auto border-b border-border bg-background px-4 py-3">
             {channelTabs.map((t) => {
               const Icon = t.icon;
               const isActive = channelFilter === t.id;
@@ -876,13 +978,13 @@ function InboxPage() {
                 <button
                   key={t.id}
                   onClick={() => setChannelFilter(t.id)}
-                  className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border px-3 py-1.5 text-[11px] font-medium transition-colors ${
+                  className={`conversation-channel-tab flex h-10 shrink-0 items-center gap-2 whitespace-nowrap rounded-xl border px-4 text-[13px] font-medium transition-colors ${
                     isActive
-                      ? "border-gold-soft bg-gold-soft text-gold-soft-foreground"
-                      : "border-transparent text-muted-foreground hover:bg-secondary"
+                      ? "is-active border-[#E8D4AA] bg-[#FAF3E4] text-[#9A6821]"
+                      : "border-[#E5E7EB] bg-white text-[#344054] hover:bg-[#F8FAFC]"
                   }`}
                 >
-                  <Icon className="h-3 w-3" />
+                  <Icon className={`h-4 w-4 ${t.iconClass ?? ""}`} />
                   {t.label}
                 </button>
               );
@@ -916,13 +1018,27 @@ function InboxPage() {
               />
             ))}
             {conversations.length === 0 && (
-              <div className="p-8 text-center text-xs text-muted-foreground">No conversations match these filters</div>
+              <div className="p-8 text-center">
+                <p className="text-sm font-medium text-foreground">
+                  {channelFilter === "messenger"
+                    ? "No Messenger conversations yet"
+                    : channelFilter === "instagram"
+                      ? "No Instagram conversations yet"
+                      : "No conversations match these filters"}
+                </p>
+                {(channelFilter === "messenger" || channelFilter === "instagram") && (
+                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                    Conversations appear after someone messages your connected{" "}
+                    {channelFilter === "messenger" ? "Facebook Page" : "Instagram account"}.
+                  </p>
+                )}
+              </div>
             )}
           </div>
         </section>
 
         {/* PANE 3 — Thread */}
-        <section className="flex min-h-0 flex-col bg-background">
+        <section className="conversation-thread-pane flex min-h-0 flex-col bg-background">
           {active && contact ? (
             <>
               <div className="flex items-center justify-between border-b border-border bg-background px-5 py-4">
@@ -932,7 +1048,7 @@ function InboxPage() {
                     <div className="flex items-center gap-2 text-[15px] font-semibold">
                       <span className="truncate">{active.contactName}</span>
                       <Badge variant="outline" className="h-4.5 shrink-0 px-1.5 text-[9px] uppercase">
-                        {contact.tags?.[0] ?? "Customer"}
+                        {activeContactTags[0] ?? "Customer"}
                       </Badge>
                     </div>
                     <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
@@ -947,20 +1063,41 @@ function InboxPage() {
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 px-2"
+                    title={checkStarred(active.id) ? "Unstar conversation" : "Star conversation"}
+                    onClick={() => {
+                      setStarredIds((prev) => {
+                        const next = new Set(prev);
+                        next.has(active.id) ? next.delete(active.id) : next.add(active.id);
+                        return next;
+                      });
+                    }}
+                  >
+                    <Star
+                      className={`h-4 w-4 ${
+                        checkStarred(active.id)
+                          ? "fill-amber-400 text-amber-400"
+                          : "text-muted-foreground"
+                      }`}
+                    />
+                  </Button>
                   <Button variant="ghost" size="sm" className="h-8 px-2" title="WhatsApp"
                     onClick={() => setComposeChannel("whatsapp")}>
-                    <MessageSquare className={`h-4 w-4 ${composeChannel === "whatsapp" ? "text-primary" : ""}`} />
+                    <FaWhatsapp className={`h-4 w-4 ${composeChannel === "whatsapp" ? "text-[#25D366]" : "text-[#667085]"}`} />
                   </Button>
                   {contact?.messenger_psid && (
                     <Button variant="ghost" size="sm" className="h-8 px-2" title="Messenger"
                       onClick={() => setComposeChannel("messenger")}>
-                      <MessageSquare className={`h-4 w-4 ${composeChannel === "messenger" ? "text-primary" : ""}`} />
+                      <FaFacebookMessenger className={`h-4 w-4 ${composeChannel === "messenger" ? "text-[#0084FF]" : "text-[#667085]"}`} />
                     </Button>
                   )}
                   {contact?.instagram_igsid && (
                     <Button variant="ghost" size="sm" className="h-8 px-2" title="Instagram"
                       onClick={() => setComposeChannel("instagram")}>
-                      <AtSign className={`h-4 w-4 ${composeChannel === "instagram" ? "text-primary" : ""}`} />
+                      <FaInstagram className={`h-4 w-4 ${composeChannel === "instagram" ? "text-[#E4405F]" : "text-[#667085]"}`} />
                     </Button>
                   )}
                   <Button variant="ghost" size="sm" className="h-8 px-2" title="Call"
@@ -1019,7 +1156,7 @@ function InboxPage() {
                 </div>
               </div>
 
-              <div className="min-h-0 flex-1 space-y-6 overflow-y-auto bg-secondary/20 px-8 py-6">
+              <div className="conversation-thread-body min-h-0 flex-1 space-y-7 overflow-y-auto px-8 py-6">
                 {groupByDay(thread).map((group) => (
                   <div key={group.day}>
                     <div className="mb-4 flex items-center gap-3">
@@ -1061,18 +1198,18 @@ function InboxPage() {
               </div>
 
               {/* Composer */}
-              <div className="border-t border-border bg-background p-4">
-              <div className="rounded-xl border border-border bg-card p-4 shadow-sm">
+              <div className="conversation-composer-wrap border-t border-border p-4">
+              <div className="conversation-composer rounded-2xl border border-[#E5E7EB] bg-white p-4">
                 <div className="mb-3 flex flex-wrap items-center gap-2">
-                  <div className="flex h-8 items-center gap-0.5 rounded-md border border-border bg-background p-0.5">
+                  <div className="conversation-compose-tabs flex min-h-10 items-center gap-1 rounded-xl border border-[#E5E7EB] bg-white p-1">
                     <ComposeTab id="sms" current={composeChannel} onSelect={setComposeChannel} icon={MessageSquare} label="SMS" />
-                    <ComposeTab id="whatsapp" current={composeChannel} onSelect={setComposeChannel} icon={MessageSquare} label="WhatsApp" />
+                    <ComposeTab id="whatsapp" current={composeChannel} onSelect={setComposeChannel} icon={FaWhatsapp} label="WhatsApp" />
                     <ComposeTab id="email" current={composeChannel} onSelect={setComposeChannel} icon={Mail} label="Email" />
                     {contact?.messenger_psid && (
-                      <ComposeTab id="messenger" current={composeChannel} onSelect={setComposeChannel} icon={MessageSquare} label="Messenger" />
+                      <ComposeTab id="messenger" current={composeChannel} onSelect={setComposeChannel} icon={FaFacebookMessenger} label="Messenger" />
                     )}
                     {contact?.instagram_igsid && (
-                      <ComposeTab id="instagram" current={composeChannel} onSelect={setComposeChannel} icon={AtSign} label="Instagram" />
+                      <ComposeTab id="instagram" current={composeChannel} onSelect={setComposeChannel} icon={FaInstagram} label="Instagram" />
                     )}
                     <ComposeTab id="note" current={composeChannel} onSelect={setComposeChannel} icon={StickyNote} label="Note" />
                   </div>
@@ -1154,7 +1291,7 @@ function InboxPage() {
                       AI Draft
                     </Button>
                     <span className="mx-1 h-4 w-px bg-border" />
-                    <Button variant="ghost" size="sm" className="h-7 px-2" title="Mention"
+                    <Button variant="ghost" size="sm" className="h-7 px-2" title="Mention contact or teammate"
                       onClick={() => setDraft((d) => d ? `${d} @` : "@")}>
                       <Hash className="h-3.5 w-3.5" />
                     </Button>
@@ -1164,12 +1301,28 @@ function InboxPage() {
                           <Smile className="h-3.5 w-3.5" />
                         </Button>
                       </PopoverTrigger>
-                      <PopoverContent align="end" className="w-56 p-2">
-                        <div className="grid grid-cols-8 gap-0.5">
-                          {["👍","😊","🙏","✅","👋","🏠","🔨","📋","💰","📅","⚡","🎉","👌","💪","🤝","😄"].map((e) => (
-                            <button key={e} className="flex h-7 w-7 items-center justify-center rounded hover:bg-secondary text-base"
-                              onClick={() => { setDraft((d) => d + e); setEmojiOpen(false); }}>
-                              {e}
+                      <PopoverContent align="end" className="w-72 p-3">
+                        <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                          Add emoji
+                        </div>
+                        <div className="grid max-h-56 grid-cols-8 gap-1 overflow-y-auto pr-1">
+                          {[
+                            "👍","👎","👏","🙌","🤝","🙏","👋","👌",
+                            "✅","❌","⭐","❤️","🔥","🎉","💯","⚡",
+                            "😊","😄","😁","😂","🙂","😉","😍","🥳",
+                            "😎","🤔","😕","😅","😢","😮","😴","🤯",
+                            "🏠","🏢","🔨","🧰","📋","📄","📎","✏️",
+                            "📅","⏰","📞","📧","💬","📍","🚚","🛠️",
+                            "💰","💳","🧾","📈","🔑","🚪","🪟","🧱",
+                          ].map((emoji) => (
+                            <button
+                              key={emoji}
+                              type="button"
+                              className="flex h-8 w-8 items-center justify-center rounded-md text-lg transition-colors hover:bg-secondary"
+                              onClick={() => setDraft((current) => current + emoji)}
+                              aria-label={`Insert ${emoji}`}
+                            >
+                              {emoji}
                             </button>
                           ))}
                         </div>
@@ -1208,14 +1361,20 @@ function InboxPage() {
                         ? "Write an email…"
                         : composeChannel === "sms"
                           ? "Send a text message…"
-                          : "Add an internal note (visible to your team only)…"
+                          : composeChannel === "whatsapp"
+                            ? "Send a WhatsApp message…"
+                            : composeChannel === "messenger"
+                              ? "Send a Messenger message…"
+                              : composeChannel === "instagram"
+                                ? "Send an Instagram message…"
+                                : "Add an internal note (visible to your team only)…"
                     }
                     value={draft}
                     onChange={(e) => setDraft(e.target.value)}
-                    className="min-h-24 resize-none border-0 bg-transparent px-3 py-2.5 text-sm focus-visible:ring-0"
+                    className="min-h-[86px] resize-none border-0 bg-transparent px-4 py-3 text-sm text-[#273142] placeholder:text-[#8A94A6] focus-visible:ring-0"
                   />
                 </div>
-                <div className="mt-3 flex items-center justify-between">
+                <div className="conversation-composer-bottom mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-[#EEF0F3] pt-3">
                   <div className="text-[10px] text-muted-foreground">
                     {composeChannel === "sms" && `${draft.length}/160 chars · 1 segment`}
                     {composeChannel === "email" && "Will reply from sales@yourco.com"}
@@ -1257,7 +1416,7 @@ function InboxPage() {
                         </div>
                       </PopoverContent>
                     </Popover>
-                    <Button size="sm" className="h-8" onClick={handleSend}>
+                    <Button size="sm" className="conversation-send h-10 rounded-xl bg-[#C88D22] px-5 text-sm font-semibold text-white shadow-sm hover:bg-[#B77E18]" onClick={handleSend}>
                       <Send className="mr-1.5 h-3.5 w-3.5" /> Send
                     </Button>
                   </div>
@@ -1325,13 +1484,13 @@ function InboxPage() {
                     <div className="mt-1 truncate text-xs text-muted-foreground">{contact.email}</div>
                     <div className="mt-0.5 truncate text-xs text-muted-foreground">{contact.phone}</div>
                     {activeContactHasRealId && (
-                      <Link
-                        to="/contacts"
-                        search={{ contactId: active.contactId }}
+                      <button
+                        type="button"
+                        onClick={() => setContactDrawerOpen(true)}
                         className="mt-1.5 inline-block text-xs font-medium text-gold hover:underline"
                       >
                         View full contact
-                      </Link>
+                      </button>
                     )}
                   </div>
                 </div>
@@ -1357,15 +1516,76 @@ function InboxPage() {
                 </ContextSection>
               )}
 
-              {contact.tags && contact.tags.length > 0 && (
-                <ContextSection title="Tags">
-                  <div className="flex flex-wrap gap-1.5">
-                    {contact.tags.map((t) => (
-                      <Badge key={t} variant="outline" className="h-6 px-2 text-[11px]">{t}</Badge>
-                    ))}
-                  </div>
-                </ContextSection>
-              )}
+              <ContextSection title="Tags">
+                <div className="flex flex-wrap gap-1.5">
+                  {activeContactTags.length > 0 ? (
+                    activeContactTags.map((tag) => (
+                      <Badge
+                        key={tag}
+                        variant="outline"
+                        className={`h-6 gap-1.5 bg-white px-2 text-[11px] text-foreground ${getTagBorderColor(tag)}`}
+                      >
+                        <span className={`h-2 w-2 rounded-full ${getTagColor(tag)}`} />
+                        {tag}
+                      </Badge>
+                    ))
+                  ) : (
+                    <span className="text-xs text-muted-foreground">No tags assigned</span>
+                  )}
+                </div>
+
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="mt-3 h-8 w-full justify-center text-xs"
+                      disabled={!activeContactHasRealId}
+                    >
+                      <Tag className="mr-1.5 h-3.5 w-3.5" />
+                      Assign tags
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent align="end" className="w-64 p-2">
+                    <div className="px-2 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Contact tags
+                    </div>
+                    <div className="max-h-64 space-y-1 overflow-y-auto">
+                      {managedTags.map((tag) => {
+                        const selected = activeContactTags.some(
+                          (item) => item.toLowerCase() === tag.label.toLowerCase(),
+                        );
+
+                        return (
+                          <button
+                            key={tag.label}
+                            type="button"
+                            onClick={() => handleToggleContactTag(tag.label)}
+                            className="flex w-full items-center justify-between rounded-md px-2 py-2 text-left text-sm hover:bg-secondary"
+                          >
+                            <span className="flex items-center gap-2">
+                              <span className={`h-2 w-2 rounded-full ${tag.color}`} />
+                              {tag.label}
+                            </span>
+                            {selected && <CheckCircle2 className="h-4 w-4 text-emerald-500" />}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="mt-2 border-t border-border pt-2">
+                      <button
+                        type="button"
+                        onClick={() => setTagManagerOpen(true)}
+                        className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-xs text-muted-foreground hover:bg-secondary hover:text-foreground"
+                      >
+                        <Tag className="h-3.5 w-3.5" />
+                        Manage available tags
+                      </button>
+                    </div>
+                  </PopoverContent>
+                </Popover>
+              </ContextSection>
 
               <ContextSection title={`Active Projects (${sbProjects.length})`}>
                 {sbProjects.length === 0 ? (
@@ -1503,6 +1723,7 @@ function InboxPage() {
     {/* New Conversation Sheet */}
     <NewConversationSheet
       open={newConvOpen}
+      contacts={allStoreContacts}
       onClose={() => setNewConvOpen(false)}
       onSelect={(c) => {
         // Use the channel currently filtered on (WhatsApp/SMS/Messenger/
@@ -1596,6 +1817,216 @@ function InboxPage() {
       </AlertDialogContent>
     </AlertDialog>
 
+    <Sheet open={contactDrawerOpen} onOpenChange={setContactDrawerOpen}>
+      <SheetContent side="right" className="w-full overflow-y-auto sm:max-w-md">
+        <SheetHeader>
+          <SheetTitle>Contact details</SheetTitle>
+          <SheetDescription>
+            Review this contact without leaving Conversations.
+          </SheetDescription>
+        </SheetHeader>
+
+        {active && contact && (
+          <div className="mt-6 space-y-6">
+            <div className="flex items-center gap-3">
+              <ContactAvatar id={active.contactId} name={contact.name} size="lg" className="h-14 w-14" />
+              <div className="min-w-0">
+                <div className="truncate text-lg font-semibold text-foreground">{contact.name}</div>
+                <div className="mt-0.5 text-sm text-muted-foreground">
+                  {contact.owner && contact.owner !== "—" ? `Owned by ${contact.owner}` : "Unassigned"}
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-border bg-card">
+              <div className="border-b border-border p-4">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Email</div>
+                <div className="mt-1 break-all text-sm text-foreground">{contact.email || "No email on file"}</div>
+              </div>
+              <div className="border-b border-border p-4">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Phone</div>
+                <div className="mt-1 text-sm text-foreground">{contact.phone || "No phone on file"}</div>
+              </div>
+              <div className="p-4">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Tags</div>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {activeContactTags.length > 0 ? (
+                    activeContactTags.map((tag) => (
+                      <Badge
+                        key={tag}
+                        variant="outline"
+                        className={`h-6 gap-1.5 bg-white px-2 text-[11px] text-foreground ${getTagBorderColor(tag)}`}
+                      >
+                        <span className={`h-2 w-2 rounded-full ${getTagColor(tag)}`} />
+                        {tag}
+                      </Badge>
+                    ))
+                  ) : (
+                    <span className="text-sm text-muted-foreground">No tags</span>
+                  )}
+                </div>
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="mt-3 h-8"
+                      disabled={!activeContactHasRealId}
+                    >
+                      <Tag className="mr-1.5 h-3.5 w-3.5" />
+                      Assign tag
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent align="start" className="w-64 p-2">
+                    {managedTags.map((tag) => {
+                      const selected = activeContactTags.some(
+                        (item) => item.toLowerCase() === tag.label.toLowerCase(),
+                      );
+                      return (
+                        <button
+                          key={tag.label}
+                          type="button"
+                          onClick={() => handleToggleContactTag(tag.label)}
+                          className="flex w-full items-center justify-between rounded-md px-2 py-2 text-sm hover:bg-secondary"
+                        >
+                          <span className="flex items-center gap-2">
+                            <span className={`h-2 w-2 rounded-full ${tag.color}`} />
+                            {tag.label}
+                          </span>
+                          {selected && <CheckCircle2 className="h-4 w-4 text-emerald-500" />}
+                        </button>
+                      );
+                    })}
+                  </PopoverContent>
+                </Popover>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setComposeChannel("email");
+                  setContactDrawerOpen(false);
+                }}
+              >
+                <Mail className="mr-1.5 h-3.5 w-3.5" /> Email
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setComposeChannel("sms");
+                  setContactDrawerOpen(false);
+                }}
+              >
+                <MessageSquare className="mr-1.5 h-3.5 w-3.5" /> SMS
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => toast.info(`Calling ${contact.phone || ""}…`)}
+              >
+                <PhoneCall className="mr-1.5 h-3.5 w-3.5" /> Call
+              </Button>
+            </div>
+
+            <div className="rounded-xl border border-border p-4">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                Related records
+              </div>
+              <div className="mt-3 grid grid-cols-3 gap-3 text-center">
+                <div>
+                  <div className="text-lg font-semibold">{sbDeals.length}</div>
+                  <div className="text-[11px] text-muted-foreground">Open deals</div>
+                </div>
+                <div>
+                  <div className="text-lg font-semibold">{sbProjects.length}</div>
+                  <div className="text-[11px] text-muted-foreground">Projects</div>
+                </div>
+                <div>
+                  <div className="text-lg font-semibold">{sbAppointments.length}</div>
+                  <div className="text-[11px] text-muted-foreground">Appointments</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </SheetContent>
+    </Sheet>
+
+    <Sheet open={tagManagerOpen} onOpenChange={setTagManagerOpen}>
+      <SheetContent side="right" className="w-full sm:max-w-sm">
+        <SheetHeader>
+          <SheetTitle>Manage conversation tags</SheetTitle>
+          <SheetDescription>
+            Add or remove the tags shown in the Conversations sidebar.
+          </SheetDescription>
+        </SheetHeader>
+
+        <div className="mt-6 space-y-4">
+          <form
+            className="flex gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const label = newTagName.trim();
+              if (!label) return;
+              if (managedTags.some((tag) => tag.label.toLowerCase() === label.toLowerCase())) {
+                toast.error("That tag already exists");
+                return;
+              }
+              const colors = ["bg-violet-400", "bg-cyan-400", "bg-orange-400", "bg-fuchsia-400", "bg-lime-400"];
+              setManagedTags((current) => [
+                ...current,
+                { label, color: colors[current.length % colors.length] },
+              ]);
+              setNewTagName("");
+              toast.success("Tag added");
+            }}
+          >
+            <Input
+              value={newTagName}
+              onChange={(event) => setNewTagName(event.target.value)}
+              placeholder="New tag name"
+              className="h-9"
+            />
+            <Button type="submit" size="sm" className="h-9">
+              <Plus className="mr-1 h-3.5 w-3.5" /> Add
+            </Button>
+          </form>
+
+          <div className="space-y-2">
+            {managedTags.map((tag) => (
+              <div
+                key={tag.label}
+                className="flex items-center justify-between rounded-lg border border-border bg-card px-3 py-2.5"
+              >
+                <div className="flex items-center gap-2.5">
+                  <span className={`h-2.5 w-2.5 rounded-full ${tag.color}`} />
+                  <span className="text-sm font-medium">{tag.label}</span>
+                </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
+                  onClick={() => {
+                    setManagedTags((current) => current.filter((item) => item.label !== tag.label));
+                    toast.success("Tag removed");
+                  }}
+                  aria-label={`Remove ${tag.label}`}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </SheetContent>
+    </Sheet>
+
     <NewDealDialog
       open={dealDialogOpen}
       onOpenChange={setDealDialogOpen}
@@ -1627,22 +2058,31 @@ function ComposeTab({
   id: ComposeChannel;
   current: ComposeChannel;
   onSelect: (id: ComposeChannel) => void;
-  icon: typeof Mail;
+  icon: ChannelIcon;
   label: string;
 }) {
   const isActive = current === id;
+  const iconClass =
+    id === "whatsapp"
+      ? "text-[#25D366]"
+      : id === "messenger"
+        ? "text-[#0084FF]"
+        : id === "instagram"
+          ? "text-[#E4405F]"
+          : "";
+
   return (
     <button
       onClick={() => onSelect(id)}
-      className={`flex h-6 items-center gap-1 rounded px-2 text-[11px] font-medium transition-colors ${
+      className={`conversation-compose-tab flex h-8 items-center gap-1.5 rounded-lg px-3 text-[12px] font-medium transition-colors ${
         isActive
           ? id === "note"
-            ? "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
-            : "bg-gold-soft text-gold-soft-foreground"
-          : "text-muted-foreground hover:bg-secondary"
+            ? "border border-amber-200 bg-amber-50 text-amber-700"
+            : "border border-[#E8D4AA] bg-[#FAF3E4] text-[#9A6821]"
+          : "border border-transparent text-[#667085] hover:bg-[#F8FAFC]"
       }`}
     >
-      <Icon className="h-3 w-3" /> {label}
+      <Icon className={`h-3.5 w-3.5 ${iconClass}`} /> {label}
     </button>
   );
 }
@@ -1734,17 +2174,17 @@ function MessageBubble({ msg }: { msg: LocalMessage }) {
     <div className={`flex ${isOut ? "justify-end" : "justify-start"}`}>
       <div className={`flex max-w-[72%] flex-col gap-1 sm:max-w-md lg:max-w-lg ${isOut ? "items-end" : "items-start"}`}>
         <div
-          className={`rounded-2xl px-3.5 py-2 text-sm leading-relaxed ${
+          className={`conversation-message-bubble rounded-2xl border px-4 py-3 text-sm leading-relaxed ${
             msg.isScheduled
-              ? "rounded-br-sm border border-dashed border-gold bg-gold-soft/50 text-foreground"
+              ? "rounded-br-md border-dashed border-[#E3C98F] bg-[#FAF3E4] text-[#273142]"
               : isOut
-                ? "rounded-br-sm border border-gold-soft bg-gold-soft text-gold-soft-foreground"
-                : "rounded-bl-sm border border-border bg-card text-foreground"
+                ? "rounded-br-md border-[#F0E0C1] bg-[#FAF3E4] text-[#273142]"
+                : "rounded-bl-md border-[#E5E7EB] bg-[#F3F4F6] text-[#273142]"
           }`}
         >
           {msg.body}
         </div>
-        <div className="flex items-center gap-1.5 px-1 text-[10px] text-muted-foreground">
+        <div className={`conversation-message-meta flex items-center gap-1.5 px-1 text-[10px] ${isOut ? "text-[#9A7B45]" : "text-[#8A94A6]"}`}>
           <ChannelGlyph channel={msg.channel} />
           <span>{fmtTime(msg.at)}</span>
           {msg.isScheduled ? (
@@ -1769,92 +2209,163 @@ function MessageBubble({ msg }: { msg: LocalMessage }) {
 // ── New Conversation Sheet ────────────────────────────────────────────────────
 
 function NewConversationSheet({
-  open, onClose, onSelect,
+  open,
+  contacts,
+  onClose,
+  onSelect,
 }: {
   open: boolean;
+  contacts: Array<{
+    id: string;
+    name: string;
+    email: string;
+    phone: string;
+    tags?: string[];
+  }>;
   onClose: () => void;
   onSelect: (c: { id: string; name: string }) => void;
 }) {
   const [query, setQuery] = useState("");
-  const [sbList, setSbList] = useState<{ id: string; name: string; email: string; phone: string }[]>([]);
-  const [sbLoading, setSbLoading] = useState(true);
 
   useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    setSbLoading(true);
-    (async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user || cancelled) { setSbLoading(false); return; }
-      const { data: profile } = await supabase.from("profiles").select("organization_id").eq("id", user.id).maybeSingle();
-      const orgId = profile?.organization_id;
-      if (!orgId || cancelled) { setSbLoading(false); return; }
-      const { data } = await supabase
-        .from("contacts")
-        .select("id, full_name, email, phone")
-        .eq("org_id", orgId)
-        .order("full_name", { ascending: true })
-        .limit(500);
-      if (cancelled) return;
-      setSbList((data ?? []).map((c: any) => ({
-        id: c.id,
-        name: c.full_name ?? "Unknown",
-        email: c.email ?? "",
-        phone: c.phone ?? "",
-      })));
-      setSbLoading(false);
-    })();
-    return () => { cancelled = true; };
+    if (!open) setQuery("");
   }, [open]);
 
-  const contacts = useMemo(() => {
-    const q = query.toLowerCase();
-    return sbList
-      .filter((c) => !q || c.name.toLowerCase().includes(q) || c.email.toLowerCase().includes(q) || c.phone.includes(q))
-      .slice(0, 100);
-  }, [query, sbList]);
+  const filteredContacts = useMemo(() => {
+    const q = query.trim().toLowerCase();
+
+    return contacts
+      .filter((contact) => {
+        if (!q) return true;
+
+        return (
+          contact.name.toLowerCase().includes(q) ||
+          contact.email.toLowerCase().includes(q) ||
+          contact.phone.toLowerCase().includes(q) ||
+          (contact.tags ?? []).some((tag) => tag.toLowerCase().includes(q))
+        );
+      })
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .slice(0, 150);
+  }, [contacts, query]);
 
   return (
-    <Sheet open={open} onOpenChange={(o) => !o && onClose()}>
-      <SheetContent side="right" className="w-full sm:max-w-sm flex flex-col">
+    <Sheet open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}>
+      <SheetContent side="right" className="flex w-full flex-col sm:max-w-md">
         <SheetHeader className="border-b border-border pb-4">
           <SheetTitle>New Conversation</SheetTitle>
-          <SheetDescription>Choose a contact to start a conversation with.</SheetDescription>
+          <SheetDescription>
+            Choose a contact to start a conversation with.
+          </SheetDescription>
         </SheetHeader>
+
         <div className="relative mt-4">
-          <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             autoFocus
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search contacts…"
-            className="h-8 pl-8 text-sm"
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search name, email, phone, or tag…"
+            className="h-10 pl-9 text-sm"
           />
         </div>
-        <div className="mt-3 flex-1 overflow-y-auto space-y-0.5">
-          {sbLoading && (
-            <p className="p-6 text-center text-xs text-muted-foreground">Loading contacts…</p>
+
+        <div className="mt-4 min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
+          {contacts.length === 0 && (
+            <div className="rounded-xl border border-dashed border-border p-8 text-center">
+              <p className="text-sm font-medium text-foreground">No contacts available</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Add a contact first, then return here to start a conversation.
+              </p>
+            </div>
           )}
-          {!sbLoading && contacts.length === 0 && (
-            <p className="p-6 text-center text-xs text-muted-foreground">No contacts found</p>
+
+          {contacts.length > 0 && filteredContacts.length === 0 && (
+            <div className="rounded-xl border border-dashed border-border p-8 text-center">
+              <p className="text-sm font-medium text-foreground">No contacts found</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Try searching by name, email, phone number, or tag.
+              </p>
+            </div>
           )}
-          {contacts.map((c) => (
-            <button
-              key={c.id}
-              onClick={() => onSelect({ id: c.id, name: c.name })}
-              className="flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left hover:bg-secondary transition-colors"
-            >
-              <Avatar className="h-8 w-8 shrink-0">
-                <AvatarFallback className="bg-primary-soft text-[11px] font-semibold text-primary">
-                  {c.name.split(" ").map((n) => n[0]).join("").slice(0, 2).toUpperCase()}
-                </AvatarFallback>
-              </Avatar>
-              <div className="min-w-0">
-                <div className="truncate text-sm font-medium">{c.name}</div>
-                <div className="truncate text-[11px] text-muted-foreground">{c.phone || c.email}</div>
-              </div>
-            </button>
-          ))}
+
+          {filteredContacts.map((contact) => {
+            const tags = contact.tags ?? [];
+
+            return (
+              <button
+                key={contact.id}
+                type="button"
+                onClick={() => onSelect({ id: contact.id, name: contact.name })}
+                className="group flex w-full items-start gap-3 rounded-xl border border-transparent px-3 py-3 text-left transition-colors hover:border-[#E8D4AA] hover:bg-[#FAF3E4]/60"
+              >
+                <ContactAvatar
+                  id={contact.id}
+                  name={contact.name}
+                  size="md"
+                  className="h-10 w-10 shrink-0"
+                />
+
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="truncate text-sm font-semibold text-foreground">
+                      {contact.name}
+                    </div>
+
+                    {tags[0] && (
+                      <Badge
+                        variant="outline"
+                        className="h-5 shrink-0 border-[#E8D4AA] bg-[#FAF3E4] px-1.5 text-[9px] font-medium text-[#9A6821]"
+                      >
+                        {tags[0]}
+                      </Badge>
+                    )}
+                  </div>
+
+                  <div className="mt-1 space-y-0.5">
+                    {contact.email && (
+                      <div className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">
+                        <Mail className="h-3 w-3 shrink-0" />
+                        <span className="truncate">{contact.email}</span>
+                      </div>
+                    )}
+
+                    {contact.phone && (
+                      <div className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">
+                        <Phone className="h-3 w-3 shrink-0" />
+                        <span className="truncate">{contact.phone}</span>
+                      </div>
+                    )}
+
+                    {!contact.email && !contact.phone && (
+                      <div className="text-[11px] text-muted-foreground">
+                        No contact information
+                      </div>
+                    )}
+                  </div>
+
+                  {tags.length > 1 && (
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {tags.slice(1, 4).map((tag) => (
+                        <Badge
+                          key={tag}
+                          variant="outline"
+                          className="h-5 px-1.5 text-[9px] text-muted-foreground"
+                        >
+                          {tag}
+                        </Badge>
+                      ))}
+                      {tags.length > 4 && (
+                        <span className="self-center text-[10px] text-muted-foreground">
+                          +{tags.length - 4}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </button>
+            );
+          })}
         </div>
       </SheetContent>
     </Sheet>
@@ -1862,11 +2373,12 @@ function NewConversationSheet({
 }
 
 function ChannelGlyph({ channel }: { channel: LocalMessage["channel"] }) {
-  if (channel === "email") return <Mail className="h-3 w-3 text-muted-foreground" />;
-  if (channel === "sms" || channel === "note") return <MessageSquare className="h-3 w-3 text-muted-foreground" />;
-  if (channel === "whatsapp" || channel === "messenger") return <MessageSquare className="h-3 w-3 text-muted-foreground" />;
-  if (channel === "instagram") return <AtSign className="h-3 w-3 text-muted-foreground" />;
-  return <Phone className="h-3 w-3 text-muted-foreground" />;
+  if (channel === "email") return <Mail className="h-3 w-3 text-[#667085]" />;
+  if (channel === "sms" || channel === "note") return <MessageSquare className="h-3 w-3 text-[#667085]" />;
+  if (channel === "whatsapp") return <FaWhatsapp className="h-3 w-3 text-[#25D366]" />;
+  if (channel === "messenger") return <FaFacebookMessenger className="h-3 w-3 text-[#0084FF]" />;
+  if (channel === "instagram") return <FaInstagram className="h-3 w-3 text-[#E4405F]" />;
+  return <Phone className="h-3 w-3 text-[#667085]" />;
 }
 
 function initials(name: string) {

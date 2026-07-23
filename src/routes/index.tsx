@@ -243,7 +243,7 @@ function QuickActions({ navigate, onNewContact, onNewDeal }: {
     { icon: ContactIcon, label: "New Contact", action: onNewContact, bg: "bg-info-soft", color: "text-info" },
     { icon: Plus, label: "New Deal", action: onNewDeal, bg: "bg-success-soft", color: "text-success" },
     { icon: FileText, label: "New Estimate", action: () => navigate({ to: "/estimates", search: { openNew: true } }), bg: "bg-orange-soft", color: "text-orange" },
-    { icon: Zap, label: "Run Workflow", action: () => navigate({ to: "/workflows" }), bg: "bg-violet-soft", color: "text-violet" },
+    { icon: Zap, label: "Run Workflow", action: () => navigate({ to: "/automation/workflows" }), bg: "bg-violet-soft", color: "text-violet" },
   ];
   return (
     // Fixed h-44 to match KpiCard exactly (same row, same grid) — this used
@@ -273,7 +273,7 @@ function QuickActions({ navigate, onNewContact, onNewDeal }: {
             <span className={cn("h-8 w-8 rounded-lg grid place-items-center shrink-0", bg)}>
               <Icon className={cn("h-4 w-4", color)} />
             </span>
-            <span className="leading-tight whitespace-normal break-words">{label}</span>
+            <span className="leading-tight whitespace-normal wrap-break-word">{label}</span>
           </button>
         ))}
       </div>
