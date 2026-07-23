@@ -75,6 +75,7 @@ import type {
   Deal,
   LostReason,
   SalesPipelineStage,
+  StageOutcome,
 } from "@/lib/sales/types";
 import { useTopbarAction } from "@/lib/topbar-action";
 
@@ -95,6 +96,7 @@ type BoardStage = {
   color: string;
   probability: number;
   position: number;
+  outcome: StageOutcome;
 };
 
 type ValueFilter =
@@ -541,7 +543,6 @@ function PipelinePage() {
     dealId: string,
     targetStage: BoardStage,
   ) {
-    const status = stageStatus(targetStage.slug);
     const previousStageId = normalizedDeals.find((deal) => {
       return deal.id === dealId;
     })?.resolvedStageId;
@@ -552,14 +553,16 @@ function PipelinePage() {
     }));
 
     try {
+      // Status is derived from the target stage's own outcome inside
+      // updateDeal (pipeline_stages.outcome is the single source of
+      // truth) — not computed here from the stage slug.
       await updateDeal(
         dealId,
         {
           stageId: targetStage.id,
           stage: targetStage.slug,
           probability: targetStage.probability,
-          status,
-          lostReason: status === "lost" ? undefined : null,
+          lostReason: targetStage.outcome === "lost" ? undefined : null,
         } as Partial<Deal>,
       );
     } catch (error) {
@@ -583,6 +586,15 @@ function PipelinePage() {
     dealId: string,
     requestedStage: string,
   ) {
+    // Only called today via the Deal drawer's "Mark Won" button, passing
+    // the literal string "won". Most pipelines have no stage actually named
+    // "Won" (confirmed live — only one demo pipeline does), so requiring a
+    // real board-stage match here would toast-error and silently fail to
+    // mark the deal won for every other pipeline. If a real stage matches,
+    // move into it (keeps existing behavior for pipelines that do have one);
+    // otherwise fall back to a direct status update — the same safe path
+    // already used by Leads' and Inbox's equivalent handlers, where
+    // pipeline_stages.outcome (via updateDeal) is still the source of truth.
     const target = boardStages.find((stage) => {
       return (
         stage.id === requestedStage ||
@@ -590,13 +602,12 @@ function PipelinePage() {
       );
     });
 
-    if (!target) {
-      toast.error("That pipeline stage could not be found.");
-      return;
-    }
-
     try {
-      await moveDealToStage(dealId, target);
+      if (target) {
+        await moveDealToStage(dealId, target);
+      } else {
+        await updateDeal(dealId, { stage: requestedStage } as Partial<Deal>);
+      }
     } catch (error) {
       console.error("[pipeline] stage update failed:", error);
       toast.error("Failed to update the deal stage.");
@@ -1559,6 +1570,7 @@ function normalizeStage(
     probability:
       stage.probability ?? defaultProbability(slug, index),
     position: stage.position ?? index,
+    outcome: stage.outcome ?? "open",
   };
 }
 
@@ -1575,16 +1587,6 @@ function resolveDealStage(
       stage.name === deal.stage
     );
   });
-}
-
-function stageStatus(
-  slug: string,
-): "open" | "won" | "lost" {
-  const normalized = slug.toLowerCase();
-
-  if (normalized === "won") return "won";
-  if (normalized === "lost") return "lost";
-  return "open";
 }
 
 function normalizeStageColor(

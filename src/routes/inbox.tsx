@@ -28,7 +28,6 @@ import {
   MoreHorizontal,
   StickyNote,
   Smile,
-  Hash,
   Video,
   Tag,
   Clock,
@@ -194,6 +193,7 @@ function InboxPage() {
   const [subject, setSubject] = useState("");
   const [composeChannel, setComposeChannel] = useState<ComposeChannel>("sms");
   const [search, setSearch] = useState("");
+  const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [tplOpen, setTplOpen] = useState(false);
   const [tplSearch, setTplSearch] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -338,7 +338,30 @@ function InboxPage() {
         if (folder === "mentions" && !hasMention(c.id)) return false;
         if (folder === "archived" && !isArchived(c.id)) return false;
         if (folder !== "archived" && isArchived(c.id)) return false;
-        if (search && !c.contactName.toLowerCase().includes(search.toLowerCase()) && !c.preview.toLowerCase().includes(search.toLowerCase())) return false;
+
+        if (selectedTag) {
+          const contactTags =
+            contactTagOverrides[c.contactId] ??
+            storeContactMap.get(c.contactId)?.tags ??
+            [];
+
+          if (
+            !contactTags.some(
+              (tag) => tag.toLowerCase() === selectedTag.toLowerCase(),
+            )
+          ) {
+            return false;
+          }
+        }
+
+        if (
+          search &&
+          !c.contactName.toLowerCase().includes(search.toLowerCase()) &&
+          !c.preview.toLowerCase().includes(search.toLowerCase())
+        ) {
+          return false;
+        }
+
         return true;
       })
       .sort((a, b) => {
@@ -352,7 +375,16 @@ function InboxPage() {
         return new Date(b.lastAt).getTime() - new Date(a.lastAt).getTime();
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [folder, channelFilter, search, starredIds, allConversations]);
+  }, [
+    folder,
+    channelFilter,
+    search,
+    selectedTag,
+    starredIds,
+    allConversations,
+    storeContactMap,
+    contactTagOverrides,
+  ]);
 
   const folderCounts = useMemo(() => {
     const list = allConversations;
@@ -915,7 +947,10 @@ function InboxPage() {
               return (
                 <button
                   key={f.id}
-                  onClick={() => setFolder(f.id)}
+                  onClick={() => {
+                    setFolder(f.id);
+                    setSelectedTag(null);
+                  }}
                   className={`flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
                     isActive ? "bg-gold-soft text-gold-soft-foreground" : "text-foreground hover:bg-secondary"
                   }`}
@@ -939,21 +974,55 @@ function InboxPage() {
           </div>
           <div className="flex flex-col gap-1 px-2.5">
             {managedTags.map((t) => {
-              const count = allStoreContacts.filter((c) =>
-                (c.tags ?? []).some((tag) => tag.toLowerCase() === t.label.toLowerCase())
-              ).length;
+              const isActive =
+                selectedTag?.toLowerCase() === t.label.toLowerCase();
+
+              const count = allConversations.filter((conversation) => {
+                if (isArchived(conversation.id)) return false;
+
+                const tags =
+                  contactTagOverrides[conversation.contactId] ??
+                  storeContactMap.get(conversation.contactId)?.tags ??
+                  [];
+
+                return tags.some(
+                  (tag) => tag.toLowerCase() === t.label.toLowerCase(),
+                );
+              }).length;
+
               return (
                 <button
                   key={t.label}
                   type="button"
-                  onClick={() => setSearch(t.label)}
-                  className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm font-medium text-foreground hover:bg-secondary"
+                  aria-pressed={isActive}
+                  onClick={() => {
+                    setSelectedTag((current) =>
+                      current?.toLowerCase() === t.label.toLowerCase()
+                        ? null
+                        : t.label,
+                    );
+                    setFolder("all");
+                    setSearch("");
+                  }}
+                  className={`flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
+                    isActive
+                      ? "bg-secondary text-foreground"
+                      : "text-foreground hover:bg-secondary"
+                  }`}
                 >
                   <span className="flex items-center gap-2.5">
                     <span className={`h-2 w-2 rounded-full ${t.color}`} />
                     {t.label}
                   </span>
-                  <span className="text-[11px] text-muted-foreground">{count}</span>
+                  <span
+                    className={`text-[11px] tabular-nums ${
+                      isActive
+                        ? "font-semibold text-foreground"
+                        : "text-muted-foreground"
+                    }`}
+                  >
+                    {count}
+                  </span>
                 </button>
               );
             })}
@@ -1014,23 +1083,41 @@ function InboxPage() {
                 conv={c}
                 active={c.id === active?.id}
                 starred={checkStarred(c.id)}
+                contactTags={
+                  allStoreContacts.find((contact) => contact.id === c.contactId)?.tags ?? []
+                }
+                tagDefinitions={managedTags}
                 onClick={() => setActiveId(c.id)}
               />
             ))}
             {conversations.length === 0 && (
               <div className="p-8 text-center">
                 <p className="text-sm font-medium text-foreground">
-                  {channelFilter === "messenger"
-                    ? "No Messenger conversations yet"
-                    : channelFilter === "instagram"
-                      ? "No Instagram conversations yet"
-                      : "No conversations match these filters"}
+                  {selectedTag
+                    ? `No conversations tagged ${selectedTag}`
+                    : channelFilter === "messenger"
+                      ? "No Messenger conversations yet"
+                      : channelFilter === "instagram"
+                        ? "No Instagram conversations yet"
+                        : "No conversations match these filters"}
                 </p>
-                {(channelFilter === "messenger" || channelFilter === "instagram") && (
-                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                    Conversations appear after someone messages your connected{" "}
-                    {channelFilter === "messenger" ? "Facebook Page" : "Instagram account"}.
-                  </p>
+                {selectedTag ? (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedTag(null)}
+                    className="mt-2 text-xs font-medium text-gold-soft-foreground hover:underline"
+                  >
+                    Clear tag filter
+                  </button>
+                ) : (
+                  (channelFilter === "messenger" || channelFilter === "instagram") && (
+                    <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                      Conversations appear after someone messages your connected{" "}
+                      {channelFilter === "messenger"
+                        ? "Facebook Page"
+                        : "Instagram account"}.
+                    </p>
+                  )
                 )}
               </div>
             )}
@@ -1214,86 +1301,38 @@ function InboxPage() {
                     <ComposeTab id="note" current={composeChannel} onSelect={setComposeChannel} icon={StickyNote} label="Note" />
                   </div>
                   <div className="ml-auto flex items-center gap-1">
-                    <Popover open={tplOpen} onOpenChange={setTplOpen}>
-                      <PopoverTrigger asChild>
-                        <Button variant="ghost" size="sm" className="h-7 text-[11px]">
-                          <FileText className="mr-1 h-3 w-3" /> Templates
-                        </Button>
-                      </PopoverTrigger>
-                      <PopoverContent align="end" className="w-80 p-0">
-                        <div className="border-b border-border p-2">
-                          <div className="relative">
-                            <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                            <Input
-                              autoFocus
-                              value={tplSearch}
-                              onChange={(e) => setTplSearch(e.target.value)}
-                              placeholder={`Search ${composeChannel === "email" ? "email" : composeChannel === "sms" ? "SMS" : ""} templates…`}
-                              className="h-8 pl-7 text-xs"
-                            />
-                          </div>
-                          <div className="mt-1.5 flex items-center justify-between text-[10px] text-muted-foreground">
-                            <span>Merging for {contact?.name ?? "—"}</span>
-                            <Link to="/settings/templates" className="hover:text-primary">Manage</Link>
-                          </div>
-                        </div>
-                        <div className="max-h-72 overflow-y-auto p-1">
-                          {visibleTemplates.length === 0 ? (
-                            <div className="p-6 text-center text-[11px] text-muted-foreground">
-                              No templates match
-                            </div>
-                          ) : (
-                            visibleTemplates.map((t) => {
-                              const previewSrc = t.channel === "email" && t.subject ? t.subject : t.body;
-                              return (
-                                <button
-                                  key={t.id}
-                                  onClick={() => applyTemplate(t)}
-                                  className="flex w-full flex-col gap-0.5 rounded-md px-2 py-1.5 text-left hover:bg-secondary"
-                                >
-                                  <div className="flex items-center gap-1.5">
-                                    {t.channel === "email" ? (
-                                      <Mail className="h-3 w-3 text-muted-foreground" />
-                                    ) : (
-                                      <MessageSquare className="h-3 w-3 text-muted-foreground" />
-                                    )}
-                                    <span className="truncate text-[12px] font-medium">{t.name}</span>
-                                    {t.starred && <Star className="h-2.5 w-2.5 fill-amber-400 text-amber-400" />}
-                                    <Badge variant="outline" className="ml-auto h-4 px-1 text-[9px]">{t.category}</Badge>
-                                  </div>
-                                  <div className="line-clamp-1 text-[10px] text-muted-foreground">
-                                    {resolveMergeTags(previewSrc, mergeCtx)}
-                                  </div>
-                                </button>
-                              );
-                            })
-                          )}
-                        </div>
-                      </PopoverContent>
-                    </Popover>
                     <Button
                       variant="ghost"
                       size="sm"
                       className="h-7 text-[11px]"
                       onClick={() => setPickerOpen(true)}
                     >
-                      <Sparkles className="mr-1 h-3 w-3" /> Pick template
+                      <FileText className="mr-1 h-3.5 w-3.5 text-[#B7791F]" />
+                      <span className="font-medium text-[#9A6821]">Pick Template</span>
                     </Button>
                     <Button
-                      variant="ghost" size="sm"
-                      className="h-7 text-[11px] text-primary hover:text-primary"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 text-[11px] hover:bg-violet-50"
                       onClick={handleAiDraft}
                       disabled={aiDrafting}
                     >
-                      {aiDrafting
-                        ? <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                        : <Sparkles className="mr-1 h-3 w-3" />}
-                      AI Draft
+                      {aiDrafting ? (
+                        <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin text-violet-600" />
+                      ) : (
+                        <Sparkles className="mr-1 h-3.5 w-3.5 text-violet-600" />
+                      )}
+                      <span className="font-medium text-violet-700">AI Draft</span>
                     </Button>
                     <span className="mx-1 h-4 w-px bg-border" />
-                    <Button variant="ghost" size="sm" className="h-7 px-2" title="Mention contact or teammate"
-                      onClick={() => setDraft((d) => d ? `${d} @` : "@")}>
-                      <Hash className="h-3.5 w-3.5" />
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 px-2"
+                      title="Mention contact or teammate"
+                      onClick={() => setDraft((d) => (d ? `${d} @` : "@"))}
+                    >
+                      <AtSign className="h-3.5 w-3.5" />
                     </Button>
                     <Popover open={emojiOpen} onOpenChange={setEmojiOpen}>
                       <PopoverTrigger asChild>
@@ -2096,7 +2135,90 @@ function ContextSection({ title, children }: { title: string; children: React.Re
   );
 }
 
-function ConversationRow({ conv, active, starred, onClick }: { conv: Conversation; active: boolean; starred: boolean; onClick: () => void }) {
+function conversationTagBadgeClasses(dotColor: string) {
+  const styles: Record<string, string> = {
+    "bg-amber-400":
+      "border-amber-400 bg-amber-50 text-amber-800 dark:border-amber-500 dark:bg-amber-950/50 dark:text-amber-300",
+    "bg-emerald-400":
+      "border-emerald-400 bg-emerald-50 text-emerald-800 dark:border-emerald-500 dark:bg-emerald-950/50 dark:text-emerald-300",
+    "bg-rose-400":
+      "border-rose-400 bg-rose-50 text-rose-800 dark:border-rose-500 dark:bg-rose-950/50 dark:text-rose-300",
+    "bg-sky-400":
+      "border-sky-400 bg-sky-50 text-sky-800 dark:border-sky-500 dark:bg-sky-950/50 dark:text-sky-300",
+    "bg-violet-400":
+      "border-violet-400 bg-violet-50 text-violet-800 dark:border-violet-500 dark:bg-violet-950/50 dark:text-violet-300",
+    "bg-orange-400":
+      "border-orange-400 bg-orange-50 text-orange-800 dark:border-orange-500 dark:bg-orange-950/50 dark:text-orange-300",
+    "bg-fuchsia-400":
+      "border-fuchsia-400 bg-fuchsia-50 text-fuchsia-800 dark:border-fuchsia-500 dark:bg-fuchsia-950/50 dark:text-fuchsia-300",
+    "bg-cyan-400":
+      "border-cyan-400 bg-cyan-50 text-cyan-800 dark:border-cyan-500 dark:bg-cyan-950/50 dark:text-cyan-300",
+    "bg-lime-400":
+      "border-lime-400 bg-lime-50 text-lime-800 dark:border-lime-500 dark:bg-lime-950/50 dark:text-lime-300",
+    "bg-blue-400":
+      "border-blue-400 bg-blue-50 text-blue-800 dark:border-blue-500 dark:bg-blue-950/50 dark:text-blue-300",
+    "bg-indigo-400":
+      "border-indigo-400 bg-indigo-50 text-indigo-800 dark:border-indigo-500 dark:bg-indigo-950/50 dark:text-indigo-300",
+    "bg-slate-400":
+      "border-slate-400 bg-slate-50 text-slate-800 dark:border-slate-500 dark:bg-slate-900/60 dark:text-slate-300",
+  };
+
+  return styles[dotColor] ?? styles["bg-slate-400"];
+}
+
+function ConversationRow({
+  conv,
+  active,
+  starred,
+  contactTags,
+  tagDefinitions,
+  onClick,
+}: {
+  conv: Conversation;
+  active: boolean;
+  starred: boolean;
+  contactTags: string[];
+  tagDefinitions: { label: string; color: string }[];
+  onClick: () => void;
+}) {
+  const badges = [
+    ...(hasMention(conv.id)
+      ? [{
+          key: "mentioned",
+          label: "Mentioned",
+          className:
+            "border-violet-300 bg-violet-50 text-violet-700 dark:border-violet-800 dark:bg-violet-950 dark:text-violet-300",
+        }]
+      : []),
+    ...(isUnassigned(conv.id)
+      ? [{
+          key: "unassigned",
+          label: "Unassigned",
+          className:
+            "border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300",
+        }]
+      : []),
+    ...(conv.unread
+      ? [{
+          key: "needs-reply",
+          label: "Needs reply",
+          className:
+            "border-rose-300 bg-rose-50 text-rose-700 dark:border-rose-800 dark:bg-rose-950 dark:text-rose-300",
+        }]
+      : []),
+    ...contactTags.slice(0, 3).map((tag) => {
+      const definition = tagDefinitions.find(
+        (item) => item.label.toLowerCase() === tag.toLowerCase(),
+      );
+
+      return {
+        key: `tag-${tag}`,
+        label: tag,
+        className: conversationTagBadgeClasses(definition?.color ?? "bg-slate-400"),
+      };
+    }),
+  ].slice(0, 3);
+
   return (
     <button
       onClick={onClick}
@@ -2110,30 +2232,52 @@ function ConversationRow({ conv, active, starred, onClick }: { conv: Conversatio
           <ChannelGlyph channel={conv.channel} />
         </span>
       </div>
+
       <div className="min-w-0 flex-1">
         <div className="flex items-center justify-between gap-2">
-          <span className={`truncate text-sm ${conv.unread ? "font-semibold text-foreground" : "font-medium text-foreground/90"} ${active ? "text-gold-soft-foreground" : ""}`}>
+          <span
+            className={`truncate text-sm ${
+              conv.unread
+                ? "font-semibold text-foreground"
+                : "font-medium text-foreground/90"
+            } ${active ? "text-gold-soft-foreground" : ""}`}
+          >
             {conv.contactName}
           </span>
-          <span className="shrink-0 text-[11px] text-muted-foreground">{relativeShort(conv.lastAt)}</span>
+          <span className="shrink-0 text-[11px] text-muted-foreground">
+            {relativeShort(conv.lastAt)}
+          </span>
         </div>
-        <div className="mt-1 line-clamp-2 text-[12.5px] leading-snug text-muted-foreground">{conv.preview}</div>
-        <div className="mt-1.5 flex items-center gap-1.5">
-          {starred && <Star className="h-3 w-3 fill-amber-400 text-amber-400" />}
-          {hasMention(conv.id) && (
-            <Badge variant="outline" className="h-4.5 border-violet-300 bg-violet-50 px-1.5 text-[9px] text-violet-700 dark:border-violet-800 dark:bg-violet-950 dark:text-violet-300">
-              @mention
-            </Badge>
-          )}
-          {isUnassigned(conv.id) && (
-            <Badge variant="outline" className="h-4.5 border-amber-300 bg-amber-50 px-1.5 text-[9px] text-amber-700 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300">
-              unassigned
-            </Badge>
-          )}
+
+        <div className="mt-1 line-clamp-2 text-[12.5px] leading-snug text-muted-foreground">
+          {conv.preview}
         </div>
+
+        {(starred || badges.length > 0) && (
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            {starred && (
+              <Star className="h-3 w-3 shrink-0 fill-amber-400 text-amber-400" />
+            )}
+
+            {badges.map((badge) => (
+              <Badge
+                key={badge.key}
+                variant="outline"
+                className={`h-4.5 px-1.5 text-[9px] ${badge.className}`}
+              >
+                {badge.label}
+              </Badge>
+            ))}
+          </div>
+        )}
       </div>
-      {active && !conv.unread && <span className="mt-2 h-2 w-2 shrink-0 rounded-full bg-gold" />}
-      {conv.unread && <span className="mt-2 h-2 w-2 shrink-0 rounded-full bg-info" />}
+
+      {active && !conv.unread && (
+        <span className="mt-2 h-2 w-2 shrink-0 rounded-full bg-gold" />
+      )}
+      {conv.unread && (
+        <span className="mt-2 h-2 w-2 shrink-0 rounded-full bg-info" />
+      )}
     </button>
   );
 }

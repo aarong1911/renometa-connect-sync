@@ -1,6 +1,7 @@
 // src/components/sales/deal-detail-drawer.tsx
 
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "@tanstack/react-router";
 import { formatDistanceToNow } from "date-fns";
 import {
   AlertCircle,
@@ -9,6 +10,7 @@ import {
   Calendar,
   CheckCircle2,
   Clock3,
+  ExternalLink,
   FileText,
   Mail,
   MapPin,
@@ -26,6 +28,7 @@ import {
 import { toast } from "sonner";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
+import { StatusBadge, type BadgeTone } from "@/components/ui/status-badge";
 import { Button } from "@/components/ui/button";
 import { ContactAvatar } from "@/components/ui/contact-avatar";
 import {
@@ -77,6 +80,29 @@ const LOST_REASONS: LostReason[] = [
   "Competitor",
   "No response",
 ];
+
+// Mirrors estimates.tsx's own STATUS_TONE mapping so the drawer's badge
+// reads the same way the Estimates page does — not a shared export since
+// that page keeps it local too.
+const ESTIMATE_STATUS_TONE: Record<string, BadgeTone> = {
+  draft: "muted",
+  sent: "info",
+  viewed: "violet",
+  accepted: "success",
+  declined: "danger",
+};
+
+type LinkedEstimate = {
+  id: string;
+  number: string | null;
+  title: string;
+  status: string;
+  total: number;
+  client_total: number | null;
+  created_at: string;
+  valid_until: string | null;
+  client_name: string | null;
+};
 
 const SOURCE_OPTIONS = [
   "Website",
@@ -529,6 +555,10 @@ export function DealDetailDrawer({
   const [contactOptions, setContactOptions] = useState<ContactOption[]>([]);
   const [loadingContactOptions, setLoadingContactOptions] = useState(false);
 
+  const [estimates, setEstimates] = useState<LinkedEstimate[]>([]);
+  const [loadingEstimates, setLoadingEstimates] = useState(false);
+  const [estimatesError, setEstimatesError] = useState<string | null>(null);
+
   const [editOpen, setEditOpen] = useState(false);
   const [lostOpen, setLostOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -562,6 +592,8 @@ export function DealDetailDrawer({
     if (!deal) {
       setActivities([]);
       setContacts([]);
+      setEstimates([]);
+      setEstimatesError(null);
       return;
     }
 
@@ -569,7 +601,31 @@ export function DealDetailDrawer({
     void loadContacts(deal.id);
     void loadAccounts();
     void loadContactOptions();
+    void loadEstimates(deal.id, deal.orgId);
   }, [deal?.id]);
+
+  async function loadEstimates(dealId: string, orgId: string) {
+    setLoadingEstimates(true);
+    setEstimatesError(null);
+
+    try {
+      const { data, error } = await supabase
+        .from("estimates")
+        .select("id, number, title, status, total, client_total, created_at, valid_until, client_name")
+        .eq("deal_id", dealId)
+        .eq("org_id", orgId)
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+
+      setEstimates((data ?? []) as LinkedEstimate[]);
+    } catch (error) {
+      console.error("[deal-drawer] estimates load failed:", error);
+      setEstimatesError("Failed to load estimates for this deal.");
+    } finally {
+      setLoadingEstimates(false);
+    }
+  }
 
   async function loadContactOptions() {
     setLoadingContactOptions(true);
@@ -1750,11 +1806,75 @@ export function DealDetailDrawer({
             </TabsContent>
 
             <TabsContent value="estimate" className="mt-5">
-              <EmptyTab
-                icon={FileText}
-                title="No estimate linked"
-                description="Estimate linking will be connected during the Estimates phase."
-              />
+              {loadingEstimates ? (
+                <p className="py-10 text-center text-sm text-muted-foreground">
+                  Loading estimates...
+                </p>
+              ) : estimatesError ? (
+                <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+                  {estimatesError}
+                </div>
+              ) : estimates.length ? (
+                <div className="space-y-3">
+                  {estimates.map((estimate) => (
+                    <div key={estimate.id} className="rounded-lg border bg-card p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-semibold">
+                            {estimate.number ?? estimate.title}
+                          </p>
+                          {estimate.number && (
+                            <p className="truncate text-xs text-muted-foreground">{estimate.title}</p>
+                          )}
+                        </div>
+                        <StatusBadge tone={ESTIMATE_STATUS_TONE[estimate.status] ?? "muted"}>
+                          {estimate.status}
+                        </StatusBadge>
+                      </div>
+
+                      <div className="mt-3 grid grid-cols-2 gap-3 text-sm sm:grid-cols-3">
+                        <div>
+                          <p className="text-[10px] uppercase tracking-wide text-muted-foreground">Total</p>
+                          <p className="font-medium">
+                            {formatMoney(estimate.client_total ?? estimate.total)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-[10px] uppercase tracking-wide text-muted-foreground">Created</p>
+                          <p className="font-medium">{formatDateShort(estimate.created_at)}</p>
+                        </div>
+                        <div>
+                          <p className="text-[10px] uppercase tracking-wide text-muted-foreground">Expires</p>
+                          <p className="font-medium">
+                            {estimate.valid_until ? formatDateShort(estimate.valid_until) : "—"}
+                          </p>
+                        </div>
+                        {estimate.client_name && (
+                          <div className="col-span-2 sm:col-span-3">
+                            <p className="text-[10px] uppercase tracking-wide text-muted-foreground">Contact</p>
+                            <p className="font-medium">{estimate.client_name}</p>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="mt-3">
+                        <Button variant="outline" size="sm" asChild>
+                          <Link to="/estimates">
+                            <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
+                            Open in Estimates
+                          </Link>
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <EmptyTab
+                  icon={FileText}
+                  title="No estimate linked"
+                  description="Estimates created for this deal's contact will appear here once linked."
+                />
+              )}
             </TabsContent>
 
             <TabsContent value="tasks" className="mt-5">

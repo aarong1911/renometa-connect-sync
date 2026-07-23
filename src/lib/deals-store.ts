@@ -16,6 +16,7 @@ import type {
   LostReason,
   SalesPipeline,
   SalesPipelineStage,
+  StageOutcome,
   UpdateDealInput,
 } from "@/lib/sales/types";
 
@@ -125,6 +126,7 @@ const FALLBACK_STAGES: SalesPipelineStage[] = [
   position: Number(position),
   probability: Number(probability),
   color: String(color),
+  outcome: (String(slug) === "won" ? "won" : String(slug) === "lost" ? "lost" : "open") as StageOutcome,
   createdAt: "",
   updatedAt: "",
 }));
@@ -231,8 +233,43 @@ export function mapStage(row: any): SalesPipelineStage {
     position: Number(row.position ?? 0),
     probability: Number(row.probability ?? 50),
     color: row.color ?? "#3b82f6",
+    outcome: (row.outcome as StageOutcome) ?? "open",
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function clampProbability(value: number): number {
+  return Math.min(100, Math.max(0, Math.round(value)));
+}
+
+// ── Single source of truth for deriving a Deal's status (and
+// actual_close_date) from a pipeline stage's outcome. Every write path that
+// moves a Deal into a stage or explicitly sets its status (addDeal,
+// updateDeal — and, through those, the Pipeline board's drag-and-drop, the
+// Deal drawer's Edit/Mark Won/Mark Lost actions, Leads' and Inbox's Create
+// Deal flows) goes through this — nothing computes status independently.
+// The convert_lead_to_deal RPC has its own equivalent derivation
+// (v_stage.outcome -> deals.status) since it runs server-side in Postgres,
+// not through this module — but follows the identical rule.
+//
+// `actualCloseDate: undefined` in the return means "leave the column
+// untouched" (the caller should omit it from the update payload entirely);
+// `null` or a date string means "set it explicitly".
+export function resolveDealStatusForOutcome(
+  outcome: StageOutcome,
+  current: { status: DealStatus; actualCloseDate: string | null },
+): { status: DealStatus; actualCloseDate: string | null | undefined } {
+  if (outcome === "open") {
+    // Only clear actual_close_date when actually leaving won/lost — if the
+    // deal was already open, leave the column untouched.
+    return { status: "open", actualCloseDate: current.status === "open" ? undefined : null };
+  }
+  // Entering won/lost: populate actual_close_date only if it isn't already
+  // set — never overwrite an existing one.
+  return {
+    status: outcome,
+    actualCloseDate: current.actualCloseDate ? undefined : new Date().toISOString().slice(0, 10),
   };
 }
 
@@ -603,6 +640,14 @@ export async function addDeal(input: AddDealInput): Promise<Deal> {
   const contactId = await findOrCreateContact(orgId, input);
   const expectedClose =
     input.expectedClose ?? new Date(Date.now() + 30 * 86_400_000).toISOString().slice(0, 10);
+  // A brand-new Deal always starts "open" per the resolution rule (there is
+  // no prior status/actual_close_date to preserve) — unless it's created
+  // directly into a stage already classified won/lost, in which case the
+  // stage's outcome is the source of truth from the very first insert.
+  const statusResolution = resolveDealStatusForOutcome(stage.outcome, {
+    status: "open",
+    actualCloseDate: null,
+  });
   const { data, error } = await supabase
     .from("deals")
     .insert({
@@ -618,7 +663,8 @@ export async function addDeal(input: AddDealInput): Promise<Deal> {
       probability: Math.min(100, Math.max(0, Number(input.probability ?? stage.probability ?? 50))),
       expected_close_date: expectedClose || null,
       assigned_to: input.ownerId ?? null,
-      status: "open",
+      status: statusResolution.status,
+      actual_close_date: statusResolution.actualCloseDate ?? null,
       notes: input.notes?.trim() || null,
       custom_fields: input.customFields ?? {},
       source: input.source ?? null,
@@ -666,24 +712,39 @@ export async function updateDeal(
   const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
   let nextStatus = current.status;
   let resolvedStage: SalesPipelineStage | null = null;
-  if ("stageId" in patch && patch.stageId) resolvedStage = resolveStageById(patch.stageId);
-  else if ("stage" in patch && patch.stage) {
-    if (patch.stage === "won") nextStatus = "won";
-    else if (patch.stage === "lost") nextStatus = "lost";
-    else {
-      resolvedStage = resolveStageBySlug(patch.stage);
-      nextStatus = "open";
+  let explicitOutcome: StageOutcome | null = null;
+
+  if ("stageId" in patch && patch.stageId) {
+    resolvedStage = resolveStageById(patch.stageId);
+  } else if ("stage" in patch && patch.stage) {
+    resolvedStage = resolveStageBySlug(patch.stage);
+    if (!resolvedStage && (patch.stage === "won" || patch.stage === "lost")) {
+      // No real stage matches "won"/"lost" — these strings are used as
+      // virtual pseudo-stages elsewhere in the app (winning/losing a Deal
+      // doesn't require moving it to an actual stage row). Treat as an
+      // explicit outcome rather than a stage resolution failure.
+      explicitOutcome = patch.stage;
     }
   }
-  if ("status" in patch && patch.status) nextStatus = patch.status;
+  if ("status" in patch && patch.status) explicitOutcome = patch.status;
+
   if (resolvedStage) {
     update.stage_id = resolvedStage.id;
     if (!("probability" in patch)) update.probability = resolvedStage.probability;
   }
-  if (nextStatus !== current.status || "status" in patch || "stage" in patch) {
-    update.status = nextStatus;
-    update.actual_close_date =
-      nextStatus === "won" || nextStatus === "lost" ? new Date().toISOString().slice(0, 10) : null;
+
+  // pipeline_stages.outcome is the single source of truth for status
+  // whenever a real stage is resolved — it wins over any redundant explicit
+  // status/stage string the caller also passed alongside it.
+  const outcome: StageOutcome | null = resolvedStage ? resolvedStage.outcome : explicitOutcome;
+  if (outcome) {
+    const resolution = resolveDealStatusForOutcome(outcome, {
+      status: current.status,
+      actualCloseDate: current.actualCloseDate,
+    });
+    nextStatus = resolution.status;
+    update.status = resolution.status;
+    if (resolution.actualCloseDate !== undefined) update.actual_close_date = resolution.actualCloseDate;
   }
   if ("name" in patch && patch.name !== undefined) update.title = patch.name;
   if ("description" in patch && patch.description !== undefined)
@@ -951,6 +1012,258 @@ export async function linkDealContact(args: {
       role: args.role ?? null,
     },
   });
+  await fetchSalesData();
+}
+
+// ── Pipeline Settings: real Supabase-backed CRUD ──────────────────────────
+// Additive only — every existing export above is untouched. All mutations
+// follow the same convention already used by addDeal/updateDeal: write to
+// Supabase, then await fetchSalesData() to refresh deals/pipelines/stages
+// together so the board, New Deal dialog, and Deal drawer all pick up the
+// change immediately without a page reload.
+
+export async function createPipeline(input: {
+  name: string;
+  description?: string | null;
+  isDefault?: boolean;
+}): Promise<SalesPipeline> {
+  const orgId = await getOrgId();
+  if (!orgId) throw new Error("Not authenticated");
+  if (!input.name?.trim()) throw new Error("Pipeline name is required");
+
+  if (input.isDefault) {
+    const { error: unsetError } = await supabase
+      .from("pipelines")
+      .update({ is_default: false })
+      .eq("org_id", orgId)
+      .eq("is_default", true);
+    if (unsetError) throw unsetError;
+  }
+
+  const { data, error } = await supabase
+    .from("pipelines")
+    .insert({
+      org_id: orgId,
+      name: input.name.trim(),
+      description: input.description?.trim() || null,
+      is_default: Boolean(input.isDefault),
+      is_active: true,
+    })
+    .select("*")
+    .single();
+  if (error) throw error;
+
+  await fetchSalesData();
+  const created = pipelines.find((p) => p.id === data.id);
+  if (!created) throw new Error("Pipeline created but could not be reloaded");
+  return created;
+}
+
+export async function updatePipeline(
+  id: string,
+  patch: { name?: string; description?: string | null },
+): Promise<void> {
+  const orgId = await getOrgId();
+  if (!orgId) throw new Error("Not authenticated");
+  const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  if (patch.name !== undefined) {
+    if (!patch.name.trim()) throw new Error("Pipeline name is required");
+    update.name = patch.name.trim();
+  }
+  if (patch.description !== undefined) update.description = patch.description?.trim() || null;
+  const { error } = await supabase.from("pipelines").update(update).eq("id", id).eq("org_id", orgId);
+  if (error) throw error;
+  await fetchSalesData();
+}
+
+export async function renamePipeline(id: string, name: string): Promise<void> {
+  await updatePipeline(id, { name });
+}
+
+export async function setDefaultPipeline(id: string): Promise<void> {
+  const orgId = await getOrgId();
+  if (!orgId) throw new Error("Not authenticated");
+  const { error: unsetError } = await supabase
+    .from("pipelines")
+    .update({ is_default: false })
+    .eq("org_id", orgId)
+    .eq("is_default", true)
+    .neq("id", id);
+  if (unsetError) throw unsetError;
+  const { error } = await supabase
+    .from("pipelines")
+    .update({ is_default: true, updated_at: new Date().toISOString() })
+    .eq("id", id)
+    .eq("org_id", orgId);
+  if (error) throw error;
+  await fetchSalesData();
+}
+
+export async function setPipelineActive(id: string, isActive: boolean): Promise<void> {
+  const orgId = await getOrgId();
+  if (!orgId) throw new Error("Not authenticated");
+  if (!isActive) {
+    const activeCount = pipelines.filter((p) => p.isActive).length;
+    const target = pipelines.find((p) => p.id === id);
+    if (target?.isActive && activeCount <= 1) {
+      throw new Error("Cannot archive the only active pipeline. Activate another pipeline first.");
+    }
+  }
+  const { error } = await supabase
+    .from("pipelines")
+    .update({ is_active: isActive, updated_at: new Date().toISOString() })
+    .eq("id", id)
+    .eq("org_id", orgId);
+  if (error) throw error;
+  await fetchSalesData();
+}
+
+export async function deletePipeline(id: string): Promise<void> {
+  const orgId = await getOrgId();
+  if (!orgId) throw new Error("Not authenticated");
+
+  const { count, error: countError } = await supabase
+    .from("deals")
+    .select("id", { count: "exact", head: true })
+    .eq("pipeline_id", id)
+    .eq("org_id", orgId);
+  if (countError) throw countError;
+  if (count && count > 0) {
+    throw new Error(`Cannot delete this pipeline — ${count} deal${count === 1 ? "" : "s"} still reference it.`);
+  }
+
+  const target = pipelines.find((p) => p.id === id);
+  if (target?.isActive && pipelines.filter((p) => p.isActive).length <= 1) {
+    throw new Error("Cannot delete the only active pipeline.");
+  }
+
+  const { error: stagesError } = await supabase.from("pipeline_stages").delete().eq("pipeline_id", id);
+  if (stagesError) throw stagesError;
+  const { error } = await supabase.from("pipelines").delete().eq("id", id).eq("org_id", orgId);
+  if (error) throw error;
+  await fetchSalesData();
+}
+
+export async function createPipelineStage(
+  pipelineId: string,
+  input: { name: string; color?: string; probability?: number; outcome?: StageOutcome },
+): Promise<SalesPipelineStage> {
+  if (!input.name?.trim()) throw new Error("Stage name is required");
+  const pipeline = pipelines.find((p) => p.id === pipelineId);
+  if (!pipeline) throw new Error("Pipeline not found");
+
+  const stagesInPipeline = stages.filter((s) => s.pipelineId === pipelineId);
+  const maxPosition = stagesInPipeline.length
+    ? Math.max(...stagesInPipeline.map((s) => s.position))
+    : -1;
+
+  const { data, error } = await supabase
+    .from("pipeline_stages")
+    .insert({
+      pipeline_id: pipelineId,
+      name: input.name.trim(),
+      color: input.color ?? "#3b82f6",
+      probability: clampProbability(input.probability ?? 50),
+      position: maxPosition + 1,
+      outcome: input.outcome ?? "open",
+    })
+    .select("*")
+    .single();
+  if (error) throw error;
+
+  await fetchSalesData();
+  const created = stages.find((s) => s.id === data.id);
+  if (!created) throw new Error("Stage created but could not be reloaded");
+  return created;
+}
+
+export async function updatePipelineStage(
+  stageId: string,
+  patch: { name?: string; color?: string; probability?: number; outcome?: StageOutcome },
+): Promise<void> {
+  const stage = stages.find((s) => s.id === stageId);
+  if (!stage) throw new Error("Stage not found");
+
+  const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  if (patch.name !== undefined) {
+    if (!patch.name.trim()) throw new Error("Stage name is required");
+    update.name = patch.name.trim();
+  }
+  if (patch.color !== undefined) update.color = patch.color;
+  if (patch.probability !== undefined) update.probability = clampProbability(patch.probability);
+  if (patch.outcome !== undefined) {
+    if (patch.outcome !== "open") {
+      const openStagesRemaining = stages.filter(
+        (s) => s.pipelineId === stage.pipelineId && s.id !== stageId && s.outcome === "open",
+      ).length;
+      if (openStagesRemaining === 0) {
+        throw new Error("At least one open stage must remain in this pipeline.");
+      }
+    }
+    update.outcome = patch.outcome;
+  }
+
+  const { error } = await supabase.from("pipeline_stages").update(update).eq("id", stageId);
+  if (error) throw error;
+  await fetchSalesData();
+}
+
+export async function renamePipelineStage(stageId: string, name: string): Promise<void> {
+  await updatePipelineStage(stageId, { name });
+}
+export async function updatePipelineStageColor(stageId: string, color: string): Promise<void> {
+  await updatePipelineStage(stageId, { color });
+}
+export async function updatePipelineStageProbability(stageId: string, probability: number): Promise<void> {
+  await updatePipelineStage(stageId, { probability });
+}
+export async function updatePipelineStageOutcome(stageId: string, outcome: StageOutcome): Promise<void> {
+  await updatePipelineStage(stageId, { outcome });
+}
+
+export async function reorderPipelineStages(pipelineId: string, orderedStageIds: string[]): Promise<void> {
+  // Two-pass update: push everything to negative placeholder positions
+  // first, then assign final sequential positions. Avoids a transient
+  // collision if a (pipeline_id, position) uniqueness constraint exists.
+  const tempResults = await Promise.all(
+    orderedStageIds.map((id, i) =>
+      supabase.from("pipeline_stages").update({ position: -(i + 1) }).eq("id", id).eq("pipeline_id", pipelineId),
+    ),
+  );
+  const tempError = tempResults.find((r) => r.error)?.error;
+  if (tempError) throw tempError;
+
+  const finalResults = await Promise.all(
+    orderedStageIds.map((id, i) =>
+      supabase.from("pipeline_stages").update({ position: i }).eq("id", id).eq("pipeline_id", pipelineId),
+    ),
+  );
+  const finalError = finalResults.find((r) => r.error)?.error;
+  if (finalError) throw finalError;
+
+  await fetchSalesData();
+}
+
+export async function deletePipelineStage(stageId: string): Promise<void> {
+  const stage = stages.find((s) => s.id === stageId);
+  if (!stage) throw new Error("Stage not found");
+
+  const { count, error: countError } = await supabase
+    .from("deals")
+    .select("id", { count: "exact", head: true })
+    .eq("stage_id", stageId);
+  if (countError) throw countError;
+  if (count && count > 0) {
+    throw new Error(`Cannot delete this stage — ${count} deal${count === 1 ? "" : "s"} still reference it.`);
+  }
+
+  const stagesInPipeline = stages.filter((s) => s.pipelineId === stage.pipelineId);
+  if (stagesInPipeline.length <= 1) {
+    throw new Error("A pipeline must have at least one stage.");
+  }
+
+  const { error } = await supabase.from("pipeline_stages").delete().eq("id", stageId);
+  if (error) throw error;
   await fetchSalesData();
 }
 

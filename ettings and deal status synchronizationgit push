@@ -1,0 +1,13 @@
+warning: in the working copy of 'netlify/functions/portal-action.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/components/sales/deal-detail-drawer.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/routes/inbox.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/routes/settings.pipelines.tsx', LF will be replaced by CRLF the next time Git touches it
+ netlify/functions/portal-action.ts          |   2 [32m+[m[31m-[m
+ src/components/sales/deal-detail-drawer.tsx | 130 [32m++++[m[31m-[m
+ src/lib/deals-store.ts                      | 339 [32m++++++++++++[m[31m-[m
+ src/lib/pipelines.ts                        | 200 [31m--------[m
+ src/lib/sales/types.ts                      |   3 [32m+[m
+ src/routes/inbox.tsx                        | 354 [32m+++++++++[m[31m-----[m
+ src/routes/sales.pipeline.tsx               |  40 [32m+[m[31m-[m
+ src/routes/settings.pipelines.tsx           | 706 [32m+++++++++++++++++++[m[31m---------[m
+ 8 files changed, 1220 insertions(+), 554 deletions(-)

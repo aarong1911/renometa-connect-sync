@@ -39,6 +39,8 @@ export type SalesPipeline = {
   updatedAt: string;
 };
 
+export type StageOutcome = "open" | "won" | "lost";
+
 export type SalesPipelineStage = {
   id: string;
   pipelineId: string;
@@ -47,6 +49,7 @@ export type SalesPipelineStage = {
   position: number;
   probability: number;
   color: string;
+  outcome: StageOutcome;
   createdAt: string;
   updatedAt: string;
 };
