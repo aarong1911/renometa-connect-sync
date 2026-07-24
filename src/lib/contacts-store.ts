@@ -102,7 +102,7 @@ export function upsertContactFromRow(row: any): Contact {
   return mapped;
 }
 
-export async function addContact(contact: Omit<Contact, "id">): Promise<Contact | null> {
+export async function addContact(contact: Omit<Contact, "id">, opts?: { source?: string }): Promise<Contact | null> {
   const orgId = await getOrgId();
   if (!orgId) return null;
 
@@ -115,7 +115,7 @@ export async function addContact(contact: Omit<Contact, "id">): Promise<Contact 
       phone: contact.phone || null,
       company: contact.company || null,
       address: contact.address || null,
-      source: "manual",
+      source: opts?.source ?? "manual",
       labels: contact.tags ?? [],
       owner: contact.owner && contact.owner !== "—" ? contact.owner : null,
     })

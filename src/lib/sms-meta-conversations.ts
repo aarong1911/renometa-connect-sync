@@ -38,11 +38,32 @@ async function getOrgId(): Promise<string | null> {
   return membership?.org_id ?? null;
 }
 
+// Reusable, org-scoped "mark read" — the single place this logic lives.
+// Marks every INBOUND message in this (contact, channel) conversation as
+// read; outbound messages are never touched (they can't be unread) and
+// this never throws silently — callers decide how to surface failure.
+export async function markConversationRead(
+  orgId: string,
+  contactId: string,
+  channel: SmsMetaChannel,
+): Promise<void> {
+  const { error } = await supabase
+    .from("sms_meta_messages")
+    .update({ is_read: true })
+    .eq("org_id", orgId)
+    .eq("contact_id", contactId)
+    .eq("channel", channel)
+    .eq("direction", "in");
+  if (error) throw error;
+}
+
 export function useSmsMetaConversations(): {
   conversations: Conversation[];
   messages: Message[];
   loading: boolean;
   refresh: () => void;
+  /** Optimistically marks a conversation read locally, then persists via markConversationRead; rolls back on failure. */
+  markRead: (contactId: string, channel: SmsMetaChannel) => Promise<void>;
 } {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -64,7 +85,7 @@ export function useSmsMetaConversations(): {
 
     const { data, error } = await supabase
       .from("sms_meta_messages")
-      .select("id, contact_id, channel, direction, body, from_address, created_at, meta")
+      .select("id, contact_id, channel, direction, body, from_address, created_at, meta, is_read, provider_message_id")
       .eq("org_id", orgId)
       .order("created_at", { ascending: true })
       .limit(2000);
@@ -126,13 +147,21 @@ export function useSmsMetaConversations(): {
       const contactEntry = contactMap[group.contactId];
       const contactName = contactEntry?.name || `${channelLabels[group.channel]} Contact`;
 
+      // Real unread signal: any inbound message not explicitly marked read.
+      // is_read is never overwritten to false anywhere, so treating a
+      // missing/null value the same as false is a safe default for rows
+      // that predate this column being read by the client.
+      const hasUnreadInbound = group.rows.some(
+        (row) => row.direction === "in" && row.is_read !== true,
+      );
+
       convs.push({
         id: convId,
         contactId: group.contactId,
         contactName,
         channel: group.channel,
         preview: lastRow?.body?.slice(0, 80) ?? "",
-        unread: lastRow?.direction === "in",
+        unread: hasUnreadInbound,
         lastAt: lastRow?.created_at ?? new Date().toISOString(),
         callerPhone: contactEntry?.phone || undefined,
       });
@@ -181,5 +210,30 @@ export function useSmsMetaConversations(): {
     };
   }, [fetchData, instanceId]);
 
-  return { conversations, messages, loading, refresh: fetchData };
+  const markRead = useCallback(
+    async (contactId: string, channel: SmsMetaChannel) => {
+      const orgId = await getOrgId();
+      if (!orgId) return;
+
+      // Optimistic: flip this conversation's unread flag locally right away.
+      const convId = `sm-${contactId}::${channel}`;
+      const previousConversations = conversations;
+      const previousMessages = messages;
+      setConversations((current) =>
+        current.map((c) => (c.id === convId ? { ...c, unread: false } : c)),
+      );
+
+      try {
+        await markConversationRead(orgId, contactId, channel);
+      } catch (error) {
+        console.error("[sms-meta-conversations] markRead failed:", error);
+        setConversations(previousConversations);
+        setMessages(previousMessages);
+        throw error;
+      }
+    },
+    [conversations, messages],
+  );
+
+  return { conversations, messages, loading, refresh: fetchData, markRead };
 }

@@ -91,6 +91,9 @@ export const handler: Handler = async (event) => {
 
   let sentAsTemplate = false;
   let templateNameUsed: string | undefined;
+  // Populated from each provider's own send response below — never
+  // fabricated, left null if a provider response doesn't include one.
+  let providerMessageId: string | null = null;
 
   try {
     if (channel === "sms") {
@@ -133,6 +136,8 @@ export const handler: Handler = async (event) => {
         const err: any = await res.json().catch(() => ({}));
         throw new Error(err.message ?? `Twilio error ${res.status}: ${err.code ?? ""}`);
       }
+      const twilioResult: any = await res.json().catch(() => ({}));
+      providerMessageId = twilioResult?.sid ?? null;
     } else if (channel === "email") {
       // Fetch org's Gmail credentials from integration_settings
       const { data: orgForEmail } = await supabaseAdmin
@@ -322,6 +327,8 @@ export const handler: Handler = async (event) => {
           const err: any = await res.json().catch(() => ({}));
           throw new Error(err?.error?.message ?? `WhatsApp send failed (${res.status})`);
         }
+        const waResult: any = await res.json().catch(() => ({}));
+        providerMessageId = waResult?.messages?.[0]?.id ?? null;
         if (!sessionOpen) {
           sentAsTemplate = true;
           templateNameUsed = templateNameForThisSend;
@@ -352,6 +359,8 @@ export const handler: Handler = async (event) => {
           const err: any = await res.json().catch(() => ({}));
           throw new Error(err?.error?.message ?? `${channel} send failed (${res.status})`);
         }
+        const pageResult: any = await res.json().catch(() => ({}));
+        providerMessageId = pageResult?.message_id ?? null;
       }
     }
     // "note" channel: server-side no-op
@@ -365,6 +374,8 @@ export const handler: Handler = async (event) => {
     // without seeing it risks creating a second, conflicting source of
     // truth for email history. "note" is a client-side-only concept with
     // no external send and no persistence table.
+    let persisted = true;
+    let persistWarning: string | null = null;
     if (channel === "sms" || channel === "whatsapp" || channel === "messenger" || channel === "instagram") {
       const { error: insertErr } = await supabaseAdmin.from("sms_meta_messages").insert({
         org_id: orgId,
@@ -377,13 +388,18 @@ export const handler: Handler = async (event) => {
         // doesn't show a message that was never really delivered as written.
         body: sentAsTemplate ? `[Template: ${templateNameUsed}] (sent because no message was received from this contact in the last 24h)` : body,
         from_address: to,
+        provider_message_id: providerMessageId,
         meta: sentAsTemplate ? { sent_as_template: templateNameUsed } : null,
       });
       if (insertErr) {
         // Don't fail the request over this — the external send already
         // succeeded, losing the local history row is a lesser problem than
-        // reporting a false failure to the user.
+        // reporting a false failure to the user. Still surface it, though:
+        // the client should know the message won't show up in history/won't
+        // sync a delivery id, not have that fail silently.
         console.error("[send-inbox-message] sms_meta_messages insert failed:", insertErr.message);
+        persisted = false;
+        persistWarning = "Message was sent, but saving it to conversation history failed. It may not appear in the Inbox.";
       }
     }
 
@@ -394,6 +410,8 @@ export const handler: Handler = async (event) => {
         ok: true,
         sentAsTemplate,
         ...(sentAsTemplate ? { templateName: templateNameUsed } : {}),
+        persisted,
+        ...(persistWarning ? { warning: persistWarning } : {}),
       }),
     };
   } catch (err: any) {

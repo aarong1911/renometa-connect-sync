@@ -45,6 +45,7 @@ import {
   Plus,
   Loader2,
   Trash2,
+  RefreshCw,
 } from "lucide-react";
 import {
   DropdownMenu,
@@ -55,7 +56,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   mockContacts,
-  mockProjects,
   type Conversation,
   type Message,
 } from "@/lib/mock-data";
@@ -96,6 +96,13 @@ import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
 import { useVoiceConversations } from "@/lib/voice-conversations";
 import { useSmsMetaConversations } from "@/lib/sms-meta-conversations";
+import { analyzeSmsLength } from "@/lib/sms-segments";
+import { conversationMapKey, resolveConversationIdentity, useConversationArchiveStates } from "@/lib/conversation-states";
+import { normalizeEmail, useGmailConversations } from "@/lib/gmail-conversations";
+import { UnmatchedGmailSenderBanner } from "@/components/inbox/unmatched-gmail-sender-banner";
+import { GmailSenderAvatar } from "@/components/inbox/gmail-sender-avatar";
+import { unlinkGmailContactFromThread } from "@/lib/gmail-contact-actions";
+import { triggerGmailSync, fetchGmailConnectionStatus } from "@/lib/gmail-sync-client";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -129,6 +136,14 @@ type LocalMessage = Omit<Message, "channel"> & {
   channel: "email" | "sms" | "voice" | "note" | "whatsapp" | "messenger" | "instagram";
   isScheduled?: boolean;
   scheduledFor?: string;
+  // Email-only optimistic-echo reconciliation metadata (see the "GMAIL
+  // RECONCILIATION" block below) — subject/toEmail are captured at send
+  // time so a later real gmail_messages row can be matched against them;
+  // pendingGmailSync marks this as a successful send still awaiting sync,
+  // as opposed to a failed-send echo (which is never reconciled/hidden).
+  subject?: string;
+  toEmail?: string;
+  pendingGmailSync?: boolean;
 };
 
 const folders: { id: FolderId; label: string; icon: typeof InboxIcon }[] = [
@@ -268,7 +283,50 @@ function InboxPage() {
   // fallback, these channels only ever show real data. This is the only
   // source of actual message content for these 4 channels; Email has its
   // own separate real tables (not handled here).
-  const { conversations: realConvs, messages: realMsgs, refresh: refreshRealConvs } = useSmsMetaConversations();
+  const { conversations: realConvs, messages: realMsgs, refresh: refreshRealConvs, markRead } = useSmsMetaConversations();
+  // Real Gmail history — no mock fallback, same principle as realConvs above.
+  const { conversations: gmailConvs, messages: gmailMsgs, refresh: refreshGmailConvs } = useGmailConversations();
+  // Manual "Sync Gmail" action in the channel toolbar (Email tab only) —
+  // reuses the same gmail-sync.ts call Settings → Integrations already
+  // makes, via the shared src/lib/gmail-sync-client.ts helper.
+  const [gmailSyncing, setGmailSyncing] = useState(false);
+  const [gmailLastSyncAt, setGmailLastSyncAt] = useState<string | null>(null);
+  useEffect(() => {
+    if (channelFilter !== "email") return;
+    fetchGmailConnectionStatus().then((status) => {
+      if (status) setGmailLastSyncAt(status.lastSyncAt);
+    });
+  }, [channelFilter]);
+
+  const handleSyncGmailInInbox = async () => {
+    setGmailSyncing(true);
+    try {
+      const result = await triggerGmailSync();
+      if (!result.ok) {
+        toast.error(result.error, {
+          action: {
+            label: "Open Settings",
+            onClick: () => navigate({ to: "/settings/integrations" }),
+          },
+        });
+        return;
+      }
+      toast.success(`Gmail synced: ${result.inserted} new, ${result.updated} updated`);
+      refreshGmailConvs();
+      fetchGmailConnectionStatus().then((status) => {
+        if (status) setGmailLastSyncAt(status.lastSyncAt);
+      });
+    } finally {
+      setGmailSyncing(false);
+    }
+  };
+  // Real, persisted Archive state — replaces the old hash-based mock
+  // isArchived() below. Org-wide, keyed by (contactId, channel).
+  const { archivedMap, setArchived } = useConversationArchiveStates();
+  const checkArchived = (c: Conversation) => {
+    const key = conversationMapKey(c);
+    return key ? !!archivedMap[key] : false;
+  };
   // Contacts from the store — uses correct org via getOrgId() + memberships fallback
   const allStoreContacts = useContacts();
   const storeContactMap = useMemo(
@@ -314,15 +372,16 @@ function InboxPage() {
   const allConversations = useMemo(
     () => [
       ...realConvs,
+      ...gmailConvs,
       ...placeholderConvs,
       ...voiceConvs,
       ...localConversations,
     ],
-    [realConvs, placeholderConvs, voiceConvs, localConversations]
+    [realConvs, gmailConvs, placeholderConvs, voiceConvs, localConversations]
   );
   const allMessages = useMemo(
-    () => [...voiceMsgs, ...realMsgs],
-    [voiceMsgs, realMsgs]
+    () => [...voiceMsgs, ...realMsgs, ...gmailMsgs],
+    [voiceMsgs, realMsgs, gmailMsgs]
   );
 
   const checkStarred = (id: string) => starredIds.has(id) || isStarred(id);
@@ -336,8 +395,8 @@ function InboxPage() {
         if (folder === "unassigned" && !isUnassigned(c.id)) return false;
         if (folder === "assigned" && !isAssignedToMe(c.id)) return false;
         if (folder === "mentions" && !hasMention(c.id)) return false;
-        if (folder === "archived" && !isArchived(c.id)) return false;
-        if (folder !== "archived" && isArchived(c.id)) return false;
+        if (folder === "archived" && !checkArchived(c)) return false;
+        if (folder !== "archived" && checkArchived(c)) return false;
 
         if (selectedTag) {
           const contactTags =
@@ -369,7 +428,7 @@ function InboxPage() {
         // actual message history, voice- = voice calls) sort first, then
         // empty placeholder contacts (sb-) with no messages yet, then
         // anything else — then by recency within each group.
-        const tier = (id: string) => id.startsWith("sm-") || id.startsWith("voice-") ? 0 : id.startsWith("sb-") ? 1 : 2;
+        const tier = (id: string) => id.startsWith("sm-") || id.startsWith("voice-") || id.startsWith("gm-") ? 0 : id.startsWith("sb-") ? 1 : 2;
         const td = tier(a.id) - tier(b.id);
         if (td !== 0) return td;
         return new Date(b.lastAt).getTime() - new Date(a.lastAt).getTime();
@@ -384,21 +443,22 @@ function InboxPage() {
     allConversations,
     storeContactMap,
     contactTagOverrides,
+    archivedMap,
   ]);
 
   const folderCounts = useMemo(() => {
     const list = allConversations;
     return {
-      all: list.filter((c) => !isArchived(c.id)).length,
-      unread: list.filter((c) => c.unread && !isArchived(c.id)).length,
-      assigned: list.filter((c) => isAssignedToMe(c.id) && !isArchived(c.id)).length,
-      mentions: list.filter((c) => hasMention(c.id) && !isArchived(c.id)).length,
-      starred: list.filter((c) => checkStarred(c.id) && !isArchived(c.id)).length,
-      unassigned: list.filter((c) => isUnassigned(c.id) && !isArchived(c.id)).length,
-      archived: list.filter((c) => isArchived(c.id)).length,
+      all: list.filter((c) => !checkArchived(c)).length,
+      unread: list.filter((c) => c.unread && !checkArchived(c)).length,
+      assigned: list.filter((c) => isAssignedToMe(c.id) && !checkArchived(c)).length,
+      mentions: list.filter((c) => hasMention(c.id) && !checkArchived(c)).length,
+      starred: list.filter((c) => checkStarred(c.id) && !checkArchived(c)).length,
+      unassigned: list.filter((c) => isUnassigned(c.id) && !checkArchived(c)).length,
+      archived: list.filter((c) => checkArchived(c)).length,
     } as Record<FolderId, number>;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allConversations, starredIds]);
+  }, [allConversations, starredIds, archivedMap]);
 
   // Prefer a non-voice conversation as the auto-selected default so email/SMS always has a contact with an address
   const active = conversations.find((c) => c.id === activeId)
@@ -407,9 +467,24 @@ function InboxPage() {
   const thread: LocalMessage[] = active
     ? [
         ...(allMessages.filter((m) => m.conversationId === active.id) as LocalMessage[]),
-        ...localMessages.filter((m) => m.conversationId === active.id),
+        ...localMessages
+          .filter((m) => m.conversationId === active.id)
+          .filter((m) => !isLocalEmailReconciled(m, active, gmailConvs, gmailMsgs)),
       ].sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime())
     : [];
+
+  // Opening a conversation marks its unread inbound messages read. Only
+  // sms_meta_messages-backed channels carry a real is_read signal; other
+  // channels (voice, email, note) have nothing to mark here.
+  useEffect(() => {
+    if (!active || !active.unread) return;
+    const channel = active.channel;
+    if (channel !== "sms" && channel !== "whatsapp" && channel !== "messenger" && channel !== "instagram") return;
+    markRead(active.contactId, channel).catch((error) => {
+      console.error("[inbox] auto markRead failed:", error);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active?.id, active?.unread]);
   const resolvedStoreContact = active ? (storeContactMap.get(active.contactId) ?? null) : null;
   const contact = active
     ? (resolvedStoreContact
@@ -417,7 +492,6 @@ function InboxPage() {
         : mockContacts.find((c) => c.id === active.contactId)
           ?? { name: active.contactName, email: "", phone: active.callerPhone ?? "", tags: [], owner: "", messenger_psid: undefined, instagram_igsid: undefined })
     : undefined;
-  const contactProjects = contact ? mockProjects.filter((p) => p.client === contact.name) : [];
   const activeContactTags = active
     ? (contactTagOverrides[active.contactId] ?? contact?.tags ?? [])
     : [];
@@ -478,6 +552,25 @@ function InboxPage() {
     }
   };
 
+  // Selecting a conversation defaults the composer to THAT conversation's
+  // own channel (an Email thread composes Email, not whatever channel was
+  // last used elsewhere) — keyed only on activeId, so this fires exactly
+  // once per conversation switch and never re-fires (and never overrides a
+  // manual channel change) while the user stays on the same conversation.
+  // Voice has no composer, so a voice conversation leaves composeChannel
+  // exactly as it already was (last valid text channel, or the "sms"
+  // initial default) — the messenger/instagram validity check right below
+  // still applies afterward. Note is never a conversation channel, so it's
+  // never auto-selected here — only manually, from the compose tabs.
+  useEffect(() => {
+    if (!active) return;
+    const channel = active.channel;
+    if (channel === "email" || channel === "sms" || channel === "whatsapp" || channel === "messenger" || channel === "instagram") {
+      setComposeChannel(channel);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId]);
+
   // If the active conversation changes to a contact who doesn't have a
   // Messenger/Instagram identifier on file, but composeChannel is still set
   // to one of those, fall back to SMS rather than leaving the compose box
@@ -491,7 +584,7 @@ function InboxPage() {
   const { items: contactActivity } = useContactActivity(active?.contactId ?? null);
 
   // Real projects + lifetime value from Supabase for sidebar
-  const [sbProjects, setSbProjects] = useState<{ id: string; name: string; status: string; budget_total: number; completion_percentage: number }[]>([]);
+  const [sbProjects, setSbProjects] = useState<{ id: string; name: string; status: string; budget_total: number; completion_percentage: number; address: string | null; start_date: string | null; updated_at: string | null }[]>([]);
   const [sbInvoiceTotal, setSbInvoiceTotal] = useState(0);
   const [sbInvoiceCount, setSbInvoiceCount] = useState(0);
   const [sbDeals, setSbDeals] = useState<{ id: string; name: string; value: number; status: string }[]>([]);
@@ -510,7 +603,7 @@ function InboxPage() {
 
       const { data: projs } = await supabase
         .from("projects")
-        .select("id, name, status, budget_total, completion_percentage")
+        .select("id, name, status, budget_total, completion_percentage, address, start_date, updated_at")
         .eq("client_id", contactId).eq("org_id", orgId)
         .order("created_at", { ascending: false });
 
@@ -554,28 +647,54 @@ function InboxPage() {
     return () => { cancelled = true; };
   }, [active?.contactId]);
 
+  // Deterministic "which real project represents this contact for template
+  // merge purposes" rule: an active/open project (anything not completed or
+  // cancelled — the real `projects.status` values are cancelled, completed,
+  // planning, pre-construction) wins first; among ties, the most recently
+  // updated wins; if none are active, fall back to the first project
+  // returned (already newest-created-first from the query order). No
+  // mock-data fallback — a contact with no real projects simply gets the
+  // generic placeholder copy below.
+  const mergedProject = useMemo(() => {
+    if (sbProjects.length === 0) return null;
+    const isActive = (p: (typeof sbProjects)[number]) => p.status !== "completed" && p.status !== "cancelled";
+    const active = sbProjects.filter(isActive);
+    if (active.length > 0) {
+      return [...active].sort((a, b) => {
+        const at = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+        const bt = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+        return bt - at;
+      })[0];
+    }
+    return sbProjects[0];
+  }, [sbProjects]);
+
   const mergeCtx: MergeContext = useMemo(() => {
-    const firstProject = contactProjects[0];
     const [first_name = "", ...rest] = (contact?.name ?? "").split(" ");
     const last_name = rest.join(" ");
-    const total = firstProject?.contractValue ?? 0;
+    const total = mergedProject?.budget_total ?? 0;
     const fmtMoney = (n: number) =>
       new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(n);
     return {
       first_name,
       last_name,
-      project_address: firstProject?.address ?? "your project address",
-      project_type: firstProject?.type ?? "renovation",
+      project_address: mergedProject?.address || "your project address",
+      // The real projects table has no `type` column — this is a static
+      // default, not sourced from any (mock or real) project data.
+      project_type: "renovation",
       owner_name: currentUserName || "Your Name",
       company_name: org.companyName || "Your Company",
       estimate_total: total ? fmtMoney(total) : "$—",
       deposit_amount: total ? fmtMoney(Math.round(total * 0.5)) : "$—",
       deposit_due: "Friday",
-      start_date: firstProject?.startDate
-        ? new Date(firstProject.startDate).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+      start_date: mergedProject?.start_date
+        ? new Date(mergedProject.start_date).toLocaleDateString("en-US", { month: "short", day: "numeric" })
         : "next Monday",
     };
-  }, [contact, contactProjects, currentUserName, org.companyName]);
+  }, [contact, mergedProject, currentUserName, org.companyName]);
+
+  // Real GSM-7/UCS-2 char + segment count for the SMS composer (Phase 7 Part 6).
+  const smsInfo = useMemo(() => analyzeSmsLength(draft), [draft]);
 
   // ── Send handler ──────────────────────────────────────────────────────────
   const handleSend = async () => {
@@ -673,7 +792,27 @@ function InboxPage() {
         // copy is kept for these channels (see top of this function) since
         // that previously caused the same message to render twice: once
         // from a stale localStorage entry, once from the real row.
-        if (composeChannel !== "email") refreshRealConvs();
+        if (composeChannel !== "email") {
+          refreshRealConvs();
+        } else {
+          // Email has no equivalent "refresh and see the real row" path —
+          // it's sent via SMTP (send-inbox-message.ts), not the Gmail API,
+          // so there's no way to know when (or whether) it lands in
+          // gmail_messages. Show it immediately as a local echo, flagged
+          // pendingGmailSync so it can be reconciled away once/if a
+          // matching real row shows up (see GMAIL RECONCILIATION below).
+          setLocalMessages((prev) => [...prev, {
+            id: `local-email-${Date.now()}`,
+            conversationId: active.id,
+            direction: "out",
+            channel: "email",
+            body: draftText,
+            subject: subject || undefined,
+            toEmail: to,
+            at: new Date().toISOString(),
+            pendingGmailSync: true,
+          }]);
+        }
       }
     } catch {
       toast.error("Network error — message not sent");
@@ -752,6 +891,21 @@ function InboxPage() {
 
   // ── Create Deal from this conversation's contact ────────────────────────────
   const activeContactHasRealId = !!active?.contactId && UUID_RE.test(active.contactId);
+  // A Gmail sender with no matching saved contact — shows "Not in contacts"
+  // instead of the generic "Customer" badge, plus Create Contact/Create
+  // Lead/Link to Existing Contact actions (see UnmatchedGmailSenderBanner).
+  const activeIsUnmatchedGmailSender = !!active && active.channel === "email" && !activeContactHasRealId;
+
+  // Composer button label: "Reply" for a real, already-persisted thread
+  // (sm- = SMS/WhatsApp/Messenger/Instagram, gm- = Gmail, voice- = voice
+  // calls), "Send" for a conversation that doesn't have a persisted message
+  // yet (sb- = SMS placeholder for a contact with no thread yet, or
+  // local-conv- = the New Conversation sheet's brand-new placeholder).
+  // Deliberately keyed off the conversation id's identity, not thread
+  // length — a placeholder with a locally-echoed failed-send/note message
+  // is still a brand-new conversation, not an existing one.
+  const activeIsExistingThread =
+    !!active && (active.id.startsWith("sm-") || active.id.startsWith("gm-") || active.id.startsWith("voice-"));
 
   const dealPrefill = useMemo(() => {
     if (!active || !contact) return undefined;
@@ -978,7 +1132,7 @@ function InboxPage() {
                 selectedTag?.toLowerCase() === t.label.toLowerCase();
 
               const count = allConversations.filter((conversation) => {
-                if (isArchived(conversation.id)) return false;
+                if (checkArchived(conversation)) return false;
 
                 const tags =
                   contactTagOverrides[conversation.contactId] ??
@@ -1039,25 +1193,50 @@ function InboxPage() {
 
         {/* PANE 2 — Conversation list */}
         <section className="conversation-list-pane flex min-h-0 flex-col border-r border-border">
-          <div className="conversation-channel-tabs flex items-center gap-2 overflow-x-auto border-b border-border bg-background px-4 py-3">
-            {channelTabs.map((t) => {
-              const Icon = t.icon;
-              const isActive = channelFilter === t.id;
-              return (
-                <button
-                  key={t.id}
-                  onClick={() => setChannelFilter(t.id)}
-                  className={`conversation-channel-tab flex h-10 shrink-0 items-center gap-2 whitespace-nowrap rounded-xl border px-4 text-[13px] font-medium transition-colors ${
-                    isActive
-                      ? "is-active border-[#E8D4AA] bg-[#FAF3E4] text-[#9A6821]"
-                      : "border-[#E5E7EB] bg-white text-[#344054] hover:bg-[#F8FAFC]"
-                  }`}
+          <div className="conversation-channel-tabs flex items-center justify-between gap-2 border-b border-border bg-background px-4 py-3">
+            <div className="flex items-center gap-2 overflow-x-auto">
+              {channelTabs.map((t) => {
+                const Icon = t.icon;
+                const isActive = channelFilter === t.id;
+                return (
+                  <button
+                    key={t.id}
+                    onClick={() => setChannelFilter(t.id)}
+                    className={`conversation-channel-tab flex h-10 shrink-0 items-center gap-2 whitespace-nowrap rounded-xl border px-4 text-[13px] font-medium transition-colors ${
+                      isActive
+                        ? "is-active border-[#E8D4AA] bg-[#FAF3E4] text-[#9A6821]"
+                        : "border-[#E5E7EB] bg-white text-[#344054] hover:bg-[#F8FAFC]"
+                    }`}
+                  >
+                    <Icon className={`h-4 w-4 ${t.iconClass ?? ""}`} />
+                    {t.label}
+                  </button>
+                );
+              })}
+            </div>
+            {channelFilter === "email" && (
+              <div className="flex shrink-0 items-center gap-2">
+                {gmailLastSyncAt && (
+                  <span className="hidden text-[11px] text-muted-foreground sm:inline" title={new Date(gmailLastSyncAt).toLocaleString()}>
+                    Last synced {relativeShort(gmailLastSyncAt)}
+                  </span>
+                )}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 shrink-0 text-xs"
+                  disabled={gmailSyncing}
+                  onClick={handleSyncGmailInInbox}
                 >
-                  <Icon className={`h-4 w-4 ${t.iconClass ?? ""}`} />
-                  {t.label}
-                </button>
-              );
-            })}
+                  {gmailSyncing ? (
+                    <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                  )}
+                  Sync Gmail
+                </Button>
+              </div>
+            )}
           </div>
           <div className="border-b border-border p-3">
             <div className="relative">
@@ -1130,12 +1309,22 @@ function InboxPage() {
             <>
               <div className="flex items-center justify-between border-b border-border bg-background px-5 py-4">
                 <div className="flex min-w-0 items-center gap-3">
-                  <ContactAvatar id={active.contactId} name={active.contactName} size="md" className="h-10 w-10" />
+                  {active.channel === "email" ? (
+                    <GmailSenderAvatar
+                      senderName={active.contactName}
+                      senderEmail={active.senderEmail ?? ""}
+                      matchedContactId={active.contactId}
+                      size="md"
+                      className="h-10 w-10"
+                    />
+                  ) : (
+                    <ContactAvatar id={active.contactId} name={active.contactName} size="md" className="h-10 w-10" />
+                  )}
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 text-[15px] font-semibold">
                       <span className="truncate">{active.contactName}</span>
                       <Badge variant="outline" className="h-4.5 shrink-0 px-1.5 text-[9px] uppercase">
-                        {activeContactTags[0] ?? "Customer"}
+                        {activeContactTags[0] ?? (activeIsUnmatchedGmailSender ? "Not in contacts" : "Customer")}
                       </Badge>
                     </div>
                     <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
@@ -1203,10 +1392,48 @@ function InboxPage() {
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
-                      <DropdownMenuItem onClick={() => toast.success("Marked as read")}>Mark as read</DropdownMenuItem>
+                      <DropdownMenuItem
+                        onClick={async () => {
+                          if (!active) return;
+                          const channel = active.channel;
+                          if (channel !== "sms" && channel !== "whatsapp" && channel !== "messenger" && channel !== "instagram") {
+                            toast.success("Marked as read");
+                            return;
+                          }
+                          try {
+                            await markRead(active.contactId, channel);
+                            toast.success("Marked as read");
+                          } catch {
+                            toast.error("Could not mark as read");
+                          }
+                        }}
+                      >
+                        Mark as read
+                      </DropdownMenuItem>
                       <DropdownMenuItem onClick={() => toast.success("Conversation assigned")}>Assign to me</DropdownMenuItem>
                       {activeContactHasRealId && (
                         <DropdownMenuItem onClick={() => setDealDialogOpen(true)}>Create Deal</DropdownMenuItem>
+                      )}
+                      {active?.channel === "email" && activeContactHasRealId && (
+                        <DropdownMenuItem
+                          onClick={async () => {
+                            if (!active) return;
+                            try {
+                              const result = await unlinkGmailContactFromThread({ id: active.id, channel: active.channel });
+                              if (!result.ok) { toast.error(result.error); return; }
+                              if (!result.hadLink) {
+                                toast.info("This contact is matched by email, not an explicit link — nothing to unlink");
+                                return;
+                              }
+                              toast.success("Contact unlinked");
+                              refreshGmailConvs();
+                            } catch {
+                              toast.error("Could not unlink this contact");
+                            }
+                          }}
+                        >
+                          Unlink contact
+                        </DropdownMenuItem>
                       )}
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
@@ -1234,14 +1461,48 @@ function InboxPage() {
                       </DropdownMenuItem>
                       <DropdownMenuItem onClick={handleCopyThread}>Copy conversation</DropdownMenuItem>
                       <DropdownMenuSeparator />
-                      <DropdownMenuItem className="text-destructive focus:text-destructive"
-                        onClick={() => toast.success("Conversation archived")}>
-                        Archive
+                      <DropdownMenuItem
+                        className="text-destructive focus:text-destructive"
+                        onClick={async () => {
+                          if (!active) return;
+                          // Archiving needs a stable identity — a real
+                          // saved contact for SMS/WhatsApp/Messenger/
+                          // Instagram (and Gmail threads matched to one),
+                          // or a gmail:<thread_id> external key for
+                          // unmatched Gmail threads (see
+                          // resolveConversationIdentity). We never
+                          // auto-create a contact just to allow archiving.
+                          const identity = resolveConversationIdentity(active);
+                          if (!identity.contactId && !identity.externalKey) {
+                            toast.error("This contact must be saved before archiving conversations");
+                            return;
+                          }
+                          const nowArchived = checkArchived(active);
+                          try {
+                            await setArchived(active, !nowArchived);
+                            toast.success(nowArchived ? "Conversation unarchived" : "Conversation archived");
+                          } catch {
+                            toast.error("Could not update archive state");
+                          }
+                        }}
+                      >
+                        {active && checkArchived(active) ? "Unarchive" : "Archive"}
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </div>
               </div>
+
+              {activeIsUnmatchedGmailSender && active?.senderEmail && (
+                <UnmatchedGmailSenderBanner
+                  conversationId={active.id}
+                  senderEmail={active.senderEmail}
+                  senderName={active.contactName}
+                  senderDisplayName={active.senderDisplayName}
+                  snippet={thread[0]?.body}
+                  onConverted={refreshGmailConvs}
+                />
+              )}
 
               <div className="conversation-thread-body min-h-0 flex-1 space-y-7 overflow-y-auto px-8 py-6">
                 {groupByDay(thread).map((group) => (
@@ -1415,7 +1676,12 @@ function InboxPage() {
                 </div>
                 <div className="conversation-composer-bottom mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-[#EEF0F3] pt-3">
                   <div className="text-[10px] text-muted-foreground">
-                    {composeChannel === "sms" && `${draft.length}/160 chars · 1 segment`}
+                    {composeChannel === "sms" && (
+                      <span className={smsInfo.isUnusuallyLong ? "text-warning" : ""}>
+                        {smsInfo.length}/{smsInfo.singleSegmentLimit} chars · {smsInfo.segments || 1} segment{smsInfo.segments === 1 ? "" : "s"} ({smsInfo.encoding})
+                        {smsInfo.isUnusuallyLong && " · unusually long message"}
+                      </span>
+                    )}
                     {composeChannel === "email" && "Will reply from sales@yourco.com"}
                     {composeChannel === "note" && "Internal · @mention to notify"}
                   </div>
@@ -1456,7 +1722,7 @@ function InboxPage() {
                       </PopoverContent>
                     </Popover>
                     <Button size="sm" className="conversation-send h-10 rounded-xl bg-[#C88D22] px-5 text-sm font-semibold text-white shadow-sm hover:bg-[#B77E18]" onClick={handleSend}>
-                      <Send className="mr-1.5 h-3.5 w-3.5" /> Send
+                      <Send className="mr-1.5 h-3.5 w-3.5" /> {activeIsExistingThread ? "Reply" : "Send"}
                     </Button>
                   </div>
                 </div>
@@ -1517,7 +1783,17 @@ function InboxPage() {
             <div className="min-h-0 flex-1 overflow-y-auto">
               <div className="border-b border-border p-5">
                 <div className="flex items-start gap-3">
-                  <ContactAvatar id={active.contactId} name={contact.name} size="lg" className="h-12 w-12" />
+                  {active.channel === "email" ? (
+                    <GmailSenderAvatar
+                      senderName={contact.name}
+                      senderEmail={active.senderEmail ?? ""}
+                      matchedContactId={active.contactId}
+                      size="lg"
+                      className="h-12 w-12"
+                    />
+                  ) : (
+                    <ContactAvatar id={active.contactId} name={contact.name} size="lg" className="h-12 w-12" />
+                  )}
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[15px] font-semibold">{contact.name}</div>
                     <div className="mt-1 truncate text-xs text-muted-foreground">{contact.email}</div>
@@ -2227,7 +2503,17 @@ function ConversationRow({
       }`}
     >
       <div className="relative shrink-0">
-        <ContactAvatar id={conv.contactId} name={conv.contactName} size="sm" className="h-10 w-10" />
+        {conv.channel === "email" ? (
+          <GmailSenderAvatar
+            senderName={conv.contactName}
+            senderEmail={conv.senderEmail ?? ""}
+            matchedContactId={conv.contactId}
+            size="sm"
+            className="h-10 w-10"
+          />
+        ) : (
+          <ContactAvatar id={conv.contactId} name={conv.contactName} size="sm" className="h-10 w-10" />
+        )}
         <span className="absolute -bottom-0.5 -right-0.5 flex h-4 w-4 items-center justify-center rounded-full border-2 border-background bg-card">
           <ChannelGlyph channel={conv.channel} />
         </span>
@@ -2530,8 +2816,18 @@ function initials(name: string) {
 }
 
 function relativeShort(iso: string) {
-  const days = Math.round((NOW - new Date(iso).getTime()) / 86_400_000);
-  if (days <= 0) return "now";
+  // Finer-grained than pure day-rounding: the old `days <= 0 -> "now"`
+  // check collapsed anything from earlier the same day into "now" (up to
+  // ~24h), which made a batch of Gmail messages received at different
+  // times throughout today look identical/wrong. Only genuinely-recent
+  // (<1 minute, or slightly in the future due to clock skew) shows "now".
+  const diffMs = NOW - new Date(iso).getTime();
+  const diffMinutes = Math.round(diffMs / 60_000);
+  if (diffMinutes < 1) return "now";
+  if (diffMinutes < 60) return `${diffMinutes}m`;
+  const diffHours = Math.round(diffMs / 3_600_000);
+  if (diffHours < 24) return `${diffHours}h`;
+  const days = Math.round(diffMs / 86_400_000);
   if (days === 1) return "1d";
   if (days < 7) return `${days}d`;
   return `${Math.round(days / 7)}w`;
@@ -2560,6 +2856,78 @@ function groupByDay(messages: LocalMessage[]) {
   return Array.from(map.entries()).map(([day, messages]) => ({ day, messages }));
 }
 
+// ── GMAIL RECONCILIATION (Phase 7, Part 1) ──────────────────────────────────
+// Isolated on purpose, so it can be deleted cleanly if/when a real
+// gmail-sync path starts returning provider-side ids for our own sends.
+//
+// Email is sent via SMTP (netlify/functions/send-inbox-message.ts), not the
+// Gmail API, so a successful send has no thread_id/message_id to correlate
+// against the eventual gmail_messages row that (if/when Gmail sync picks it
+// up) represents the same email. Until then, the just-sent email is shown
+// from an optimistic local echo (LocalMessage.pendingGmailSync) so it's
+// visible immediately. This function decides when that echo has been
+// superseded by a real synced row, so it stops being shown — it never
+// deletes the local echo/localStorage entry, only excludes it from the
+// currently-rendered thread.
+//
+// Matching, most confident first:
+//   1. thread/message id — not available for SMTP-sent mail in this
+//      codebase; always falls through today. Left as tier 1 so it takes
+//      effect for free if a future gmail-sync path starts stamping outbound
+//      sends with a real thread id.
+//   2. normalized recipient email — real gmail conversations are already
+//      matched to a contact by email address (see gmail-conversations.ts),
+//      so "same contactId as this local echo's conversation" IS the
+//      normalized-email match when the contact resolved; when it didn't
+//      resolve to a real contact, gmailConvs carries a synthetic
+//      `gmail-unknown-{address}` id that's compared directly instead.
+//   3. subject — case-insensitive containment against the real message body
+//      (real bodies are "subject\n\nsnippet" or bare snippet/subject).
+//   4. timestamp proximity — within 15 minutes of the local echo.
+//   5. body/snippet overlap — last resort, a short prefix of the local
+//      body appearing in the real message body.
+// A real outbound message is treated as a match if it satisfies the email
+// tier AND at least one of subject/timestamp/body — email address alone is
+// too weak (a contact can easily receive more than one real email), but
+// full agreement isn't required either since we're matching a short snippet
+// against a real message body, not a full body against a full body.
+function isLocalEmailReconciled(
+  local: LocalMessage,
+  activeConv: Conversation,
+  gmailConvsList: Conversation[],
+  gmailMsgsList: Message[],
+): boolean {
+  if (!local.pendingGmailSync) return false;
+
+  const candidateConvIds = new Set(
+    gmailConvsList
+      .filter((c) => {
+        if (c.contactId === activeConv.contactId) return true;
+        const normTo = local.toEmail ? normalizeEmail(local.toEmail) : "";
+        return normTo && c.contactId === `gmail-unknown-${normTo}`;
+      })
+      .map((c) => c.id),
+  );
+  if (candidateConvIds.size === 0) return false;
+
+  const candidates = gmailMsgsList.filter(
+    (m) => candidateConvIds.has(m.conversationId) && m.direction === "out",
+  );
+  if (candidates.length === 0) return false;
+
+  const localTime = new Date(local.at).getTime();
+  const localSubject = (local.subject ?? "").trim().toLowerCase();
+  const localBodyPrefix = local.body.trim().slice(0, 40).toLowerCase();
+
+  return candidates.some((m) => {
+    const body = m.body.toLowerCase();
+    const subjectMatches = localSubject.length > 0 && body.includes(localSubject);
+    const timeMatches = Math.abs(new Date(m.at).getTime() - localTime) <= 15 * 60_000;
+    const bodyMatches = localBodyPrefix.length > 0 && body.includes(localBodyPrefix);
+    return subjectMatches || timeMatches || bodyMatches;
+  });
+}
+
 // Deterministic mock helpers (no random per render → no hydration drift)
 function hash(id: string) {
   let h = 0;
@@ -2570,4 +2938,5 @@ function isStarred(id: string) { return hash(id) % 5 === 0; }
 function hasMention(id: string) { return hash(id) % 6 === 0; }
 function isUnassigned(id: string) { return hash(id) % 4 === 0; }
 function isAssignedToMe(id: string) { return hash(id) % 3 === 0; }
-function isArchived(id: string) { return hash(id) % 11 === 0; }
+// isArchived was replaced by the real, persisted useConversationArchiveStates()
+// hook (see conversation-states.ts) — this mock hash-based version is gone.

@@ -227,6 +227,10 @@ export type Conversation = {
   lastAt: string;
   /** Caller's raw phone number — set for voice conversations so SMS/call targets the right number */
   callerPhone?: string;
+  /** Case-preserved sender email — set for Gmail conversations (see gmail-conversations.ts), even when contactName shows a display name instead of the bare address. Normalize before matching/storage. */
+  senderEmail?: string;
+  /** The Gmail From header's display-name portion, parsed directly (e.g. "Jane Doe", or "Google" for a genuine Google-sent alert) — null/absent when the header has no display name. See resolveGmailSenderName in gmail-contact-actions.ts. */
+  senderDisplayName?: string;
 };
 
 export type Message = {
@@ -1021,7 +1025,7 @@ export function getCompanyBySlug(slug: string): Company | undefined {
 }
 
 // ============= LEADS =============
-export type LeadSource = "Website" | "Referral" | "Angi" | "Thumbtack" | "Google Ads" | "Walk-in" | "Social Media";
+export type LeadSource = "Website" | "Referral" | "Angi" | "Thumbtack" | "Google Ads" | "Walk-in" | "Social Media" | "Gmail";
 export type LeadStatus = "new" | "contacted" | "qualified" | "converted" | "lost";
 export type LeadScore = "hot" | "warm" | "cold";
 
@@ -1044,7 +1048,7 @@ export type Lead = {
   convertedDealId?: string;
 };
 
-const LEAD_SOURCES: LeadSource[] = ["Website", "Referral", "Angi", "Thumbtack", "Google Ads", "Walk-in", "Social Media"];
+const LEAD_SOURCES: LeadSource[] = ["Website", "Referral", "Angi", "Thumbtack", "Google Ads", "Walk-in", "Social Media", "Gmail"];
 const LEAD_STATUSES: LeadStatus[] = ["new", "contacted", "qualified", "converted", "lost"];
 const LEAD_SCORES: LeadScore[] = ["hot", "warm", "cold"];
 const LEAD_PROJECT_TYPES = ["Kitchen Remodel", "Bath Remodel", "Whole Home Renovation", "Basement Finish", "Addition", "Outdoor Living", "Primary Suite"];
