@@ -34,6 +34,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
+import { computeEffectiveEstimateTotals } from "@/lib/estimate-totals";
 
 // `template`/`clientName` are accepted (but not yet consumed) for the
 // pre-existing "Create estimate from template" link on the Leads page —
@@ -145,12 +146,6 @@ function mapItems(raw: any[]): EstimateItem[] {
         total: Number(row.total ?? qty * price),
       };
     });
-}
-
-function computeTotals(items: EstimateItem[]) {
-  const subtotal = items.reduce((s, i) => s + i.total, 0);
-  const tax_total = subtotal * TAX_RATE;
-  return { subtotal, tax_total, total: subtotal + tax_total };
 }
 
 // ── Estimate Form Sheet (create + edit) ──────────────────────────────────────
@@ -1166,10 +1161,13 @@ function EstimatesPage() {
     setEstimates(
       estData.map((r: any) => {
         const items = mapItems(itemsByEstimate.get(r.id) ?? []);
-        // Always compute from items when items are present; stored totals can be stale
-        const { subtotal, tax_total, total } = items.length
-          ? computeTotals(items)
-          : { subtotal: Number(r.subtotal ?? 0), tax_total: Number(r.tax_total ?? 0), total: Number(r.total ?? 0) };
+        // Shared with the Command Center's Estimates card (see
+        // src/lib/estimate-totals.ts) so both pages can never silently
+        // diverge on which total is "correct" for the same estimate.
+        const { subtotal, tax_total, total } = computeEffectiveEstimateTotals(
+          { subtotal: Number(r.subtotal ?? 0), tax_total: Number(r.tax_total ?? 0), total: Number(r.total ?? 0) },
+          items,
+        );
         return {
           id: r.id,
           number: r.number ?? null,
