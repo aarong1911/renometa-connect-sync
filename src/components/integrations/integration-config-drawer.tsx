@@ -307,7 +307,17 @@ export function IntegrationConfigDrawer({ integration, open, onOpenChange, onCon
       // Build new settings — omit blank secret fields (keep previous value)
       const next: Record<string, string> = {};
       for (const f of fieldDefs) {
-        const val = (fields[f.key] ?? "").trim();
+        let val = (fields[f.key] ?? "").trim();
+        // Google's UI displays a Gmail App Password as "xxxx xxxx xxxx xxxx"
+        // for readability — Gmail's SMTP AUTH expects the bare 16-character
+        // value with no spaces. Pasting it as shown (common) previously got
+        // saved with the spaces intact, causing SMTP auth to fail with
+        // 535-5.7.8 even though the password itself was valid. Strip all
+        // internal whitespace for this one field specifically — other
+        // integrations' secrets are untouched.
+        if (int.id === "gmail" && f.key === "appPassword") {
+          val = val.replace(/\s+/g, "");
+        }
         if (val) {
           next[f.key] = val;
         } else if (f.secret && prev[f.key]) {

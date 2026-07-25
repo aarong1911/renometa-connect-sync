@@ -354,6 +354,10 @@ export function useGmailConversations(): {
         // gmail-contact-actions.ts. null when the header has no display
         // name (a bare address).
         senderDisplayName: displayName ?? undefined,
+        // Real Subject header from the newest message, decoded — used to
+        // prefill "Re: <subject>" when replying to this thread. Never a
+        // fabricated/generic subject.
+        emailSubject: newestRow?.subject ? decodeHtmlEntities(newestRow.subject) : undefined,
       });
 
       for (const row of rows) {

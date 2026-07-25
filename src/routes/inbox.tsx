@@ -102,6 +102,7 @@ import { normalizeEmail, useGmailConversations } from "@/lib/gmail-conversations
 import { UnmatchedGmailSenderBanner } from "@/components/inbox/unmatched-gmail-sender-banner";
 import { GmailSenderAvatar } from "@/components/inbox/gmail-sender-avatar";
 import { unlinkGmailContactFromThread } from "@/lib/gmail-contact-actions";
+import { resolveComposerRecipient } from "@/lib/composer-recipient";
 import { triggerGmailSync, fetchGmailConnectionStatus } from "@/lib/gmail-sync-client";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -568,6 +569,28 @@ function InboxPage() {
     if (channel === "email" || channel === "sms" || channel === "whatsapp" || channel === "messenger" || channel === "instagram") {
       setComposeChannel(channel);
     }
+    // Derive the subject for the newly-selected conversation. This effect
+    // is keyed ONLY on activeId, so it never re-fires while the user stays
+    // on the same conversation — a manual edit is therefore always safe
+    // (nothing here runs again until they actually switch threads). Once
+    // they DO switch, the previous thread's subject (auto-generated OR
+    // manually edited — either way, it belongs to a different thread now)
+    // must not leak into the newly-selected one, so this always sets an
+    // explicit value rather than only filling an empty field.
+    if (channel === "email") {
+      if (active.id.startsWith("gm-") && active.emailSubject) {
+        const already = /^re:/i.test(active.emailSubject.trim());
+        setSubject(already ? active.emailSubject : `Re: ${active.emailSubject}`);
+      } else {
+        // A brand-new email conversation (not an existing Gmail thread) —
+        // its own subject behavior is simply to start blank, never a
+        // leftover reply subject from whatever thread was open before.
+        setSubject("");
+      }
+    }
+    // Non-email channels never show the subject field at all — leave
+    // whatever subject text exists untouched rather than clearing it
+    // "unnecessarily".
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId]);
 
@@ -719,21 +742,16 @@ function InboxPage() {
       return;
     }
 
-    const to =
-      composeChannel === "sms" || composeChannel === "whatsapp" ? contact?.phone :
-      composeChannel === "messenger" ? contact?.messenger_psid :
-      composeChannel === "instagram" ? contact?.instagram_igsid :
-      contact?.email;
-
-    if (!to) {
-      const missing =
-        composeChannel === "sms" || composeChannel === "whatsapp" ? "phone number" :
-        composeChannel === "messenger" ? "Messenger connection (they must message you first)" :
-        composeChannel === "instagram" ? "Instagram connection (they must message you first)" :
-        "email address";
-      toast.error(`${active.contactName} has no ${missing} on file`);
+    const recipientResult = resolveComposerRecipient({
+      composeChannel,
+      activeConversation: active,
+      selectedContact: contact,
+    });
+    if (!recipientResult.ok) {
+      toast.error(recipientResult.error);
       return;
     }
+    const to = recipientResult.to;
 
     try {
       const { data: { session } } = await supabase.auth.getSession();
@@ -1721,7 +1739,7 @@ function InboxPage() {
                         </div>
                       </PopoverContent>
                     </Popover>
-                    <Button size="sm" className="conversation-send h-10 rounded-xl bg-[#C88D22] px-5 text-sm font-semibold text-white shadow-sm hover:bg-[#B77E18]" onClick={handleSend}>
+                    <Button size="sm" className="conversation-send h-10 rounded-xl border border-blue-500 bg-white px-5 text-sm font-semibold text-slate-700 shadow-sm hover:border-blue-600 hover:bg-blue-50 hover:text-slate-800" onClick={handleSend}>
                       <Send className="mr-1.5 h-3.5 w-3.5" /> {activeIsExistingThread ? "Reply" : "Send"}
                     </Button>
                   </div>

@@ -231,6 +231,8 @@ export type Conversation = {
   senderEmail?: string;
   /** The Gmail From header's display-name portion, parsed directly (e.g. "Jane Doe", or "Google" for a genuine Google-sent alert) — null/absent when the header has no display name. See resolveGmailSenderName in gmail-contact-actions.ts. */
   senderDisplayName?: string;
+  /** The most recent message's actual Gmail Subject header, decoded — used to prefill "Re: <subject>" when replying to an existing thread. Never fabricated. */
+  emailSubject?: string;
 };
 
 export type Message = {

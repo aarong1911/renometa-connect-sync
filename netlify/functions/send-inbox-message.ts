@@ -155,12 +155,24 @@ export const handler: Handler = async (event) => {
         };
       }
 
+      // Google's UI displays an App Password as "xxxx xxxx xxxx xxxx" (16
+      // real characters + 3 spaces = 19) for readability when the user
+      // copies it — but Gmail's SMTP AUTH expects the bare 16-character
+      // value with no spaces. If a password was ever saved with that
+      // formatting intact (e.g. pasted straight from Google's page), Gmail
+      // rejects it with 535-5.7.8 even though the password itself is
+      // valid. Stripping whitespace here fixes already-stored values
+      // without needing a data migration; integration-config-drawer.tsx is
+      // also fixed to strip it at save time so this can't recur.
+      const smtpUser = gmail.email.trim();
+      const smtpPass = String(gmail.appPassword).replace(/\s+/g, "");
+
       const transporter = nodemailer.createTransport({
         service: "gmail",
-        auth: { user: gmail.email, pass: gmail.appPassword },
+        auth: { user: smtpUser, pass: smtpPass },
       });
       await transporter.sendMail({
-        from: `${from_name ?? "RenoMeta Connect"} <${gmail.email}>`,
+        from: `${from_name ?? "RenoMeta Connect"} <${smtpUser}>`,
         to,
         subject: subject || "(no subject)",
         text: body,

@@ -8,6 +8,12 @@
   --conversation-muted: #8a94a6;
   --conversation-line: #e5e7eb;
   --conversation-canvas: #fbfcfe;
+  /* Reply/Send button — matches Tailwind's blue-500/blue-600/blue-50/slate-700/slate-800 */
+  --conversation-send-border: #3b82f6;
+  --conversation-send-border-hover: #2563eb;
+  --conversation-send-bg-hover: #eff6ff;
+  --conversation-send-text: #334155;
+  --conversation-send-text-hover: #1e293b;
   color: var(--conversation-ink);
 }
 
@@ -76,13 +82,21 @@
 
 .conversation-send {
   min-width: 96px;
-  border: 1px solid #bd811b !important;
-  background: var(--conversation-gold) !important;
-  color: #fff !important;
+  border: 1px solid var(--conversation-send-border) !important;
+  background: #fff !important;
+  color: var(--conversation-send-text) !important;
 }
 
-.conversation-send:hover {
-  background: var(--conversation-gold-hover) !important;
+.conversation-send:hover:not(:disabled) {
+  background: var(--conversation-send-bg-hover) !important;
+  border-color: var(--conversation-send-border-hover) !important;
+  color: var(--conversation-send-text-hover) !important;
+}
+
+.conversation-send:disabled {
+  border-color: var(--conversation-line) !important;
+  background: #fff !important;
+  color: var(--conversation-muted) !important;
 }
 
 @media (max-width: 1535px) {
