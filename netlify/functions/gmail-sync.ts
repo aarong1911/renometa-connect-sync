@@ -256,7 +256,11 @@ export const handler: Handler = async (event) => {
     .in("id", fetchedIds);
   const existingIds = new Set((existingRows ?? []).map((r: any) => r.id));
 
-  const detailHeaders = "&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Bcc";
+  // Message-ID/In-Reply-To/References are RFC 5322 threading headers — NOT
+  // the same thing as Gmail's own thread_id (already captured separately
+  // below via detail.threadId). Needed so send-inbox-message.ts can build
+  // real inReplyTo/references values for outbound replies.
+  const detailHeaders = "&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Bcc&metadataHeaders=Message-ID&metadataHeaders=In-Reply-To&metadataHeaders=References";
   const rows: any[] = [];
   let skipped = 0;
 
@@ -287,6 +291,15 @@ export const handler: Handler = async (event) => {
         bcc_emails: splitAddressList(headerValue(detail, "Bcc")),
         subject: headerValue(detail, "Subject"),
         labels: detail.labelIds ?? null,
+        // RFC 5322 identity — distinct from `thread_id` (Gmail's own
+        // grouping id, already stored above). Direction is derived the same
+        // way the client currently does (labels.includes("SENT")), just
+        // computed once here server-side so it's a stored, queryable fact
+        // instead of being re-derived ad hoc on every read.
+        rfc_message_id: headerValue(detail, "Message-ID"),
+        in_reply_to: headerValue(detail, "In-Reply-To"),
+        references_header: headerValue(detail, "References"),
+        direction: (detail.labelIds ?? []).includes("SENT") ? "out" : "in",
       });
     }
   }

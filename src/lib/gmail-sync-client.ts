@@ -43,6 +43,10 @@ export async function triggerGmailSync(): Promise<GmailSyncResult> {
 export type GmailConnectionStatus = {
   connected: boolean;
   accountEmail: string | null;
+  // Connected account's own Google profile photo, when Google has returned
+  // one and it's been captured (see gmail-oauth-callback.ts) — a safe,
+  // non-secret URL only. Never fetched for/applied to any other sender.
+  accountPictureUrl: string | null;
   hasRefreshToken: boolean;
   tokenExpiresAt: string | null;
   lastSyncAt: string | null;

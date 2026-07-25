@@ -242,6 +242,11 @@ export type Message = {
   direction: "in" | "out";
   body: string;
   at: string;
+  // Email only — RFC 5322 Message-ID header (see gmail-conversations.ts and
+  // gmail-sync.ts). Used for strong-identity reconciliation of the optimistic
+  // local echo against the synced Gmail row; undefined for every other
+  // channel and for email messages synced before this column existed.
+  rfcMessageId?: string;
 };
 
 export type WorkflowCategory = "Sales" | "Operations" | "Finance" | "Marketing" | "Client Care";

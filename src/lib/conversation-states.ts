@@ -25,25 +25,9 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
+import { getOrgId } from "@/lib/org-id";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-async function getOrgId(): Promise<string | null> {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return null;
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("organization_id")
-    .eq("id", user.id)
-    .maybeSingle();
-  if (profile?.organization_id) return profile.organization_id;
-  const { data: membership } = await supabase
-    .from("org_memberships")
-    .select("org_id")
-    .eq("member_id", user.id)
-    .maybeSingle();
-  return membership?.org_id ?? null;
-}
 
 export type ConversationIdentity = {
   /** Metadata only for Gmail rows — never the lookup key when externalKey is set. */

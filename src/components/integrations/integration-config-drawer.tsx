@@ -131,6 +131,23 @@ export function IntegrationConfigDrawer({ integration, open, onOpenChange, onCon
         return;
       }
 
+      if (currentId === "gmail") {
+        // Gmail's App Password is stored server-side only (encrypted in
+        // organization_integration_secrets — see smtp-config-status.ts).
+        // Status/email come from this endpoint; the password itself is
+        // never returned, so the password field is left blank here.
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session) return;
+        const res = await fetch("/.netlify/functions/smtp-config-status", {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        });
+        if (!res.ok) return;
+        const json = await res.json().catch(() => ({}));
+        setIsConfigured(!!json.configured);
+        if (json.email) setFields({ email: json.email });
+        return;
+      }
+
       const orgId = await getOrgId();
       if (!orgId) return;
       const { data } = await supabase
@@ -290,6 +307,35 @@ export function IntegrationConfigDrawer({ integration, open, onOpenChange, onCon
 
     setSaving(true);
     try {
+      if (int.id === "gmail") {
+        // Routed through the secure endpoint — the App Password is
+        // encrypted server-side (organization_integration_secrets) and
+        // never written to organizations.integration_settings from the
+        // browser. A blank password field means "keep the existing saved
+        // password"; smtp-config-save.ts enforces that one exists already
+        // in that case.
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session) throw new Error("Not authenticated");
+        const res = await fetch("/.netlify/functions/smtp-config-save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+          body: JSON.stringify({
+            email: (fields.email ?? "").trim(),
+            appPassword: (fields.appPassword ?? "").trim(),
+          }),
+        });
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(json.error ?? "Failed to save credentials");
+
+        setIsConfigured(true);
+        setReconfiguring(false);
+        onConnect?.(int);
+        toast.success(`${int.name} credentials saved`);
+        setFields({ email: json.email ?? fields.email ?? "" });
+        setSaving(false);
+        return;
+      }
+
       const orgId = await getOrgId();
       if (!orgId) throw new Error("Not authenticated");
 
@@ -352,6 +398,28 @@ export function IntegrationConfigDrawer({ integration, open, onOpenChange, onCon
   async function handleDisconnect() {
     setSaving(true);
     try {
+      if (int.id === "gmail") {
+        // Only removes the SMTP (App Password) secret + metadata — the
+        // Gmail OAuth inbox-sync connection (settings.integrations.tsx's
+        // separate "Sync Inbox" section) is untouched by this endpoint.
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session) throw new Error("Not authenticated");
+        const res = await fetch("/.netlify/functions/smtp-disconnect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        });
+        if (!res.ok) {
+          const json = await res.json().catch(() => ({}));
+          throw new Error(json.error ?? "Disconnect failed");
+        }
+        setIsConfigured(false);
+        setFields({});
+        onDisconnect?.(int);
+        toast.success(`${int.name} disconnected`);
+        setSaving(false);
+        return;
+      }
+
       const orgId = await getOrgId();
       if (!orgId) throw new Error("Not authenticated");
       const { data: orgRow } = await supabase.from("organizations").select("integration_settings").eq("id", orgId).maybeSingle();

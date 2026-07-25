@@ -58,7 +58,7 @@ export const handler: Handler = async (event) => {
 
   const { data: integration, error } = await supabaseAdmin
     .from("integrations")
-    .select("status, provider_account_email, token_expires_at, refresh_token_encrypted, last_sync_at, last_sync_status, sync_error")
+    .select("status, provider_account_email, token_expires_at, refresh_token_encrypted, last_sync_at, last_sync_status, sync_error, config")
     .eq("org_id", orgId)
     .eq("provider", "gmail")
     .maybeSingle();
@@ -75,6 +75,7 @@ export const handler: Handler = async (event) => {
       body: JSON.stringify({
         connected: false,
         accountEmail: null,
+        accountPictureUrl: null,
         hasRefreshToken: false,
         tokenExpiresAt: null,
         lastSyncAt: null,
@@ -84,12 +85,20 @@ export const handler: Handler = async (event) => {
     };
   }
 
+  // Only ever this one safe, non-secret URL out of `config` — never the
+  // whole config object, so nothing else stored there in the future is
+  // exposed by this endpoint without a deliberate decision to do so.
+  const pictureUrl = (integration.config && typeof integration.config === "object")
+    ? (integration.config as Record<string, any>).picture_url ?? null
+    : null;
+
   return {
     statusCode: 200,
     headers: CORS,
     body: JSON.stringify({
       connected: integration.status === "connected",
       accountEmail: integration.provider_account_email ?? null,
+      accountPictureUrl: typeof pictureUrl === "string" ? pictureUrl : null,
       hasRefreshToken: !!integration.refresh_token_encrypted,
       tokenExpiresAt: integration.token_expires_at ?? null,
       lastSyncAt: integration.last_sync_at ?? null,

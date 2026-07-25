@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
+import { getOrgId } from "@/lib/org-id";
 
 export const Route = createFileRoute("/settings/integrations")({
   component: IntegrationsSettings,
@@ -46,16 +47,19 @@ function IntegrationsSettings() {
   const handleDisconnectGmailSmtp = useCallback(async () => {
     setGmailSmtpDisconnecting(true);
     try {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) { toast.error("You must be signed in to disconnect Gmail sending"); return; }
-      const { data: profile } = await supabase.from("profiles").select("organization_id").eq("id", user.id).maybeSingle();
-      const orgId = profile?.organization_id;
-      if (!orgId) { toast.error("No organization found"); return; }
-      const { data: orgRow } = await supabase.from("organizations").select("integration_settings").eq("id", orgId).maybeSingle();
-      const existing: Record<string, any> = { ...(orgRow?.integration_settings ?? {}) };
-      delete existing.gmail;
-      const { error } = await supabase.from("organizations").update({ integration_settings: existing }).eq("id", orgId);
-      if (error) throw error;
+      // Routed through the secure endpoint — it deletes the encrypted App
+      // Password secret and clears the non-secret gmail metadata, without
+      // touching the separate Gmail OAuth inbox-sync connection.
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) { toast.error("You must be signed in to disconnect Gmail sending"); return; }
+      const res = await fetch("/.netlify/functions/smtp-disconnect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error ?? "Disconnect failed");
+      }
       setGmailSmtpEmail(null);
       updateConnectionStatus("gmail", false);
       toast.success("Gmail sending credentials disconnected");
@@ -242,10 +246,7 @@ function IntegrationsSettings() {
       return;
     }
     (async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) return;
-      const { data: profile } = await supabase.from("profiles").select("organization_id").eq("id", user.id).maybeSingle();
-      const orgId = profile?.organization_id;
+      const orgId = await getOrgId();
       if (!orgId) return;
 
       const { data: org } = await supabase.from("organizations").select("integration_settings").eq("id", orgId).maybeSingle();
@@ -595,11 +596,9 @@ function IntegrationsSettings() {
             // The drawer just saved organizations.integration_settings.gmail
             // — refetch so the card's configured-email display updates
             // without a full page reload.
-            supabase.auth.getUser().then(async ({ data: { user } }) => {
-              if (!user) return;
-              const { data: profile } = await supabase.from("profiles").select("organization_id").eq("id", user.id).maybeSingle();
-              if (!profile?.organization_id) return;
-              const { data: org } = await supabase.from("organizations").select("integration_settings").eq("id", profile.organization_id).maybeSingle();
+            getOrgId().then(async (orgId) => {
+              if (!orgId) return;
+              const { data: org } = await supabase.from("organizations").select("integration_settings").eq("id", orgId).maybeSingle();
               setGmailSmtpEmail(org?.integration_settings?.gmail?.email ?? null);
             });
           }

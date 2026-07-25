@@ -3,6 +3,7 @@ import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import nodemailer from "nodemailer";
 import crypto from "node:crypto";
+import { getOrgSecret, setOrgSecret } from "./lib/org-secret-store";
 
 const CORS = {
   "Content-Type": "application/json",
@@ -77,6 +78,12 @@ export const handler: Handler = async (event) => {
     // supplied, since the Inbox compose box is currently a single
     // free-text field with no appointment-specific inputs.
     templateVars?: { dateTime?: string; service?: string; confirmationNumber?: string };
+    // Gmail's own thread id (NOT an RFC Message-ID) — only sent by the
+    // client when replying to an existing gm-<thread_id> conversation, so
+    // this function can look up that thread's real threading headers
+    // (rfc_message_id/references_header) itself. Never used for recipient
+    // resolution — that's already fully resolved client-side into `to`.
+    email_thread_id?: string;
   };
   try {
     reqBody = JSON.parse(event.body ?? "{}");
@@ -84,7 +91,7 @@ export const handler: Handler = async (event) => {
     return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: "Invalid JSON" }) };
   }
 
-  const { channel, to, body, subject, from_name, contact_id, templateVars } = reqBody;
+  const { channel, to, body, subject, from_name, contact_id, templateVars, email_thread_id } = reqBody;
   if (!channel || !to || !body) {
     return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: "channel, to, body are required" }) };
   }
@@ -139,7 +146,8 @@ export const handler: Handler = async (event) => {
       const twilioResult: any = await res.json().catch(() => ({}));
       providerMessageId = twilioResult?.sid ?? null;
     } else if (channel === "email") {
-      // Fetch org's Gmail credentials from integration_settings
+      // Fetch org's Gmail email + (legacy, possibly still-plaintext)
+      // integration_settings in one read.
       const { data: orgForEmail } = await supabaseAdmin
         .from("organizations")
         .select("integration_settings")
@@ -147,7 +155,25 @@ export const handler: Handler = async (event) => {
         .maybeSingle();
 
       const gmail = orgForEmail?.integration_settings?.gmail;
-      if (!gmail?.email || !gmail?.appPassword) {
+      if (!gmail?.email) {
+        return {
+          statusCode: 422,
+          headers: CORS,
+          body: JSON.stringify({ error: "Gmail not configured — go to Settings → Integrations → Gmail to add your credentials" }),
+        };
+      }
+
+      // Password source, in order: the encrypted secret table (current,
+      // correct storage — see org-secret-store.ts), then a legacy
+      // plaintext password still sitting in integration_settings.gmail
+      // (pre-migration orgs). Never log which path was used beyond this
+      // boolean — never the value itself, encrypted or plaintext.
+      let smtpPassPlain = await getOrgSecret(supabaseAdmin, orgId, "gmail", "smtp_app_password");
+      const usedLegacyPlaintext = !smtpPassPlain && !!gmail.appPassword;
+      if (!smtpPassPlain && gmail.appPassword) {
+        smtpPassPlain = String(gmail.appPassword);
+      }
+      if (!smtpPassPlain) {
         return {
           statusCode: 422,
           headers: CORS,
@@ -158,25 +184,89 @@ export const handler: Handler = async (event) => {
       // Google's UI displays an App Password as "xxxx xxxx xxxx xxxx" (16
       // real characters + 3 spaces = 19) for readability when the user
       // copies it — but Gmail's SMTP AUTH expects the bare 16-character
-      // value with no spaces. If a password was ever saved with that
-      // formatting intact (e.g. pasted straight from Google's page), Gmail
-      // rejects it with 535-5.7.8 even though the password itself is
-      // valid. Stripping whitespace here fixes already-stored values
-      // without needing a data migration; integration-config-drawer.tsx is
-      // also fixed to strip it at save time so this can't recur.
+      // value with no spaces. Stripped here regardless of source (secret
+      // table or legacy plaintext) so an already-bad stored value still
+      // works without needing a data migration first.
       const smtpUser = gmail.email.trim();
-      const smtpPass = String(gmail.appPassword).replace(/\s+/g, "");
+      const smtpPass = smtpPassPlain.replace(/\s+/g, "");
+
+      // Standards-based reply threading: only attempted when the client
+      // tells us this is a reply to an existing Gmail thread. A lookup
+      // failure or missing headers must never block the send — threading
+      // is best-effort on top of a send that already works without it.
+      let inReplyTo: string | undefined;
+      let referencesHeader: string | undefined;
+      if (email_thread_id) {
+        try {
+          const { data: threadRows } = await supabaseAdmin
+            .from("gmail_messages")
+            .select("rfc_message_id, references_header, labels, internal_date")
+            .eq("org_id", orgId)
+            .eq("thread_id", email_thread_id)
+            .order("internal_date", { ascending: false });
+
+          const rows = (threadRows ?? []) as any[];
+          const isOutboundRow = (r: any) => Array.isArray(r.labels) && r.labels.includes("SENT");
+          // Newest INBOUND message with a real Message-ID first; if none,
+          // fall back to the newest message of any direction that has one.
+          const chosen =
+            rows.find((r) => !isOutboundRow(r) && r.rfc_message_id) ??
+            rows.find((r) => r.rfc_message_id);
+
+          if (chosen?.rfc_message_id) {
+            inReplyTo = chosen.rfc_message_id;
+            referencesHeader = [chosen.references_header, chosen.rfc_message_id]
+              .filter(Boolean)
+              .join(" ")
+              .trim() || undefined;
+          }
+        } catch (threadLookupErr: any) {
+          console.warn("[send-inbox-message] threading header lookup failed (sending without):", threadLookupErr.message);
+        }
+      }
 
       const transporter = nodemailer.createTransport({
         service: "gmail",
         auth: { user: smtpUser, pass: smtpPass },
       });
-      await transporter.sendMail({
+      const sendResult = await transporter.sendMail({
         from: `${from_name ?? "RenoMeta Connect"} <${smtpUser}>`,
         to,
         subject: subject || "(no subject)",
         text: body,
+        ...(inReplyTo ? { inReplyTo } : {}),
+        ...(referencesHeader ? { references: referencesHeader } : {}),
       });
+      // Nodemailer's own generated (or provider-echoed) RFC Message-ID for
+      // this exact send — this is the "outbound identity" Gmail sync will
+      // later match against (see gmail-sync.ts's rfc_message_id column) to
+      // update this row instead of creating a duplicate.
+      providerMessageId = sendResult?.messageId ?? null;
+
+      // Legacy-plaintext migration — only after the send has genuinely
+      // succeeded (a failed send shouldn't trigger a storage migration for
+      // a credential that just proved to not work). Best-effort: a
+      // migration failure here must not turn a successful send into an
+      // error response.
+      if (usedLegacyPlaintext) {
+        try {
+          const migrateResult = await setOrgSecret(supabaseAdmin, orgId, "gmail", "smtp_app_password", smtpPass);
+          if (migrateResult.ok) {
+            const { data: latestOrg } = await supabaseAdmin
+              .from("organizations")
+              .select("integration_settings")
+              .eq("id", orgId)
+              .maybeSingle();
+            const settings: Record<string, any> = { ...(latestOrg?.integration_settings ?? {}) };
+            if (settings.gmail) {
+              settings.gmail = { email: settings.gmail.email ?? gmail.email, configured: true };
+            }
+            await supabaseAdmin.from("organizations").update({ integration_settings: settings }).eq("id", orgId);
+          }
+        } catch (migrateErr: any) {
+          console.error("[send-inbox-message] legacy password migration failed (send still succeeded):", migrateErr.message);
+        }
+      }
     } else if (channel === "whatsapp" || channel === "messenger" || channel === "instagram") {
       const productKey = channel === "whatsapp" ? "whatsapp" : channel === "messenger" ? "messenger" : "instagram";
 
@@ -424,6 +514,11 @@ export const handler: Handler = async (event) => {
         ...(sentAsTemplate ? { templateName: templateNameUsed } : {}),
         persisted,
         ...(persistWarning ? { warning: persistWarning } : {}),
+        // Email-specific: nodemailer's RFC Message-ID for this send, so the
+        // client can attach it to its optimistic local echo — this is the
+        // strong-identity key gmail-sync.ts's rfc_message_id column will
+        // later match against to update this row instead of duplicating it.
+        ...(channel === "email" && providerMessageId ? { smtpMessageId: providerMessageId } : {}),
       }),
     };
   } catch (err: any) {

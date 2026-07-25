@@ -99,10 +99,11 @@ import { useSmsMetaConversations } from "@/lib/sms-meta-conversations";
 import { analyzeSmsLength } from "@/lib/sms-segments";
 import { conversationMapKey, resolveConversationIdentity, useConversationArchiveStates } from "@/lib/conversation-states";
 import { normalizeEmail, useGmailConversations } from "@/lib/gmail-conversations";
+import { getOrgId } from "@/lib/org-id";
 import { UnmatchedGmailSenderBanner } from "@/components/inbox/unmatched-gmail-sender-banner";
 import { GmailSenderAvatar } from "@/components/inbox/gmail-sender-avatar";
 import { unlinkGmailContactFromThread } from "@/lib/gmail-contact-actions";
-import { resolveComposerRecipient } from "@/lib/composer-recipient";
+import { extractReplyAddress, resolveComposerRecipient } from "@/lib/composer-recipient";
 import { triggerGmailSync, fetchGmailConnectionStatus } from "@/lib/gmail-sync-client";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -145,6 +146,11 @@ type LocalMessage = Omit<Message, "channel"> & {
   subject?: string;
   toEmail?: string;
   pendingGmailSync?: boolean;
+  // Captured from send-inbox-message.ts's response (nodemailer's own RFC
+  // Message-ID for this exact send) when available — lets reconciliation
+  // match this echo against the real gmail_messages row by strong identity
+  // instead of only the subject/timestamp/body heuristics below.
+  rfcMessageId?: string;
 };
 
 const folders: { id: FolderId; label: string; icon: typeof InboxIcon }[] = [
@@ -298,6 +304,46 @@ function InboxPage() {
       if (status) setGmailLastSyncAt(status.lastSyncAt);
     });
   }, [channelFilter]);
+
+  // Connected Gmail account's own address + Google profile photo (see
+  // gmail-connection-status.ts) — used only to detect when a thread's
+  // sender IS this org's own connected account, so GmailSenderAvatar can
+  // show its real photo instead of a guessed domain logo. Fetched once on
+  // mount (not gated to the Email tab like gmailLastSyncAt above) since
+  // avatars render in the conversation list regardless of which channel
+  // filter tab is currently selected.
+  const [gmailAccountEmail, setGmailAccountEmail] = useState<string | null>(null);
+  const [gmailAccountPictureUrl, setGmailAccountPictureUrl] = useState<string | null>(null);
+  useEffect(() => {
+    fetchGmailConnectionStatus().then((status) => {
+      if (!status) return;
+      setGmailAccountEmail(status.accountEmail);
+      setGmailAccountPictureUrl(status.accountPictureUrl);
+    });
+  }, []);
+
+  // Real configured SMTP sender (see smtp-config-status.ts) — replaces the
+  // old hardcoded "Will reply from sales@yourco.com" composer footer text.
+  // Never exposes the App Password itself, only email + configured status.
+  const [smtpEmail, setSmtpEmail] = useState<string | null>(null);
+  const [smtpConfigured, setSmtpConfigured] = useState<boolean | null>(null);
+  useEffect(() => {
+    (async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) return;
+      try {
+        const res = await fetch("/.netlify/functions/smtp-config-status", {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        });
+        if (!res.ok) return;
+        const json = await res.json().catch(() => ({}));
+        setSmtpConfigured(!!json.configured);
+        setSmtpEmail(typeof json.email === "string" ? json.email : null);
+      } catch {
+        // Best-effort — the composer footer just omits the line below.
+      }
+    })();
+  }, []);
 
   const handleSyncGmailInInbox = async () => {
     setGmailSyncing(true);
@@ -618,10 +664,7 @@ function InboxPage() {
     if (!contactId || !UUID_RE.test(contactId)) { setSbProjects([]); setSbInvoiceTotal(0); setSbInvoiceCount(0); setSbDeals([]); setSbAppointments([]); setContactCompanyId(null); return; }
     let cancelled = false;
     (async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user || cancelled) return;
-      const { data: profile } = await supabase.from("profiles").select("organization_id").eq("id", user.id).maybeSingle();
-      const orgId = profile?.organization_id;
+      const orgId = await getOrgId();
       if (!orgId || cancelled) return;
 
       const { data: projs } = await supabase
@@ -768,6 +811,11 @@ function InboxPage() {
           subject: composeChannel === "email" ? subject : undefined,
           from_name: mergeCtx.company_name,
           contact_id: active.contactId,
+          // Gmail's own thread id (not an RFC Message-ID) — only meaningful
+          // when replying inside an existing gm-<thread_id> conversation, so
+          // send-inbox-message.ts can look up that thread's real threading
+          // headers itself. Omitted for a brand-new email conversation.
+          email_thread_id: composeChannel === "email" && active.id.startsWith("gm-") ? active.id.slice(3) : undefined,
         }),
       });
       if (!res.ok) {
@@ -829,6 +877,7 @@ function InboxPage() {
             toEmail: to,
             at: new Date().toISOString(),
             pendingGmailSync: true,
+            rfcMessageId: typeof result.smtpMessageId === "string" ? result.smtpMessageId : undefined,
           }]);
         }
       }
@@ -1285,6 +1334,8 @@ function InboxPage() {
                 }
                 tagDefinitions={managedTags}
                 onClick={() => setActiveId(c.id)}
+                gmailAccountEmail={gmailAccountEmail}
+                gmailAccountPictureUrl={gmailAccountPictureUrl}
               />
             ))}
             {conversations.length === 0 && (
@@ -1332,6 +1383,8 @@ function InboxPage() {
                       senderName={active.contactName}
                       senderEmail={active.senderEmail ?? ""}
                       matchedContactId={active.contactId}
+                      connectedAccountEmail={gmailAccountEmail}
+                      connectedAccountPictureUrl={gmailAccountPictureUrl}
                       size="md"
                       className="h-10 w-10"
                     />
@@ -1345,15 +1398,19 @@ function InboxPage() {
                         {activeContactTags[0] ?? (activeIsUnmatchedGmailSender ? "Not in contacts" : "Customer")}
                       </Badge>
                     </div>
-                    <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
-                      <span className="flex items-center gap-1">
-                        <Mail className="h-3 w-3" /> {contact.email}
-                      </span>
-                      <span>·</span>
-                      <span className="flex items-center gap-1">
-                        <Phone className="h-3 w-3" /> {contact.phone}
-                      </span>
-                    </div>
+                    {active.channel === "email" ? (
+                      <SenderEmailLine senderEmail={active.senderEmail} className="mt-0.5" />
+                    ) : (
+                      <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
+                        <span className="flex items-center gap-1">
+                          <Mail className="h-3 w-3" /> {contact.email}
+                        </span>
+                        <span>·</span>
+                        <span className="flex items-center gap-1">
+                          <Phone className="h-3 w-3" /> {contact.phone}
+                        </span>
+                      </div>
+                    )}
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
@@ -1700,7 +1757,13 @@ function InboxPage() {
                         {smsInfo.isUnusuallyLong && " · unusually long message"}
                       </span>
                     )}
-                    {composeChannel === "email" && "Will reply from sales@yourco.com"}
+                    {composeChannel === "email" && (
+                      smtpConfigured === true && smtpEmail
+                        ? `Will reply from ${smtpEmail}`
+                        : smtpConfigured === false
+                          ? "Gmail sending isn't configured — add an App Password in Settings → Integrations"
+                          : null
+                    )}
                     {composeChannel === "note" && "Internal · @mention to notify"}
                   </div>
                   <div className="flex items-center gap-1.5">
@@ -1806,6 +1869,8 @@ function InboxPage() {
                       senderName={contact.name}
                       senderEmail={active.senderEmail ?? ""}
                       matchedContactId={active.contactId}
+                      connectedAccountEmail={gmailAccountEmail}
+                      connectedAccountPictureUrl={gmailAccountPictureUrl}
                       size="lg"
                       className="h-12 w-12"
                     />
@@ -1814,7 +1879,11 @@ function InboxPage() {
                   )}
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[15px] font-semibold">{contact.name}</div>
-                    <div className="mt-1 truncate text-xs text-muted-foreground">{contact.email}</div>
+                    {active.channel === "email" ? (
+                      <SenderEmailLine senderEmail={active.senderEmail} className="mt-1" />
+                    ) : (
+                      <div className="mt-1 truncate text-xs text-muted-foreground">{contact.email}</div>
+                    )}
                     <div className="mt-0.5 truncate text-xs text-muted-foreground">{contact.phone}</div>
                     {activeContactHasRealId && (
                       <button
@@ -2420,6 +2489,31 @@ function ComposeTab({
   );
 }
 
+// The real Gmail reply address for the active thread — deliberately fed
+// from `senderEmail` (the conversation's own from-address, see
+// gmail-conversations.ts/composer-recipient.ts), never `contact.email`,
+// since a linked/matched CRM contact's email can legitimately differ from
+// the actual thread it's linked to (see composer-recipient.ts's header
+// comment). Renders nothing when there's no address to show — never a
+// placeholder like "Unknown email".
+function SenderEmailLine({ senderEmail, className }: { senderEmail: string | null | undefined; className?: string }) {
+  const address = extractReplyAddress(senderEmail);
+  if (!address) return null;
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        navigator.clipboard.writeText(address);
+        toast.success("Email address copied");
+      }}
+      title={address}
+      className={`block max-w-full truncate text-left text-xs text-muted-foreground hover:text-foreground hover:underline ${className ?? ""}`}
+    >
+      {address}
+    </button>
+  );
+}
+
 function ContextSection({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="border-b border-border p-5">
@@ -2467,6 +2561,8 @@ function ConversationRow({
   contactTags,
   tagDefinitions,
   onClick,
+  gmailAccountEmail,
+  gmailAccountPictureUrl,
 }: {
   conv: Conversation;
   active: boolean;
@@ -2474,6 +2570,8 @@ function ConversationRow({
   contactTags: string[];
   tagDefinitions: { label: string; color: string }[];
   onClick: () => void;
+  gmailAccountEmail?: string | null;
+  gmailAccountPictureUrl?: string | null;
 }) {
   const badges = [
     ...(hasMention(conv.id)
@@ -2526,6 +2624,8 @@ function ConversationRow({
             senderName={conv.contactName}
             senderEmail={conv.senderEmail ?? ""}
             matchedContactId={conv.contactId}
+            connectedAccountEmail={gmailAccountEmail}
+            connectedAccountPictureUrl={gmailAccountPictureUrl}
             size="sm"
             className="h-10 w-10"
           />
@@ -2889,10 +2989,11 @@ function groupByDay(messages: LocalMessage[]) {
 // currently-rendered thread.
 //
 // Matching, most confident first:
-//   1. thread/message id — not available for SMTP-sent mail in this
-//      codebase; always falls through today. Left as tier 1 so it takes
-//      effect for free if a future gmail-sync path starts stamping outbound
-//      sends with a real thread id.
+//   1. RFC Message-ID — nodemailer's Message-ID for the send (captured from
+//      send-inbox-message.ts's response) compared against the same header
+//      Gmail sync parses off the synced copy (gmail-sync.ts). Sufficient on
+//      its own when both sides have it; falls through to the heuristics
+//      below for any email sent/synced before this field existed.
 //   2. normalized recipient email — real gmail conversations are already
 //      matched to a contact by email address (see gmail-conversations.ts),
 //      so "same contactId as this local echo's conversation" IS the
@@ -2916,6 +3017,18 @@ function isLocalEmailReconciled(
   gmailMsgsList: Message[],
 ): boolean {
   if (!local.pendingGmailSync) return false;
+
+  // Tier 1 — strong identity: nodemailer's RFC Message-ID for this send
+  // (captured at send time from send-inbox-message.ts's response) equals
+  // the same header Gmail sync later parses off the synced copy of that
+  // same sent message (see gmail-sync.ts). When present, this alone is
+  // sufficient — no email-address/subject/timestamp corroboration needed,
+  // since a Message-ID collision across two different emails is not a
+  // realistic concern.
+  if (local.rfcMessageId) {
+    const strongMatch = gmailMsgsList.some((m) => m.rfcMessageId && m.rfcMessageId === local.rfcMessageId);
+    if (strongMatch) return true;
+  }
 
   const candidateConvIds = new Set(
     gmailConvsList

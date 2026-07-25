@@ -32,23 +32,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { supabase } from "@/lib/supabase";
 import type { Conversation, Message } from "@/lib/mock-data";
-
-async function getOrgId(): Promise<string | null> {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return null;
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("organization_id")
-    .eq("id", user.id)
-    .maybeSingle();
-  if (profile?.organization_id) return profile.organization_id;
-  const { data: membership } = await supabase
-    .from("org_memberships")
-    .select("org_id")
-    .eq("member_id", user.id)
-    .maybeSingle();
-  return membership?.org_id ?? null;
-}
+import { getOrgId } from "@/lib/org-id";
 
 export function normalizeEmail(raw: string | null | undefined): string {
   return (raw ?? "").trim().toLowerCase();
@@ -217,7 +201,7 @@ export function useGmailConversations(): {
 
     const { data, error } = await supabase
       .from("gmail_messages")
-      .select("id, thread_id, internal_date, snippet, from_email, to_emails, subject, labels, created_at")
+      .select("id, thread_id, internal_date, snippet, from_email, to_emails, subject, labels, created_at, rfc_message_id")
       .eq("org_id", orgId)
       .order("internal_date", { ascending: true })
       .limit(2000);
@@ -377,6 +361,7 @@ export function useGmailConversations(): {
           direction: isOutbound(row) ? "out" : "in",
           body,
           at: parseGmailTimestamp(row.internal_date, row.created_at),
+          rfcMessageId: row.rfc_message_id ?? undefined,
         });
       }
     }

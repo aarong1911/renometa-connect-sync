@@ -150,7 +150,21 @@ export const handler: Handler = async (event) => {
     }
 
     // Connected account email — used for display only, never for auth.
+    //
+    // Current GOOGLE_GMAIL_SCOPES (see .env) is gmail.readonly + gmail.send
+    // only — no openid/email/profile scope is requested, and this function
+    // never requests one on its own (broadening scope requires new user
+    // consent, which is out of scope here). The legacy
+    // oauth2/v2/userinfo endpoint has nonetheless always returned `email`
+    // for this app under those scopes (see accountEmail below, populated
+    // successfully for every existing connection) — it may also return
+    // `picture` without needing an explicit `profile` scope grant, since
+    // that field reflects public Google Account profile data rather than
+    // Gmail API access. Captured opportunistically here: if Google includes
+    // it, it's stored; if not, `accountPictureUrl` stays null and nothing
+    // else changes. This is not a new API call and not a scope change.
     let accountEmail: string | null = null;
+    let accountPictureUrl: string | null = null;
     try {
       const profileRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
         headers: { Authorization: `Bearer ${accessToken}` },
@@ -158,6 +172,9 @@ export const handler: Handler = async (event) => {
       if (profileRes.ok) {
         const profileJson: any = await profileRes.json();
         accountEmail = profileJson.email ?? null;
+        // Only ever the connected account's own photo URL — never fetched
+        // for, or applied to, any other sender's address.
+        accountPictureUrl = typeof profileJson.picture === "string" ? profileJson.picture : null;
       }
     } catch (e: any) {
       console.warn("[gmail-oauth-callback] userinfo fetch failed:", e.message);
@@ -165,7 +182,7 @@ export const handler: Handler = async (event) => {
 
     const { data: existing } = await supabaseAdmin
       .from("integrations")
-      .select("id, refresh_token_encrypted")
+      .select("id, refresh_token_encrypted, config")
       .eq("org_id", orgId)
       .eq("provider", "gmail")
       .maybeSingle();
@@ -183,6 +200,12 @@ export const handler: Handler = async (event) => {
 
     const expiresAt = new Date(Date.now() + expiresInSec * 1000).toISOString();
 
+    // Non-secret account metadata only — merged with (not overwriting)
+    // whatever else is already in `config`, so a future unrelated config
+    // key added by some other code path is never clobbered here.
+    const existingConfig: Record<string, any> = (existing?.config && typeof existing.config === "object") ? existing.config : {};
+    const nextConfig = { ...existingConfig, picture_url: accountPictureUrl };
+
     const payload: Record<string, any> = {
       org_id: orgId,
       provider: "gmail",
@@ -190,6 +213,7 @@ export const handler: Handler = async (event) => {
       access_token_encrypted: encryptToBytea(accessToken),
       token_expires_at: expiresAt,
       provider_account_email: accountEmail,
+      config: nextConfig,
       last_sync_status: null,
       sync_error: null,
       updated_at: new Date().toISOString(),

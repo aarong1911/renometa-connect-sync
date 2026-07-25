@@ -6,40 +6,40 @@
 // newsletter makes it look like a real CRM contact, which is misleading.
 //
 // Priority for an unmatched sender:
-//   1. A logo, attempted for the sender's normalized domain (see
-//      domainForLogo) — every domain gets ONE attempt per browser session,
-//      not just a hardcoded allowlist; KNOWN_LOGO_DOMAINS below is a
-//      curated list of common senders confirmed to have a real favicon,
-//      kept for documentation/clarity, not as a gate.
-//   2. Two-letter initials derived from the sender's display name, or the
-//      email local-part if there's no usable display name
-//   3. A generic email icon, only if neither of the above produced
-//      anything at all
+//   1. The connected Gmail account's own Google profile photo, when the
+//      sender IS that same account (see connectedAccountEmail/
+//      connectedAccountPictureUrl below).
+//   2. A logo — ONLY for a domain explicitly present in KNOWN_BRAND_DOMAINS
+//      below (after resolving a known mail-infra alias, see
+//      ALIAS_STRIP_PREFIXES). This is a strict allowlist, not "attempt
+//      every domain once": an unrecognized domain never constructs a
+//      favicon URL and never renders <AvatarImage>, so it can never cause a
+//      network request (previously every unmatched sender's domain was
+//      attempted once per session, which spammed the console with 404s for
+//      arbitrary senders like "aimstel.com"/"dealnotes.ai").
+//   3. Two-letter initials derived from the sender's display name, or the
+//      email local-part if there's no usable display name.
+//   4. A generic email icon, only if neither of the above produced
+//      anything at all.
 //
-// Logo source: no company-logo/favicon utility already existed in this
-// repo (checked first). Uses Google's public favicon-fetching endpoint —
+// Logo source: Google's public favicon-fetching endpoint —
 // https://www.google.com/s2/favicons?domain=<domain>&sz=64 — free, no key,
-// no paid dependency, HTTPS, and only ever sent the bare normalized
-// domain, never the full email address. This endpoint returns a generic
-// fallback icon for most domains rather than a hard 404, but a genuine
-// 404/network failure IS possible for some domains — handled by caching a
-// per-domain success/failure result for the browser session (module-level
-// Map, shared by every instance of this component: conversation list,
-// thread header, right-side panel, unmatched-sender banner all look at the
-// same cache), so a failing domain is requested at most once per session,
-// never repeatedly on re-render or across rows.
+// only ever sent one of the exact KNOWN_BRAND_DOMAINS values, never the
+// full email address or an arbitrary/derived domain.
 //
-// Domain normalization: strips known mail-infrastructure subdomains
-// (email./mail./notifications./noreply.), then reduces to the
-// registrable domain. No public-suffix-list dependency exists in this
-// project and none was added solely for this (per instructions) — instead
-// a small, non-exhaustive set of common multi-label suffixes
-// (KNOWN_MULTI_LABEL_SUFFIXES) prevents mangling domains like
-// "example.co.uk" or "example.com.au" down to just "co.uk"/"com.au". This
-// isn't a complete public-suffix implementation, but for a display-only
-// logo lookup the worst case on an unlisted compound suffix is just "no
-// logo, initials fallback" — never anything incorrect or user-visible as
-// broken.
+// Domain resolution — deliberately NOT a public-suffix/label-reduction
+// algorithm. A prior version reduced any domain down to "last two labels"
+// (with a small hardcoded exception list for compound suffixes like
+// "co.uk"), which is unsafe: a ccTLD it didn't know about (e.g. "co.il")
+// got mangled — "company.co.il" was reduced to the bare public suffix
+// "co.il" and THAT got requested as a favicon domain. This version never
+// reduces labels at all. It only ever strips one of a small fixed set of
+// literal known mail-infrastructure subdomain prefixes (ALIAS_STRIP_PREFIXES
+// — e.g. "email.claude.com" -> "claude.com", "accounts.google.com" ->
+// "google.com") and then requires an EXACT match against
+// KNOWN_BRAND_DOMAINS. Any domain that doesn't exactly match after that one
+// optional strip — including "company.co.il", or any other domain not on
+// the list — falls straight through to initials with zero network activity.
 
 import { useState } from "react";
 import { Mail } from "lucide-react";
@@ -47,6 +47,7 @@ import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
 import { ContactAvatar } from "@/components/ui/contact-avatar";
 import { cn } from "@/lib/utils";
 import { localPartToWords } from "@/lib/gmail-contact-actions";
+import { extractReplyAddress } from "@/lib/composer-recipient";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -57,78 +58,107 @@ const SIZE_CLASSES = {
   lg: "h-12 w-12",
 } as const;
 
-// Mail-infrastructure subdomains that don't carry their own brand favicon —
-// stripped before resolving a logo so "noreply@email.openai.com" queries
-// "openai.com", not a subdomain with no favicon of its own.
-const STRIP_PREFIXES = ["email.", "mail.", "notifications.", "noreply."];
-
-// Common two-label public suffixes — checked before reducing to "last two
-// labels" so e.g. "news.example.co.uk" correctly becomes "example.co.uk",
-// not "co.uk". Deliberately small; see file header for why.
-const KNOWN_MULTI_LABEL_SUFFIXES = new Set([
-  "co.uk", "org.uk", "me.uk", "ac.uk", "ltd.uk", "plc.uk",
-  "com.au", "net.au", "org.au", "edu.au",
-  "co.nz", "co.jp", "co.in", "co.za", "co.id",
-  "com.br", "com.mx", "com.co", "com.sg", "com.hk", "com.tw",
-]);
-
-// Curated list of common Gmail senders confirmed to have a real,
-// recognizable favicon — documentation of what this feature is expected to
-// cover well. NOT a gate: any other normalized domain is still attempted
-// once (see domainForLogo/the session cache below), per requirement.
-const KNOWN_LOGO_DOMAINS = new Set([
-  "claude.com",
+// The ONLY domains a logo will ever be requested for. Adding a brand here
+// is the sole way to make its logo appear — there is no fallback path that
+// attempts an unlisted domain.
+const KNOWN_BRAND_DOMAINS = new Set([
+  "google.com",
+  "openai.com",
   "anthropic.com",
+  "claude.com",
   "linkedin.com",
   "buffer.com",
   "playstation.com",
   "sony.com",
+  "capitalone.com",
+  "microsoft.com",
+  "apple.com",
+  "stripe.com",
+  "skool.com",
   "investopedia.com",
   "verizon.com",
   "startengine.com",
   "schwab.com",
-  "capitalone.com",
-  "google.com",
-  "openai.com",
-  "skool.com",
-  "microsoft.com",
-  "apple.com",
-  "stripe.com",
+  // Added from real inbox sender domains (see gmail_messages.from_email) —
+  // each is an unambiguous, recognizable brand's own root domain.
+  "hostinger.com",
+  "indeed.com",
+  "redfin.com",
+  "paypal.com",
+  "wellsfargo.com",
+  "zapier.com",
+  "gusto.com",
+  "quora.com",
+  "supabase.com",
+  "substack.com",
+  "morningstar.com",
+  "seekingalpha.com",
+  "interactivebrokers.com",
+  "aliexpress.com",
+  "webull.com",
+  "binance.us",
+  "bluehost.com",
+  "flippa.com",
+  "gunbroker.com",
+  "caseys.com",
+  "acquire.com",
+  "neon.tech",
 ]);
 
-function reduceToRegistrableDomain(domain: string): string {
-  const labels = domain.split(".").filter(Boolean);
-  if (labels.length <= 2) return domain;
-  const lastTwo = labels.slice(-2).join(".");
-  if (labels.length > 2 && KNOWN_MULTI_LABEL_SUFFIXES.has(lastTwo)) {
-    return labels.slice(-3).join(".");
-  }
-  return lastTwo;
-}
+// A small, fixed set of literal (never wildcard, never label-counted) known
+// mail-infrastructure subdomain prefixes that some of the brands above send
+// from — e.g. "email.claude.com", "accounts.google.com",
+// "notifications.linkedin.com", "email.openai.com", "info.hostinger.com",
+// "notify.wellsfargo.com", "mail.redfin.com". Stripping one of these
+// literal prefixes (at most once) is the only normalization performed
+// before the exact KNOWN_BRAND_DOMAINS lookup; it is never applied
+// generically to reduce an arbitrary domain's labels.
+const ALIAS_STRIP_PREFIXES = [
+  "email.", "mail.", "notifications.", "notification.",
+  "communications.", "communication.", "accounts.", "noreply.", "no-reply.",
+  "info.", "notify.", "customer.", "offers.", "marketing.", "notice.", "send.", "e.",
+];
 
-/** Normalizes a sender email down to the domain used for logo lookup — never the full address. Null for an unusable address. */
-function domainForLogo(email: string): string | null {
+// Sender subdomains tied 1:1 to one specific brand where the subdomain
+// itself isn't a generic, reusable mail-infra term (unlike "notify."/
+// "marketing." above) — e.g. Indeed's job-alert and job-match senders.
+// Explicit full-domain entries only; never pattern-matched.
+const EXPLICIT_ALIAS_DOMAINS: Record<string, string> = {
+  "jobalert.indeed.com": "indeed.com",
+  "match.indeed.com": "indeed.com",
+};
+
+/**
+ * Resolves a sender email down to a KNOWN_BRAND_DOMAINS member, or null if
+ * it isn't one — never returns an arbitrary/derived domain. Null means "no
+ * logo attempt, initials only, zero network request."
+ */
+function knownBrandDomainForLogo(email: string): string | null {
   const at = email.lastIndexOf("@");
   if (at < 0) return null;
-  let domain = email.slice(at + 1).trim().toLowerCase();
-  if (!domain) return null;
+  const rawDomain = email.slice(at + 1).trim().toLowerCase();
+  if (!rawDomain) return null;
 
-  for (const prefix of STRIP_PREFIXES) {
-    if (domain.startsWith(prefix)) {
-      domain = domain.slice(prefix.length);
-      break;
+  if (KNOWN_BRAND_DOMAINS.has(rawDomain)) return rawDomain;
+  if (EXPLICIT_ALIAS_DOMAINS[rawDomain]) return EXPLICIT_ALIAS_DOMAINS[rawDomain];
+
+  for (const prefix of ALIAS_STRIP_PREFIXES) {
+    if (rawDomain.startsWith(prefix)) {
+      const stripped = rawDomain.slice(prefix.length);
+      if (KNOWN_BRAND_DOMAINS.has(stripped)) return stripped;
+      break; // only one strip attempt — never chain multiple prefixes
     }
   }
 
-  return reduceToRegistrableDomain(domain) || null;
+  return null;
 }
 
-// Session-lived (resets on page reload, per requirement — not persisted
-// anywhere) cache of logo attempts, shared across every GmailSenderAvatar
-// instance on the page. A domain already known to fail is never requested
-// again; a domain already known to succeed doesn't need to be re-decided,
-// though the browser's own HTTP cache handles the actual re-fetch cost.
-const logoStatusCache = new Map<string, "success" | "failed">();
+// Session-lived (resets on page reload, not persisted anywhere) cache of
+// logo load outcomes — bounded to KNOWN_BRAND_DOMAINS (at most ~17 entries)
+// since unknown domains never reach this cache at all. Shared across every
+// GmailSenderAvatar instance on the page so a known brand's logo that
+// failed to load once isn't re-attempted by every row/instance.
+const knownBrandLogoStatusCache = new Map<string, "success" | "failed">();
 
 function initialsFromWords(text: string): string {
   const words = text
@@ -154,6 +184,8 @@ export function GmailSenderAvatar({
   senderName,
   senderEmail,
   matchedContactId,
+  connectedAccountEmail,
+  connectedAccountPictureUrl,
   size = "sm",
   className,
 }: {
@@ -161,6 +193,10 @@ export function GmailSenderAvatar({
   senderEmail: string;
   /** Real contacts.id when the sender matches or is explicitly linked to a saved contact — anything else (undefined, or a synthetic gmail-unknown-* id) gets the unmatched-sender treatment. */
   matchedContactId?: string | null;
+  /** The org's own connected Gmail OAuth account address (see gmail-connection-status.ts) — used only to detect when a thread's sender IS that same account, so its real Google profile photo can be shown instead of a guessed domain logo/initials. Never used to fetch a photo for any OTHER address. */
+  connectedAccountEmail?: string | null;
+  /** The connected account's own Google profile photo URL, if one has been captured — a safe, non-secret URL only (see gmail-oauth-callback.ts). */
+  connectedAccountPictureUrl?: string | null;
   size?: keyof typeof SIZE_CLASSES;
   className?: string;
 }) {
@@ -168,14 +204,40 @@ export function GmailSenderAvatar({
   // other instances/rows for the same domain read the shared cache fresh
   // on their own next render, they don't need to be poked.
   const [, setFailedTick] = useState(0);
+  const [connectedPhotoFailed, setConnectedPhotoFailed] = useState(false);
 
   if (matchedContactId && UUID_RE.test(matchedContactId)) {
     return <ContactAvatar id={matchedContactId} name={senderName} size={size} className={className} />;
   }
 
-  const domain = senderEmail ? domainForLogo(senderEmail) : null;
   const initials = deriveSenderInitials(senderName, senderEmail);
-  const cachedStatus = domain ? logoStatusCache.get(domain) : undefined;
+
+  // Sender-is-the-connected-account case: compare normalized bare addresses
+  // (never the raw "Name <addr>" form) so e.g. "Aaron G <aarong1911@gmail.com>"
+  // matches a connected account email of "aarong1911@gmail.com".
+  const normalizedSender = senderEmail ? extractReplyAddress(senderEmail)?.toLowerCase() ?? null : null;
+  const normalizedConnected = connectedAccountEmail ? connectedAccountEmail.trim().toLowerCase() : null;
+  const isConnectedAccount = !!normalizedSender && !!normalizedConnected && normalizedSender === normalizedConnected;
+
+  if (isConnectedAccount && connectedAccountPictureUrl && !connectedPhotoFailed) {
+    return (
+      <Avatar className={cn(SIZE_CLASSES[size], "shrink-0 ring-1 ring-black/5", className)}>
+        <AvatarImage
+          src={connectedAccountPictureUrl}
+          alt=""
+          onLoadingStatusChange={(status) => {
+            if (status === "error") setConnectedPhotoFailed(true);
+          }}
+        />
+        <AvatarFallback className="bg-secondary text-[10px] font-semibold text-muted-foreground">
+          {initials || <Mail className="h-3.5 w-3.5" />}
+        </AvatarFallback>
+      </Avatar>
+    );
+  }
+
+  const domain = senderEmail ? knownBrandDomainForLogo(senderEmail) : null;
+  const cachedStatus = domain ? knownBrandLogoStatusCache.get(domain) : undefined;
   const attemptLogo = !!domain && cachedStatus !== "failed";
 
   return (
@@ -186,10 +248,10 @@ export function GmailSenderAvatar({
           alt=""
           onLoadingStatusChange={(status) => {
             if (status === "error") {
-              logoStatusCache.set(domain!, "failed");
+              knownBrandLogoStatusCache.set(domain!, "failed");
               setFailedTick((n) => n + 1);
             } else if (status === "loaded") {
-              logoStatusCache.set(domain!, "success");
+              knownBrandLogoStatusCache.set(domain!, "success");
             }
           }}
         />
