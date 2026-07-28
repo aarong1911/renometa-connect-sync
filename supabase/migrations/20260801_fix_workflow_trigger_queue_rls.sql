@@ -1,0 +1,77 @@
+-- Phase 9.6 security closure — fixes a confirmed cross-organization RLS
+-- vulnerability on workflow_trigger_queue.
+--
+-- SCHEMA AUDIT (performed before writing this migration; see Phase 9.6
+-- closure report for full detail): live columns, confirmed via PostgREST
+-- with the service-role key, are exactly:
+--   id, event_type, event_data (jsonb), status, attempts, last_error,
+--   created_at, processed_at
+-- There is NO org_id column and NO workflow_id column on this table.
+-- Any "org_id" seen in sample rows lives inside the untrusted event_data
+-- jsonb blob (one row even has the literal string "test-org", not a real
+-- UUID) — it is application payload, not a security-checkable column, and
+-- must never be treated as one.
+--
+-- CONSUMER AUDIT: a full-repository search (src/, netlify/functions/,
+-- supabase/migrations/) found no code that reads (SELECTs) from this
+-- table, and no application code that INSERTs into it directly either.
+-- The only known writers are:
+--   1. Database triggers on deals/contacts/leads/projects/invoices/
+--      appointments/tasks (per 20260606_deals_rls_and_wtq.sql's "Fix B",
+--      which ran `alter function ... security definer` on every trigger
+--      function found on those tables — i.e. DEFINER context, which in
+--      Supabase runs as the function's owning role. If that owning role
+--      has BYPASSRLS (true for the roles Supabase migrations normally run
+--      as), these trigger-driven inserts are UNAFFECTED by any RLS policy
+--      change made here, because BYPASSRLS skips policy evaluation
+--      entirely regardless of which policies exist.
+--   2. Possibly an external system outside this repository (e.g. the
+--      marketing site's contact-form integration) — rows exist with
+--      event_type='form_submitted' that no function in this codebase
+--      produces. Any such writer must be using either the service-role
+--      key or an authenticated session already scoped some other way;
+--      this cannot be verified from within this repository and is
+--      reported as a residual gap, not fixed here (see report Priority 3).
+--
+-- The new Phase 9.6 agentic framework (agent_executions/etc.) does NOT
+-- use this table at all — confirmed by the same search.
+--
+-- FIX: default-deny for authenticated/anon clients (no replacement SELECT
+-- or INSERT policy). This is the safest option per the migration
+-- requirements: the table's real schema has no column that could scope a
+-- policy to an organization in a trustworthy way, and nothing in this
+-- codebase's UI ever needs to read or write this table directly. If
+-- something still needs post-deploy access, that must be added later
+-- with an actual audited need, not restored defensively.
+--
+-- WHY THE OLD POLICIES WERE UNSAFE (exact text, from
+-- 20260606_deals_rls_and_wtq.sql):
+--   create policy "org members can insert workflow triggers"
+--     on workflow_trigger_queue for insert to authenticated with check (true);
+--   create policy "org members can read workflow triggers"
+--     on workflow_trigger_queue for select to authenticated using (true);
+-- Despite their names, neither policy actually checks organization
+-- membership — `with check (true)` and `using (true)` allow ANY
+-- authenticated user, in ANY organization, to insert or read EVERY
+-- organization's queue rows. This is a real cross-tenant data exposure.
+
+alter table workflow_trigger_queue enable row level security;
+
+-- Drop ONLY the two known-permissive policies, by their exact names.
+-- Nothing else on this table (or any other table) is touched.
+drop policy if exists "org members can insert workflow triggers" on workflow_trigger_queue;
+drop policy if exists "org members can read workflow triggers" on workflow_trigger_queue;
+
+-- No replacement policy is added for authenticated/anon SELECT, INSERT,
+-- UPDATE, or DELETE. With RLS enabled and zero matching policies, both
+-- roles get zero rows and every write is rejected — a safe default-deny.
+-- Service-role Netlify functions and SECURITY DEFINER trigger functions
+-- (which run with BYPASSRLS) are unaffected by this and continue to work.
+--
+-- VERIFY AFTER DEPLOYING (see Phase 9.6 closure report, Priority 7/8):
+-- create/edit a deal, contact, or lead in the app and confirm no 403/42501
+-- error occurs. If one does occur, the trigger functions on this
+-- environment are NOT actually running under a BYPASSRLS role, and a
+-- narrower, org-scoped policy (keyed off a column added to this table)
+-- will need to be designed as a follow-up — do not restore
+-- `using (true)`/`with check (true)` to fix it.

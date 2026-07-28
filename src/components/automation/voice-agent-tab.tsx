@@ -407,7 +407,10 @@ export function VoiceAgentTab() {
         return {
           id: a.id,
           vapi_assistant_id: a.vapi_assistant_id,
-          name: a.name || "Voice Agent",
+          // Display-only fallback (Part 12) — some rows have a bare numeric
+          // name (e.g. "30") with no real display name ever set. Never
+          // shown as-is; never written back to the database.
+          name: a.name && !/^\d+$/.test(String(a.name).trim()) ? a.name : `Voice Agent ${a.name ?? ""}`.trim(),
           tagline:
             a.first_message?.substring(0, 80) + "..." ||
             "Configure this agent to handle calls.",

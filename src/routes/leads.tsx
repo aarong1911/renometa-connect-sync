@@ -18,6 +18,13 @@ import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
 } from "@/components/ui/dialog";
 import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  Popover, PopoverContent, PopoverTrigger,
+} from "@/components/ui/popover";
+import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -30,7 +37,7 @@ import {
   ArrowRight, MoreHorizontal, DollarSign, Calendar, User, Building2,
   ExternalLink, SlidersHorizontal, FileText, Sparkles, Users, CheckCircle2 as CheckCircleIcon,
 } from "lucide-react";
-import { Download, Upload } from "lucide-react";
+import { Download, Upload, Trash2, Pencil as PencilIcon, Loader2 } from "lucide-react";
 import { AlertTriangle, CheckCircle2 } from "lucide-react";
 import { StickyNote, Pencil, Check, X as XIcon } from "lucide-react";
 import { type Lead, type LeadSource, type LeadStatus, type LeadScore } from "@/lib/mock-data";
@@ -38,13 +45,16 @@ import { formatMoney, formatDateShort, formatPhone } from "@/lib/format";
 import { formatDistanceToNow } from "date-fns";
 import { toast } from "sonner";
 import { useTopbarAction } from "@/lib/topbar-action";
-import { useTeam } from "@/lib/organization";
+import { useTeam, type TeamMember } from "@/lib/organization";
 import {
   useLeads, addLead as storeAddLead, updateLeadStatus as storeUpdateStatus,
-  updateLeadScore as storeUpdateScore, importLeads,
+  updateLeadsStatusBulk, updateLead as storeUpdateLead,
+  updateLeadOwner as storeUpdateLeadOwner, updateLeadsOwnerBulk,
+  deleteLead as storeDeleteLead, deleteLeadsBulk, addLeadsBatch,
 } from "@/lib/leads-store";
 import { useLeadNotes, addLeadNote } from "@/lib/leads-store";
 import { updateLeadNote } from "@/lib/leads-store";
+import { useEntityNotes } from "@/lib/contact-notes";
 import { ConvertLeadDialog } from "@/components/leads/convert-lead-dialog";
 import { DealDetailDrawer } from "@/components/sales/deal-detail-drawer";
 import {
@@ -56,6 +66,14 @@ import {
   leadsToCSV, downloadCSV, parseCSVPreview, autoMapHeaders, applyMappingToLeads,
   LEAD_FIELDS, type ColumnMapping, type LeadFieldKey, type TemplateType,
 } from "@/lib/leads-csv";
+import { LEAD_STATUSES, LEAD_STATUS_LABELS, leadStatusLabel, leadStatusBadgeVariant } from "@/lib/lead-status";
+import { leadSourceLabel } from "@/lib/lead-source";
+import { normalizeEmail, findDuplicateContactCandidates } from "@/lib/identity-normalization";
+import { getOrgId as getContactsOrgId } from "@/lib/contacts-store";
+import { CSV_MAX_SYNC_IMPORT_ROWS, CSV_WARN_ROW_THRESHOLD } from "@/lib/csv-utils";
+import { createImportJob, logImportRows, completeImportJob, prefetchContactIdentitySets } from "@/lib/import-jobs-store";
+import { ImportHistoryDialog } from "@/components/crm/import-history-dialog";
+import { History } from "lucide-react";
 
 type LeadsSearch = { leadId?: string };
 
@@ -66,17 +84,17 @@ export const Route = createFileRoute("/leads")({
   component: LeadsPage,
 });
 
-const SOURCE_FILTERS = ["All sources", "Website", "Referral", "Angi", "Thumbtack", "Google Ads", "Walk-in", "Social Media"] as const;
-const STATUS_FILTERS = ["All statuses", "new", "contacted", "qualified", "converted", "lost"] as const;
+// STATUS_FILTERS/ALL_STATUSES/STATUS_LABELS/statusBadgeVariant previously
+// duplicated the same 5-value list inline (Phase 9 audit finding) — now
+// sourced from src/lib/lead-status.ts, the single shared definition.
+const STATUS_FILTERS = ["All statuses", ...LEAD_STATUSES] as const;
 const SCORE_FILTERS = ["All scores", "hot", "warm", "cold"] as const;
 const ALL_SOURCES: LeadSource[] = ["Website", "Referral", "Angi", "Thumbtack", "Google Ads", "Walk-in", "Social Media"];
-const ALL_STATUSES: LeadStatus[] = ["new", "contacted", "qualified", "converted", "lost"];
+const ALL_STATUSES: LeadStatus[] = LEAD_STATUSES;
 const ALL_SCORES: LeadScore[] = ["hot", "warm", "cold"];
 const PROJECT_TYPES = ["Kitchen Remodel", "Bath Remodel", "Whole Home Renovation", "Basement Finish", "Addition", "Outdoor Living", "Primary Suite"];
 
-const STATUS_LABELS: Record<LeadStatus, string> = {
-  new: "New", contacted: "Contacted", qualified: "Qualified", converted: "Converted", lost: "Lost",
-};
+const STATUS_LABELS: Record<LeadStatus, string> = LEAD_STATUS_LABELS;
 
 function scoreIcon(score: LeadScore) {
   switch (score) {
@@ -86,14 +104,33 @@ function scoreIcon(score: LeadScore) {
   }
 }
 
-function statusBadgeVariant(status: LeadStatus): "default" | "secondary" | "outline" | "destructive" {
-  switch (status) {
-    case "new": return "default";
-    case "contacted": return "secondary";
-    case "qualified": return "outline";
-    case "converted": return "default";
-    case "lost": return "destructive";
+// leads.assigned_to (a real FK-shaped UUID, confirmed live — see Phase 9.2
+// report) is now canonical. `owner`/`ownerInitials` are legacy
+// custom_fields display text kept only as a fallback for rows created
+// before assignedTo existed. Resolving the name from the live team list
+// (rather than trusting a possibly-renamed cached string) means a renamed
+// team member's leads show the CURRENT name immediately, with no backfill.
+function resolveOwnerName(lead: Lead, teamMembers: TeamMember[]): string {
+  if (lead.assignedTo) {
+    const member = teamMembers.find((m) => m.id === lead.assignedTo);
+    if (member) return member.name;
+    // assignedTo is set but doesn't match any current team member (removed
+    // member, or a member from a different org — shouldn't happen since
+    // useTeam() is already org-scoped, but fails safe either way).
+    return "Unknown member";
   }
+  return lead.owner && lead.owner !== "—" ? lead.owner : "Unassigned";
+}
+
+// Phase 9.2 consistency pass — a converted lead is retained as a historical
+// source record and is never individually or bulk-deletable from this page.
+// The store (deleteLead/deleteLeadsBulk in leads-store.ts) enforces this
+// independently of the UI; this local check only decides what the delete
+// dialog itself shows (no destructive "delete anyway" action for these).
+const CONVERTED_LEAD_DELETE_MESSAGE = "Converted leads are retained to preserve the sales history associated with their deal.";
+
+function isDeleteBlockedConverted(lead: Pick<Lead, "status" | "convertedDealId">): boolean {
+  return lead.status === "converted" || !!lead.convertedDealId;
 }
 
 function LeadsPage() {
@@ -103,10 +140,22 @@ function LeadsPage() {
   const pipelineStages = usePipelineStages();
   const deals = useDeals();
   const leads = useLeads();
+  const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
   const [sourceFilter, setSourceFilter] = useState<string>("All sources");
   const [statusFilter, setStatusFilter] = useState<string>("All statuses");
   const [scoreFilter, setScoreFilter] = useState<string>("All scores");
+  // "More filters" (Priority 7) — kept as separate controlled state rather
+  // than folded into the always-visible filter row, so the existing
+  // filter-bar layout doesn't change; these live inside a popover opened
+  // from the same "More filters" button that was previously a no-op.
+  const [ownerFilter, setOwnerFilter] = useState<string>("All owners");
+  const [convertedFilter, setConvertedFilter] = useState<"all" | "converted" | "unconverted">("all");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [budgetMin, setBudgetMin] = useState("");
+  const [budgetMax, setBudgetMax] = useState("");
+  const [moreFiltersOpen, setMoreFiltersOpen] = useState(false);
   const [selected, setSelected] = useState<Lead | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [convertLead, setConvertLead] = useState<Lead | null>(null);
@@ -120,10 +169,41 @@ function LeadsPage() {
   const [csvTotalRows, setCsvTotalRows] = useState(0);
   const [colMapping, setColMapping] = useState<ColumnMapping | null>(null);
   const [templateType, setTemplateType] = useState<TemplateType>("lead");
+  const [importChecking, setImportChecking] = useState(false);
+  const [importFilename, setImportFilename] = useState("leads.csv");
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [newLead, setNewLead] = useState({
     name: "", email: "", phone: "", address: "", source: "" as string,
-    projectType: "", estimatedBudget: "", score: "" as string, owner: "", notes: "",
+    projectType: "", estimatedBudget: "", score: "" as string,
+    // assignedTo holds a team member id ("" = unassigned) — the canonical
+    // owner field. Never a display name (Priority 1, Phase 9.2 consistency
+    // pass).
+    assignedTo: "", notes: "",
   });
+
+  // Edit Lead (Priority 2)
+  const [editLead, setEditLead] = useState<Lead | null>(null);
+  const [editOpen, setEditOpen] = useState(false);
+  const [editSaving, setEditSaving] = useState(false);
+  const [editForm, setEditForm] = useState({
+    name: "", email: "", phone: "", address: "", source: "", projectType: "",
+    estimatedBudget: "", status: "new" as LeadStatus, assignedTo: "", notes: "",
+  });
+
+  // Delete (Priority 5 — no archive column exists on `leads`, confirmed
+  // live; hard delete with confirmation is the only option implemented
+  // this pass).
+  const [deleteTarget, setDeleteTarget] = useState<Lead | null>(null);
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [bulkDeleteConfirmOpen, setBulkDeleteConfirmOpen] = useState(false);
+  const [bulkActionLoading, setBulkActionLoading] = useState(false);
+
+  // Search debounce (Priority 8) — 250ms, matching the debounce interval
+  // topbar.tsx's global search already uses.
+  useEffect(() => {
+    const t = setTimeout(() => setSearch(searchInput), 250);
+    return () => clearTimeout(t);
+  }, [searchInput]);
 
   // Deep-link
   useEffect(() => {
@@ -135,19 +215,73 @@ function LeadsPage() {
     }
   }, [leadId, leads]);
 
+  // Source filter options derived from the leads actually loaded (Priority
+  // 9) — not a fixed/fabricated category list. Distinct raw values,
+  // labeled for display via leadSourceLabel(); the raw value is what's
+  // actually compared when filtering.
+  const sourceFilterOptions = useMemo(() => {
+    const raw = [...new Set(leads.map((l) => l.source).filter(Boolean))];
+    raw.sort((a, b) => leadSourceLabel(a).localeCompare(leadSourceLabel(b)));
+    return raw;
+  }, [leads]);
+
+  const ownerFilterOptions = useMemo(() => {
+    const names = new Set<string>();
+    for (const l of leads) names.add(resolveOwnerName(l, teamMembers));
+    return [...names].sort((a, b) => a.localeCompare(b));
+  }, [leads, teamMembers]);
+
   const filtered = useMemo(() => {
     let list = leads;
     if (search) {
-      const q = search.toLowerCase();
-      list = list.filter((l) =>
-        l.name.toLowerCase().includes(q) || l.email.toLowerCase().includes(q) || l.phone.includes(q) || l.projectType.toLowerCase().includes(q),
-      );
+      // Normalized so a formatted or unformatted phone/email still matches
+      // (Priority 8) — compares digits-only phone and lowercased/trimmed
+      // email in addition to the plain substring match on every other
+      // field, rather than relying on the raw string containing the query.
+      const q = search.toLowerCase().trim();
+      const qDigits = q.replace(/\D/g, "");
+      const qEmail = normalizeEmail(q);
+      list = list.filter((l) => {
+        const ownerName = resolveOwnerName(l, teamMembers).toLowerCase();
+        const phoneDigits = l.phone.replace(/\D/g, "");
+        return (
+          l.name.toLowerCase().includes(q) ||
+          (qEmail && normalizeEmail(l.email).includes(qEmail)) ||
+          l.email.toLowerCase().includes(q) ||
+          (qDigits && phoneDigits.includes(qDigits)) ||
+          l.phone.includes(q) ||
+          l.address.toLowerCase().includes(q) ||
+          leadSourceLabel(l.source).toLowerCase().includes(q) ||
+          l.projectType.toLowerCase().includes(q) ||
+          ownerName.includes(q)
+        );
+      });
     }
     if (sourceFilter !== "All sources") list = list.filter((l) => l.source === sourceFilter);
     if (statusFilter !== "All statuses") list = list.filter((l) => l.status === statusFilter);
     if (scoreFilter !== "All scores") list = list.filter((l) => l.score === scoreFilter);
+    if (ownerFilter !== "All owners") list = list.filter((l) => resolveOwnerName(l, teamMembers) === ownerFilter);
+    if (convertedFilter === "converted") list = list.filter((l) => l.status === "converted");
+    if (convertedFilter === "unconverted") list = list.filter((l) => l.status !== "converted");
+    if (dateFrom) {
+      const from = new Date(dateFrom);
+      list = list.filter((l) => new Date(l.createdAt) >= from);
+    }
+    if (dateTo) {
+      const to = new Date(dateTo);
+      to.setHours(23, 59, 59, 999);
+      list = list.filter((l) => new Date(l.createdAt) <= to);
+    }
+    if (budgetMin.trim()) {
+      const min = Number(budgetMin);
+      if (Number.isFinite(min)) list = list.filter((l) => l.estimatedBudget >= min);
+    }
+    if (budgetMax.trim()) {
+      const max = Number(budgetMax);
+      if (Number.isFinite(max)) list = list.filter((l) => l.estimatedBudget <= max);
+    }
     return list;
-  }, [leads, search, sourceFilter, statusFilter, scoreFilter]);
+  }, [leads, search, sourceFilter, statusFilter, scoreFilter, ownerFilter, convertedFilter, dateFrom, dateTo, budgetMin, budgetMax, teamMembers]);
 
   // Stats
   const stats = useMemo(() => {
@@ -163,14 +297,148 @@ function LeadsPage() {
     navigate({ search: { leadId: lead.id }, replace: true });
   };
 
-  const handleStatusChange = (id: string, newStatus: LeadStatus) => {
-    storeUpdateStatus(id, newStatus);
-    toast.success(`Lead status updated to ${STATUS_LABELS[newStatus]}`);
+  const handleStatusChange = async (id: string, newStatus: LeadStatus) => {
+    try {
+      await storeUpdateStatus(id, newStatus);
+      toast.success(`Lead status updated to ${STATUS_LABELS[newStatus]}`);
+    } catch (error) {
+      console.error("[leads] status change failed:", error);
+      toast.error("Failed to update the lead's status.");
+    }
   };
 
-  const handleScoreChange = (id: string, newScore: LeadScore) => {
-    storeUpdateScore(id, newScore);
-    toast.success(`Lead score updated to ${newScore}`);
+  // Priority 4 — leads.score has no writable, honestly-mappable column for
+  // this hot/warm/cold category (see report): the real `leads.score` int
+  // column is a separate AI Center quality metric, always null today and
+  // written by nothing. The UI's score is a client-computed classification
+  // (classifyScore(), from budget + status) — there is no interactive
+  // "change score" control anymore; see LeadDetailDrawer, which now shows
+  // it read-only with an explanatory caption instead.
+
+  const handleEditLead = (lead: Lead) => {
+    setEditLead(lead);
+    setEditForm({
+      name: lead.name, email: lead.email, phone: lead.phone, address: lead.address,
+      source: lead.source, projectType: lead.projectType,
+      estimatedBudget: String(lead.estimatedBudget || ""),
+      status: lead.status, assignedTo: lead.assignedTo ?? "",
+      notes: lead.notes,
+    });
+    setEditOpen(true);
+  };
+
+  const handleSaveEdit = async () => {
+    if (!editLead) return;
+    if (!editForm.name.trim()) { toast.error("Name is required"); return; }
+    setEditSaving(true);
+    try {
+      await storeUpdateLead(editLead.id, {
+        name: editForm.name.trim(),
+        email: normalizeEmail(editForm.email),
+        phone: editForm.phone.trim(),
+        address: editForm.address.trim(),
+        source: editForm.source.trim() || "Website",
+        projectType: editForm.projectType.trim(),
+        estimatedBudget: Number(editForm.estimatedBudget) || 0,
+        notes: editForm.notes.trim(),
+      });
+
+      if (editForm.status !== editLead.status) {
+        await storeUpdateStatus(editLead.id, editForm.status);
+      }
+      const currentAssignedTo = editLead.assignedTo ?? "";
+      if (editForm.assignedTo !== currentAssignedTo) {
+        await storeUpdateLeadOwner(editLead.id, editForm.assignedTo || null);
+      }
+
+      toast.success("Lead updated");
+      setEditOpen(false);
+      setEditLead(null);
+    } catch (error) {
+      console.error("[leads] edit save failed:", error);
+      toast.error("Failed to save changes to this lead.");
+    } finally {
+      setEditSaving(false);
+    }
+  };
+
+  const handleDeleteLead = async () => {
+    if (!deleteTarget) return;
+    setDeleteLoading(true);
+    const result = await storeDeleteLead(deleteTarget.id);
+    setDeleteLoading(false);
+    if (result.ok) {
+      toast.success(`${deleteTarget.name} deleted`);
+      setDeleteTarget(null);
+      if (selected?.id === deleteTarget.id) navigate({ search: { leadId: undefined }, replace: true });
+    } else {
+      toast.error(result.error);
+    }
+  };
+
+  const handleBulkStatusChange = async (status: LeadStatus) => {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    setBulkActionLoading(true);
+    const { failedIds } = await updateLeadsStatusBulk(ids, status);
+    setBulkActionLoading(false);
+    if (failedIds.length === 0) {
+      toast.success(`${ids.length} lead${ids.length === 1 ? "" : "s"} updated to ${STATUS_LABELS[status]}`);
+      setSelectedIds(new Set());
+    } else if (failedIds.length < ids.length) {
+      toast.warning(`${ids.length - failedIds.length} updated, ${failedIds.length} failed`);
+      setSelectedIds(new Set(failedIds));
+    } else {
+      toast.error("Failed to update the selected leads.");
+    }
+  };
+
+  const handleBulkOwnerAssign = async (memberId: string) => {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    setBulkActionLoading(true);
+    const { failedIds } = await updateLeadsOwnerBulk(ids, memberId || null);
+    setBulkActionLoading(false);
+    if (failedIds.length === 0) {
+      toast.success(`Owner updated for ${ids.length} lead${ids.length === 1 ? "" : "s"}`);
+      setSelectedIds(new Set());
+    } else if (failedIds.length < ids.length) {
+      toast.warning(`${ids.length - failedIds.length} updated, ${failedIds.length} failed`);
+      setSelectedIds(new Set(failedIds));
+    } else {
+      toast.error("Failed to reassign the selected leads.");
+    }
+  };
+
+  const handleBulkDelete = async () => {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+
+    // Converted leads are never bulk-deleted — preserving deal history
+    // takes priority. The store (deleteLeadsBulk) re-derives the
+    // converted/eligible split itself as the actual enforcement point
+    // (Priority 2 — not relying only on this UI-level check), so the full
+    // selection is passed through rather than pre-filtered here.
+    setBulkActionLoading(true);
+    const { failedIds, skippedConvertedIds } = await deleteLeadsBulk(ids);
+    setBulkActionLoading(false);
+    setBulkDeleteConfirmOpen(false);
+
+    const deletedCount = ids.length - failedIds.length - skippedConvertedIds.length;
+    if (failedIds.length === 0 && skippedConvertedIds.length === 0) {
+      toast.success(`${deletedCount} lead${deletedCount === 1 ? "" : "s"} deleted`);
+      setSelectedIds(new Set());
+    } else {
+      const parts = [`${deletedCount} deleted`];
+      if (skippedConvertedIds.length > 0) parts.push(`${skippedConvertedIds.length} skipped (converted)`);
+      if (failedIds.length > 0) parts.push(`${failedIds.length} failed`);
+      toast.warning(parts.join(" · "));
+      // Skipped-converted and failed rows stay selected so the user can see
+      // exactly which ones didn't delete and why; successfully deleted rows
+      // are no longer in `leads` at all, so they drop out of the set
+      // naturally on the next render regardless.
+      setSelectedIds(new Set([...failedIds, ...skippedConvertedIds]));
+    }
   };
 
   const handleConvertToDeal = (lead: Lead) => {
@@ -229,8 +497,12 @@ function LeadsPage() {
 
   const handleAddLead = () => {
     if (!newLead.name.trim()) return;
-    const owner = newLead.owner || teamMembers[0]?.name || "Unassigned";
-    const initials = owner.split(" ").map((p) => p[0]).join("");
+    // Canonical owner (Priority 1, Phase 9.2 consistency pass): writes
+    // assignedTo (a team member id, or null for unassigned) directly on
+    // insert — never a forced default and never a display name. The
+    // legacy `owner`/`ownerInitials` text fields are left at their
+    // "unassigned" defaults; resolveOwnerName() resolves the display name
+    // from assignedTo + the live team list wherever it's shown.
     storeAddLead({
       name: newLead.name.trim(),
       email: newLead.email.trim(),
@@ -242,13 +514,14 @@ function LeadsPage() {
       projectType: newLead.projectType || "Kitchen Remodel",
       estimatedBudget: Number(newLead.estimatedBudget) || 0,
       notes: newLead.notes.trim(),
-      owner,
-      ownerInitials: initials,
+      owner: "—",
+      ownerInitials: "",
+      assignedTo: newLead.assignedTo || null,
       createdAt: new Date().toISOString(),
       lastActivity: new Date().toISOString(),
     });
     setAddOpen(false);
-    setNewLead({ name: "", email: "", phone: "", address: "", source: "", projectType: "", estimatedBudget: "", score: "", owner: "", notes: "" });
+    setNewLead({ name: "", email: "", phone: "", address: "", source: "", projectType: "", estimatedBudget: "", score: "", assignedTo: "", notes: "" });
     toast.success("Lead added");
   };
 
@@ -256,15 +529,20 @@ function LeadsPage() {
     if (node) node.value = "";
   }, []);
 
+  // Exports the currently filtered/searched view (Stage 9.5 Priority 10 —
+  // filtered/selected/all export variants), not always the full org dataset
+  // regardless of active search/filters. Use "Export selected" for a
+  // checkbox-picked subset instead.
   const handleExport = () => {
-    const csv = leadsToCSV(leads);
-    downloadCSV(csv, `leads-export-${new Date().toISOString().slice(0, 10)}.csv`);
-    toast.success(`Exported ${leads.length} leads`);
+    const csv = leadsToCSV(filtered, (lead) => resolveOwnerName(lead, teamMembers));
+    downloadCSV(csv, `leads-${new Date().toISOString().slice(0, 10)}.csv`);
+    toast.success(`Exported ${filtered.length} lead${filtered.length === 1 ? "" : "s"}`);
   };
 
   const handleImportFile = (e: React.ChangeEvent<HTMLInputElement>): void => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setImportFilename(file.name);
     const reader = new FileReader();
     reader.onload = (ev) => {
       const text = ev.target?.result as string;
@@ -272,6 +550,15 @@ function LeadsPage() {
       if (headers.length === 0 || totalRows === 0) {
         toast.error("Empty or invalid CSV file");
         return;
+      }
+      if (totalRows > CSV_MAX_SYNC_IMPORT_ROWS) {
+        toast.error("File too large to import", {
+          description: `This file has ${totalRows} rows. Imports are supported up to ${CSV_MAX_SYNC_IMPORT_ROWS} rows per file — split it into smaller files.`,
+        });
+        return;
+      }
+      if (totalRows > CSV_WARN_ROW_THRESHOLD) {
+        toast.warning(`Large file: ${totalRows} rows`, { description: "This may take a little longer to check for duplicates." });
       }
       setCsvRaw(text);
       setCsvHeaders(headers);
@@ -284,17 +571,107 @@ function LeadsPage() {
     e.target.value = "";
   };
 
-  const handleConfirmImport = () => {
+  const handleConfirmImport = async () => {
     if (!colMapping) return;
-    const { leads: parsed, errors } = applyMappingToLeads(csvRaw, colMapping);
-    if (parsed.length === 0) {
+    const { leads: parsedRaw, errors } = applyMappingToLeads(csvRaw, colMapping);
+    if (parsedRaw.length === 0) {
       toast.error("No leads imported", { description: errors[0] || "Check your column mapping." });
       return;
     }
-    const count = importLeads(parsed);
-    toast.success(`Imported ${count} leads`, {
-      description: errors.length ? `${errors.length} row(s) skipped.` : undefined,
+
+    // CSV owner column → assignedTo (Priority 5, Phase 9.2 consistency
+    // pass): applyMappingToLeads only ever produces a free-text owner
+    // name — never write that text into assigned_to. Resolve it against
+    // the current, already org-scoped active team list by an EXACT
+    // (case-insensitive, trimmed) name match only; a name matching more
+    // than one active member is treated as ambiguous, same as no match.
+    // Anything that doesn't resolve imports unassigned and is reported,
+    // rather than guessed or left to write a legacy display name anywhere.
+    const activeMembers = teamMembers.filter((m) => m.status === "active");
+    const nameCounts = new Map<string, number>();
+    for (const m of activeMembers) {
+      const key = m.name.trim().toLowerCase();
+      nameCounts.set(key, (nameCounts.get(key) ?? 0) + 1);
+    }
+    const ownerByName = new Map<string, string>();
+    for (const m of activeMembers) {
+      const key = m.name.trim().toLowerCase();
+      if (nameCounts.get(key) === 1) ownerByName.set(key, m.id);
+    }
+
+    let unresolvedOwnerCount = 0;
+    const parsed = parsedRaw.map((row) => {
+      const ownerText = (row.owner ?? "").trim();
+      if (!ownerText || ownerText === "Unassigned" || ownerText === "—") {
+        return { ...row, assignedTo: null };
+      }
+      const matchId = ownerByName.get(ownerText.toLowerCase());
+      if (matchId) return { ...row, assignedTo: matchId };
+      unresolvedOwnerCount++;
+      return { ...row, assignedTo: null };
     });
+
+    setImportChecking(true);
+    // Stage 9.5: replaces the old "skip duplicate checks silently above 200
+    // rows" behavior. Prefetches this org's contact identities ONCE (bounded
+    // — same set the Contacts page already loads), then checks every row
+    // in-memory, so the check always runs regardless of file size (up to
+    // the CSV_MAX_SYNC_IMPORT_ROWS cap enforced at file-select time) instead
+    // of silently being skipped for larger files.
+    const orgId = await getContactsOrgId();
+    const identitySets = orgId ? await prefetchContactIdentitySets(orgId) : { emails: new Set<string>(), phones: new Set<string>() };
+
+    let duplicateCount = 0;
+    const toCreate: typeof parsed = [];
+    const skippedDuplicateErrors: string[] = [];
+    parsed.forEach((row, idx) => {
+      const email = normalizeEmail(row.email);
+      const phoneDigits = row.phone.replace(/\D/g, "");
+      const isDup = (email && identitySets.emails.has(email)) || (phoneDigits && identitySets.phones.has(phoneDigits));
+      if (isDup) {
+        duplicateCount++;
+        skippedDuplicateErrors.push(`Row ${idx + 2}: matched an existing contact by email/phone, skipped.`);
+      } else {
+        toCreate.push(row);
+      }
+    });
+    setImportChecking(false);
+
+    if (toCreate.length === 0) {
+      toast.error("No leads imported", {
+        description: duplicateCount > 0 ? `All ${duplicateCount} row(s) matched an existing contact.` : errors[0],
+      });
+      setMapOpen(false);
+      return;
+    }
+
+    const jobId = await createImportJob("lead", importFilename, csvTotalRows);
+    const { created, failedIndexes, byIndex } = await addLeadsBatch(toCreate);
+
+    if (jobId) {
+      const rowLogs = toCreate.map((_, i) => {
+        const failed = failedIndexes.includes(i);
+        return {
+          source_row_number: i + 2,
+          entity_id: byIndex[i]?.id ?? null,
+          action: failed ? ("failed" as const) : ("created" as const),
+          status: failed ? ("error" as const) : ("ok" as const),
+        };
+      });
+      await logImportRows(jobId, rowLogs);
+      await completeImportJob(jobId, { created: created.length, skipped: duplicateCount, failed: failedIndexes.length }, [...errors, ...skippedDuplicateErrors]);
+    }
+
+    const summaryParts = [`${created.length} created`];
+    if (duplicateCount > 0) summaryParts.push(`${duplicateCount} skipped as duplicate`);
+    if (errors.length > 0) summaryParts.push(`${errors.length} validation notice(s)`);
+    if (failedIndexes.length > 0) summaryParts.push(`${failedIndexes.length} failed to save`);
+    if (unresolvedOwnerCount > 0) summaryParts.push(`${unresolvedOwnerCount} owner name(s) unresolved, imported unassigned`);
+    if (created.length < toCreate.length) {
+      toast.warning("Import completed with some failures", { description: summaryParts.join(" · ") });
+    } else {
+      toast.success(`Import complete`, { description: summaryParts.join(" · ") });
+    }
     setMapOpen(false);
   };
 
@@ -328,7 +705,16 @@ function LeadsPage() {
   }, [colMapping, csvRaw]);
 
 
-  const hasActiveFilters = search !== "" || sourceFilter !== "All sources" || statusFilter !== "All statuses" || scoreFilter !== "All scores";
+  const moreFiltersActiveCount = [
+    ownerFilter !== "All owners",
+    convertedFilter !== "all",
+    !!dateFrom,
+    !!dateTo,
+    !!budgetMin.trim(),
+    !!budgetMax.trim(),
+  ].filter(Boolean).length;
+
+  const hasActiveFilters = search !== "" || sourceFilter !== "All sources" || statusFilter !== "All statuses" || scoreFilter !== "All scores" || moreFiltersActiveCount > 0;
   const allVisibleSelected = filtered.length > 0 && filtered.every((lead) => selectedIds.has(lead.id));
 
   const toggleLeadSelection = (id: string) => {
@@ -349,16 +735,23 @@ function LeadsPage() {
   };
 
   const clearFilters = () => {
+    setSearchInput("");
     setSearch("");
     setSourceFilter("All sources");
     setStatusFilter("All statuses");
     setScoreFilter("All scores");
+    setOwnerFilter("All owners");
+    setConvertedFilter("all");
+    setDateFrom("");
+    setDateTo("");
+    setBudgetMin("");
+    setBudgetMax("");
   };
 
   const exportSelected = () => {
     const selectedLeads = leads.filter((lead) => selectedIds.has(lead.id));
     if (!selectedLeads.length) return;
-    downloadCSV(leadsToCSV(selectedLeads), `selected-leads-${new Date().toISOString().slice(0, 10)}.csv`);
+    downloadCSV(leadsToCSV(selectedLeads, (lead) => resolveOwnerName(lead, teamMembers)), `leads-selected-${new Date().toISOString().slice(0, 10)}.csv`);
     toast.success(`Exported ${selectedLeads.length} selected lead${selectedLeads.length === 1 ? "" : "s"}`);
   };
 
@@ -402,9 +795,13 @@ function LeadsPage() {
                 <input type="file" accept=".csv" className="sr-only" onChange={handleImportFile} />
               </label>
             </Button>
+            <Button size="sm" variant="outline" onClick={() => setHistoryOpen(true)}>
+              <History className="mr-1.5 h-3.5 w-3.5" /> Import History
+            </Button>
           </div>
         }
       />
+      <ImportHistoryDialog open={historyOpen} onOpenChange={setHistoryOpen} entityType="lead" />
 
       <div className="mb-6 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <LeadMetricCard label="Total Leads" value={stats.total} icon={Users} tone="blue" series={dailySeries} />
@@ -430,10 +827,28 @@ function LeadsPage() {
               <span className="rounded-md border border-amber-200 bg-white/70 px-2.5 py-1.5 text-xs font-medium text-amber-900">
                 {selectedIds.size} selected
               </span>
-              <Button size="sm" variant="outline" onClick={exportSelected}>
+              <Select onValueChange={(v) => handleBulkStatusChange(v as LeadStatus)} disabled={bulkActionLoading}>
+                <SelectTrigger className="h-8 w-auto min-w-[128px] text-xs"><SelectValue placeholder="Change status" /></SelectTrigger>
+                <SelectContent>
+                  {LEAD_STATUSES.map((s) => <SelectItem key={s} value={s} className="text-xs">{LEAD_STATUS_LABELS[s]}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              <Select onValueChange={(v) => handleBulkOwnerAssign(v === "__unassigned__" ? "" : v)} disabled={bulkActionLoading}>
+                <SelectTrigger className="h-8 w-auto min-w-[128px] text-xs"><SelectValue placeholder="Assign owner" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__unassigned__" className="text-xs">Unassigned</SelectItem>
+                  {teamMembers.filter((m) => m.status === "active").map((m) => (
+                    <SelectItem key={m.id} value={m.id} className="text-xs">{m.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button size="sm" variant="outline" onClick={exportSelected} disabled={bulkActionLoading}>
                 <Download className="mr-1.5 h-3.5 w-3.5" /> Export selected
               </Button>
-              <Button size="sm" variant="ghost" onClick={() => setSelectedIds(new Set())}>Clear</Button>
+              <Button size="sm" variant="outline" className="text-destructive hover:text-destructive" onClick={() => setBulkDeleteConfirmOpen(true)} disabled={bulkActionLoading}>
+                <Trash2 className="mr-1.5 h-3.5 w-3.5" /> Delete
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setSelectedIds(new Set())} disabled={bulkActionLoading}>Clear</Button>
             </div>
           )}
         </div>
@@ -442,21 +857,86 @@ function LeadsPage() {
           <div className="relative min-w-[220px] flex-1 lg:max-w-sm">
             <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <Input
-              placeholder="Search by name, email, phone, or project…"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search by name, email, phone, address, source, project, or owner…"
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
               className="h-9 pl-9 text-sm"
             />
           </div>
-          <FilterSelect value={sourceFilter} onChange={setSourceFilter} options={SOURCE_FILTERS as unknown as string[]} />
+          <FilterSelect
+            value={sourceFilter}
+            onChange={setSourceFilter}
+            options={["All sources", ...sourceFilterOptions]}
+            labelFor={(o) => (o === "All sources" ? o : leadSourceLabel(o))}
+          />
           <FilterSelect value={statusFilter} onChange={setStatusFilter} options={STATUS_FILTERS as unknown as string[]} />
           <FilterSelect value={scoreFilter} onChange={setScoreFilter} options={SCORE_FILTERS as unknown as string[]} />
           {hasActiveFilters && (
             <Button size="sm" variant="ghost" className="h-9 text-xs" onClick={clearFilters}>Clear filters</Button>
           )}
-          <Button size="icon" variant="outline" className="ml-auto h-9 w-9" aria-label="More filters">
-            <SlidersHorizontal className="h-4 w-4" />
-          </Button>
+          <Popover open={moreFiltersOpen} onOpenChange={setMoreFiltersOpen}>
+            <PopoverTrigger asChild>
+              <Button size="icon" variant="outline" className="relative ml-auto h-9 w-9" aria-label="More filters">
+                <SlidersHorizontal className="h-4 w-4" />
+                {moreFiltersActiveCount > 0 && (
+                  <span className="absolute -right-1 -top-1 grid h-4 w-4 place-items-center rounded-full bg-primary text-[9px] font-semibold text-primary-foreground">
+                    {moreFiltersActiveCount}
+                  </span>
+                )}
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="end" className="w-72 space-y-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs">Owner</Label>
+                <Select value={ownerFilter} onValueChange={setOwnerFilter}>
+                  <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="All owners" className="text-xs">All owners</SelectItem>
+                    {ownerFilterOptions.map((o) => <SelectItem key={o} value={o} className="text-xs">{o}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Conversion status</Label>
+                <Select value={convertedFilter} onValueChange={(v) => setConvertedFilter(v as typeof convertedFilter)}>
+                  <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all" className="text-xs">All leads</SelectItem>
+                    <SelectItem value="converted" className="text-xs">Converted only</SelectItem>
+                    <SelectItem value="unconverted" className="text-xs">Not yet converted</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Created from</Label>
+                  <Input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className="h-8 text-xs" />
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Created to</Label>
+                  <Input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className="h-8 text-xs" />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Budget min</Label>
+                  <Input type="number" min="0" value={budgetMin} onChange={(e) => setBudgetMin(e.target.value)} placeholder="0" className="h-8 text-xs" />
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Budget max</Label>
+                  <Input type="number" min="0" value={budgetMax} onChange={(e) => setBudgetMax(e.target.value)} placeholder="No max" className="h-8 text-xs" />
+                </div>
+              </div>
+              {moreFiltersActiveCount > 0 && (
+                <Button
+                  size="sm" variant="ghost" className="w-full text-xs"
+                  onClick={() => { setOwnerFilter("All owners"); setConvertedFilter("all"); setDateFrom(""); setDateTo(""); setBudgetMin(""); setBudgetMax(""); }}
+                >
+                  Clear these filters
+                </Button>
+              )}
+            </PopoverContent>
+          </Popover>
         </div>
 
         <div className="overflow-x-auto">
@@ -515,12 +995,17 @@ function LeadsPage() {
                     </td>
                     <td className="px-3 py-3.5">
                       <div className="max-w-[190px] truncate text-xs font-medium">{lead.projectType || "Not specified"}</div>
-                      <div className="mt-0.5 text-[11px] text-muted-foreground">{lead.source}</div>
+                      <div className="mt-0.5 text-[11px] text-muted-foreground">{leadSourceLabel(lead.source)}</div>
                     </td>
                     <td className="px-3 py-3.5 text-xs font-medium tabular-nums">{formatMoney(lead.estimatedBudget)}</td>
                     <td className="px-3 py-3.5">
-                      <Badge variant={statusBadgeVariant(lead.status)} className="text-[10px] font-medium">
-                        {STATUS_LABELS[lead.status]}
+                      {/* Renders lead.rawStatus (the literal DB value) rather
+                          than the coerced lead.status, so an unrecognized
+                          legacy status (leads.status has no CHECK
+                          constraint) still displays honestly instead of
+                          silently showing as "New". */}
+                      <Badge variant={leadStatusBadgeVariant(lead.rawStatus ?? lead.status)} className="text-[10px] font-medium">
+                        {leadStatusLabel(lead.rawStatus ?? lead.status)}
                       </Badge>
                     </td>
                     <td className="px-3 py-3.5">
@@ -531,8 +1016,8 @@ function LeadsPage() {
                     </td>
                     <td className="px-3 py-3.5">
                       <div className="flex min-w-[130px] items-center gap-2">
-                        <ContactAvatar id={lead.owner || "unassigned"} name={lead.owner || "Unassigned"} size="xs" />
-                        <span className="truncate text-xs">{lead.owner || "Unassigned"}</span>
+                        <ContactAvatar id={lead.assignedTo || lead.owner || "unassigned"} name={resolveOwnerName(lead, teamMembers)} size="xs" />
+                        <span className="truncate text-xs">{resolveOwnerName(lead, teamMembers)}</span>
                       </div>
                     </td>
                     <td className="px-3 py-3.5 text-xs text-muted-foreground">
@@ -547,12 +1032,16 @@ function LeadsPage() {
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end" className="w-48">
                           <DropdownMenuItem onClick={() => openLead(lead)}>View details</DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => handleEditLead(lead)}>Edit lead</DropdownMenuItem>
                           <DropdownMenuItem asChild>
                             <Link to="/estimates" search={{ template: "open", clientName: lead.name }}>Create estimate</Link>
                           </DropdownMenuItem>
                           {lead.status !== "converted" && lead.status !== "lost" && (
                             <DropdownMenuItem onClick={() => handleConvertToDeal(lead)}>Convert to deal</DropdownMenuItem>
                           )}
+                          <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={() => setDeleteTarget(lead)}>
+                            Delete lead
+                          </DropdownMenuItem>
                         </DropdownMenuContent>
                       </DropdownMenu>
                     </td>
@@ -586,10 +1075,11 @@ function LeadsPage() {
         lead={selected ? leads.find((l) => l.id === selected.id) ?? selected : null}
         onOpenChange={(o) => { if (!o) navigate({ search: { leadId: undefined }, replace: true }); }}
         onStatusChange={handleStatusChange}
-        onScoreChange={handleScoreChange}
         onConvert={handleConvertToDeal}
         onOpenConvertedDeal={(dealId) => setDealDrawerId(dealId)}
-        teamMembers={teamMembers.map((m) => ({ id: m.id, name: m.name }))}
+        onEdit={handleEditLead}
+        onDelete={(l) => setDeleteTarget(l)}
+        teamMembers={teamMembers}
       />
 
       <ConvertLeadDialog
@@ -609,6 +1099,177 @@ function LeadsPage() {
         stages={pipelineStages}
         teamMembers={teamMembers.map((m) => ({ id: m.id, name: m.name }))}
       />
+
+      {/* Edit lead dialog (Priority 2) — reuses the store's real updateLead()
+          for name/email/phone/address/source/projectType/estimatedBudget/
+          notes, plus the existing updateLeadStatus()/updateLeadOwner() for
+          those two fields specifically (each already has its own dedicated,
+          correctly-typed store method — reusing them rather than
+          duplicating that logic here). */}
+      <Dialog open={editOpen} onOpenChange={(o) => { if (!o) setEditOpen(false); }}>
+        <DialogContent
+          className="sm:max-w-lg"
+          onInteractOutside={(e) => {
+            const target = ((e as CustomEvent).detail?.originalEvent?.target ?? e.target) as HTMLElement | null;
+            if (target?.closest?.(".pac-container")) e.preventDefault();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>Edit Lead</DialogTitle>
+            <DialogDescription>Update this lead's details.</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3 py-2 sm:grid-cols-2">
+            <div className="space-y-1.5 sm:col-span-2">
+              <Label>Name *</Label>
+              <Input value={editForm.name} onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))} placeholder="Full name" />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Email</Label>
+              <Input value={editForm.email} onChange={(e) => setEditForm((f) => ({ ...f, email: e.target.value }))} placeholder="email@example.com" />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Phone</Label>
+              <Input value={editForm.phone} onChange={(e) => setEditForm((f) => ({ ...f, phone: formatPhone(e.target.value) }))} placeholder="(555) 123-4567" inputMode="tel" />
+            </div>
+            <div className="space-y-1.5 sm:col-span-2">
+              <Label>Address</Label>
+              <AddressAutocomplete
+                value={editForm.address}
+                onChange={(value) => setEditForm((f) => ({ ...f, address: value }))}
+                onSelect={(parts) =>
+                  setEditForm((f) => ({
+                    ...f,
+                    address: [parts.street, parts.city, `${parts.state} ${parts.zip}`].filter(Boolean).join(", "),
+                  }))
+                }
+                placeholder="123 Main St, City, ST"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Source</Label>
+              <Input value={editForm.source} onChange={(e) => setEditForm((f) => ({ ...f, source: e.target.value }))} placeholder="Website" />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Status</Label>
+              <Select value={editForm.status} onValueChange={(v) => setEditForm((f) => ({ ...f, status: v as LeadStatus }))}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>{LEAD_STATUSES.map((s) => <SelectItem key={s} value={s}>{LEAD_STATUS_LABELS[s]}</SelectItem>)}</SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label>Project Type</Label>
+              <Input value={editForm.projectType} onChange={(e) => setEditForm((f) => ({ ...f, projectType: e.target.value }))} />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Estimated Budget</Label>
+              <Input type="number" value={editForm.estimatedBudget} onChange={(e) => setEditForm((f) => ({ ...f, estimatedBudget: e.target.value }))} placeholder="50000" />
+            </div>
+            <div className="space-y-1.5 sm:col-span-2">
+              <Label>Owner</Label>
+              <Select
+                value={editForm.assignedTo || "__unassigned__"}
+                onValueChange={(v) => setEditForm((f) => ({ ...f, assignedTo: v === "__unassigned__" ? "" : v }))}
+              >
+                <SelectTrigger><SelectValue placeholder="Assign owner" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__unassigned__">Unassigned</SelectItem>
+                  {/* Active, org-scoped members only (useTeam() is already
+                      org-scoped) — an invited/roster member has no real
+                      profile id yet, so isn't a valid assigned_to target. */}
+                  {teamMembers.filter((m) => m.status === "active").map((m) => (
+                    <SelectItem key={m.id} value={m.id}>{m.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5 sm:col-span-2">
+              <Label>Notes</Label>
+              <Textarea value={editForm.notes} onChange={(e) => setEditForm((f) => ({ ...f, notes: e.target.value }))} rows={3} className="resize-none" />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditOpen(false)} disabled={editSaving}>Cancel</Button>
+            <Button onClick={handleSaveEdit} disabled={editSaving || !editForm.name.trim()}>
+              {editSaving && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
+              Save Changes
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete confirmation (Priority 5 / Phase 9.2 consistency pass) — no
+          archive column exists on `leads`; hard delete with confirmation is
+          the only implemented option this pass. A converted lead is never
+          deletable here — no "delete anyway" escape hatch — the destructive
+          action is replaced entirely with an explanation and, when the
+          linked deal is still resolvable locally, a direct link to it. */}
+      <AlertDialog open={!!deleteTarget} onOpenChange={(o) => { if (!o) setDeleteTarget(null); }}>
+        <AlertDialogContent>
+          {deleteTarget && isDeleteBlockedConverted(deleteTarget) ? (
+            <>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Can't delete {deleteTarget.name}</AlertDialogTitle>
+                <AlertDialogDescription>{CONVERTED_LEAD_DELETE_MESSAGE}</AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                {deleteTarget.convertedDealId && deals.some((d) => d.id === deleteTarget.convertedDealId) && (
+                  <Button
+                    variant="outline"
+                    onClick={() => { setDealDrawerId(deleteTarget.convertedDealId!); setDeleteTarget(null); }}
+                  >
+                    <ExternalLink className="mr-1.5 h-3.5 w-3.5" /> Open deal
+                  </Button>
+                )}
+                <AlertDialogCancel onClick={() => setDeleteTarget(null)}>Close</AlertDialogCancel>
+              </AlertDialogFooter>
+            </>
+          ) : (
+            <>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Delete {deleteTarget?.name}?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  This permanently removes the lead record. This cannot be undone.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel disabled={deleteLoading}>Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                  disabled={deleteLoading}
+                  onClick={(e) => { e.preventDefault(); handleDeleteLead(); }}
+                >
+                  {deleteLoading && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
+                  Delete
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </>
+          )}
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Bulk delete confirmation */}
+      <AlertDialog open={bulkDeleteConfirmOpen} onOpenChange={setBulkDeleteConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete {selectedIds.size} lead{selectedIds.size === 1 ? "" : "s"}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This permanently removes the selected lead records. Any already-converted leads in this selection will be
+              skipped automatically — their deals are never affected.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={bulkActionLoading}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={bulkActionLoading}
+              onClick={(e) => { e.preventDefault(); handleBulkDelete(); }}
+            >
+              {bulkActionLoading && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Add lead dialog */}
       <Dialog open={addOpen} onOpenChange={setAddOpen}>
@@ -679,9 +1340,20 @@ function LeadsPage() {
             </div>
             <div className="space-y-1.5 sm:col-span-2">
               <Label>Owner</Label>
-              <Select value={newLead.owner} onValueChange={(v) => setNewLead((p) => ({ ...p, owner: v }))}>
+              {/* Same active, org-scoped member list and id-based value as
+                  Edit Lead / bulk owner assignment (Priority 1 / Priority 4
+                  consistency). */}
+              <Select
+                value={newLead.assignedTo || "__unassigned__"}
+                onValueChange={(v) => setNewLead((p) => ({ ...p, assignedTo: v === "__unassigned__" ? "" : v }))}
+              >
                 <SelectTrigger><SelectValue placeholder="Assign owner" /></SelectTrigger>
-                <SelectContent>{teamMembers.map((m) => <SelectItem key={m.id} value={m.name}>{m.name}</SelectItem>)}</SelectContent>
+                <SelectContent>
+                  <SelectItem value="__unassigned__">Unassigned</SelectItem>
+                  {teamMembers.filter((m) => m.status === "active").map((m) => (
+                    <SelectItem key={m.id} value={m.id}>{m.name}</SelectItem>
+                  ))}
+                </SelectContent>
               </Select>
             </div>
             <div className="space-y-1.5 sm:col-span-2">
@@ -831,9 +1503,10 @@ function LeadsPage() {
             </div>
           )}
           <DialogFooter className="gap-2 sm:gap-2">
-            <Button variant="outline" onClick={() => setMapOpen(false)}>Cancel</Button>
-            <Button onClick={handleConfirmImport} disabled={!colMapping || colMapping.name < 0 || !importValidation?.validCount}>
-              Import {importValidation?.validCount ?? 0} Lead{(importValidation?.validCount ?? 0) !== 1 ? "s" : ""}
+            <Button variant="outline" onClick={() => setMapOpen(false)} disabled={importChecking}>Cancel</Button>
+            <Button onClick={handleConfirmImport} disabled={!colMapping || colMapping.name < 0 || !importValidation?.validCount || importChecking}>
+              {importChecking && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
+              {importChecking ? "Checking for duplicates…" : `Import ${importValidation?.validCount ?? 0} Lead${(importValidation?.validCount ?? 0) !== 1 ? "s" : ""}`}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -918,7 +1591,9 @@ function LeadMetricCard({
   );
 }
 
-function FilterSelect({ value, onChange, options }: { value: string; onChange: (v: string) => void; options: string[] }) {
+function FilterSelect({ value, onChange, options, labelFor }: { value: string; onChange: (v: string) => void; options: string[]; labelFor?: (o: string) => string }) {
+  const defaultLabel = (o: string) => (o === "new" ? "New" : o === "contacted" ? "Contacted" : o === "qualified" ? "Qualified" : o === "converted" ? "Converted" : o === "lost" ? "Lost" : o);
+  const getLabel = labelFor ?? defaultLabel;
   return (
     <Select value={value} onValueChange={onChange}>
       <SelectTrigger className="h-9 w-auto min-w-[128px] text-xs">
@@ -926,7 +1601,7 @@ function FilterSelect({ value, onChange, options }: { value: string; onChange: (
       </SelectTrigger>
       <SelectContent>
         {options.map((o) => (
-          <SelectItem key={o} value={o} className="capitalize text-xs">{o === "new" ? "New" : o === "contacted" ? "Contacted" : o === "qualified" ? "Qualified" : o === "converted" ? "Converted" : o === "lost" ? "Lost" : o}</SelectItem>
+          <SelectItem key={o} value={o} className="capitalize text-xs">{getLabel(o)}</SelectItem>
         ))}
       </SelectContent>
     </Select>
@@ -940,18 +1615,20 @@ function LeadDetailDrawer({
   lead,
   onOpenChange,
   onStatusChange,
-  onScoreChange,
   onConvert,
   onOpenConvertedDeal,
+  onEdit,
+  onDelete,
   teamMembers,
 }: {
   lead: Lead | null;
   onOpenChange: (open: boolean) => void;
   onStatusChange: (id: string, status: LeadStatus) => void;
-  onScoreChange: (id: string, score: LeadScore) => void;
   onConvert: (lead: Lead) => void;
   onOpenConvertedDeal: (dealId: string) => void;
-  teamMembers: { id: string; name: string }[];
+  onEdit: (lead: Lead) => void;
+  onDelete: (lead: Lead) => void;
+  teamMembers: TeamMember[];
 }) {
   const allDeals = useDeals();
 
@@ -959,6 +1636,7 @@ function LeadDetailDrawer({
 
   const convertedDeal = lead.convertedDealId ? allDeals.find((d) => d.id === lead.convertedDealId) ?? null : null;
   const { Icon: ScoreIcon, className: scoreCls } = scoreIcon(lead.score);
+  const ownerName = resolveOwnerName(lead, teamMembers);
   const nextStatuses: LeadStatus[] = (() => {
     switch (lead.status) {
       case "new": return ["contacted"];
@@ -975,17 +1653,17 @@ function LeadDetailDrawer({
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0 flex-1 text-left">
               <div className="mb-1.5 flex items-center gap-2">
-                <Badge variant={statusBadgeVariant(lead.status)} className="text-[10px]">
-                  {STATUS_LABELS[lead.status]}
+                <Badge variant={leadStatusBadgeVariant(lead.rawStatus ?? lead.status)} className="text-[10px]">
+                  {leadStatusLabel(lead.rawStatus ?? lead.status)}
                 </Badge>
-                <div className="flex items-center gap-1">
+                <div className="flex items-center gap-1" title="Automatically estimated from budget and status — not manually saved.">
                   <ScoreIcon className={`h-3.5 w-3.5 ${scoreCls}`} />
                   <span className="text-[11px] capitalize text-muted-foreground">{lead.score}</span>
                 </div>
               </div>
               <SheetTitle className="text-base leading-snug">{lead.name}</SheetTitle>
               <SheetDescription className="mt-0.5 text-xs">
-                {lead.source} · Owned by {lead.owner}
+                {leadSourceLabel(lead.source)} · Owned by {ownerName}
               </SheetDescription>
             </div>
             <div className="text-right">
@@ -1001,6 +1679,9 @@ function LeadDetailDrawer({
                 <ArrowRight className="mr-1.5 h-3.5 w-3.5" /> Convert to Deal
               </Button>
             )}
+            <Button size="sm" variant="outline" onClick={() => onEdit(lead)}>
+              <PencilIcon className="mr-1.5 h-3.5 w-3.5" /> Edit
+            </Button>
             {nextStatuses.map((ns) => (
               <Button key={ns} size="sm" variant="outline" className="flex-1" onClick={() => onStatusChange(lead.id, ns)}>
                 {STATUS_LABELS[ns]}
@@ -1018,6 +1699,9 @@ function LeadDetailDrawer({
               <FileText className="mr-1.5 h-3.5 w-3.5" />
               Create estimate from template
             </Link>
+          </Button>
+          <Button size="sm" variant="ghost" className="w-full text-destructive hover:text-destructive" onClick={() => onDelete(lead)}>
+            <Trash2 className="mr-1.5 h-3.5 w-3.5" /> Delete lead
           </Button>
         </SheetHeader>
 
@@ -1049,35 +1733,30 @@ function LeadDetailDrawer({
 
           {/* Facts */}
           <section className="grid grid-cols-2 gap-3">
-            <FactCard icon={User} label="Owner" value={lead.owner} />
-            <FactCard icon={Target} label="Source" value={lead.source} />
+            <FactCard icon={User} label="Owner" value={ownerName} />
+            <FactCard icon={Target} label="Source" value={leadSourceLabel(lead.source)} />
             <FactCard icon={Building2} label="Project" value={lead.projectType} />
             <FactCard icon={Calendar} label="Created" value={formatDateShort(lead.createdAt)} />
           </section>
 
           <Separator />
 
-          {/* Score selector */}
+          {/* Lead Score — read-only (Priority 4). This used to be an
+              interactive 3-button selector, but clicking it never actually
+              persisted anything: leads.score IS a real column, but it's a
+              separate AI Center quality metric (always null today, written
+              by nothing) — not this hot/warm/cold category. The category
+              shown here is purely computed client-side from budget +
+              status (classifyScore()) and is recomputed on every data
+              refresh, so a manual "change" was silently reverted on the
+              next reload. Presenting it as read-only is the honest
+              behavior until real AI-driven scoring exists. */}
           <section>
             <div className="mb-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Lead Score</div>
-            <div className="flex gap-2">
-              {ALL_SCORES.map((s) => {
-                const { Icon: SI, className: sc } = scoreIcon(s);
-                return (
-                  <button
-                    key={s}
-                    onClick={() => onScoreChange(lead.id, s)}
-                    className={`flex flex-1 items-center justify-center gap-1.5 rounded-md border px-3 py-2 text-sm font-medium capitalize transition-colors ${
-                      lead.score === s
-                        ? "border-primary/40 bg-primary-soft text-primary"
-                        : "border-border bg-background text-foreground hover:bg-secondary/60"
-                    }`}
-                  >
-                    <SI className={`h-3.5 w-3.5 ${sc}`} />
-                    {s}
-                  </button>
-                );
-              })}
+            <div className="flex items-center gap-2 rounded-md border border-border bg-secondary/30 px-3 py-2">
+              <ScoreIcon className={`h-4 w-4 ${scoreCls}`} />
+              <span className="text-sm font-medium capitalize">{lead.score}</span>
+              <span className="ml-auto text-[10.5px] text-muted-foreground">Computed from budget &amp; status — not manually saved</span>
             </div>
           </section>
 
@@ -1138,8 +1817,19 @@ function FactCard({ icon: Icon, label, value }: { icon: React.ComponentType<{ cl
   );
 }
 
+// Unified shape for display only — merges the pre-existing localStorage
+// quick-notes (useLeadNotes/addLeadNote, untouched — still the only
+// source the textarea below writes to) with real, org-scoped rows from
+// the canonical `notes` table (entity_type: "lead"), which is where
+// agent-created notes (e.g. create_follow_up_task's approved output) are
+// actually written. Without this merge, an approved agent note would
+// insert successfully but never appear here, since this tab previously
+// only ever read the localStorage list.
+type DisplayNote = { id: string; text: string; createdAt: string; source: "local" | "db" };
+
 function InternalNotes({ leadId }: { leadId: string }) {
   const notes = useLeadNotes(leadId);
+  const { notes: dbNotes, loading: dbNotesLoading } = useEntityNotes("lead", leadId);
   const [text, setText] = useState("");
 
   const handleAdd = () => {
@@ -1150,7 +1840,12 @@ function InternalNotes({ leadId }: { leadId: string }) {
     toast.success("Note added");
   };
 
-  const recent = notes.slice(0, 3);
+  const merged: DisplayNote[] = [
+    ...notes.map((n): DisplayNote => ({ id: n.id, text: n.text, createdAt: n.createdAt, source: "local" })),
+    ...dbNotes.map((n): DisplayNote => ({ id: n.id, text: n.content, createdAt: n.createdAt, source: "db" })),
+  ].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+  const recent = merged.slice(0, 5);
 
   return (
     <section>
@@ -1175,9 +1870,14 @@ function InternalNotes({ leadId }: { leadId: string }) {
       {recent.length > 0 && (
         <div className="mt-3 max-h-48 space-y-2 overflow-y-auto scrollbar-thin">
           {recent.map((n) => (
-            <EditableNote key={n.id} note={n} leadId={leadId} />
+            n.source === "local"
+              ? <EditableNote key={n.id} note={{ id: n.id, text: n.text, createdAt: n.createdAt }} leadId={leadId} />
+              : <ReadOnlyLeadNote key={n.id} text={n.text} createdAt={n.createdAt} />
           ))}
         </div>
+      )}
+      {dbNotesLoading && merged.length === 0 && (
+        <div className="mt-2 text-[11px] text-muted-foreground">Loading notes…</div>
       )}
     </section>
   );
@@ -1234,6 +1934,21 @@ function EditableNote({ note, leadId }: { note: { id: string; text: string; crea
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+// Read-only display for a real `notes`-table row (entity_type: "lead") —
+// e.g. one created by an approved agent action. Not routed through
+// EditableNote's edit/save flow, since that only knows how to update the
+// separate localStorage note list.
+function ReadOnlyLeadNote({ text, createdAt }: { text: string; createdAt: string }) {
+  return (
+    <div className="rounded-md border border-border bg-card p-2.5">
+      <p className="min-w-0 flex-1 whitespace-pre-wrap text-sm text-foreground">{text}</p>
+      <div className="mt-1 text-[10px] text-muted-foreground">
+        {formatDistanceToNow(new Date(createdAt), { addSuffix: true })}
+      </div>
     </div>
   );
 }

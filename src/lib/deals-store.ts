@@ -64,17 +64,16 @@ export type ContactRow = {
   avatar_url: string | null;
 };
 
-export type CompanyRow = {
-  id: string;
-  name: string;
-  slug: string;
-  logo_url: string | null;
-  email: string | null;
-  phone: string | null;
-  address: string | null;
-  city: string | null;
-  state: string | null;
-};
+// Phase 9.4 — a bounded subset of the canonical Company type (companies-store.ts),
+// matching this file's own deliberately narrow `.select(...)` (it only ever
+// needs these columns for deal cards, not a full company row). Re-declared
+// as a Pick rather than importing Company directly so the select statement
+// and the type can't silently drift apart, while still deriving field names
+// from one canonical source instead of a second independent definition.
+export type CompanyRow = Pick<
+  import("@/lib/companies-store").Company,
+  "id" | "name" | "slug" | "logo_url" | "email" | "phone" | "address" | "city" | "state"
+>;
 
 export type ProfileRow = {
   id: string;

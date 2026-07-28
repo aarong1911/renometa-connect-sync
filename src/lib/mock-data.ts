@@ -6,6 +6,10 @@ export type Contact = {
   email: string;
   phone: string;
   address?: string;
+  // Legacy free-text company name. Phase 9.1: contacts.company_id (below)
+  // is now the canonical contact→company relationship going forward;
+  // `company` remains a display fallback for historical rows that only
+  // ever had free text and no linked company row. See contacts-store.ts.
   company: string;
   tags: string[];
   owner: string;
@@ -20,6 +24,23 @@ export type Contact = {
   // Manually-assigned local avatar id (e.g. "avatar-07"), or null/undefined
   // when unset — ContactAvatar then falls back to deterministic selection.
   avatar_key?: string | null;
+  // Real (currently always-null-in-practice, but live and confirmed to
+  // exist — see contacts-store.ts) uploaded-photo URL, distinct from
+  // avatar_key's illustrated-avatar catalog choice. Nothing in this
+  // codebase writes it yet; kept optional and read-only here.
+  avatar_url?: string | null;
+  // Canonical FK to companies.id (see contacts-store.ts / Phase 9 audit).
+  // Null for a contact with no linked company row, including one that only
+  // has legacy free-text `company`.
+  company_id?: string | null;
+  // Resolved company name when company_id is set — NOT a stored column,
+  // populated client-side from a companies lookup. Prefer this over
+  // `company` for display; fall back to `company` only when this is null.
+  companyName?: string | null;
+  // Real contacts.source column (free text, e.g. "manual"/"import"/"gmail").
+  // Optional here only for backward-compat with older in-memory Contact
+  // objects constructed before this field existed.
+  source?: string;
 };
 
 export type LostReason = "Budget" | "Timing" | "Scope" | "Competitor" | "No response";
@@ -1044,15 +1065,32 @@ export type Lead = {
   address: string;
   source: LeadSource;
   status: LeadStatus;
+  // The literal, un-coerced value of leads.status as stored in the
+  // database. `status` above is coerced to the 5 canonical values for
+  // typing convenience (see leads-store.ts's mapRow); `rawStatus` preserves
+  // whatever was actually stored so an unrecognized legacy value can still
+  // be displayed honestly (see src/lib/lead-status.ts) instead of silently
+  // showing as "New". leads.status has no database CHECK constraint.
+  rawStatus?: string;
   score: LeadScore;
   projectType: string;
   estimatedBudget: number;
   notes: string;
+  // Legacy display-name text (from leads.custom_fields.owner). Kept for
+  // rows created before assignedTo existed, or wherever the resolved
+  // member name isn't available. Never write a display name into
+  // assignedTo — see leads-store.ts's updateLeadOwner().
   owner: string;
   ownerInitials: string;
   createdAt: string;
   lastActivity: string;
   convertedDealId?: string;
+  // Canonical owner reference: leads.assigned_to, a real FK-shaped UUID
+  // (org_memberships.member_id / profiles.id — confirmed live, see Phase
+  // 9.2). Null means unassigned. Resolve the display name via the current
+  // useTeam() list at render time rather than trusting `owner` once this
+  // is set.
+  assignedTo?: string | null;
 };
 
 const LEAD_SOURCES: LeadSource[] = ["Website", "Referral", "Angi", "Thumbtack", "Google Ads", "Walk-in", "Social Media", "Gmail"];

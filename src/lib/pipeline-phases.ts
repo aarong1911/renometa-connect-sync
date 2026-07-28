@@ -3,7 +3,7 @@
 // Groups raw deal.stage ids into five executive-level phases for the
 // Command Center's Live Pipeline donut and Sales Pipeline Snapshot ONLY.
 // This never changes deal/stage data, and the Pipeline page
-// (src/routes/sales.pipeline.tsx) keeps showing every raw stage untouched.
+// (src/routes/pipeline.tsx) keeps showing every raw stage untouched.
 //
 // This is a separate concern from the per-raw-stage palette in
 // stage-colors.ts (used by the Pipeline board's Kanban columns) — the two

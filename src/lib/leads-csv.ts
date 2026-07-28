@@ -1,4 +1,9 @@
 import type { Lead, LeadSource, LeadStatus, LeadScore } from "@/lib/mock-data";
+import { escapeCSV, parseCSVLine, splitCSVLines, downloadCSV, parseCSVPreview as sharedParseCSVPreview } from "@/lib/csv-utils";
+import { leadStatusLabel } from "@/lib/lead-status";
+import { leadSourceLabel } from "@/lib/lead-source";
+
+export { downloadCSV };
 
 const CSV_HEADERS = [
   "name", "email", "phone", "address", "source", "status", "score",
@@ -9,52 +14,26 @@ const VALID_SOURCES: LeadSource[] = ["Website", "Referral", "Angi", "Thumbtack",
 const VALID_STATUSES: LeadStatus[] = ["new", "contacted", "qualified", "converted", "lost"];
 const VALID_SCORES: LeadScore[] = ["hot", "warm", "cold"];
 
-function escapeCSV(val: string): string {
-  if (val.includes(",") || val.includes('"') || val.includes("\n")) {
-    return `"${val.replace(/"/g, '""')}"`;
-  }
-  return val;
-}
-
-export function leadsToCSV(leads: Lead[]): string {
+/**
+ * `resolveOwnerName`, if supplied, exports the live team-member display
+ * name resolved from Lead.assignedTo (Priority 10) instead of the legacy
+ * cached owner text, which can go stale after a rename. Status/source are
+ * always exported as readable labels, never internal codes/ids.
+ */
+export function leadsToCSV(leads: Lead[], resolveOwnerName?: (lead: Lead) => string): string {
   const header = CSV_HEADERS.join(",");
   const rows = leads.map((l) =>
     CSV_HEADERS.map((h) => {
-      const val = h === "estimatedBudget" ? String(l[h]) : (l[h as keyof Lead] as string) ?? "";
+      let val: string;
+      if (h === "estimatedBudget") val = String(l[h]);
+      else if (h === "status") val = leadStatusLabel(l.status);
+      else if (h === "source") val = leadSourceLabel(l.source);
+      else if (h === "owner") val = resolveOwnerName ? resolveOwnerName(l) : ((l.owner && l.owner !== "—") ? l.owner : "Unassigned");
+      else val = (l[h as keyof Lead] as string) ?? "";
       return escapeCSV(val);
     }).join(","),
   );
   return [header, ...rows].join("\n");
-}
-
-export function downloadCSV(csv: string, filename: string) {
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-function parseCSVLine(line: string): string[] {
-  const result: string[] = [];
-  let current = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (inQuotes) {
-      if (ch === '"' && line[i + 1] === '"') { current += '"'; i++; }
-      else if (ch === '"') { inQuotes = false; }
-      else { current += ch; }
-    } else {
-      if (ch === '"') { inQuotes = true; }
-      else if (ch === ",") { result.push(current.trim()); current = ""; }
-      else { current += ch; }
-    }
-  }
-  result.push(current.trim());
-  return result;
 }
 
 // Lead fields available for mapping
@@ -79,12 +58,7 @@ export type ColumnMapping = Record<LeadFieldKey, number>;
 
 /** Parse raw CSV text and return headers + first few preview rows */
 export function parseCSVPreview(csv: string): { headers: string[]; preview: string[][]; totalRows: number } {
-  const lines = csv.split(/\r?\n/).filter((l) => l.trim());
-  if (lines.length === 0) return { headers: [], preview: [], totalRows: 0 };
-  const headers = parseCSVLine(lines[0]);
-  const dataLines = lines.slice(1);
-  const preview = dataLines.slice(0, 3).map(parseCSVLine);
-  return { headers, preview, totalRows: dataLines.length };
+  return sharedParseCSVPreview(csv);
 }
 
 /** Auto-guess mapping from CSV headers to lead fields */
@@ -147,9 +121,14 @@ export function autoMapHeaders(csvHeaders: string[], templateType: TemplateType 
   return mapping;
 }
 
-/** Convert parsed CSV rows using the user-defined column mapping */
+/**
+ * Convert parsed CSV rows using the user-defined column mapping. Invalid
+ * source/status/score values are coerced to a safe default (never fail the
+ * whole row over a cosmetic field) but ARE now reported as row+field errors
+ * (Priority 4) instead of being silently swallowed as before this pass.
+ */
 export function applyMappingToLeads(csv: string, mapping: ColumnMapping): { leads: Omit<Lead, "id">[]; errors: string[] } {
-  const lines = csv.split(/\r?\n/).filter((l) => l.trim());
+  const lines = splitCSVLines(csv);
   if (lines.length < 2) return { leads: [], errors: ["CSV must have a header row and at least one data row."] };
 
   if (mapping.name < 0) return { leads: [], errors: ["You must map the Name field."] };
@@ -159,6 +138,7 @@ export function applyMappingToLeads(csv: string, mapping: ColumnMapping): { lead
   const now = new Date().toISOString();
 
   for (let i = 1; i < lines.length; i++) {
+    const rowNum = i + 1; // header is row 1
     const cols = parseCSVLine(lines[i]);
     const get = (key: LeadFieldKey) => {
       const idx = mapping[key];
@@ -166,14 +146,26 @@ export function applyMappingToLeads(csv: string, mapping: ColumnMapping): { lead
     };
 
     const name = get("name");
-    if (!name) { errors.push(`Row ${i + 1}: missing name, skipped.`); continue; }
+    if (!name) { errors.push(`Row ${rowNum}: name — missing, skipped.`); continue; }
 
     const rawSource = get("source");
     const source = (VALID_SOURCES.includes(rawSource as LeadSource) ? rawSource : "Website") as LeadSource;
+    if (rawSource && source !== rawSource) errors.push(`Row ${rowNum}: source — "${rawSource}" not recognized, defaulted to "Website".`);
+
     const rawStatus = get("status");
     const status = (VALID_STATUSES.includes(rawStatus as LeadStatus) ? rawStatus : "new") as LeadStatus;
+    if (rawStatus && status !== rawStatus) errors.push(`Row ${rowNum}: status — "${rawStatus}" not recognized, defaulted to "new".`);
+
     const rawScore = get("score");
     const score = (VALID_SCORES.includes(rawScore as LeadScore) ? rawScore : "warm") as LeadScore;
+    if (rawScore && score !== rawScore) errors.push(`Row ${rowNum}: score — "${rawScore}" not recognized, defaulted to "warm".`);
+
+    const rawBudget = get("estimatedBudget");
+    const estimatedBudget = Number(rawBudget.replace(/[^0-9.-]/g, "")) || 0;
+    if (rawBudget && !Number.isFinite(Number(rawBudget.replace(/[^0-9.-]/g, "")))) {
+      errors.push(`Row ${rowNum}: estimatedBudget — "${rawBudget}" is not numeric, defaulted to 0.`);
+    }
+
     const owner = get("owner") || "Unassigned";
 
     parsed.push({
@@ -185,7 +177,7 @@ export function applyMappingToLeads(csv: string, mapping: ColumnMapping): { lead
       status,
       score,
       projectType: get("projectType") || "Kitchen Remodel",
-      estimatedBudget: Number(get("estimatedBudget")) || 0,
+      estimatedBudget,
       notes: get("notes"),
       owner,
       ownerInitials: owner.split(" ").map((p) => p[0]).join(""),

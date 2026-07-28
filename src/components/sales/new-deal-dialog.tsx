@@ -35,6 +35,7 @@ import {
 } from "@/lib/deals-store";
 import { formatPhone } from "@/lib/format";
 import { useTeam } from "@/lib/organization";
+import { useCompanies } from "@/lib/companies-store";
 import type { AddDealInput, Deal } from "@/lib/sales/types";
 import { supabase } from "@/lib/supabase";
 
@@ -109,11 +110,6 @@ type ContactOption = {
   companyId: string;
 };
 
-type AccountOption = {
-  id: string;
-  name: string;
-};
-
 type DealForm = {
   name: string;
   contactId: string;
@@ -180,7 +176,9 @@ export function NewDealDialog({
     ...initialValues,
   });
   const [contacts, setContacts] = useState<ContactOption[]>([]);
-  const [accounts, setAccounts] = useState<AccountOption[]>([]);
+  // Store consolidation (Phase 9.4 consistency pass) — reads from the
+  // canonical companies-store instead of this dialog's own ad hoc fetch.
+  const accounts = useCompanies();
   const [loadingOptions, setLoadingOptions] = useState(false);
   const selectedTags = useMemo(
     () =>
@@ -280,21 +278,13 @@ export function NewDealDialog({
 
       if (!orgId) return;
 
-      const [contactsResult, accountsResult] = await Promise.all([
-        supabase
-          .from("contacts")
-          .select("id, full_name, email, phone, address, company_id")
-          .eq("org_id", orgId)
-          .order("full_name"),
-        supabase
-          .from("companies")
-          .select("id, name")
-          .eq("org_id", orgId)
-          .order("name"),
-      ]);
+      const contactsResult = await supabase
+        .from("contacts")
+        .select("id, full_name, email, phone, address, company_id")
+        .eq("org_id", orgId)
+        .order("full_name");
 
       if (contactsResult.error) throw contactsResult.error;
-      if (accountsResult.error) throw accountsResult.error;
 
       setContacts(
         (contactsResult.data ?? []).map((contact) => ({
@@ -304,13 +294,6 @@ export function NewDealDialog({
           phone: contact.phone ?? "",
           address: contact.address ?? "",
           companyId: contact.company_id ?? "",
-        })),
-      );
-
-      setAccounts(
-        (accountsResult.data ?? []).map((account) => ({
-          id: account.id,
-          name: account.name,
         })),
       );
     } catch (error) {

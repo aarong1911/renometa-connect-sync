@@ -19,7 +19,7 @@ export const FAVORITE_CATALOG: FavoriteOption[] = [
   { to: "/contacts", label: "Contacts", icon: Users, group: "CRM" },
   { to: "/companies", label: "Companies", icon: Building2, group: "CRM" },
   { to: "/leads", label: "Leads", icon: Target, group: "CRM" },
-  { to: "/sales/pipeline", label: "Pipeline", icon: TrendingUp, group: "CRM" },
+  { to: ROUTES.PIPELINE, label: "Pipeline", icon: TrendingUp, group: "CRM" },
   { to: "/projects", label: "Projects", icon: Briefcase, group: "Projects" },
   { to: "/tasks", label: "Tasks", icon: ListTodo, group: "Projects" },
   { to: "/calendar", label: "Calendar", icon: Calendar, group: "Projects" },
@@ -39,7 +39,15 @@ export const FAVORITE_CATALOG: FavoriteOption[] = [
 
 export const MAX_FAVORITES = 2;
 const KEY = "renometa.favorites.v1";
-const DEFAULT_FAVS: string[] = ["/sales/pipeline", "/projects"];
+const DEFAULT_FAVS: string[] = [ROUTES.PIPELINE, "/projects"];
+
+// Pipeline's canonical route moved from /sales/pipeline to /pipeline —
+// remap any favorite persisted under the old path so existing users don't
+// silently lose it (useFavoriteOptions drops ids that no longer match the
+// catalog by exact string).
+const LEGACY_ROUTE_REMAP: Record<string, string> = {
+  "/sales/pipeline": ROUTES.PIPELINE,
+};
 
 function load(): string[] {
   if (typeof window === "undefined") return [...DEFAULT_FAVS];
@@ -48,7 +56,10 @@ function load(): string[] {
     if (!raw) return [...DEFAULT_FAVS];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [...DEFAULT_FAVS];
-    return parsed.filter((x): x is string => typeof x === "string").slice(0, MAX_FAVORITES);
+    return parsed
+      .filter((x): x is string => typeof x === "string")
+      .map((x) => LEGACY_ROUTE_REMAP[x] ?? x)
+      .slice(0, MAX_FAVORITES);
   } catch {
     return [...DEFAULT_FAVS];
   }

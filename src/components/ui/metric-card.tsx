@@ -41,6 +41,7 @@ export function MetricCard({
   trend,
   sub,
   className,
+  layout = "stack",
 }: {
   icon: ComponentType<{ className?: string }>;
   tone?: MetricTone;
@@ -53,9 +54,33 @@ export function MetricCard({
   /** Plain trailing text, shown only when `trend` isn't set. */
   sub?: string;
   className?: string;
+  /** "stack" (default, unchanged) = icon+label then large value below. "row" = icon+label left, value right, single compact line — for dense dashboards. */
+  layout?: "stack" | "row";
 }) {
   const resolvedBg = tone ? TONE_CLASSES[tone].bg : (iconBg ?? TONE_CLASSES.primary.bg);
   const resolvedIcon = tone ? TONE_CLASSES[tone].icon : (iconColor ?? TONE_CLASSES.primary.icon);
+
+  if (layout === "row") {
+    return (
+      <div
+        className={cn(
+          "rounded-xl border border-border/70 bg-card h-auto",
+          "shadow-[0_1px_2px_rgba(15,23,42,0.04)] hover:shadow-[0_4px_16px_-4px_rgba(15,23,42,0.08)] hover:border-border transition-all duration-200",
+          className,
+        )}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <div className={cn("h-7 w-7 rounded-lg grid place-items-center shrink-0", resolvedBg)}>
+              <Icon className={cn("h-4 w-4", resolvedIcon)} />
+            </div>
+            <span className="truncate text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{label}</span>
+          </div>
+          <div className="shrink-0 text-xl font-semibold tracking-tight text-foreground tabular-nums">{value}</div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div

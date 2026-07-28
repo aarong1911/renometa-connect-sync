@@ -1,62 +1,35 @@
 import type { Contact } from "@/lib/mock-data";
+import { normalizeTags } from "@/lib/tag-utils";
+import { escapeCSV, parseCSVLine, splitCSVLines, downloadCSV, parseCSVPreview as sharedParseCSVPreview } from "@/lib/csv-utils";
 
-const CSV_HEADERS = [
-  "name", "email", "phone", "company", "tags", "owner",
-] as const;
+export { downloadCSV };
 
-function escapeCSV(val: string): string {
-  if (val.includes(",") || val.includes('"') || val.includes("\n")) {
-    return `"${val.replace(/"/g, '""')}"`;
-  }
-  return val;
-}
+const CSV_HEADERS = ["name", "email", "phone", "company", "tags", "owner"] as const;
 
 export function contactsToCSV(contacts: Contact[]): string {
   const header = CSV_HEADERS.join(",");
   const rows = contacts.map((c) =>
     CSV_HEADERS.map((h) => {
-      const val = h === "tags" ? c.tags.join("; ") : (c[h as keyof Contact] as string) ?? "";
+      const val = h === "tags"
+        ? c.tags.join("; ")
+        : h === "company"
+          ? (c.companyName || c.company || "")
+          : (c[h as keyof Contact] as string) ?? "";
       return escapeCSV(val);
     }).join(","),
   );
   return [header, ...rows].join("\n");
 }
 
-export function downloadCSV(csv: string, filename: string) {
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-function parseCSVLine(line: string): string[] {
-  const result: string[] = [];
-  let current = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (inQuotes) {
-      if (ch === '"' && line[i + 1] === '"') { current += '"'; i++; }
-      else if (ch === '"') { inQuotes = false; }
-      else { current += ch; }
-    } else {
-      if (ch === '"') { inQuotes = true; }
-      else if (ch === ",") { result.push(current.trim()); current = ""; }
-      else { current += ch; }
-    }
-  }
-  result.push(current.trim());
-  return result;
-}
-
 export const CONTACT_FIELDS = [
   { key: "name", label: "Name", required: true },
   { key: "email", label: "Email" },
   { key: "phone", label: "Phone" },
-  { key: "company", label: "Company" },
+  // Display label only — Contacts UX pass renamed "Company" to "Account" in
+  // user-facing text. The field `key` stays "company" (matches
+  // Contact.company / ParsedContactRow) since this is a UI wording change
+  // only, not a data-model rename.
+  { key: "company", label: "Account" },
   { key: "tags", label: "Tags" },
   { key: "owner", label: "Owner" },
 ] as const;
@@ -94,12 +67,7 @@ const TEMPLATE_ALIASES: Record<ContactTemplateType, Record<ContactFieldKey, stri
 };
 
 export function parseCSVPreview(csv: string): { headers: string[]; preview: string[][]; totalRows: number } {
-  const lines = csv.split(/\r?\n/).filter((l) => l.trim());
-  if (lines.length === 0) return { headers: [], preview: [], totalRows: 0 };
-  const headers = parseCSVLine(lines[0]);
-  const dataLines = lines.slice(1);
-  const preview = dataLines.slice(0, 3).map(parseCSVLine);
-  return { headers, preview, totalRows: dataLines.length };
+  return sharedParseCSVPreview(csv);
 }
 
 export function autoMapHeaders(csvHeaders: string[], templateType: ContactTemplateType = "contact"): ContactColumnMapping {
@@ -143,7 +111,6 @@ export function detectTagDelimiterWithConfidence(values: string[]): DelimiterDet
     const hasSemicolon = si >= 0;
 
     if (hasComma && hasSemicolon) {
-      // Whichever appears first gets a stronger weight (1.0 vs 0.5)
       if (ci < si) { commaScore += 1; semicolonScore += 0.5; }
       else { semicolonScore += 1; commaScore += 0.5; }
     } else if (hasComma) {
@@ -155,6 +122,7 @@ export function detectTagDelimiterWithConfidence(values: string[]): DelimiterDet
 
   const total = commaScore + semicolonScore;
   const sampled = sample.length;
+  void total;
 
   if (commaScore > 0 && semicolonScore === 0) {
     return { delimiter: "comma", confidence: sampled >= 3 ? "high" : "medium", reason: `Comma found in ${Math.round(commaScore)}/${sampled} rows, no semicolons` };
@@ -186,8 +154,48 @@ export function splitTags(raw: string, delimiter: TagDelimiter): string[] {
   return raw.split(pattern).map((t) => t.trim()).filter(Boolean);
 }
 
-export function applyMappingToContacts(csv: string, mapping: ContactColumnMapping, tagDelimiter: TagDelimiter = "both"): { contacts: Omit<Contact, "id">[]; errors: string[] } {
-  const lines = csv.split(/\r?\n/).filter((l) => l.trim());
+/**
+ * Exact-match company resolution for Contact CSV import (Priority 13):
+ * matches a CSV "company" cell against a same-org company's name (or, if
+ * given, slug/website domain) — case-insensitive, whitespace-normalized,
+ * EXACT only. No fuzzy matching, no cross-org lookup (the caller must only
+ * pass companies already scoped to the current org). Returns null and lets
+ * the caller report "unresolved" on no-match or ambiguous match; never
+ * silently guesses and never creates a company implicitly.
+ */
+export function resolveCompanyByName(
+  raw: string,
+  companies: { id: string; name: string }[],
+): { id: string; name: string } | "ambiguous" | null {
+  const needle = raw.trim().toLowerCase();
+  if (!needle) return null;
+  const matches = companies.filter((c) => c.name.trim().toLowerCase() === needle);
+  if (matches.length === 0) return null;
+  if (matches.length > 1) return "ambiguous";
+  return matches[0];
+}
+
+export type ParsedContactRow = Omit<Contact, "id"> & {
+  /** Set only on an exact, unambiguous same-org company-name match (Priority 13). */
+  companyResolution?: "matched" | "ambiguous" | "none" | "not-mapped";
+};
+
+/**
+ * `companies`, if supplied, enables Contact→Company resolution (Priority
+ * 13): an exact name match sets company_id and clears the legacy free-text
+ * company field; an ambiguous or missing match imports the contact
+ * unassigned with company left as free text, and is reported via
+ * companyResolution so the caller's import summary can show an
+ * unresolved-company count. Omitting `companies` preserves old behavior
+ * (legacy free-text company only).
+ */
+export function applyMappingToContacts(
+  csv: string,
+  mapping: ContactColumnMapping,
+  tagDelimiter: TagDelimiter = "both",
+  companies?: { id: string; name: string }[],
+): { contacts: ParsedContactRow[]; errors: string[] } {
+  const lines = splitCSVLines(csv);
   if (lines.length < 2) return { contacts: [], errors: ["CSV must have a header row and at least one data row."] };
   if (mapping.name < 0) return { contacts: [], errors: ["You must map the Name field."] };
 
@@ -202,10 +210,11 @@ export function applyMappingToContacts(csv: string, mapping: ContactColumnMappin
   }
 
   const errors: string[] = [];
-  const parsed: Omit<Contact, "id">[] = [];
+  const parsed: ParsedContactRow[] = [];
   const now = new Date().toISOString();
 
   for (let i = 1; i < lines.length; i++) {
+    const rowNum = i + 1;
     const cols = parseCSVLine(lines[i]);
     const get = (key: ContactFieldKey) => {
       const idx = mapping[key];
@@ -213,22 +222,50 @@ export function applyMappingToContacts(csv: string, mapping: ContactColumnMappin
     };
 
     const name = get("name");
-    if (!name) { errors.push(`Row ${i + 1}: missing name, skipped.`); continue; }
+    if (!name) { errors.push(`Row ${rowNum}: name — missing, skipped.`); continue; }
 
     const rawTags = get("tags");
-    const tags = splitTags(rawTags, resolvedDelimiter);
+    const tags = normalizeTags(splitTags(rawTags, resolvedDelimiter));
     const owner = get("owner") || "Unassigned";
+    const rawCompany = get("company");
+
+    let company_id: string | null = null;
+    let companyResolution: ParsedContactRow["companyResolution"] = "not-mapped";
+    let companyText = rawCompany;
+
+    if (mapping.company >= 0) {
+      if (!rawCompany) {
+        companyResolution = "none";
+      } else if (companies) {
+        const match = resolveCompanyByName(rawCompany, companies);
+        if (match === "ambiguous") {
+          companyResolution = "ambiguous";
+          errors.push(`Row ${rowNum}: company — "${rawCompany}" matched more than one account, imported unassigned.`);
+        } else if (match) {
+          companyResolution = "matched";
+          company_id = match.id;
+          companyText = "";
+        } else {
+          companyResolution = "none";
+        }
+      } else {
+        companyResolution = "none";
+      }
+    }
 
     parsed.push({
       name,
       email: get("email"),
       phone: get("phone"),
-      company: get("company"),
+      company: companyText,
+      company_id,
+      companyName: null,
       tags,
       owner,
       createdAt: now,
       lastActivity: now,
-    });
+      companyResolution,
+    } as ParsedContactRow);
   }
 
   return { contacts: parsed, errors };

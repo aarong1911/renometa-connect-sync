@@ -111,14 +111,37 @@ export type CreateContactFromGmailInput = {
   email: string;
 };
 
-/** Creates a new contact for an unmatched Gmail sender. Caller is responsible for checking findContactByEmail first if dedupe matters. Refuses to create a contact with no usable email. */
-export async function createContactFromGmailSender(input: CreateContactFromGmailInput): Promise<Contact | null> {
+export type CreateContactFromGmailResult = { contact: Contact; created: boolean };
+
+/**
+ * Creates a contact for an unmatched Gmail sender — or, per Phase 9.1's
+ * duplicate-prevention fix, reuses the existing org contact for this email
+ * if one is already on file (`created: false`) instead of inserting a
+ * second row. Previously this dedupe check lived only in
+ * createLeadFromGmailSender's caller-side logic, per this file's own header
+ * comment ("caller is responsible for checking findContactByEmail first") —
+ * that meant a caller invoking this function directly (e.g. the "Create
+ * Contact" button in unmatched-gmail-sender-banner.tsx) had no such
+ * protection. The check now lives here so every caller is safe by
+ * construction. Refuses to create a contact with no usable email, or when
+ * no organization can be resolved.
+ */
+export async function createContactFromGmailSender(input: CreateContactFromGmailInput): Promise<CreateContactFromGmailResult | null> {
   const norm = normalizeEmail(input.email);
   if (!norm) {
     console.error("[gmail-contact-actions] createContactFromGmailSender called with no usable email");
     return null;
   }
-  return addContact(
+  const orgId = await getOrgId();
+  if (!orgId) {
+    console.error("[gmail-contact-actions] createContactFromGmailSender: no organization found");
+    return null;
+  }
+
+  const existing = await findContactByEmail(orgId, norm);
+  if (existing) return { contact: existing, created: false };
+
+  const created = await addContact(
     {
       // The displayed/typed name may retain its original casing (e.g. "Jane
       // Doe") — only the email is normalized, per storage requirements.
@@ -134,6 +157,8 @@ export async function createContactFromGmailSender(input: CreateContactFromGmail
     },
     { source: "gmail" },
   );
+  if (!created) return null;
+  return { contact: created, created: true };
 }
 
 export type CreateLeadFromGmailInput = {
@@ -161,15 +186,19 @@ export async function createLeadFromGmailSender(input: CreateLeadFromGmailInput)
   const norm = normalizeEmail(input.email);
   if (!norm) return { ok: false, error: "This sender has no usable email address" };
 
-  let contact = await findContactByEmail(orgId, norm);
-  if (contact) {
+  // createContactFromGmailSender does its own email-based dedupe now (Phase
+  // 9.1) — reuses the existing contact for this email when there is one,
+  // rather than this function doing its own separate findContactByEmail
+  // call first.
+  const result = await createContactFromGmailSender({ name: input.name, email: norm });
+  if (!result) return { ok: false, error: "Could not create a contact for this lead" };
+  const { contact, created } = result;
+
+  if (!created) {
     const hasLead = await contactHasLead(contact.id);
     if (hasLead) {
       return { ok: true, duplicate: true, reason: `A lead already exists for ${norm}` };
     }
-  } else {
-    contact = await createContactFromGmailSender({ name: input.name, email: norm });
-    if (!contact) return { ok: false, error: "Could not create a contact for this lead" };
   }
 
   const notes = [input.subject, input.snippet].filter(Boolean).join("\n\n") || null;

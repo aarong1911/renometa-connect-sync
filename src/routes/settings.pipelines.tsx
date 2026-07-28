@@ -44,7 +44,7 @@ export const Route = createFileRoute("/settings/pipelines")({
 });
 
 // Curated palette matching the hex values already in use across the
-// Pipeline board (sales.pipeline.tsx's DEFAULT_STAGE_COLORS) and the live
+// Pipeline board (pipeline.tsx's DEFAULT_STAGE_COLORS) and the live
 // pipeline_stages data — not an arbitrary browser color input.
 const STAGE_COLOR_PALETTE = [
   "#3B82F6", // blue

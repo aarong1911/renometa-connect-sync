@@ -3,8 +3,9 @@
 
 import { useState, useEffect, useSyncExternalStore } from "react";
 import { supabase } from "@/lib/supabase";
-import type { Lead, LeadStatus, LeadScore } from "@/lib/mock-data";
+import type { Lead, LeadStatus, LeadScore, LeadSource } from "@/lib/mock-data";
 import { triggerWorkflow } from "@/lib/trigger-workflow";
+import { normalizeLeadStatusForWrite } from "@/lib/lead-status";
 
 // ── Org helper ──
 async function getOrgId(): Promise<string | null> {
@@ -37,13 +38,12 @@ function mapRow(row: any, contactMap: Record<string, any>): Lead {
   const cf = row.custom_fields ?? {};
   const budget = row.estimated_value ? parseFloat(String(row.estimated_value)) : 0;
 
-  // Map Supabase status to frontend status
-  let status: LeadStatus = "new";
-  if (row.status === "qualified") status = "qualified";
-  else if (row.status === "contacted") status = "contacted";
-  else if (row.status === "converted") status = "converted";
-  else if (row.status === "lost") status = "lost";
-  else if (row.status === "new") status = "new";
+  // Coerced to one of the 5 canonical statuses for typing convenience —
+  // rawStatus below preserves the literal stored value so an unrecognized
+  // legacy value (leads.status has no CHECK constraint) can still be
+  // rendered honestly rather than silently shown as "New". See
+  // src/lib/lead-status.ts.
+  const status: LeadStatus = normalizeLeadStatusForWrite(row.status);
 
   return {
     id: row.id,
@@ -53,6 +53,7 @@ function mapRow(row: any, contactMap: Record<string, any>): Lead {
     address: contact?.address ?? cf.address ?? "",
     source: row.source ?? "Website",
     status,
+    rawStatus: row.status ?? "new",
     score: classifyScore(budget, row.status),
     projectType: cf.service ?? "",
     estimatedBudget: budget,
@@ -62,6 +63,7 @@ function mapRow(row: any, contactMap: Record<string, any>): Lead {
     createdAt: row.created_at ?? new Date().toISOString(),
     lastActivity: row.updated_at ?? row.created_at ?? new Date().toISOString(),
     convertedDealId: row.converted_to_deal_id ?? undefined,
+    assignedTo: row.assigned_to ?? null,
   };
 }
 
@@ -165,6 +167,12 @@ export async function addLead(lead: Omit<Lead, "id">): Promise<Lead> {
         status: lead.status || "new",
         estimated_value: lead.estimatedBudget || 0,
         notes: lead.notes || null,
+        // Canonical owner reference, written directly on insert rather than
+        // creating the lead unassigned and issuing a second updateLeadOwner()
+        // call right after (Phase 9.2 consistency pass). `undefined`/missing
+        // assignedTo means the caller didn't select an owner — never forced
+        // to a value, and never written as a display name anywhere here.
+        assigned_to: lead.assignedTo ?? null,
         custom_fields: {
           service: lead.projectType || null,
           budget: lead.estimatedBudget?.toString() || null,
@@ -174,7 +182,7 @@ export async function addLead(lead: Omit<Lead, "id">): Promise<Lead> {
       .single();
 
     if (!error && data) {
-      const mapped: Lead = { ...lead, id: data.id };
+      const mapped: Lead = { ...lead, id: data.id, assignedTo: data.assigned_to ?? null };
       leads = [mapped, ...leads];
       emit();
       triggerWorkflow("new_lead", { lead: mapped }, contactId ?? undefined);
@@ -191,12 +199,17 @@ export async function addLead(lead: Omit<Lead, "id">): Promise<Lead> {
 
 export async function updateLead(
   id: string,
-  updates: Partial<Pick<Lead, "name" | "email" | "phone" | "address" | "source" | "projectType" | "estimatedBudget" | "owner" | "notes">>,
+  // `source` is widened to a plain string here — leads.source is free text
+  // with no CHECK constraint (Phase 9 audit), and Lead["source"]'s
+  // LeadSource union is only an approximation of the values the UI's own
+  // creation form offers, not a real constraint on what can be edited to
+  // or already exists in the database (see src/lib/lead-source.ts).
+  updates: Partial<Pick<Lead, "name" | "email" | "phone" | "address" | "projectType" | "estimatedBudget" | "owner" | "notes">> & { source?: string },
 ): Promise<void> {
   const current = leads.find((lead) => lead.id === id);
   if (!current) return;
 
-  const next = { ...current, ...updates, lastActivity: new Date().toISOString() };
+  const next: Lead = { ...current, ...updates, source: (updates.source ?? current.source) as LeadSource, lastActivity: new Date().toISOString() };
   const { data: leadRow, error: readError } = await supabase
     .from("leads")
     .select("contact_id, custom_fields")
@@ -258,18 +271,177 @@ export async function updateLeadStatus(id: string, status: LeadStatus): Promise<
     .update({ status, updated_at: new Date().toISOString() })
     .eq("id", id);
 
-  if (error) console.error("[leads-store] status update failed:", error);
+  if (error) {
+    console.error("[leads-store] status update failed:", error);
+    throw error;
+  }
 
   leads = leads.map((l) =>
-    l.id === id ? { ...l, status, lastActivity: new Date().toISOString() } : l
+    l.id === id ? { ...l, status, rawStatus: status, lastActivity: new Date().toISOString() } : l
   );
   emit();
 }
 
-export async function updateLeadScore(id: string, score: LeadScore): Promise<void> {
-  // Score is computed client-side, not stored in Supabase
-  leads = leads.map((l) => (l.id === id ? { ...l, score } : l));
+/**
+ * Bulk status update — a single `.in("id", ids)` Supabase call instead of
+ * one request per row. Returns the ids that failed (if any) so the caller
+ * can report a partial failure rather than assuming all-or-nothing.
+ */
+export async function updateLeadsStatusBulk(ids: string[], status: LeadStatus): Promise<{ failedIds: string[] }> {
+  if (ids.length === 0) return { failedIds: [] };
+  const { error } = await supabase
+    .from("leads")
+    .update({ status, updated_at: new Date().toISOString() })
+    .in("id", ids);
+
+  if (error) {
+    console.error("[leads-store] bulk status update failed:", error);
+    return { failedIds: ids };
+  }
+
+  const idSet = new Set(ids);
+  leads = leads.map((l) =>
+    idSet.has(l.id) ? { ...l, status, rawStatus: status, lastActivity: new Date().toISOString() } : l
+  );
   emit();
+  return { failedIds: [] };
+}
+
+/**
+ * Writes the canonical owner reference (leads.assigned_to — a real FK-
+ * shaped UUID, confirmed live; see Phase 9.2 report). `memberId: null`
+ * clears assignment ("Unassigned"). Deliberately does NOT touch the legacy
+ * `custom_fields.owner` display-name text — new code should never write a
+ * display name into assigned_to, and the local `owner`/`ownerInitials`
+ * fields are left as whatever they were (the route resolves the current
+ * display name from assignedTo + the live team list at render time instead
+ * of trusting a possibly-stale cached name).
+ */
+export async function updateLeadOwner(id: string, memberId: string | null): Promise<void> {
+  const { error } = await supabase
+    .from("leads")
+    .update({ assigned_to: memberId, updated_at: new Date().toISOString() })
+    .eq("id", id);
+
+  if (error) {
+    console.error("[leads-store] owner update failed:", error);
+    throw error;
+  }
+
+  leads = leads.map((l) => (l.id === id ? { ...l, assignedTo: memberId, lastActivity: new Date().toISOString() } : l));
+  emit();
+}
+
+export async function updateLeadsOwnerBulk(ids: string[], memberId: string | null): Promise<{ failedIds: string[] }> {
+  if (ids.length === 0) return { failedIds: [] };
+  const { error } = await supabase
+    .from("leads")
+    .update({ assigned_to: memberId, updated_at: new Date().toISOString() })
+    .in("id", ids);
+
+  if (error) {
+    console.error("[leads-store] bulk owner update failed:", error);
+    return { failedIds: ids };
+  }
+
+  const idSet = new Set(ids);
+  leads = leads.map((l) => (idSet.has(l.id) ? { ...l, assignedTo: memberId, lastActivity: new Date().toISOString() } : l));
+  emit();
+  return { failedIds: [] };
+}
+
+export type DeleteLeadResult = { ok: true } | { ok: false; error: string; blocked?: true };
+
+const CONVERTED_LEAD_MESSAGE = "Converted leads are retained to preserve the sales history associated with their deal.";
+
+function isConvertedLead(lead: Pick<Lead, "status" | "convertedDealId">): boolean {
+  return lead.status === "converted" || !!lead.convertedDealId;
+}
+
+/**
+ * Hard-deletes a lead. No archive/soft-delete column exists on `leads`
+ * today (confirmed via a live schema check — no `is_archived`/`archived`/
+ * `archived_at`/`deleted_at` column) so this is the only option this pass
+ * implements; a real archive field is deferred pending a migration
+ * decision, not invented here.
+ *
+ * A converted lead is retained as a historical source record — this is a
+ * hard, store-level guard (not just a UI-level one, per the Phase 9.2
+ * consistency pass), checked against this function's own in-memory `leads`
+ * state rather than trusting the caller to have already excluded it. If a
+ * genuinely converted lead somehow isn't in local state yet (shouldn't
+ * happen in practice), this fails open to the Supabase delete rather than
+ * silently skipping — deleting a converted lead never cascades to its deal
+ * either way (leads.converted_to_deal_id references deals(id) ON DELETE
+ * SET NULL, the reverse direction; a lead row carries no ON DELETE CASCADE
+ * onto deals). Use deleteLeadUnsafe() below only when a caller has already
+ * made its own fully-informed decision to bypass this guard — nothing in
+ * this codebase currently does.
+ */
+export async function deleteLead(id: string): Promise<DeleteLeadResult> {
+  const current = leads.find((l) => l.id === id);
+  if (current && isConvertedLead(current)) {
+    return { ok: false, error: CONVERTED_LEAD_MESSAGE, blocked: true };
+  }
+  return deleteLeadUnsafe(id);
+}
+
+/**
+ * The actual Supabase delete, with no converted-lead guard. Only exported
+ * for deleteLead()/deleteLeadsBulk() to share — do not call this directly
+ * from UI code; always go through deleteLead()/deleteLeadsBulk() so the
+ * converted-lead protection can't be accidentally bypassed.
+ */
+async function deleteLeadUnsafe(id: string): Promise<DeleteLeadResult> {
+  const { error } = await supabase.from("leads").delete().eq("id", id);
+
+  if (error) {
+    console.error("[leads-store] delete failed:", error);
+    if (error.code === "23503") {
+      return { ok: false, error: "This lead is linked to other records and can't be deleted." };
+    }
+    return { ok: false, error: "Failed to delete this lead. Please try again." };
+  }
+
+  leads = leads.filter((l) => l.id !== id);
+  emit();
+  return { ok: true };
+}
+
+export type BulkDeleteLeadsResult = { failedIds: string[]; skippedConvertedIds: string[] };
+
+/**
+ * Bulk delete. Re-derives the converted/eligible split from this store's
+ * own in-memory state rather than trusting the caller's `ids` list to have
+ * already excluded converted leads — the UI does its own filtering too
+ * (so the two should normally agree), but this is the actual enforcement
+ * point. Issues one `.in("id", ids)` request for the eligible subset
+ * rather than one delete per row.
+ */
+export async function deleteLeadsBulk(ids: string[]): Promise<BulkDeleteLeadsResult> {
+  if (ids.length === 0) return { failedIds: [], skippedConvertedIds: [] };
+
+  const skippedConvertedIds: string[] = [];
+  const eligibleIds: string[] = [];
+  for (const id of ids) {
+    const lead = leads.find((l) => l.id === id);
+    if (lead && isConvertedLead(lead)) skippedConvertedIds.push(id);
+    else eligibleIds.push(id);
+  }
+
+  if (eligibleIds.length === 0) return { failedIds: [], skippedConvertedIds };
+
+  const { error } = await supabase.from("leads").delete().in("id", eligibleIds);
+
+  if (error) {
+    console.error("[leads-store] bulk delete failed:", error);
+    return { failedIds: eligibleIds, skippedConvertedIds };
+  }
+
+  const idSet = new Set(eligibleIds);
+  leads = leads.filter((l) => !idSet.has(l.id));
+  emit();
+  return { failedIds: [], skippedConvertedIds };
 }
 
 // ── Transactional conversion (convert_lead_to_deal RPC) ──
@@ -354,6 +526,29 @@ export async function convertLeadToDeal(payload: ConvertLeadPayload): Promise<Co
       notesMigrated: result.conversion_state.notes_migrated,
     },
   };
+}
+
+/**
+ * Batched, awaited lead import (Stage 9.5) — unlike importLeads() below,
+ * this awaits every insert and returns the real created rows (with real
+ * ids) so the caller can log per-row import-job outcomes and support
+ * rollback. Inserts run in small concurrent batches (not one huge
+ * Promise.all over the whole file, not one request at a time either) to
+ * bound load while still being meaningfully faster than fully sequential.
+ */
+export async function addLeadsBatch(newLeads: Omit<Lead, "id">[], batchSize = 25): Promise<{ created: Lead[]; failedIndexes: number[]; byIndex: (Lead | null)[] }> {
+  const created: Lead[] = [];
+  const failedIndexes: number[] = [];
+  const byIndex: (Lead | null)[] = new Array(newLeads.length).fill(null);
+  for (let i = 0; i < newLeads.length; i += batchSize) {
+    const batch = newLeads.slice(i, i + batchSize);
+    const results = await Promise.allSettled(batch.map((l) => addLead(l)));
+    results.forEach((r, idx) => {
+      if (r.status === "fulfilled") { created.push(r.value); byIndex[i + idx] = r.value; }
+      else failedIndexes.push(i + idx);
+    });
+  }
+  return { created, failedIndexes, byIndex };
 }
 
 export function importLeads(newLeads: Omit<Lead, "id">[]): number {

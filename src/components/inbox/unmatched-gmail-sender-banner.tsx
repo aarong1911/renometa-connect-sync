@@ -145,9 +145,13 @@ function CreateContactDialog({
             onClick={async () => {
               setSaving(true);
               try {
-                const contact = await createContactFromGmailSender({ name: name.trim(), email: senderEmail });
-                if (!contact) { toast.error("Could not create contact"); return; }
-                toast.success(`${contact.name} saved as a contact`);
+                const result = await createContactFromGmailSender({ name: name.trim(), email: senderEmail });
+                if (!result) { toast.error("Could not create contact"); return; }
+                toast.success(
+                  result.created
+                    ? `${result.contact.name} saved as a contact`
+                    : `${result.contact.name} already exists — reused the existing contact`,
+                );
                 onOpenChange(false);
                 onConverted();
               } finally {

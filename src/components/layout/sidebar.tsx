@@ -25,8 +25,7 @@ const LOGO_KEY = "rm_org_logo";
 type NavItem = { to: string; label: string; icon: React.ComponentType<{ className?: string }>; badgeKey?: "inbox" };
 
 // Flat single-list nav (Lovable design), in Lovable's exact order — mapped
-// to this app's real routes (Lovable's own paths like /pipeline, /ai-center
-// are mockups and don't exist here). Role-based visibility preserved via
+// to this app's real routes. Role-based visibility preserved via
 // the same ROLE_ALLOWED_ROUTES prefix-matching used before — Settings and
 // Integrations stay owner-only automatically since "/settings/..." only
 // passes the filter when "/settings" is in that role's allowed list.
@@ -35,7 +34,7 @@ const NAV: NavItem[] = [
   { to: "/leads",                 label: "Leads",           icon: Target },
   { to: "/inbox",                 label: "Conversations",   icon: Inbox, badgeKey: "inbox" },
   { to: "/calendar",              label: "Calendar",        icon: Calendar },
-  { to: "/sales/pipeline",        label: "Pipeline",        icon: TrendingUp },
+  { to: ROUTES.PIPELINE,          label: "Pipeline",        icon: TrendingUp },
   { to: "/estimates",             label: "Estimates",       icon: FileText },
   { to: "/projects",              label: "Projects",        icon: Briefcase },
   { to: "/tasks",                 label: "Tasks",           icon: ListTodo },

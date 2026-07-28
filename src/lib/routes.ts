@@ -2,13 +2,14 @@
 import { linkOptions } from "@tanstack/react-router";
 
 export const ROUTES = {
-  AI_CENTER: "/automation/agents",
+  AI_CENTER: "/ai-center",
   CALL_LOGS: "/automation/call-logs",
   WORKFLOWS: "/automation/workflows",
   TRIGGERS: "/automation/triggers",
   LEADS: "/leads",
-  PIPELINE: "/sales/pipeline",
+  PIPELINE: "/pipeline",
   CONTACTS: "/contacts",
+  COMPANIES: "/companies",
   PROJECTS: "/projects",
   CALENDAR: "/calendar",
   SETTINGS: "/settings",
@@ -27,6 +28,13 @@ export const workflowDetailLink = (workflowId: string) =>
 /** Type-safe link options for opening a specific agent's detail drawer. */
 export const agentDetailLink = (agentId: string) =>
   linkOptions({
-    to: "/automation/agents",
+    to: "/ai-center",
     search: { agentId },
+  });
+
+/** Type-safe link options for a company's detail page (/accounts/$accountSlug — preserved as-is, see Phase 9.4 report). */
+export const accountDetailLink = (accountSlug: string) =>
+  linkOptions({
+    to: "/accounts/$accountSlug",
+    params: { accountSlug },
   });

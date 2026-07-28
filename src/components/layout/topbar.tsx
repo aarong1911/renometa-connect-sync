@@ -265,7 +265,23 @@ export function Topbar({ primaryAction }: { primaryAction?: ReactNode }) {
 
   return (
     <header className="sticky top-0 z-30 grid h-16 grid-cols-[1fr_auto_1fr] items-center border-b border-border bg-background/80 px-6 backdrop-blur">
-      <div />
+      <div className="justify-self-start">
+        <div
+          className="hidden h-10 w-auto items-center gap-3 whitespace-nowrap rounded-lg border border-slate-400/70 bg-secondary/30 px-3 xl:inline-flex"
+          title={`Company timezone: ${companyClock.timeZone}`}
+        >
+          <span className="text-sm font-medium tabular-nums text-foreground/85">
+            {companyClock.date}
+          </span>
+          <span className="h-4 w-px bg-slate-400/60" />
+          <span className="text-sm font-medium tabular-nums text-foreground">
+            {companyClock.time}
+          </span>
+          <span className="text-sm font-medium tabular-nums text-muted-foreground">
+            {companyClock.zone}
+          </span>
+        </div>
+      </div>
 
       <div className="w-[420px] max-w-[42vw]">
         <button
@@ -280,22 +296,6 @@ export function Topbar({ primaryAction }: { primaryAction?: ReactNode }) {
       </div>
 
       <div className="relative flex min-w-0 items-center justify-end">
-        <div
-          className="absolute left-1/2 hidden h-10 -translate-x-1/2 items-center gap-3 whitespace-nowrap rounded-lg border border-slate-400/70 bg-secondary/30 px-3 xl:flex"
-          title={`Company timezone: ${companyClock.timeZone}`}
-        >
-          <span className="text-sm font-medium tabular-nums text-foreground/85">
-            {companyClock.date}
-          </span>
-          <span className="h-4 w-px bg-slate-400/60" />
-          <span className="text-sm font-medium tabular-nums text-foreground">
-            {companyClock.time}
-          </span>
-          <span className="text-sm font-medium tabular-nums text-muted-foreground">
-            {companyClock.zone}
-          </span>
-        </div>
-
         <div className="flex shrink-0 items-center gap-1">
         <Button
           variant="ghost"

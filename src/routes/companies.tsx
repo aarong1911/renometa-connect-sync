@@ -24,6 +24,8 @@ import {
   Search,
   Trash2,
   Upload,
+  Download,
+  History,
   UserPlus,
   Users,
   X,
@@ -55,6 +57,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { MetricCard } from "@/components/ui/metric-card";
 import {
   Select,
@@ -73,6 +76,23 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { supabase } from "@/lib/supabase";
 import { useTopbarAction } from "@/lib/topbar-action";
+import {
+  useCompanies, useCompaniesLoading, refreshCompanies, deleteCompany as storeDeleteCompany,
+  countCompanyLinkedRecords, findCompanyDuplicateCandidates, getOrgId as getCompaniesOrgId,
+  createUniqueCompanySlug, upsertCompanyLocal, addCompany as storeAddCompany,
+  updateCompany as storeUpdateCompany,
+  type CompanyDuplicateCandidate, type Company as StoreCompany,
+} from "@/lib/companies-store";
+import { useDeals } from "@/lib/deals-store";
+import { useContacts } from "@/lib/contacts-store";
+import { formatMoney } from "@/lib/format";
+import {
+  companiesToCSV, downloadCSV, parseCSVPreview, autoMapHeaders as autoMapCompanyHeaders,
+  applyMappingToCompanies, COMPANY_FIELDS, type CompanyColumnMapping,
+} from "@/lib/companies-csv";
+import { CSV_MAX_SYNC_IMPORT_ROWS, CSV_WARN_ROW_THRESHOLD } from "@/lib/csv-utils";
+import { createImportJob, logImportRows, completeImportJob } from "@/lib/import-jobs-store";
+import { ImportHistoryDialog } from "@/components/crm/import-history-dialog";
 
 export const Route = createFileRoute("/companies")({
   component: AccountsPage,
@@ -270,41 +290,10 @@ function ensureHttpsWhileTyping(value: string): string {
   return `https://${trimmed.replace(/^\/+/, "")}`;
 }
 
-function slugifyAccountName(name: string): string {
-  const slug = name
-    .trim()
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-
-  return slug || "account";
-}
-
-async function createUniqueAccountSlug(
-  orgId: string,
-  accountName: string,
-): Promise<string> {
-  const baseSlug = slugifyAccountName(accountName);
-  let candidate = baseSlug;
-  let suffix = 2;
-
-  while (true) {
-    const { data, error } = await supabase
-      .from("companies")
-      .select("id")
-      .eq("org_id", orgId)
-      .eq("slug", candidate)
-      .maybeSingle();
-
-    if (error) throw error;
-    if (!data) return candidate;
-
-    candidate = `${baseSlug}-${suffix}`;
-    suffix += 1;
-  }
-}
+// Slug generation (Priority 4) \u2014 now canonical in companies-store.ts;
+// this page previously had its own copy of the exact same logic. Kept as
+// local aliases so every call site below didn't need renaming.
+const createUniqueAccountSlug = createUniqueCompanySlug;
 
 function initials(name: string): string {
   return name
@@ -377,43 +366,110 @@ function companyPayload(form: CompanyForm) {
 }
 
 function AccountsPage() {
-  const [companies, setCompanies] = useState<Company[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Phase 9.4 — reads now come from the canonical companies-store instead
+  // of this page's own ad hoc fetch. account_type/status are widened to
+  // plain `string` in the store (they're free-text columns, not real
+  // enums — same reasoning already applied to leads.source/leads.status in
+  // earlier Phase 9 stages), so the store's rows are cast to this page's
+  // existing narrower `Company` type at the boundary rather than loosening
+  // every usage below (Select options / badge-color lookups still assume
+  // one of the fixed lists, which is what every real row currently has).
+  const storeCompanies = useCompanies();
+  const companies = storeCompanies as unknown as Company[];
+  const storeLoading = useCompaniesLoading();
+  const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState("All");
   const [statusFilter, setStatusFilter] = useState("Active");
+  // csv import (Stage 9.5, Priority 12 — new capability, Companies had none)
+  const [mapOpen, setMapOpen] = useState(false);
+  const [importLoading, setImportLoading] = useState(false);
+  const [csvRaw, setCsvRaw] = useState("");
+  const [csvHeaders, setCsvHeaders] = useState<string[]>([]);
+  const [csvPreview, setCsvPreview] = useState<string[][]>([]);
+  const [csvTotalRows, setCsvTotalRows] = useState(0);
+  const [colMapping, setColMapping] = useState<CompanyColumnMapping | null>(null);
+  const [importFilename, setImportFilename] = useState("companies.csv");
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [selected, setSelected] = useState<Company | null>(null);
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Company | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Company | null>(null);
+  const [deleteLinkedRecords, setDeleteLinkedRecords] = useState<{ label: string; count: number; blocking: boolean }[] | null>(null);
+  const [deleteChecking, setDeleteChecking] = useState(false);
+  const allDeals = useDeals();
+  const allContacts = useContacts();
+
+  // storeLoading only reflects "has the store fetched at least once" — once
+  // true, subsequent refreshes (e.g. after create/edit/delete) don't flip
+  // the list back to a loading skeleton, matching the previous UX.
+  const loading = storeLoading && companies.length === 0;
 
   const loadCompanies = useCallback(async () => {
-    setLoading(true);
-    const orgId = await getOrgId();
-    if (!orgId) {
-      toast.error("Could not determine your workspace.");
-      setLoading(false);
-      return;
-    }
-
-    const { data, error } = await supabase
-      .from("companies")
-      .select("*")
-      .eq("org_id", orgId)
-      .order("name");
-
-    if (error) {
-      console.error("[accounts]", error);
-      toast.error("Could not load accounts.");
-    } else {
-      setCompanies((data ?? []) as Company[]);
-    }
-    setLoading(false);
+    await refreshCompanies();
   }, []);
 
+  // Debounced search (matches the pattern already used on Leads/Contacts).
   useEffect(() => {
-    void loadCompanies();
-  }, [loadCompanies]);
+    const t = setTimeout(() => setSearch(searchInput), 250);
+    return () => clearTimeout(t);
+  }, [searchInput]);
+
+  // Real per-company counts (Priority 13) — derived from already-loaded
+  // reactive stores (useDeals()/useContacts()), not a query per company.
+  const openDealCountByCompany = useMemo(() => {
+    const map = new Map<string, { count: number; value: number }>();
+    for (const d of allDeals) {
+      if (!d.companyId || d.status !== "open") continue;
+      const entry = map.get(d.companyId) ?? { count: 0, value: 0 };
+      entry.count += 1;
+      entry.value += Number(d.value ?? 0);
+      map.set(d.companyId, entry);
+    }
+    return map;
+  }, [allDeals]);
+
+  const contactCountByCompany = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const c of allContacts) {
+      if (!c.company_id) continue;
+      map.set(c.company_id, (map.get(c.company_id) ?? 0) + 1);
+    }
+    return map;
+  }, [allContacts]);
+
+  const ownerFilterOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const c of companies) if (c.owner_name) set.add(c.owner_name);
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [companies]);
+
+  const stateFilterOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const c of companies) if (c.state) set.add(c.state);
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [companies]);
+
+  const tagFilterOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const c of companies) for (const t of c.tags ?? []) set.add(t);
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [companies]);
+
+  const [ownerFilter, setOwnerFilter] = useState("All owners");
+  const [stateFilter, setStateFilter] = useState("All states");
+  const [tagFilter2, setTagFilter2] = useState("All tags");
+  const [hasContactsOnly, setHasContactsOnly] = useState(false);
+  const [hasOpenDealsOnly, setHasOpenDealsOnly] = useState(false);
+  const [moreFiltersOpen, setMoreFiltersOpen] = useState(false);
+
+  const moreFiltersActiveCount = [
+    ownerFilter !== "All owners",
+    stateFilter !== "All states",
+    tagFilter2 !== "All tags",
+    hasContactsOnly,
+    hasOpenDealsOnly,
+  ].filter(Boolean).length;
 
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -424,7 +480,16 @@ function AccountsPage() {
         (company.industry ?? "").toLowerCase().includes(query) ||
         (company.city ?? "").toLowerCase().includes(query) ||
         (company.email ?? "").toLowerCase().includes(query) ||
+        (company.phone ?? "").toLowerCase().includes(query) ||
+        (company.website ?? "").toLowerCase().includes(query) ||
+        (company.address ?? "").toLowerCase().includes(query) ||
         (company.tags ?? []).some((tag) => tag.toLowerCase().includes(query));
+
+      if (ownerFilter !== "All owners" && company.owner_name !== ownerFilter) return false;
+      if (stateFilter !== "All states" && company.state !== stateFilter) return false;
+      if (tagFilter2 !== "All tags" && !(company.tags ?? []).includes(tagFilter2)) return false;
+      if (hasContactsOnly && !(contactCountByCompany.get(company.id) ?? 0)) return false;
+      if (hasOpenDealsOnly && !(openDealCountByCompany.get(company.id)?.count ?? 0)) return false;
 
       return (
         matchesSearch &&
@@ -432,7 +497,15 @@ function AccountsPage() {
         (statusFilter === "All" || company.status === statusFilter)
       );
     });
-  }, [companies, search, typeFilter, statusFilter]);
+  }, [companies, search, typeFilter, statusFilter, ownerFilter, stateFilter, tagFilter2, hasContactsOnly, hasOpenDealsOnly, contactCountByCompany, openDealCountByCompany]);
+
+  const clearMoreFilters = () => {
+    setOwnerFilter("All owners");
+    setStateFilter("All states");
+    setTagFilter2("All tags");
+    setHasContactsOnly(false);
+    setHasOpenDealsOnly(false);
+  };
 
   const openCreate = () => {
     setEditing(null);
@@ -444,24 +517,154 @@ function AccountsPage() {
     setFormOpen(true);
   };
 
+  // Safe delete (Priority 12) — checks linked records before showing the
+  // destructive action at all; the store's own deleteCompany() re-checks
+  // independently (defense in depth, not UI-only).
+  useEffect(() => {
+    if (!deleteTarget) { setDeleteLinkedRecords(null); return; }
+    let cancelled = false;
+    (async () => {
+      setDeleteChecking(true);
+      const orgId = await getCompaniesOrgId();
+      if (!orgId || cancelled) { setDeleteChecking(false); return; }
+      const linked = await countCompanyLinkedRecords(deleteTarget.id, orgId);
+      if (!cancelled) { setDeleteLinkedRecords(linked); setDeleteChecking(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [deleteTarget]);
+
+  const deleteBlockingRecords = (deleteLinkedRecords ?? []).filter((r) => r.blocking);
+
   const deleteCompany = async () => {
     if (!deleteTarget) return;
+    if (deleteBlockingRecords.length > 0) return;
 
-    const { error } = await supabase
-      .from("companies")
-      .delete()
-      .eq("id", deleteTarget.id)
-      .eq("org_id", deleteTarget.org_id);
-
-    if (error) {
-      toast.error("Could not delete the account.");
+    const result = await storeDeleteCompany(deleteTarget.id);
+    if (!result.ok) {
+      toast.error(result.error);
       return;
     }
 
     toast.success(`${deleteTarget.name} deleted.`);
     if (selected?.id === deleteTarget.id) setSelected(null);
     setDeleteTarget(null);
-    await loadCompanies();
+  };
+
+  // ── Export (Priority 10) ──────────────────────────────────────────────
+  // Exports the currently filtered/searched view, not always the full org
+  // dataset regardless of active search/filters (QA pass fix — this
+  // previously always exported storeCompanies unfiltered).
+  const handleExport = () => {
+    const csv = companiesToCSV(filtered as unknown as StoreCompany[]);
+    downloadCSV(csv, `companies-${new Date().toISOString().slice(0, 10)}.csv`);
+    toast.success(`Exported ${filtered.length} account${filtered.length === 1 ? "" : "s"}`);
+  };
+
+  // ── Import: pick file (Priority 12 — new capability) ──────────────────
+  const handleImportFile = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportFilename(file.name);
+    e.target.value = "";
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const text = ev.target?.result as string;
+      const { headers, preview, totalRows } = parseCSVPreview(text);
+      if (headers.length === 0 || totalRows === 0) { toast.error("Empty or invalid CSV file"); return; }
+      if (totalRows > CSV_MAX_SYNC_IMPORT_ROWS) {
+        toast.error("File too large to import", {
+          description: `This file has ${totalRows} rows. Imports are supported up to ${CSV_MAX_SYNC_IMPORT_ROWS} rows per file — split it into smaller files.`,
+        });
+        return;
+      }
+      if (totalRows > CSV_WARN_ROW_THRESHOLD) {
+        toast.warning(`Large file: ${totalRows} rows`, { description: "This may take a little longer to check for duplicates." });
+      }
+      setCsvRaw(text);
+      setCsvHeaders(headers);
+      setCsvPreview(preview);
+      setCsvTotalRows(totalRows);
+      setColMapping(autoMapCompanyHeaders(headers));
+      setMapOpen(true);
+    };
+    reader.readAsText(file);
+  };
+
+  const importValidation = useMemo(() => {
+    if (!colMapping || !csvRaw) return null;
+    const { companies: parsed, errors } = applyMappingToCompanies(csvRaw, colMapping);
+    return { validCount: parsed.length, errors };
+  }, [colMapping, csvRaw]);
+
+  // ── Import: confirm — duplicate checks via findCompanyDuplicateCandidates
+  // (exact normalized name / website domain only, never fuzzy), slug via
+  // companies-store's own createUniqueCompanySlug, no implicit contact/
+  // company_contacts creation (Priority 12/13). ──────────────────────────
+  const handleConfirmImport = async () => {
+    if (!colMapping) return;
+    const { companies: parsed, errors } = applyMappingToCompanies(csvRaw, colMapping);
+    if (parsed.length === 0) {
+      toast.error("No accounts to import", { description: errors[0] || "Check your column mapping." });
+      return;
+    }
+
+    setImportLoading(true);
+    try {
+      const jobId = await createImportJob("company", importFilename, csvTotalRows);
+      let created = 0;
+      let skippedDupes = 0;
+      let failed = 0;
+      const rowLogs: { source_row_number: number; entity_id: string | null; action: "created" | "skipped_duplicate" | "failed"; status: "ok" | "error" }[] = [];
+
+      for (let i = 0; i < parsed.length; i++) {
+        const row = parsed[i];
+        const rowNum = i + 2;
+        const dupes = findCompanyDuplicateCandidates(row.name, row.website || undefined);
+        if (dupes.length > 0) {
+          skippedDupes++;
+          rowLogs.push({ source_row_number: rowNum, entity_id: null, action: "skipped_duplicate", status: "ok" });
+          continue;
+        }
+        const result = await storeAddCompany({
+          name: row.name,
+          email: row.email || null,
+          phone: row.phone || null,
+          website: row.website || null,
+          industry: row.industry || null,
+          address: row.address || null,
+          city: row.city || null,
+          state: row.state || null,
+          zip: row.zip || null,
+          country: row.country || "United States",
+          account_type: row.account_type,
+          status: row.status,
+          owner_name: row.owner_name || null,
+          tags: row.tags,
+          notes: row.notes || null,
+        });
+        if (result) {
+          created++;
+          rowLogs.push({ source_row_number: rowNum, entity_id: result.id, action: "created", status: "ok" });
+        } else {
+          failed++;
+          rowLogs.push({ source_row_number: rowNum, entity_id: null, action: "failed", status: "error" });
+        }
+      }
+
+      if (jobId) {
+        await logImportRows(jobId, rowLogs);
+        await completeImportJob(jobId, { created, skipped: skippedDupes, failed }, errors);
+      }
+
+      const parts = [`${created} created`];
+      if (skippedDupes > 0) parts.push(`${skippedDupes} skipped as duplicate`);
+      if (failed > 0) parts.push(`${failed} failed to save`);
+      if (errors.length > 0) parts.push(`${errors.length} validation notice(s)`);
+      toast.success(`Imported ${created} account${created !== 1 ? "s" : ""}`, { description: parts.slice(1).join(" · ") || undefined });
+      setMapOpen(false);
+    } finally {
+      setImportLoading(false);
+    }
   };
 
   useTopbarAction(
@@ -490,7 +693,98 @@ function AccountsPage() {
         title="Accounts"
         subtitle="Manage commercial customers, prospects, vendors, partners, and trade relationships."
         breadcrumb={["CRM", "Accounts"]}
+        actions={
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant="outline" asChild>
+              <label className="cursor-pointer">
+                <Upload className="mr-1.5 h-3.5 w-3.5" /> Import
+                <input type="file" accept=".csv" className="sr-only" onChange={handleImportFile} />
+              </label>
+            </Button>
+            <Button size="sm" variant="outline" onClick={handleExport}>
+              <Download className="mr-1.5 h-3.5 w-3.5" /> Export
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setHistoryOpen(true)}>
+              <History className="mr-1.5 h-3.5 w-3.5" /> Import History
+            </Button>
+          </div>
+        }
       />
+      <ImportHistoryDialog open={historyOpen} onOpenChange={setHistoryOpen} entityType="company" />
+
+      <Dialog open={mapOpen} onOpenChange={setMapOpen}>
+        <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Import Accounts</DialogTitle>
+            <DialogDescription>
+              Map your CSV columns to account fields. {csvTotalRows} row{csvTotalRows !== 1 ? "s" : ""} detected.
+            </DialogDescription>
+          </DialogHeader>
+
+          {colMapping && (
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-2 max-h-64 overflow-y-auto pr-1">
+                {COMPANY_FIELDS.map((field) => (
+                  <div key={field.key} className="grid gap-1">
+                    <Label className="text-xs">
+                      {field.label}{"required" in field && field.required && <span className="text-destructive"> *</span>}
+                    </Label>
+                    <Select
+                      value={String(colMapping[field.key])}
+                      onValueChange={(v) => setColMapping((m) => m && { ...m, [field.key]: Number(v) })}
+                    >
+                      <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="-1">— Skip —</SelectItem>
+                        {csvHeaders.map((h, idx) => (
+                          <SelectItem key={idx} value={String(idx)}>{h}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                ))}
+              </div>
+
+              {csvPreview.length > 0 && (
+                <div className="rounded-md border overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b bg-muted/50">
+                        {csvHeaders.map((h, i) => <th key={i} className="p-1.5 text-left font-medium">{h}</th>)}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {csvPreview.map((row, i) => (
+                        <tr key={i} className="border-b last:border-0">
+                          {row.map((cell, j) => <td key={j} className="p-1.5 truncate max-w-[10rem]">{cell}</td>)}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {importValidation && (
+                <div className="text-xs text-muted-foreground">
+                  {importValidation.validCount} of {csvTotalRows} row(s) valid to import.
+                  {importValidation.errors.length > 0 && ` ${importValidation.errors.length} validation notice(s).`}
+                </div>
+              )}
+            </div>
+          )}
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setMapOpen(false)} disabled={importLoading}>Cancel</Button>
+            <Button
+              onClick={handleConfirmImport}
+              disabled={!colMapping || colMapping.name < 0 || !importValidation?.validCount || importLoading}
+            >
+              {importLoading && <span className="mr-1.5 inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-t-transparent" />}
+              {importLoading ? "Importing…" : `Import ${importValidation?.validCount ?? 0} Account${(importValidation?.validCount ?? 0) !== 1 ? "s" : ""}`}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <div className="mb-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
         <MetricCard
@@ -524,9 +818,9 @@ function AccountsPage() {
           <div className="relative min-w-0 flex-1">
             <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <Input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search accounts, industries, cities, email, or tags…"
+              value={searchInput}
+              onChange={(event) => setSearchInput(event.target.value)}
+              placeholder="Search accounts, industries, cities, email, phone, website, address, or tags…"
               className="h-9 pl-9"
             />
           </div>
@@ -558,6 +852,62 @@ function AccountsPage() {
               ))}
             </SelectContent>
           </Select>
+
+          <Popover open={moreFiltersOpen} onOpenChange={setMoreFiltersOpen}>
+            <PopoverTrigger asChild>
+              <Button variant="outline" size="sm" className="relative h-9">
+                More filters
+                {moreFiltersActiveCount > 0 && (
+                  <span className="absolute -right-1.5 -top-1.5 grid h-4 w-4 place-items-center rounded-full bg-primary text-[9px] font-semibold text-primary-foreground">
+                    {moreFiltersActiveCount}
+                  </span>
+                )}
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="end" className="w-72 space-y-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs">Owner</Label>
+                <Select value={ownerFilter} onValueChange={setOwnerFilter}>
+                  <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="All owners" className="text-xs">All owners</SelectItem>
+                    {ownerFilterOptions.map((o) => <SelectItem key={o} value={o} className="text-xs">{o}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">State</Label>
+                <Select value={stateFilter} onValueChange={setStateFilter}>
+                  <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="All states" className="text-xs">All states</SelectItem>
+                    {stateFilterOptions.map((s) => <SelectItem key={s} value={s} className="text-xs">{s}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Tag</Label>
+                <Select value={tagFilter2} onValueChange={setTagFilter2}>
+                  <SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="All tags" className="text-xs">All tags</SelectItem>
+                    {tagFilterOptions.map((t) => <SelectItem key={t} value={t} className="text-xs">{t}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+              <label className="flex items-center gap-2 text-xs">
+                <input type="checkbox" checked={hasContactsOnly} onChange={(e) => setHasContactsOnly(e.target.checked)} />
+                Has contacts
+              </label>
+              <label className="flex items-center gap-2 text-xs">
+                <input type="checkbox" checked={hasOpenDealsOnly} onChange={(e) => setHasOpenDealsOnly(e.target.checked)} />
+                Has open deals
+              </label>
+              {moreFiltersActiveCount > 0 && (
+                <Button size="sm" variant="ghost" className="w-full text-xs" onClick={clearMoreFilters}>Clear all</Button>
+              )}
+            </PopoverContent>
+          </Popover>
         </div>
       </Card>
 
@@ -571,6 +921,8 @@ function AccountsPage() {
                 <th className="py-2.5 pr-4 text-left">Industry</th>
                 <th className="py-2.5 pr-4 text-left">Location</th>
                 <th className="py-2.5 pr-4 text-left">Owner</th>
+                <th className="py-2.5 pr-4 text-left">Contacts</th>
+                <th className="py-2.5 pr-4 text-left">Open Deals</th>
                 <th className="py-2.5 pr-4 text-left">Status</th>
                 <th className="py-2.5 pr-4 text-left">Updated</th>
                 <th className="w-10 py-2.5 pr-3" />
@@ -580,7 +932,7 @@ function AccountsPage() {
               {loading &&
                 Array.from({ length: 5 }).map((_, index) => (
                   <tr key={index} className="border-b border-border">
-                    {Array.from({ length: 7 }).map((__, column) => (
+                    {Array.from({ length: 9 }).map((__, column) => (
                       <td key={column} className="py-3 pr-4">
                         <Skeleton className="h-4 w-24" />
                       </td>
@@ -592,7 +944,7 @@ function AccountsPage() {
               {!loading && filtered.length === 0 && (
                 <tr>
                   <td
-                    colSpan={8}
+                    colSpan={10}
                     className="py-14 text-center text-muted-foreground"
                   >
                     No accounts match the current filters.
@@ -648,6 +1000,15 @@ function AccountsPage() {
                     </td>
                     <td className="py-2.5 pr-4 text-muted-foreground">
                       {company.owner_name || "Unassigned"}
+                    </td>
+                    <td className="py-2.5 pr-4 text-muted-foreground tabular-nums">
+                      {contactCountByCompany.get(company.id) ?? 0}
+                    </td>
+                    <td className="py-2.5 pr-4 text-muted-foreground tabular-nums">
+                      {(() => {
+                        const deal = openDealCountByCompany.get(company.id);
+                        return deal ? `${deal.count} · ${formatMoney(deal.value)}` : "—";
+                      })()}
                     </td>
                     <td className="py-2.5 pr-4">
                       <Badge variant="outline">{company.status}</Badge>
@@ -845,21 +1206,43 @@ function AccountsPage() {
         onOpenChange={(open) => !open && setDeleteTarget(null)}
       >
         <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete account?</DialogTitle>
-            <DialogDescription>
-              This deletes {deleteTarget?.name}. Linked contacts remain in
-              Contacts.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteTarget(null)}>
-              Cancel
-            </Button>
-            <Button variant="destructive" onClick={() => void deleteCompany()}>
-              Delete Account
-            </Button>
-          </DialogFooter>
+          {deleteChecking ? (
+            <div className="flex items-center justify-center gap-2 py-6 text-sm text-muted-foreground">
+              Checking linked records…
+            </div>
+          ) : deleteBlockingRecords.length > 0 ? (
+            <>
+              <DialogHeader>
+                <DialogTitle>Can't delete {deleteTarget?.name}</DialogTitle>
+                <DialogDescription>
+                  This account is still linked to {deleteBlockingRecords.map((r) => `${r.count} ${r.label}${r.count === 1 ? "" : "s"}`).join(", ")}.
+                  Reassign or remove those records first — deleting an account never removes its linked contacts,
+                  deals, projects, estimates, or invoices, so this is blocked rather than allowed to fail partway.
+                </DialogDescription>
+              </DialogHeader>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setDeleteTarget(null)}>Close</Button>
+              </DialogFooter>
+            </>
+          ) : (
+            <>
+              <DialogHeader>
+                <DialogTitle>Delete account?</DialogTitle>
+                <DialogDescription>
+                  This deletes {deleteTarget?.name}. Linked contacts remain in
+                  Contacts.
+                </DialogDescription>
+              </DialogHeader>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setDeleteTarget(null)}>
+                  Cancel
+                </Button>
+                <Button variant="destructive" onClick={() => void deleteCompany()}>
+                  Delete Account
+                </Button>
+              </DialogFooter>
+            </>
+          )}
         </DialogContent>
       </Dialog>
     </>
@@ -887,6 +1270,8 @@ function AccountFormDialog({
   const [selectedLogoFile, setSelectedLogoFile] = useState<File | null>(null);
   const [logoPreviewUrl, setLogoPreviewUrl] = useState("");
   const [newTag, setNewTag] = useState("");
+  const [duplicates, setDuplicates] = useState<CompanyDuplicateCandidate[] | null>(null);
+  const [duplicatesCheckedFor, setDuplicatesCheckedFor] = useState<string | null>(null);
   const logoInputRef = useRef<HTMLInputElement>(null);
 
   const update = <K extends keyof CompanyForm>(
@@ -894,6 +1279,10 @@ function AccountFormDialog({
     value: CompanyForm[K],
   ) => {
     setForm((current) => ({ ...current, [key]: value }));
+    // Any edit invalidates a previous duplicate warning — a stale
+    // acknowledgment can't silently apply to different name/website values.
+    setDuplicates(null);
+    setDuplicatesCheckedFor(null);
   };
 
   useEffect(() => {
@@ -904,6 +1293,8 @@ function AccountFormDialog({
       return "";
     });
     setNewTag("");
+    setDuplicates(null);
+    setDuplicatesCheckedFor(null);
   }, [company, open]);
 
   useEffect(() => {
@@ -1091,6 +1482,13 @@ function AccountFormDialog({
         );
       }
 
+      // Store consolidation (Phase 9.4 consistency pass) — this upload
+      // flow is left as its own direct query (it's coupled to a storage
+      // upload + rollback-on-failure, not plain CRUD duplication, so
+      // routing it through updateCompany() wouldn't simplify anything),
+      // but the reactive cache is still kept in sync immediately rather
+      // than waiting on the caller's full loadCompanies() refetch.
+      upsertCompanyLocal(updatedCompany as unknown as StoreCompany);
       return updatedCompany as Company;
     } finally {
       setUploadingLogo(false);
@@ -1156,6 +1554,26 @@ function AccountFormDialog({
       return;
     }
 
+    // Duplicate-company warning (Priority 18 / Phase 9.4 consistency pass)
+    // — exact normalized-name or website-domain match only, organization-
+    // scoped, on BOTH create and edit. On edit, the company itself is
+    // excluded from candidates, so keeping its own existing name/domain
+    // never warns — only editing INTO another company's values does. Never
+    // blocks outright — proceeds once acknowledged by clicking Save again.
+    {
+      const checkKey = `${form.name.trim().toLowerCase()}|${form.website.trim().toLowerCase()}`;
+      if (!(duplicates && duplicates.length > 0 && duplicatesCheckedFor === checkKey)) {
+        const candidates = findCompanyDuplicateCandidates(form.name, form.website, company?.id);
+        if (candidates.length > 0) {
+          setDuplicates(candidates);
+          setDuplicatesCheckedFor(checkKey);
+          return;
+        }
+        setDuplicates([]);
+        setDuplicatesCheckedFor(checkKey);
+      }
+    }
+
     setSaving(true);
     try {
       const orgId = await getOrgId();
@@ -1163,47 +1581,29 @@ function AccountFormDialog({
 
       let savedCompany: Company;
 
+      // Routed through the canonical companies-store (addCompany/
+      // updateCompany) rather than a second, independent
+      // supabase.from("companies") write path — QA pass fix (Phase 9.4's
+      // store was intended as the single source of truth for writes, but
+      // this dialog had its own raw insert/update since before the store
+      // existed and was never migrated over).
       if (company) {
-        const updatePayload = {
+        const updatePayload: Partial<StoreCompany> = {
           ...companyPayload(form),
+          // Backfill a slug for a legacy row that predates the slug
+          // column being required — new rows always already have one.
           ...(!company.slug
-            ? {
-                slug: await createUniqueAccountSlug(
-                  orgId,
-                  form.name.trim(),
-                ),
-              }
+            ? { slug: await createUniqueAccountSlug(orgId, form.name.trim()) }
             : {}),
         };
 
-        const { data, error } = await supabase
-          .from("companies")
-          .update(updatePayload)
-          .eq("id", company.id)
-          .eq("org_id", orgId)
-          .select("*")
-          .single();
-
-        if (error) throw error;
-        savedCompany = data as Company;
+        const updated = await storeUpdateCompany(company.id, updatePayload);
+        if (!updated) throw new Error("Could not save the account.");
+        savedCompany = updated as unknown as Company;
       } else {
-        const slug = await createUniqueAccountSlug(
-          orgId,
-          form.name.trim(),
-        );
-
-        const { data, error } = await supabase
-          .from("companies")
-          .insert({
-            ...companyPayload(form),
-            org_id: orgId,
-            slug,
-          })
-          .select("*")
-          .single();
-
-        if (error) throw error;
-        savedCompany = data as Company;
+        const created = await storeAddCompany(companyPayload(form));
+        if (!created) throw new Error("Could not save the account.");
+        savedCompany = created as unknown as Company;
       }
 
       if (selectedLogoFile) {
@@ -1675,6 +2075,26 @@ function AccountFormDialog({
               placeholder="Internal account notes…"
             />
           </section>
+
+          {duplicates && duplicates.length > 0 && (
+            <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-900 dark:bg-amber-950/30">
+              <div className="flex items-center gap-1.5 font-medium text-amber-800 dark:text-amber-400">
+                Possible duplicate account{duplicates.length === 1 ? "" : "s"} found
+              </div>
+              <ul className="mt-1.5 space-y-1">
+                {duplicates.map((d) => (
+                  <li key={d.id} className="text-xs text-amber-900 dark:text-amber-300">
+                    {d.name} — matched by {d.matchedOn === "name" ? "name" : "website"}
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-1.5 text-[11px] text-amber-700 dark:text-amber-500">
+                {company
+                  ? 'Click "Save anyway" to keep these values regardless.'
+                  : 'Click "Create anyway" to create this as a new, separate account.'}
+              </p>
+            </div>
+          )}
         </div>
 
         <DialogFooter>
@@ -1685,7 +2105,11 @@ function AccountFormDialog({
             onClick={() => void save()}
             disabled={saving || uploadingLogo}
           >
-            {saving ? "Saving…" : company ? "Save Changes" : "Create Account"}
+            {saving
+              ? "Saving…"
+              : duplicates && duplicates.length > 0
+                ? company ? "Save anyway" : "Create anyway"
+                : company ? "Save Changes" : "Create Account"}
           </Button>
         </DialogFooter>
       </DialogContent>

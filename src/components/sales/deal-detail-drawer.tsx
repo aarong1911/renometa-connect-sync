@@ -1880,8 +1880,8 @@ export function DealDetailDrawer({
             <TabsContent value="tasks" className="mt-5">
               <EmptyTab
                 icon={CheckCircle2}
-                title="No tasks linked"
-                description="Tasks connected to this deal will appear here."
+                title="Deal-linked tasks aren't available yet"
+                description="Tasks can't be linked to a specific deal yet — this tab isn't checking for any. Task support for deals is planned for a future release."
               />
             </TabsContent>
 
@@ -1899,8 +1899,8 @@ export function DealDetailDrawer({
             <TabsContent value="files" className="mt-5">
               <EmptyTab
                 icon={FileText}
-                title="No files linked"
-                description="Contracts, estimates, plans, and other deal files will appear here."
+                title="Deal-linked files aren't available yet"
+                description="Files can't be linked to a specific deal yet — this tab isn't checking for any. File support for deals is planned for a future release."
               />
             </TabsContent>
           </Tabs>

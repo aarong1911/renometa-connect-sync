@@ -39,18 +39,19 @@ import {
 import type { Lead } from "@/lib/mock-data";
 import { upsertDealFromCanonical, usePipelines, usePipelineStages } from "@/lib/deals-store";
 import { upsertContactFromRow } from "@/lib/contacts-store";
+import { findDuplicateContactCandidates, type ContactDuplicateCandidate } from "@/lib/identity-normalization";
 import { flattenLeadNotes, sha256Hex } from "@/lib/notes-hash";
 import type { Deal } from "@/lib/sales/types";
+import { useCompanies } from "@/lib/companies-store";
 
-type ContactMatch = {
-  id: string;
-  full_name: string;
-  email: string | null;
-  phone: string | null;
-  address: string | null;
-};
-
-type AccountOption = { id: string; name: string };
+// Phase 9.2 fix: previously matched by comparing a raw stripped-digits
+// phone directly against contacts.phone via `.eq()` — but this app stores
+// phone numbers as either "(555) 123-4567" (formatPhone()) or E.164
+// ("+15551234567" from Meta ingestion), never bare digits, so that
+// comparison silently never matched anything. Now reuses the same
+// org-scoped, format-aware lookup every other contact-creation path uses
+// (see src/lib/identity-normalization.ts).
+type ContactMatch = ContactDuplicateCandidate;
 
 const RPC_ERROR_MESSAGES: Record<string, string> = {
   LEAD_NOT_FOUND_OR_FORBIDDEN: "This lead could not be found in your organization.",
@@ -109,7 +110,10 @@ export function ConvertLeadDialog({ lead, open, onOpenChange, onConverted }: Con
   const [newContactPhone, setNewContactPhone] = useState("");
   const [newContactAddress, setNewContactAddress] = useState("");
 
-  const [accounts, setAccounts] = useState<AccountOption[]>([]);
+  // Phase 9.4 — reads from the canonical companies-store instead of this
+  // dialog's own ad hoc fetch (removes a redundant query fired every time
+  // this dialog opens; the store is already reactive/cached).
+  const accounts = useCompanies();
   const [accountMode, setAccountMode] = useState<"none" | "existing" | "new">("none");
   const [accountId, setAccountId] = useState("");
   const [newAccountName, setNewAccountName] = useState("");
@@ -174,35 +178,12 @@ export function ConvertLeadDialog({ lead, open, onOpenChange, onConverted }: Con
       const orgId = await resolveOrgId();
       if (!orgId || requestId !== matchRequestIdRef.current) return;
 
-      const email = currentLead.email?.trim().toLowerCase() ?? "";
-      const phone = currentLead.phone ? currentLead.phone.replace(/\D/g, "").slice(-10) : "";
-
-      const matches: ContactMatch[] = [];
-      const seen = new Set<string>();
-
-      if (email) {
-        const { data } = await supabase
-          .from("contacts")
-          .select("id, full_name, email, phone, address")
-          .eq("org_id", orgId)
-          .ilike("email", email);
-        for (const row of data ?? []) if (!seen.has(row.id)) { seen.add(row.id); matches.push(row); }
-      }
-      if (phone) {
-        const { data } = await supabase
-          .from("contacts")
-          .select("id, full_name, email, phone, address")
-          .eq("org_id", orgId)
-          .eq("phone", phone);
-        for (const row of data ?? []) if (!seen.has(row.id)) { seen.add(row.id); matches.push(row); }
-      }
+      const matches = await findDuplicateContactCandidates(orgId, {
+        email: currentLead.email,
+        phone: currentLead.phone,
+      });
       if (requestId !== matchRequestIdRef.current) return;
       setContactMatches(matches);
-
-      const { data: accountRows } = await supabase
-        .from("companies").select("id, name").eq("org_id", orgId).order("name");
-      if (requestId !== matchRequestIdRef.current) return;
-      setAccounts((accountRows ?? []).map((a) => ({ id: a.id, name: a.name })));
     } catch (error) {
       console.error("[convert-lead-dialog] match load failed:", error);
     } finally {

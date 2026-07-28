@@ -65,6 +65,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { supabase } from "@/lib/supabase";
 import { useTopbarAction } from "@/lib/topbar-action";
+import { formatMoney, formatDateShort } from "@/lib/format";
+import { fetchCompanyBySlug, updateCompany, findCompanyDuplicateCandidates, type CompanyDuplicateCandidate } from "@/lib/companies-store";
+import { useDeals } from "@/lib/deals-store";
 
 export const Route = createFileRoute("/accounts_/$accountSlug")({
   component: AccountDetailsPage,
@@ -132,6 +135,21 @@ type CompanyActivity = {
   created_at: string;
   created_by_name?: string | null;
 };
+
+// Company-level Projects/Estimates/Invoices (Priority 6/7) — projects,
+// estimates, and invoices have no company_id column at all (confirmed via a
+// live schema check). Rather than free-text company-name matching, these
+// are resolved via the real, ID-based chain: contacts.company_id (the
+// canonical direct contact→company link, distinct from the many-to-many
+// company_contacts table — see the Phase 9.4 report for the reconciliation
+// of the two) → projects/estimates.client_id / invoices.client_id. This is
+// explicitly an indirect, contact-mediated count/list, not a direct FK —
+// documented here and in the report rather than presented as authoritative
+// company-level data.
+type RelatedProject = { id: string; name: string; status: string; completion_percentage: number | null };
+type RelatedEstimate = { id: string; title: string | null; number: string | null; status: string | null; total: number | null; valid_until: string | null; created_at: string };
+type RelatedInvoice = { id: string; invoice_number: string | null; status: string | null; total_amount: number | null; amount_paid: number | null; due_date: string | null };
+type DealActivityRow = { id: string; deal_id: string; activity_type: string; title: string; description: string | null; actor_name: string | null; occurred_at: string };
 
 type AddContactMode = "existing" | "new";
 
@@ -245,6 +263,10 @@ function AccountDetailsPage() {
   const [contactOptions, setContactOptions] = useState<ContactOption[]>([]);
   const [notes, setNotes] = useState<CompanyNote[]>([]);
   const [activities, setActivities] = useState<CompanyActivity[]>([]);
+  const [projects, setProjects] = useState<RelatedProject[]>([]);
+  const [estimates, setEstimates] = useState<RelatedEstimate[]>([]);
+  const [invoices, setInvoices] = useState<RelatedInvoice[]>([]);
+  const [dealActivities, setDealActivities] = useState<DealActivityRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [activeTab, setActiveTab] = useState<TabValue>("overview");
@@ -265,27 +287,19 @@ function AccountDetailsPage() {
       return;
     }
 
-    const { data: companyRow, error: companyError } = await supabase
-      .from("companies")
-      .select("*")
-      .eq("slug", accountSlug)
-      .eq("org_id", orgId)
-      .maybeSingle();
+    // Phase 9.4 — routed through the canonical companies-store's slug
+    // lookup (org-scoped, same query this page always ran) so a successful
+    // load also populates the shared reactive cache other pages read from,
+    // instead of this page silently keeping its own separate copy.
+    const loadedCompanyFromStore = await fetchCompanyBySlug(accountSlug);
 
-    if (companyError) {
-      console.error("[account-details]", companyError);
-      toast.error("Could not load this account.");
-      setLoading(false);
-      return;
-    }
-
-    if (!companyRow) {
+    if (!loadedCompanyFromStore) {
       setNotFound(true);
       setLoading(false);
       return;
     }
 
-    const loadedCompany = companyRow as Company;
+    const loadedCompany = loadedCompanyFromStore as unknown as Company;
     const resolvedCompanyId = loadedCompany.id;
 
     setCompany(loadedCompany);
@@ -327,6 +341,37 @@ function AccountDetailsPage() {
     if (!notesResult.error) setNotes((notesResult.data ?? []) as CompanyNote[]);
     if (!activitiesResult.error) setActivities((activitiesResult.data ?? []) as CompanyActivity[]);
 
+    // Projects/Estimates/Invoices (Priority 6/7) — resolved via the direct
+    // contacts.company_id link (not company_contacts, and not free-text
+    // name matching). Also real deal_activities for this company's deals
+    // (deals.company_id is a real direct FK), merged into Activity below.
+    const [{ data: directContacts }, { data: companyDeals }] = await Promise.all([
+      supabase.from("contacts").select("id").eq("org_id", orgId).eq("company_id", resolvedCompanyId),
+      supabase.from("deals").select("id").eq("org_id", orgId).eq("company_id", resolvedCompanyId),
+    ]);
+    const directContactIds = (directContacts ?? []).map((c: any) => c.id as string);
+    const dealIds = (companyDeals ?? []).map((d: any) => d.id as string);
+
+    const [projectsResult, estimatesResult, invoicesResult, dealActivityResult] = await Promise.all([
+      directContactIds.length > 0
+        ? supabase.from("projects").select("id, name, status, completion_percentage").eq("org_id", orgId).in("client_id", directContactIds).order("created_at", { ascending: false })
+        : Promise.resolve({ data: [], error: null } as any),
+      directContactIds.length > 0
+        ? supabase.from("estimates").select("id, title, number, status, total, valid_until, created_at").eq("org_id", orgId).in("client_id", directContactIds).order("created_at", { ascending: false })
+        : Promise.resolve({ data: [], error: null } as any),
+      directContactIds.length > 0
+        ? supabase.from("invoices").select("id, invoice_number, status, total_amount, amount_paid, due_date").eq("org_id", orgId).in("client_id", directContactIds).order("issue_date", { ascending: false })
+        : Promise.resolve({ data: [], error: null } as any),
+      dealIds.length > 0
+        ? supabase.from("deal_activities").select("id, deal_id, activity_type, title, description, actor_name, occurred_at").eq("org_id", orgId).in("deal_id", dealIds).order("occurred_at", { ascending: false }).limit(50)
+        : Promise.resolve({ data: [], error: null } as any),
+    ]);
+
+    if (!projectsResult.error) setProjects((projectsResult.data ?? []) as RelatedProject[]);
+    if (!estimatesResult.error) setEstimates((estimatesResult.data ?? []) as RelatedEstimate[]);
+    if (!invoicesResult.error) setInvoices((invoicesResult.data ?? []) as RelatedInvoice[]);
+    if (!dealActivityResult.error) setDealActivities((dealActivityResult.data ?? []) as DealActivityRow[]);
+
     setLoading(false);
   }, [accountSlug]);
 
@@ -345,7 +390,57 @@ function AccountDetailsPage() {
     [contacts],
   );
   const pinnedNotes = useMemo(() => notes.filter((note) => note.is_pinned).slice(0, 3), [notes]);
-  const recentActivity = activities.slice(0, 5);
+
+  // Overview metrics (Phase 9.4 consistency pass) — real data only, and no
+  // second deals query: reuses the same reactive useDeals() store
+  // AccountRelatedDeals already reads, filtered by the real
+  // deals.company_id FK. "Open" is deal.status === "open" — the exact
+  // open/won/lost interpretation the Pipeline page uses (deals-store
+  // derives status from the stage's own outcome column). Won/Lost never
+  // count toward Open Opportunities or Pipeline Value.
+  const allDeals = useDeals();
+  const companyDealStats = useMemo(() => {
+    const companyDeals = allDeals.filter((d) => d.companyId === company?.id);
+    const open = companyDeals.filter((d) => d.status === "open");
+    return {
+      openCount: open.length,
+      openValue: open.reduce((sum, d) => sum + Number(d.value ?? 0), 0),
+    };
+  }, [allDeals, company?.id]);
+
+  // Active Projects — same "active" status set the Command Center's own
+  // Active Projects KPI uses (src/routes/index.tsx), applied to this
+  // page's already-loaded, contact-mediated project list. A project whose
+  // status falls outside both the active and terminal sets still isn't
+  // counted — matching the Command Center's inclusion-list behavior
+  // exactly rather than inventing a third interpretation.
+  const activeProjectsCount = useMemo(() => {
+    const ACTIVE_PROJECT_STATUSES = new Set(["planning", "contracted", "pre-construction", "active", "punch-list"]);
+    return projects.filter((p) => ACTIVE_PROJECT_STATUSES.has((p.status ?? "").toLowerCase())).length;
+  }, [projects]);
+
+  // Priority 9 — merges the existing real company_activities (currently
+  // only ever "note added" events) with real deal_activities for this
+  // company's deals (deals.company_id is a real direct FK) — both have
+  // genuine timestamps; nothing here is fabricated or backdated from
+  // updated_at. Deal-stage/creation events previously had no representation
+  // in this tab at all.
+  const mergedActivity = useMemo<CompanyActivity[]>(() => {
+    const fromDeals: CompanyActivity[] = dealActivities.map((d) => ({
+      id: `deal-activity-${d.id}`,
+      activity_type: d.activity_type,
+      title: d.title,
+      description: d.description,
+      occurred_at: d.occurred_at,
+      created_at: d.occurred_at,
+      created_by_name: d.actor_name ?? undefined,
+    }));
+    return [...activities, ...fromDeals].sort(
+      (a, b) => new Date(b.occurred_at || b.created_at).getTime() - new Date(a.occurred_at || a.created_at).getTime(),
+    );
+  }, [activities, dealActivities]);
+
+  const recentActivity = mergedActivity.slice(0, 5);
 
   const openAddNote = () => {
     setEditingNote(null);
@@ -357,7 +452,7 @@ function AccountDetailsPage() {
     setNoteOpen(true);
   };
 
-  const navigateToModule = async (to: "/sales/pipeline" | "/projects" | "/calendar" | "/files") => {
+  const navigateToModule = async (to: "/pipeline" | "/projects" | "/calendar" | "/files") => {
     if (company) {
       sessionStorage.setItem(
         "renometa:selectedAccount",
@@ -371,6 +466,16 @@ function AccountDetailsPage() {
     await navigate({ to });
   };
 
+  // Primary-contact change remains two client-side steps (clear old, set
+  // new) — NOT atomic. A transactional set_company_primary_contact RPC was
+  // considered for this pass and deliberately deferred: writing a
+  // SECURITY DEFINER migration requires verifying the live RLS/grant
+  // state on company_contacts, which this environment cannot do (no SQL/
+  // dashboard access — the same limitation documented in every Phase 9
+  // pass). The two steps are individually idempotent, so a failure between
+  // them leaves "no primary" (recoverable by clicking again), never two
+  // primaries — and company_contacts_one_primary_idx backstops that at the
+  // DB level regardless.
   const makePrimary = async (item: LinkedContact) => {
     if (!company) return;
     try {
@@ -387,6 +492,18 @@ function AccountDetailsPage() {
         .eq("org_id", company.org_id);
 
       if (error) throw error;
+
+      // Invariant sync (Phase 9.4): the primary contact's direct
+      // affiliation follows the primary flag — per the consistency spec,
+      // "when marking a contact primary... set contacts.company_id to that
+      // company if it is not already." Org-scoped like every other write.
+      await supabase
+        .from("contacts")
+        .update({ company_id: company.id, company: null })
+        .eq("id", item.contact_id)
+        .eq("org_id", company.org_id)
+        .neq("company_id", company.id);
+
       toast.success(`${item.contact?.full_name ?? "Contact"} is now the primary contact.`);
       await loadAccount();
     } catch (error) {
@@ -405,6 +522,19 @@ function AccountDetailsPage() {
         .eq("org_id", company.org_id);
 
       if (error) throw error;
+
+      // Invariant sync (Phase 9.4): never leave contacts.company_id
+      // pointing at a company the contact was just removed from. The
+      // .eq("company_id", company.id) filter means a contact whose direct
+      // affiliation is some OTHER company is untouched. Legacy free-text
+      // contacts.company is deliberately left alone as a display fallback.
+      await supabase
+        .from("contacts")
+        .update({ company_id: null })
+        .eq("id", item.contact_id)
+        .eq("org_id", company.org_id)
+        .eq("company_id", company.id);
+
       toast.success("Contact removed from this account.");
       await loadAccount();
     } catch (error) {
@@ -615,6 +745,9 @@ function AccountDetailsPage() {
               onShowActivity={() => setActiveTab("activity")}
               onShowNotes={() => setActiveTab("notes")}
               onNavigate={navigateToModule}
+              openDealsCount={companyDealStats.openCount}
+              pipelineValue={companyDealStats.openValue}
+              activeProjectsCount={activeProjectsCount}
             />
           </TabsContent>
 
@@ -628,7 +761,7 @@ function AccountDetailsPage() {
           </TabsContent>
 
           <TabsContent value="activity" className="m-0 border-t border-border bg-canvas p-3">
-            <ActivityTab activities={activities} onAddNote={openAddNote} />
+            <ActivityTab activities={mergedActivity} onAddNote={openAddNote} />
           </TabsContent>
 
           <TabsContent value="notes" className="m-0 border-t border-border bg-canvas p-3">
@@ -648,13 +781,22 @@ function AccountDetailsPage() {
           </TabsContent>
 
           <TabsContent value="projects" className="m-0 border-t border-border bg-canvas p-3">
-            <ModuleEmptyState tab="projects" onOpen={() => void navigateToModule("/projects")} />
+            {projects.length > 0 ? (
+              <CompanyProjectsTab projects={projects} onOpen={() => void navigateToModule("/projects")} />
+            ) : (
+              <ModuleEmptyState tab="projects" onOpen={() => void navigateToModule("/projects")} />
+            )}
           </TabsContent>
           <TabsContent value="financials" className="m-0 border-t border-border bg-canvas p-3">
-            <ModuleEmptyState
-              tab="financials"
-              onOpen={() => void navigate({ to: "/financials" })}
-            />
+            {(estimates.length > 0 || invoices.length > 0) ? (
+              <CompanyFinancialsTab
+                estimates={estimates}
+                invoices={invoices}
+                onOpen={() => void navigate({ to: "/financials" })}
+              />
+            ) : (
+              <ModuleEmptyState tab="financials" onOpen={() => void navigate({ to: "/financials" })} />
+            )}
           </TabsContent>
           <TabsContent value="files" className="m-0 border-t border-border bg-canvas p-3">
             <ModuleEmptyState tab="files" onOpen={() => void navigateToModule("/files")} />
@@ -718,6 +860,9 @@ function OverviewTab({
   onShowActivity,
   onShowNotes,
   onNavigate,
+  openDealsCount,
+  pipelineValue,
+  activeProjectsCount,
 }: {
   company: Company;
   primaryContact: LinkedContact | null;
@@ -730,7 +875,10 @@ function OverviewTab({
   onNewDeal: () => void;
   onShowActivity: () => void;
   onShowNotes: () => void;
-  onNavigate: (to: "/sales/pipeline" | "/projects" | "/calendar" | "/files") => Promise<void>;
+  onNavigate: (to: "/pipeline" | "/projects" | "/calendar" | "/files") => Promise<void>;
+  openDealsCount: number;
+  pipelineValue: number;
+  activeProjectsCount: number;
 }) {
   return (
     <div className="grid gap-3 xl:grid-cols-[minmax(0,1.8fr)_minmax(320px,0.9fr)]">
@@ -921,11 +1069,20 @@ function OverviewTab({
         <Card className="overflow-hidden p-0">
           <CardHeaderBar icon={Activity} title="Account Summary" />
           <div className="px-4 pb-2">
-            <SummaryRow label="Open Opportunities" value="—" />
-            <SummaryRow label="Pipeline Value" value="—" />
-            <SummaryRow label="Active Projects" value="—" />
-            <SummaryRow label="Outstanding Balance" value="—" />
-            <SummaryRow label="Lifetime Revenue" value="—" last />
+            {/* All three rows are real (Phase 9.4 consistency pass):
+                deals via the direct deals.company_id FK from the shared
+                useDeals() store (open-status only — Won/Lost excluded,
+                same interpretation as the Pipeline page); Active Projects
+                via this page's contact-mediated project list, using the
+                Command Center's own active-status set. The former
+                "Outstanding Balance" / "Lifetime Revenue" rows were
+                REMOVED, not populated — the only reachable invoice data
+                is the indirect contact-mediated set, and presenting a sum
+                of that as authoritative company accounting would overstate
+                its accuracy. */}
+            <SummaryRow label="Open Opportunities" value={String(openDealsCount)} />
+            <SummaryRow label="Pipeline Value" value={formatMoney(pipelineValue)} />
+            <SummaryRow label="Active Projects" value={String(activeProjectsCount)} last />
           </div>
         </Card>
 
@@ -1082,6 +1239,134 @@ function ActivityTab({
       </div>
       <ActivityList activities={activities} onAddNote={onAddNote} />
     </Card>
+  );
+}
+
+// ── Company-level Projects (Priority 6) — resolved via contacts.company_id,
+// see the RelatedProject type comment above for why this is ID-based but
+// indirect rather than a direct company_id FK (projects has none). ───────
+function CompanyProjectsTab({ projects, onOpen }: { projects: RelatedProject[]; onOpen: () => void }) {
+  return (
+    <Card className="p-5">
+      <div className="mb-4 flex items-center justify-between">
+        <div>
+          <h2 className="font-semibold">Account Projects</h2>
+          <p className="text-sm text-muted-foreground">
+            Projects for contacts linked to this account.
+          </p>
+        </div>
+        <Button size="sm" variant="outline" onClick={onOpen}>Open Projects</Button>
+      </div>
+      <div className="space-y-2">
+        {projects.map((project) => (
+          <div key={project.id} className="rounded-xl border bg-white p-3">
+            <div className="flex items-start gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-full bg-blue-50 text-blue-600">
+                <FolderKanban className="h-4 w-4" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-semibold">{project.name}</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {project.status}
+                  {project.completion_percentage !== null ? ` · ${project.completion_percentage}% complete` : ""}
+                </p>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+// ── Company-level Estimates + Invoices (Priority 7) — same contact-based
+// resolution as Projects; kept as one "Financials" tab (matching the
+// existing TAB_ITEMS grouping and the app's own financials.estimates.tsx /
+// financials.invoices.tsx pairing) rather than splitting into two new
+// top-level tabs. ─────────────────────────────────────────────────────────
+function CompanyFinancialsTab({
+  estimates,
+  invoices,
+  onOpen,
+}: {
+  estimates: RelatedEstimate[];
+  invoices: RelatedInvoice[];
+  onOpen: () => void;
+}) {
+  return (
+    <div className="space-y-4">
+      {estimates.length > 0 && (
+        <Card className="p-5">
+          <div className="mb-4 flex items-center justify-between">
+            <div>
+              <h2 className="font-semibold">Estimates</h2>
+              <p className="text-sm text-muted-foreground">
+                Estimates for contacts linked to this account.
+              </p>
+            </div>
+            <Button size="sm" variant="outline" onClick={onOpen}>Open Financials</Button>
+          </div>
+          <div className="space-y-2">
+            {estimates.map((estimate) => (
+              <div key={estimate.id} className="rounded-xl border bg-white p-3">
+                <div className="flex items-start gap-3">
+                  <div className="flex h-9 w-9 items-center justify-center rounded-full bg-amber-50 text-amber-700">
+                    <FileText className="h-4 w-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-semibold">
+                      {estimate.title || estimate.number || "Untitled Estimate"}
+                    </p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {estimate.status || "Draft"}
+                      {estimate.valid_until ? ` · Valid until ${formatDateShort(estimate.valid_until)}` : ""}
+                    </p>
+                  </div>
+                  <span className="shrink-0 text-sm font-semibold">{formatMoney(estimate.total ?? 0)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {invoices.length > 0 && (
+        <Card className="p-5">
+          <div className="mb-4 flex items-center justify-between">
+            <div>
+              <h2 className="font-semibold">Invoices</h2>
+              <p className="text-sm text-muted-foreground">
+                Invoices for contacts linked to this account.
+              </p>
+            </div>
+            <Button size="sm" variant="outline" onClick={onOpen}>Open Financials</Button>
+          </div>
+          <div className="space-y-2">
+            {invoices.map((invoice) => (
+              <div key={invoice.id} className="rounded-xl border bg-white p-3">
+                <div className="flex items-start gap-3">
+                  <div className="flex h-9 w-9 items-center justify-center rounded-full bg-violet-50 text-violet-700">
+                    <WalletCards className="h-4 w-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-semibold">{invoice.invoice_number || "Invoice"}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {invoice.status || "draft"}
+                      {invoice.due_date ? ` · Due ${formatDateShort(invoice.due_date)}` : ""}
+                      {/* amount_paid is a real, separate column — shown as
+                          its own data point rather than an unsupported
+                          computed remaining-balance figure. */}
+                      {invoice.amount_paid ? ` · ${formatMoney(invoice.amount_paid)} paid` : ""}
+                    </p>
+                  </div>
+                  <span className="shrink-0 text-sm font-semibold">{formatMoney(invoice.total_amount ?? 0)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+    </div>
   );
 }
 
@@ -1289,35 +1574,60 @@ function EditAccountDialog({
 }) {
   const [form, setForm] = useState<EditCompanyForm>(() => companyToEditForm(company));
   const [saving, setSaving] = useState(false);
+  const [duplicates, setDuplicates] = useState<CompanyDuplicateCandidate[] | null>(null);
+  const [duplicatesCheckedFor, setDuplicatesCheckedFor] = useState<string | null>(null);
   useEffect(() => {
-    if (open) setForm(companyToEditForm(company));
+    if (open) {
+      setForm(companyToEditForm(company));
+      setDuplicates(null);
+      setDuplicatesCheckedFor(null);
+    }
   }, [company, open]);
-  const update = (key: keyof EditCompanyForm, value: string) =>
+  const update = (key: keyof EditCompanyForm, value: string) => {
     setForm((current) => ({ ...current, [key]: value }));
+    setDuplicates(null);
+    setDuplicatesCheckedFor(null);
+  };
   const save = async () => {
     if (!form.name.trim()) return toast.error("Account name is required.");
+
+    // Edit-collision warning (Phase 9.4 consistency pass) — excludes this
+    // company itself, so keeping its own current name/domain never warns;
+    // only an edit INTO another company's exact normalized name/domain
+    // does. Acknowledge by clicking Save again ("Save anyway").
+    const checkKey = `${form.name.trim().toLowerCase()}|${form.website.trim().toLowerCase()}`;
+    if (!(duplicates && duplicates.length > 0 && duplicatesCheckedFor === checkKey)) {
+      const candidates = findCompanyDuplicateCandidates(form.name, form.website, company.id);
+      if (candidates.length > 0) {
+        setDuplicates(candidates);
+        setDuplicatesCheckedFor(checkKey);
+        return;
+      }
+      setDuplicates([]);
+      setDuplicatesCheckedFor(checkKey);
+    }
+
     setSaving(true);
     try {
-      const { error } = await supabase
-        .from("companies")
-        .update({
-          name: form.name.trim(),
-          account_type: form.account_type,
-          status: form.status,
-          industry: form.industry.trim() || null,
-          owner_name: form.owner_name.trim() || null,
-          email: form.email.trim() || null,
-          phone: form.phone.replace(/\D/g, "") || null,
-          website: form.website.trim() || null,
-          address: form.address.trim() || null,
-          city: form.city.trim() || null,
-          state: form.state.trim() || null,
-          zip: form.zip.trim() || null,
-          country: form.country.trim() || "United States",
-        })
-        .eq("id", company.id)
-        .eq("org_id", company.org_id);
-      if (error) throw error;
+      // Migrated to the canonical store (Phase 9.4 consistency pass) — the
+      // same org-scoped update this dialog previously ran directly, but the
+      // shared reactive cache now stays in sync too.
+      const saved = await updateCompany(company.id, {
+        name: form.name.trim(),
+        account_type: form.account_type,
+        status: form.status,
+        industry: form.industry.trim() || null,
+        owner_name: form.owner_name.trim() || null,
+        email: form.email.trim() || null,
+        phone: form.phone.replace(/\D/g, "") || null,
+        website: form.website.trim() || null,
+        address: form.address.trim() || null,
+        city: form.city.trim() || null,
+        state: form.state.trim() || null,
+        zip: form.zip.trim() || null,
+        country: form.country.trim() || "United States",
+      });
+      if (!saved) throw new Error("update failed");
       toast.success("Account updated.");
       onClose();
       await onSaved();
@@ -1392,12 +1702,29 @@ function EditAccountDialog({
             <Input value={form.country} onChange={(e) => update("country", e.target.value)} />
           </Field>
         </div>
+        {duplicates && duplicates.length > 0 && (
+          <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm">
+            <div className="font-medium text-amber-800">
+              This matches {duplicates.length === 1 ? "another existing account" : "other existing accounts"}
+            </div>
+            <ul className="mt-1.5 space-y-1">
+              {duplicates.map((d) => (
+                <li key={d.id} className="text-xs text-amber-900">
+                  {d.name} — matched by {d.matchedOn === "name" ? "name" : "website"}
+                </li>
+              ))}
+            </ul>
+            <p className="mt-1.5 text-[11px] text-amber-700">
+              Click "Save anyway" to keep these values regardless.
+            </p>
+          </div>
+        )}
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
           <Button onClick={() => void save()} disabled={saving}>
-            {saving ? "Saving…" : "Save Changes"}
+            {saving ? "Saving…" : duplicates && duplicates.length > 0 ? "Save anyway" : "Save Changes"}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1453,7 +1780,12 @@ function AddContactDialog({
             full_name: name.trim(),
             email: email.trim() || null,
             phone: phone.replace(/\D/g, "") || null,
-            company: company.name,
+            // Canonical direct affiliation (Phase 9.4 consistency pass) —
+            // previously wrote the legacy free-text `company` name here;
+            // a contact created FOR this account gets company_id, never
+            // new legacy text.
+            company_id: company.id,
+            company: null,
             source: "account",
             labels: [],
           })
@@ -1480,7 +1812,47 @@ function AddContactDialog({
         { onConflict: "company_id,contact_id" },
       );
       if (error) throw error;
-      toast.success("Contact linked to account.");
+
+      // Invariant sync (Phase 9.4) for the existing-contact path:
+      //  - no direct company yet          → this becomes it
+      //  - marked primary here            → this becomes it (primary
+      //                                     implies default affiliation,
+      //                                     per the consistency spec)
+      //  - already directly affiliated
+      //    with a DIFFERENT company and
+      //    not marked primary             → association-only; never
+      //                                     silently reassigned (the
+      //                                     many-to-many company_contacts
+      //                                     row carries the relationship),
+      //                                     disclosed via toast below.
+      if (mode === "existing") {
+        const { data: current } = await supabase
+          .from("contacts")
+          .select("company_id")
+          .eq("id", contactId)
+          .eq("org_id", company.org_id)
+          .maybeSingle();
+        const currentCompanyId = current?.company_id ?? null;
+        if (!currentCompanyId || primary) {
+          if (currentCompanyId !== company.id) {
+            await supabase
+              .from("contacts")
+              .update({ company_id: company.id, company: null })
+              .eq("id", contactId)
+              .eq("org_id", company.org_id);
+          }
+          toast.success("Contact linked to account.");
+        } else if (currentCompanyId !== company.id) {
+          toast.success("Contact linked to account.", {
+            description: "They stay directly affiliated with their existing company — this is an additional association. Mark them primary here to move their direct affiliation.",
+          });
+        } else {
+          toast.success("Contact linked to account.");
+        }
+      } else {
+        toast.success("Contact linked to account.");
+      }
+
       onClose();
       await onSaved();
     } catch (error) {

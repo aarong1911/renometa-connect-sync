@@ -53,7 +53,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <Sidebar collapsed={collapsed} onToggle={toggleCollapsed} />
         <div className={cn("flex min-w-0 flex-1 flex-col transition-[margin] duration-200", collapsed ? "ml-16" : "ml-60")}>
           <Topbar primaryAction={primaryAction} />
-          <main className="min-h-0 flex-1 overflow-y-auto p-6 space-y-4">{children}</main>
+          <main className="min-h-0 min-w-0 flex-1 overflow-y-auto p-6 space-y-4">{children}</main>
         </div>
       </div>
     </TopbarActionContext.Provider>

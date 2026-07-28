@@ -85,6 +85,13 @@ const CATEGORY_ACCENT: Record<ToolCategory, string> = {
   operations: "ring-success/20",
 };
 
+/** Category-aware icon tile classes (Part 11) — was hardcoded primary for every category regardless of type. */
+const CATEGORY_ICON_TILE: Record<ToolCategory, string> = {
+  sales: "border-primary/30 bg-primary/10 text-primary",
+  crm: "border-purple-500/30 bg-purple-500/10 text-purple-600 dark:text-purple-400",
+  operations: "border-success/30 bg-success/10 text-success",
+};
+
 type CategoryFilter = "all" | ToolCategory;
 
 // ── Create Ad Campaign — dedicated call, bypasses run-tool.mjs entirely ───────
@@ -239,7 +246,7 @@ function ToolCard({ tool, onOpen }: { tool: ToolDefinition; onOpen: () => void }
       onClick={onOpen}
     >
       <div className="flex items-start gap-2.5">
-        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-primary/30 bg-primary/10 text-primary">
+        <div className={cn("flex h-9 w-9 shrink-0 items-center justify-center rounded-md border", CATEGORY_ICON_TILE[cat] ?? CATEGORY_ICON_TILE.sales)}>
           <Icon className="h-4 w-4" />
         </div>
         <div className="min-w-0 flex-1">

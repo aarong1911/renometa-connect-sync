@@ -48,7 +48,20 @@ export function AvatarPicker({
         </button>
       </PopoverTrigger>
       <PopoverContent className="w-64 p-2" align="start">
-        <div className="mb-1.5 px-1 text-[11px] font-medium text-muted-foreground">Choose an avatar</div>
+        <div className="mb-1.5 flex items-center justify-between px-1">
+          <span className="text-[11px] font-medium text-muted-foreground">Choose an avatar</span>
+          {avatarKey && (
+            <button
+              type="button"
+              onClick={() => handlePick("")}
+              disabled={saving !== null}
+              className="text-[11px] font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground disabled:opacity-50"
+              title="Reset to the automatic default avatar"
+            >
+              Reset to default
+            </button>
+          )}
+        </div>
         <div className="grid grid-cols-5 gap-1.5">
           {AVAILABLE_AVATARS.map((a) => (
             <button

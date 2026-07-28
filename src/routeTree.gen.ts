@@ -14,6 +14,7 @@ import { Route as SignupRouteImport } from './routes/signup'
 import { Route as SigninRouteImport } from './routes/signin'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as PortalRouteImport } from './routes/portal'
+import { Route as PipelineRouteImport } from './routes/pipeline'
 import { Route as OnboardingRouteImport } from './routes/onboarding'
 import { Route as MarketingRouteImport } from './routes/marketing'
 import { Route as LeadsRouteImport } from './routes/leads'
@@ -25,6 +26,7 @@ import { Route as EstimatesRouteImport } from './routes/estimates'
 import { Route as ContactsRouteImport } from './routes/contacts'
 import { Route as CompaniesRouteImport } from './routes/companies'
 import { Route as CalendarRouteImport } from './routes/calendar'
+import { Route as AiCenterRouteImport } from './routes/ai-center'
 import { Route as SplatRouteImport } from './routes/$'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ProjectsIndexRouteImport } from './routes/projects.index'
@@ -83,6 +85,11 @@ const PortalRoute = PortalRouteImport.update({
   path: '/portal',
   getParentRoute: () => rootRouteImport,
 } as any)
+const PipelineRoute = PipelineRouteImport.update({
+  id: '/pipeline',
+  path: '/pipeline',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const OnboardingRoute = OnboardingRouteImport.update({
   id: '/onboarding',
   path: '/onboarding',
@@ -136,6 +143,11 @@ const CompaniesRoute = CompaniesRouteImport.update({
 const CalendarRoute = CalendarRouteImport.update({
   id: '/calendar',
   path: '/calendar',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AiCenterRoute = AiCenterRouteImport.update({
+  id: '/ai-center',
+  path: '/ai-center',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SplatRoute = SplatRouteImport.update({
@@ -304,6 +316,7 @@ const AutomationWorkflowsWorkflowIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/$': typeof SplatRoute
+  '/ai-center': typeof AiCenterRoute
   '/calendar': typeof CalendarRoute
   '/companies': typeof CompaniesRoute
   '/contacts': typeof ContactsRoute
@@ -315,6 +328,7 @@ export interface FileRoutesByFullPath {
   '/leads': typeof LeadsRoute
   '/marketing': typeof MarketingRoute
   '/onboarding': typeof OnboardingRoute
+  '/pipeline': typeof PipelineRoute
   '/portal': typeof PortalRoute
   '/settings': typeof SettingsRouteWithChildren
   '/signin': typeof SigninRoute
@@ -354,6 +368,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/$': typeof SplatRoute
+  '/ai-center': typeof AiCenterRoute
   '/calendar': typeof CalendarRoute
   '/companies': typeof CompaniesRoute
   '/contacts': typeof ContactsRoute
@@ -365,6 +380,7 @@ export interface FileRoutesByTo {
   '/leads': typeof LeadsRoute
   '/marketing': typeof MarketingRoute
   '/onboarding': typeof OnboardingRoute
+  '/pipeline': typeof PipelineRoute
   '/portal': typeof PortalRoute
   '/settings': typeof SettingsRouteWithChildren
   '/signin': typeof SigninRoute
@@ -404,6 +420,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/$': typeof SplatRoute
+  '/ai-center': typeof AiCenterRoute
   '/calendar': typeof CalendarRoute
   '/companies': typeof CompaniesRoute
   '/contacts': typeof ContactsRoute
@@ -415,6 +432,7 @@ export interface FileRoutesById {
   '/leads': typeof LeadsRoute
   '/marketing': typeof MarketingRoute
   '/onboarding': typeof OnboardingRoute
+  '/pipeline': typeof PipelineRoute
   '/portal': typeof PortalRoute
   '/settings': typeof SettingsRouteWithChildren
   '/signin': typeof SigninRoute
@@ -456,6 +474,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/$'
+    | '/ai-center'
     | '/calendar'
     | '/companies'
     | '/contacts'
@@ -467,6 +486,7 @@ export interface FileRouteTypes {
     | '/leads'
     | '/marketing'
     | '/onboarding'
+    | '/pipeline'
     | '/portal'
     | '/settings'
     | '/signin'
@@ -506,6 +526,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/$'
+    | '/ai-center'
     | '/calendar'
     | '/companies'
     | '/contacts'
@@ -517,6 +538,7 @@ export interface FileRouteTypes {
     | '/leads'
     | '/marketing'
     | '/onboarding'
+    | '/pipeline'
     | '/portal'
     | '/settings'
     | '/signin'
@@ -555,6 +577,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/$'
+    | '/ai-center'
     | '/calendar'
     | '/companies'
     | '/contacts'
@@ -566,6 +589,7 @@ export interface FileRouteTypes {
     | '/leads'
     | '/marketing'
     | '/onboarding'
+    | '/pipeline'
     | '/portal'
     | '/settings'
     | '/signin'
@@ -606,6 +630,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   SplatRoute: typeof SplatRoute
+  AiCenterRoute: typeof AiCenterRoute
   CalendarRoute: typeof CalendarRoute
   CompaniesRoute: typeof CompaniesRoute
   ContactsRoute: typeof ContactsRoute
@@ -617,6 +642,7 @@ export interface RootRouteChildren {
   LeadsRoute: typeof LeadsRoute
   MarketingRoute: typeof MarketingRoute
   OnboardingRoute: typeof OnboardingRoute
+  PipelineRoute: typeof PipelineRoute
   PortalRoute: typeof PortalRoute
   SettingsRoute: typeof SettingsRouteWithChildren
   SigninRoute: typeof SigninRoute
@@ -670,6 +696,13 @@ declare module '@tanstack/react-router' {
       path: '/portal'
       fullPath: '/portal'
       preLoaderRoute: typeof PortalRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/pipeline': {
+      id: '/pipeline'
+      path: '/pipeline'
+      fullPath: '/pipeline'
+      preLoaderRoute: typeof PipelineRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/onboarding': {
@@ -747,6 +780,13 @@ declare module '@tanstack/react-router' {
       path: '/calendar'
       fullPath: '/calendar'
       preLoaderRoute: typeof CalendarRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/ai-center': {
+      id: '/ai-center'
+      path: '/ai-center'
+      fullPath: '/ai-center'
+      preLoaderRoute: typeof AiCenterRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/$': {
@@ -1054,6 +1094,7 @@ const AutomationWorkflowsRouteWithChildren =
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   SplatRoute: SplatRoute,
+  AiCenterRoute: AiCenterRoute,
   CalendarRoute: CalendarRoute,
   CompaniesRoute: CompaniesRoute,
   ContactsRoute: ContactsRoute,
@@ -1065,6 +1106,7 @@ const rootRouteChildren: RootRouteChildren = {
   LeadsRoute: LeadsRoute,
   MarketingRoute: MarketingRoute,
   OnboardingRoute: OnboardingRoute,
+  PipelineRoute: PipelineRoute,
   PortalRoute: PortalRoute,
   SettingsRoute: SettingsRouteWithChildren,
   SigninRoute: SigninRoute,

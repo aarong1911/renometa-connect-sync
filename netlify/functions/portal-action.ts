@@ -136,7 +136,7 @@ export const handler: Handler = async (event) => {
       return { statusCode: 200, headers, body: JSON.stringify({ success: true, message: "Payment request sent to contractor" }) };
     }
 
-    const stripe  = new Stripe(stripeKey, { apiVersion: "2026-06-24.dahlia" });
+    const stripe  = new Stripe(stripeKey, { apiVersion: "2026-04-22.dahlia" });
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
       line_items: [{
