@@ -14,15 +14,15 @@
 // full future action set is real and typed, without pretending those
 // actions can run yet.
 //
-// KNOWN SCHEMA LIMITATION (documented rather than worked around): this
-// codebase's `tasks` table is project-scoped only (`project_id not null`,
-// confirmed live — no lead_id/contact_id column exists), and a lead
-// typically has no project until after conversion. `create_follow_up_task`
-// therefore does not write a real `tasks` row — it writes a structured,
-// clearly-labeled entry to the generic `notes` table instead (entity_type
-// or the target, content prefixed "[Follow-up task]"). This is an honest
-// stand-in, not a real task/reminder object, until a lead-scoped task
-// concept exists (candidate for Phase 10).
+// SCHEMA NOTE (Phase 10.1 resolved): `tasks` used to be project-scoped
+// only, so a pre-conversion lead had nowhere real to attach a task row —
+// create_follow_up_task worked around this by writing a tagged note
+// instead. The Phase 10.1 migration (20260803_generic_crm_task_linkage.sql)
+// added tasks.org_id/entity_type/entity_id and made project_id optional,
+// so create_follow_up_task now creates a REAL tasks row
+// (entity_type="lead") via createLeadLinkedTask (./lead-tasks.ts) — see
+// handlers.ts. The old note-based path (lead-notes.ts) is deprecated, not
+// deleted, pending live verification.
 
 import { z } from "zod";
 import type { ActionDefinition } from "./types";
@@ -40,6 +40,8 @@ const createFollowUpTaskInput = z.object({
   leadId: z.string().uuid(),
   title: z.string().min(1).max(200),
   dueDate: z.string().date().optional(),
+  priority: z.enum(["low", "medium", "high", "urgent"]).optional(),
+  assignedTo: z.string().uuid().nullable().optional(),
 });
 
 const addInternalNoteInput = z.object({
@@ -204,7 +206,7 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition<any, any>> = {
   create_follow_up_task: {
     key: "create_follow_up_task",
     displayName: "Create follow-up task",
-    description: "Records a proposed follow-up as a structured internal note on the lead (see file header — no lead-scoped task table exists yet).",
+    description: "Creates a real task linked to the lead (Phase 10.1 — see file header).",
     category: "task",
     riskLevel: "low",
     supportedActorTypes: ["user", "agent", "workflow"],

@@ -38,3 +38,17 @@ export const accountDetailLink = (accountSlug: string) =>
     to: "/accounts/$accountSlug",
     params: { accountSlug },
   });
+
+/** Type-safe link options for opening a specific lead's detail drawer (Phase 10.1 — task "Related to" links). */
+export const leadDetailLink = (leadId: string) =>
+  linkOptions({
+    to: "/leads",
+    search: { leadId },
+  });
+
+/** Type-safe link options for opening a specific deal's detail drawer (Phase 10.1 — task "Related to" links). */
+export const dealDetailLink = (dealId: string) =>
+  linkOptions({
+    to: "/pipeline",
+    search: { dealId },
+  });

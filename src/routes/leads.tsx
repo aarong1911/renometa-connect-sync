@@ -55,6 +55,7 @@ import {
 import { useLeadNotes, addLeadNote } from "@/lib/leads-store";
 import { updateLeadNote } from "@/lib/leads-store";
 import { useEntityNotes } from "@/lib/contact-notes";
+import { EntityTasksPanel } from "@/components/tasks/entity-tasks-panel";
 import { ConvertLeadDialog } from "@/components/leads/convert-lead-dialog";
 import { DealDetailDrawer } from "@/components/sales/deal-detail-drawer";
 import {
@@ -1759,6 +1760,10 @@ function LeadDetailDrawer({
               <span className="ml-auto text-[10.5px] text-muted-foreground">Computed from budget &amp; status — not manually saved</span>
             </div>
           </section>
+
+          {/* Linked tasks (Phase 10.1) — real tasks.entity_type="lead" rows, shared with the global Tasks page. */}
+          <Separator />
+          <EntityTasksPanel entityType="lead" entityId={lead.id} entityLabel="lead" />
 
           {/* Internal Notes */}
           <Separator />

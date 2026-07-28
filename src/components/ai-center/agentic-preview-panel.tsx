@@ -79,15 +79,15 @@ export function AgenticPreviewPanel() {
 
       if (decision === "reject") {
         toast.success("Action rejected.");
-      } else if (!body.success || !body.noteId) {
+      } else if (!body.success || !body.taskId) {
         // The Netlify function returns HTTP 200 even for a handler
         // failure so the UI can show a real error rather than a generic
         // network-failure message. A response is only ever treated as a
-        // success here when the server proved a real note id — never
+        // success here when the server proved a real task id — never
         // inferred from status text alone.
         toast.error(body.error ?? "Could not verify this action completed. Please try again.");
       } else if (approval?.action_key === "create_follow_up_task") {
-        toast.success(body.status === "already_executed" ? "Already added — no duplicate note created." : "Follow-up note added");
+        toast.success(body.status === "already_executed" ? "Task already created — no duplicate added" : "Follow-up task created");
       } else {
         toast.success(body.status === "already_executed" ? "Already executed — no duplicate action taken." : "Action approved and executed.");
       }
@@ -112,7 +112,7 @@ export function AgenticPreviewPanel() {
       const body = await res.json();
       if (!res.ok) { toast.error(body.error ?? "Could not run the proof of concept."); return; }
       setPocResult({ draft: body.draft?.draft, status: body.status });
-      toast.success(body.status === "awaiting_approval" ? "Prepared — follow-up note awaiting approval." : "Prepared.");
+      toast.success(body.status === "awaiting_approval" ? "Prepared — follow-up task awaiting approval." : "Prepared.");
       await loadApprovals();
     } catch {
       toast.error("Network error — please try again.");
@@ -186,7 +186,7 @@ export function AgenticPreviewPanel() {
             <h3 className="text-sm font-semibold">Prepare Follow-Up</h3>
           </div>
           <p className="mb-3 text-xs leading-relaxed text-muted-foreground">
-            Architecture preview. This loads scoped lead data and prepares a deterministic draft. It never sends a message automatically. Approved follow-up actions currently create an internal note, not a task.
+            Architecture preview. This loads scoped lead data and prepares a deterministic draft — it does not call a real model yet. It never sends a message automatically. Approved follow-up actions create a real CRM task linked to the lead.
           </p>
           <div className="space-y-1.5">
             <Label className="text-xs">Lead</Label>

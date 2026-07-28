@@ -20,7 +20,7 @@ import { approveRequest, rejectRequest, markApprovalExecuted } from "../../src/l
 import { executeApprovedStep } from "../../src/lib/agentic/action-executor";
 import type { Actor } from "../../src/lib/agentic/types";
 
-const DEBUG_VERSION = "agentic-approval-fix-v3";
+const DEBUG_VERSION = "agentic-task-linkage-v1";
 const serviceRoleConfigured = !!process.env.SUPABASE_URL && !!process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const supabaseAdmin = createClient(
@@ -127,7 +127,7 @@ export const handler: Handler = async (event) => {
     // would have used, so an approval can never execute the same
     // underlying write twice even if this endpoint is called twice.
     idempotencyKey: approval.action_key === "create_follow_up_task"
-      ? `create_follow_up_task:${approval.target_entity_id}:${new Date(approval.requested_at).toISOString().slice(0, 10)}`
+      ? `create_follow_up_task:v2:${approval.target_entity_id}:${new Date(approval.requested_at).toISOString().slice(0, 10)}`
       : undefined,
   });
 
@@ -138,34 +138,37 @@ export const handler: Handler = async (event) => {
   // handler output was recorded in agent_action_idempotency.result_snapshot
   // — an orphaned/never-completed prior claim is reclaimed and actually
   // executed instead (see action-executor.ts's root-cause comment), so a
-  // "skipped" result here can never again be a false positive for a note
-  // that was never written.
+  // "skipped" result here can never again be a false positive for a task
+  // that was never created. The "v2" idempotency key (see above) also
+  // guarantees this can never match a pre-Phase-10.1 note-based snapshot —
+  // there is no legacy {noteId}-only record this action key/key-version
+  // pair could ever collide with.
   const duplicateResult = execResult.status === "skipped"
     ? (execResult.output as { reason?: string; result?: unknown } | undefined)
     : undefined;
   const isDuplicateOfRealExecution = duplicateResult?.reason === "duplicate_suppressed";
 
   if (execResult.status === "succeeded" || isDuplicateOfRealExecution) {
-    const realResult = (isDuplicateOfRealExecution ? duplicateResult?.result : execResult.output) as { noteId?: string } | undefined;
-    const noteId = realResult?.noteId;
+    const realResult = (isDuplicateOfRealExecution ? duplicateResult?.result : execResult.output) as { taskId?: string } | undefined;
+    const taskId = realResult?.taskId;
 
-    // A "success" response is only ever built from a real, proven noteId —
+    // A "success" response is only ever built from a real, proven taskId —
     // never from an assumption. If the handler's own output shape ever
-    // changes and stops including a noteId, this reports failure rather
-    // than a false success (Step 2 requirement: "a response without a
-    // real noteId must not be treated as success").
-    if (!noteId) {
-      logCheckpoint("missing_note_id", { approvalId: reqBody.approvalId, executionId: approval.execution_id, stepId: approval.execution_step_id, status: execResult.status });
+    // changes and stops including a taskId, this reports failure rather
+    // than a false success ("a response without a real id must not be
+    // treated as success").
+    if (!taskId) {
+      logCheckpoint("missing_task_id", { approvalId: reqBody.approvalId, executionId: approval.execution_id, stepId: approval.execution_step_id, status: execResult.status });
       await supabaseAdmin.from("agent_approval_requests").update({ status: "failed" }).eq("id", reqBody.approvalId);
-      await supabaseAdmin.from("agent_executions").update({ status: "failed", error: "Handler completed without a verifiable note id.", completed_at: new Date().toISOString() }).eq("id", approval.execution_id).eq("status", "awaiting_approval");
-      return { statusCode: 200, headers, body: JSON.stringify({ success: false, status: "failed", error: "Could not verify the note was created. Please try again.", debugVersion: DEBUG_VERSION }) };
+      await supabaseAdmin.from("agent_executions").update({ status: "failed", error: "Handler completed without a verifiable task id.", completed_at: new Date().toISOString() }).eq("id", approval.execution_id).eq("status", "awaiting_approval");
+      return { statusCode: 200, headers, body: JSON.stringify({ success: false, status: "failed", error: "Could not verify the task was created. Please try again.", debugVersion: DEBUG_VERSION }) };
     }
 
-    logCheckpoint("note_insert_succeeded", { approvalId: reqBody.approvalId, executionId: approval.execution_id, stepId: approval.execution_step_id, noteId, alreadyExecuted: isDuplicateOfRealExecution });
+    logCheckpoint("task_insert_succeeded", { approvalId: reqBody.approvalId, executionId: approval.execution_id, stepId: approval.execution_step_id, taskId, alreadyExecuted: isDuplicateOfRealExecution });
     await markApprovalExecuted(supabaseAdmin, reqBody.approvalId, orgId);
-    logCheckpoint("approval_marked_executed", { approvalId: reqBody.approvalId, executionId: approval.execution_id, noteId });
+    logCheckpoint("approval_marked_executed", { approvalId: reqBody.approvalId, executionId: approval.execution_id, taskId });
     await supabaseAdmin.from("agent_executions").update({ status: "succeeded", completed_at: new Date().toISOString() }).eq("id", approval.execution_id).eq("status", "awaiting_approval");
-    logCheckpoint("execution_finalized", { approvalId: reqBody.approvalId, executionId: approval.execution_id, stepId: approval.execution_step_id, noteId, status: "succeeded" });
+    logCheckpoint("execution_finalized", { approvalId: reqBody.approvalId, executionId: approval.execution_id, stepId: approval.execution_step_id, taskId, status: "succeeded" });
 
     return {
       statusCode: 200,
@@ -176,7 +179,7 @@ export const handler: Handler = async (event) => {
         approvalId: reqBody.approvalId,
         executionId: approval.execution_id,
         stepId: approval.execution_step_id,
-        noteId,
+        taskId,
         result: realResult,
         debugVersion: DEBUG_VERSION,
       }),

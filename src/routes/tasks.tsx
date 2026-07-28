@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useState, type ComponentType } from "react";
 import {
   DragDropContext,
@@ -82,6 +82,9 @@ import {
   deleteTask,
   completeTask,
 } from "@/lib/tasks-store";
+import { useLeads } from "@/lib/leads-store";
+import { useDeals } from "@/lib/deals-store";
+import { leadDetailLink, dealDetailLink } from "@/lib/routes";
 
 export const Route = createFileRoute("/tasks")({
   component: TasksPage,
@@ -142,8 +145,50 @@ function isOverdue(iso: string, status: Status) {
   return new Date(iso).getTime() < Date.UTC(2026, 3, 18);
 }
 
-function projectName(id: string) {
-  return getProjectName(id);
+function projectName(id: string | undefined) {
+  return id ? getProjectName(id) : "No project";
+}
+
+/**
+ * Phase 10.1 — "Related to" cell. Resolves a task's linked project OR
+ * lead/deal (mutually exclusive today) from the already-loaded shared
+ * stores — no extra query per row. Missing/deleted targets degrade to a
+ * plain, non-clickable label rather than erroring.
+ */
+function RelatedToCell({ task }: { task: Task }) {
+  const leads = useLeads();
+  const deals = useDeals();
+
+  if (task.entityType === "lead") {
+    const lead = leads.find((l) => l.id === task.entityId);
+    if (!lead) return <span className="text-muted-foreground">Lead (unavailable)</span>;
+    return (
+      <Link
+        {...leadDetailLink(lead.id)}
+        onClick={(e) => e.stopPropagation()}
+        className="truncate text-primary hover:underline"
+      >
+        Lead: {lead.name}
+      </Link>
+    );
+  }
+
+  if (task.entityType === "deal") {
+    const deal = deals.find((d) => d.id === task.entityId);
+    if (!deal) return <span className="text-muted-foreground">Deal (unavailable)</span>;
+    return (
+      <Link
+        {...dealDetailLink(deal.id)}
+        onClick={(e) => e.stopPropagation()}
+        className="truncate text-primary hover:underline"
+      >
+        Deal: {deal.name}
+      </Link>
+    );
+  }
+
+  if (task.projectId) return <span className="text-muted-foreground">{projectName(task.projectId)}</span>;
+  return <span className="text-muted-foreground">Unlinked</span>;
 }
 
 function priorityClass(p: Priority) {
@@ -430,7 +475,7 @@ function TasksPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Task</TableHead>
-                <TableHead>Project</TableHead>
+                <TableHead>Related to</TableHead>
                 <TableHead>Assignee</TableHead>
                 <TableHead>Due</TableHead>
                 <TableHead>Priority</TableHead>
@@ -446,8 +491,8 @@ function TasksPage() {
                   onClick={() => setViewing(task)}
                 >
                   <TableCell className="font-medium">{task.title}</TableCell>
-                  <TableCell className="text-muted-foreground">
-                    {projectName(task.projectId)}
+                  <TableCell className="max-w-[180px] truncate text-sm">
+                    <RelatedToCell task={task} />
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-2">
@@ -535,7 +580,7 @@ function TasksPage() {
             <>
               <SheetHeader>
                 <SheetTitle>{viewing.title}</SheetTitle>
-                <SheetDescription>{projectName(viewing.projectId)}</SheetDescription>
+                <SheetDescription><RelatedToCell task={viewing} /></SheetDescription>
               </SheetHeader>
 
               <div className="mt-6 space-y-4 text-sm">
@@ -704,8 +749,8 @@ function TaskCard({
         </DropdownMenu>
       </div>
 
-      <div className="mt-1.5 truncate text-xs text-muted-foreground">
-        {projectName(task.projectId)}
+      <div className="mt-1.5 truncate text-xs">
+        <RelatedToCell task={task} />
       </div>
 
       <div className="mt-3 flex items-center justify-between">

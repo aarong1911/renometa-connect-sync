@@ -42,6 +42,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { AddressAutocomplete } from "@/components/ui/address-autocomplete";
 import { Label } from "@/components/ui/label";
+import { EntityTasksPanel } from "@/components/tasks/entity-tasks-panel";
 import {
   Select,
   SelectContent,
@@ -1878,11 +1879,7 @@ export function DealDetailDrawer({
             </TabsContent>
 
             <TabsContent value="tasks" className="mt-5">
-              <EmptyTab
-                icon={CheckCircle2}
-                title="Deal-linked tasks aren't available yet"
-                description="Tasks can't be linked to a specific deal yet — this tab isn't checking for any. Task support for deals is planned for a future release."
-              />
+              <EntityTasksPanel entityType="deal" entityId={deal.id} entityLabel="deal" />
             </TabsContent>
 
             <TabsContent value="notes" className="mt-5">

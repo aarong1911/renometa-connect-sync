@@ -17,7 +17,7 @@
 // here is called from a React component.
 
 import type { ActionHandler } from "./types";
-import { createLeadInternalNote } from "./lead-notes";
+import { createLeadLinkedTask } from "./lead-tasks";
 
 type LeadContextInput = { leadId: string };
 type LeadContextOutput = {
@@ -76,27 +76,36 @@ export const getLeadContext: ActionHandler<LeadContextInput, LeadContextOutput> 
   };
 };
 
-type CreateFollowUpTaskInput = { leadId: string; title: string; dueDate?: string };
-type CreateFollowUpTaskOutput = { noteId: string };
+type CreateFollowUpTaskInput = {
+  leadId: string;
+  title: string;
+  dueDate?: string;
+  priority?: "low" | "medium" | "high" | "urgent";
+  assignedTo?: string | null;
+};
+type CreateFollowUpTaskOutput = { taskId: string };
 
+/**
+ * Phase 10.1 — creates a REAL task linked to the lead (tasks.entity_type
+ * = "lead", entity_id = leadId), replacing the Phase 9.6 tagged-note
+ * stand-in now that a lead can have a task without a project (see
+ * lead-tasks.ts / the Phase 10.1 migration). Does not also write the old
+ * note.
+ */
 export const createFollowUpTask: ActionHandler<CreateFollowUpTaskInput, CreateFollowUpTaskOutput> = async (ctx, input) => {
-  // KNOWN LIMITATION (see action-registry.ts header): `tasks` is
-  // project-scoped only, so a pre-conversion lead has nowhere real to
-  // attach a task row. This writes a clearly-labeled structured note
-  // instead of inventing an unsupported task record.
-  const dueText = input.dueDate ? ` — due ${input.dueDate}` : "";
-  const content = `[Follow-up task]${dueText}: ${input.title}`;
-
   try {
-    const { noteId } = await createLeadInternalNote(ctx.supabase, {
+    const { taskId } = await createLeadLinkedTask(ctx.supabase, {
       orgId: ctx.orgId,
       leadId: input.leadId,
-      body: content,
+      title: input.title,
+      dueDate: input.dueDate ?? null,
+      priority: input.priority,
+      assignedTo: input.assignedTo,
       actor: ctx.actor,
     });
-    return { ok: true, output: { noteId } };
+    return { ok: true, output: { taskId } };
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : "Could not record the follow-up task." };
+    return { ok: false, error: err instanceof Error ? err.message : "Could not create the follow-up task." };
   }
 };
 

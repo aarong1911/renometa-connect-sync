@@ -120,14 +120,17 @@ export const handler: Handler = async (event) => {
       actionKey: "create_follow_up_task",
       rawInput: { leadId: reqBody.leadId, title: "Follow up on prepared response", dueDate: dayBucket },
       autonomyLevel,
-      // One follow-up-task proposal per lead per day (Priority 8 — duplicate-action prevention).
-      idempotencyKey: `create_follow_up_task:${reqBody.leadId}:${dayBucket}`,
+      // One follow-up-task proposal per lead per day (Priority 8 —
+      // duplicate-action prevention). Versioned "v2" so this never matches
+      // a pre-Phase-10.1 idempotency row from the old note-based path —
+      // those legacy rows are left untouched for audit history, and a
+      // fresh real task can always be created under the new key rather
+      // than being falsely blocked by an old, incomplete record (see
+      // action-registry.ts / lead-tasks.ts).
+      idempotencyKey: `create_follow_up_task:v2:${reqBody.leadId}:${dayBucket}`,
       targetEntityType: "lead", targetEntityId: reqBody.leadId,
-      // Honest about what this actually creates (Phase 9.6 closure pass,
-      // Priority 9) — no lead-scoped task table exists yet (see
-      // action-registry.ts header), so this records a tagged internal
-      // note, not a real task/reminder object.
-      approvalSummary: `Add a tagged internal note proposing a follow-up for this lead: "Follow up on prepared response".`,
+      // Phase 10.1 — this now creates a real task linked to the lead, not a note.
+      approvalSummary: `Create a follow-up task for this lead: "Follow up on prepared response".`,
     });
 
     const finalStatus = step3.status === "awaiting_approval" ? "awaiting_approval" : (step3.status === "succeeded" ? "succeeded" : "partially_succeeded");
@@ -146,12 +149,12 @@ export const handler: Handler = async (event) => {
         leadContext: step1.output,
         draft: step2.output,
         followUpTask: { status: step3.status, approvalRequestId: step3.approvalRequestId },
-        debugVersion: "agentic-approval-fix-v3",
+        debugVersion: "agentic-task-linkage-v1",
       }),
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unexpected error.";
     await supabaseAdmin.from("agent_executions").update({ status: "failed", error: message, completed_at: new Date().toISOString() }).eq("id", executionId);
-    return { statusCode: 500, headers, body: JSON.stringify({ error: "Execution failed.", executionId, debugVersion: "agentic-approval-fix-v3" }) };
+    return { statusCode: 500, headers, body: JSON.stringify({ error: "Execution failed.", executionId, debugVersion: "agentic-task-linkage-v1" }) };
   }
 };

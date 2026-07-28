@@ -294,7 +294,7 @@ function ProjectDetailSheet({ project, open, onClose, onReload }: {
   const handleAddTask = async () => {
     if (!newTaskTitle.trim()) return;
     setAddingTask(true);
-    await addTask({ projectId: project.id, title: newTaskTitle.trim(), assignee: "Unassigned", assigneeInitials: "—", due: new Date().toISOString(), status: "todo", priority: "med", recurrence: "none" });
+    await addTask({ projectId: project.id, title: newTaskTitle.trim(), due: new Date().toISOString(), status: "todo", priority: "med", recurrence: "none" });
     setNewTaskTitle(""); setAddingTask(false);
   };
 

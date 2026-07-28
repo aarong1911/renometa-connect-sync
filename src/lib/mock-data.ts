@@ -220,12 +220,25 @@ export type ProjectActivity = {
 };
 
 // ============= EXISTING TYPES =============
+
+/** Phase 10.1 — generic CRM entity a task can be linked to. Extend this and tasks.entity_type's DB check constraint together, not a new column, for contact/account/project/estimate/appointment/invoice/conversation support. */
+export const TASK_ENTITY_TYPES = ["lead", "deal"] as const;
+export type TaskEntityType = (typeof TASK_ENTITY_TYPES)[number];
+
+export type TaskEntityLink = {
+  entityType: TaskEntityType;
+  entityId: string;
+};
+
 export type Task = {
   id: string;
-  projectId: string;
+  /** Optional as of Phase 10.1 — a lead/deal-linked task has no project. */
+  projectId?: string;
   title: string;
   assignee: string;
   assigneeInitials: string;
+  /** Real profile UUID backing `assignee`'s display name, when known. Null/undefined = unassigned or not yet resolved. */
+  assignedTo?: string | null;
   due: string;
   status: "todo" | "in_progress" | "review" | "done";
   priority: "low" | "med" | "high";
@@ -236,6 +249,9 @@ export type Task = {
   recurrenceCount?: number;
   /** Internal counter — which occurrence in the series this instance is (1-based). */
   recurrenceIndex?: number;
+  /** Phase 10.1 — generic CRM entity link (lead/deal today). Undefined = unlinked. */
+  entityType?: TaskEntityType;
+  entityId?: string;
 };
 
 export type Conversation = {

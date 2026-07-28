@@ -18,6 +18,14 @@
 // localStorage store (src/lib/leads-store.ts's useLeadNotes) that never
 // queries this table at all. Both are fixed alongside this extraction —
 // see action-executor.ts and src/routes/leads.tsx.
+//
+// DEPRECATED as of Phase 10.1: create_follow_up_task now calls
+// createLeadLinkedTask (./lead-tasks.ts) to create a real linked task
+// instead of this note stand-in — see handlers.ts. This function is kept
+// (not deleted) since it may still be useful for a genuine "add a note"
+// action, and per Phase 10.1's own instruction not to remove the old path
+// until the real task path has been verified live. Re-check for callers
+// before deleting.
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Actor } from "./types";
