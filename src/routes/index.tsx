@@ -12,6 +12,7 @@ import {
 import { supabase } from "@/lib/supabase";
 import { useOrganization } from "@/lib/organization";
 import { useTasks } from "@/lib/tasks-store";
+import { isActiveStatus } from "@/lib/task-status";
 import { useDeals } from "@/lib/deals-store";
 import { useAICenterAgents } from "@/lib/ai-center-store";
 import { useSmsMetaConversations } from "@/lib/sms-meta-conversations";
@@ -513,7 +514,11 @@ function DashboardPage() {
 
   const taskCounts = useMemo(() => {
     const now = new Date();
-    const notDone = allTasks.filter(t => t.status !== "done");
+    // isActiveStatus excludes both completed AND cancelled — a cancelled
+    // task is not "not done" in the sense this widget means (it's not
+    // pending, it's abandoned), same rule as the Tasks page's own overdue
+    // calculation (src/lib/task-status.ts).
+    const notDone = allTasks.filter(t => isActiveStatus(t.status));
     let overdue = 0, dueToday = 0, upcoming = 0;
     for (const t of notDone) {
       const days = daysBetween(new Date(t.due), now);
@@ -521,7 +526,7 @@ function DashboardPage() {
       else if (days === 0) dueToday++;
       else upcoming++;
     }
-    const done = allTasks.filter(t => t.status === "done").length;
+    const done = allTasks.filter(t => t.status === "completed").length;
     const progressPct = (notDone.length + done) > 0 ? Math.round((done / (notDone.length + done)) * 100) : 0;
     return { overdue, dueToday, upcoming, done, progressPct };
   }, [allTasks]);
@@ -545,7 +550,7 @@ function DashboardPage() {
     const candidates: NextUpItem[] = [];
 
     for (const t of allTasks) {
-      if (t.status === "done") continue;
+      if (!isActiveStatus(t.status)) continue;
       const at = new Date(t.due).getTime();
       if (!isNaN(at) && at >= now) candidates.push({ id: `nu-task-${t.id}`, kind: "task", title: t.title, at: t.due, href: "/tasks" });
     }
@@ -644,7 +649,7 @@ function DashboardPage() {
     const items: { id: string; icon: React.ReactNode; color: string; bg: string; title: string; sub: string; badge: string; badgeColor: string; href: string; weight: number }[] = [];
 
     for (const t of allTasks) {
-      if (t.status === "done") continue;
+      if (!isActiveStatus(t.status)) continue;
       const overdueDays = daysBetween(now, new Date(t.due));
       if (overdueDays > 0) {
         items.push({
@@ -789,10 +794,14 @@ function DashboardPage() {
         // (e.g. an RPC returning per-status counts/sums), not just a higher
         // limit — deferred rather than attempted in this correction pass.
         supabase.from("estimates").select("id, status, total, updated_at, valid_until, title, client_name, created_at").eq("org_id", orgId).order("updated_at", { ascending: false }).limit(500),
-        // Tasks card "Completed recently" + Recent Activity — same
-        // projects!inner(org_id) join tasks-store.ts uses, since `tasks`
-        // has no org_id column of its own.
-        supabase.from("tasks").select("id, title, completed_at, projects!inner(org_id)").eq("projects.org_id", orgId).eq("status", "done").not("completed_at", "is", null).order("completed_at", { ascending: false }).limit(5),
+        // Tasks card "Completed recently" + Recent Activity — scoped
+        // directly by tasks.org_id (Phase 10.1 added a real column here),
+        // so this now includes Lead/Deal-linked tasks with no project too,
+        // not just project-scoped ones.
+        // "done" was never a valid tasks.status value (tasks_status_check
+        // only allows not_started/in_progress/on_hold/completed/cancelled)
+        // — this filter matched zero rows live until this fix.
+        supabase.from("tasks").select("id, title, completed_at").eq("org_id", orgId).eq("status", "completed").not("completed_at", "is", null).order("completed_at", { ascending: false }).limit(5),
         // Pipeline Pulse — real historical deal events (deals-store.ts's
         // logDealActivity), not a fabricated trend. created/won/lost/
         // stage_changed are the meaningful event types for a momentum view.

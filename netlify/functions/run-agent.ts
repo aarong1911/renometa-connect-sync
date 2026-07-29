@@ -10,6 +10,7 @@
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { execFile } from "node:child_process";
+import { createServerTask } from "../lib/tasks";
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -459,17 +460,27 @@ async function executeActions(
   }
 
   // ── create_task ────────────────────────────────────────────────────────────
+  // Phase 10.2 fix: this previously wrote status:"todo" (not a real tasks
+  // status — canonical values are not_started/in_progress/review/done) and
+  // never checked the insert's result, so a failed write was silently
+  // reported as a successful "task_created" action. Routed through the
+  // shared createServerTask() helper (netlify/lib/tasks.ts), which throws
+  // on failure and returns a confirmed task id; each invoice is isolated in
+  // its own try/catch so one failure doesn't stop the rest of the batch.
   if (has("create_task") && realData.invoices?.length) {
     for (const inv of realData.invoices as any[]) {
       if (inv.days_overdue > 30) {
         const contactName = inv.contacts?.full_name ?? "Client";
-        await supabase.from("tasks").insert({
-          org_id: orgId,
-          title: `Escalate collections for ${contactName} (#${inv.invoice_number ?? inv.id.slice(0, 8)})`,
-          priority: "high",
-          status: "todo",
-        });
-        taken.push({ type: "task_created", title: `Escalate collections for ${contactName}` });
+        try {
+          const { taskId } = await createServerTask(supabase, {
+            orgId,
+            title: `Escalate collections for ${contactName} (#${inv.invoice_number ?? inv.id.slice(0, 8)})`,
+            priority: "high",
+          });
+          taken.push({ type: "task_created", title: `Escalate collections for ${contactName}`, taskId });
+        } catch (err) {
+          console.error("[run-agent] create_task failed:", err instanceof Error ? err.message : err);
+        }
       }
     }
   }

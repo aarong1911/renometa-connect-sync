@@ -22,7 +22,7 @@ import {
   Plus, Search, LayoutGrid, List as ListIcon, Download, Loader2, MapPin,
   MoreHorizontal, ChevronsUpDown, Check, Mail, Phone, MessageSquare, X,
   TrendingUp, Clock, PauseCircle, DollarSign, Filter, ChevronRight, Calendar,
-  User, Circle, CheckCircle2, AlertCircle, FileText, Send, Trash2, Flag,
+  User, Circle, CheckCircle2, AlertCircle, XCircle, FileText, Send, Trash2, Flag,
   ExternalLink, ImageIcon, Camera, FolderOpen,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -131,11 +131,13 @@ const STEPPER_STAGES = [
 const PRIORITY_COLORS: Record<Task["priority"], string> = {
   high: "text-red-500", med: "text-amber-500", low: "text-slate-400",
 };
+// Canonical DB status values (tasks_status_check) — see src/lib/task-status.ts.
 const STATUS_ICONS: Record<Task["status"], React.ReactNode> = {
-  todo:        <Circle       className="h-4 w-4 text-muted-foreground" />,
+  not_started: <Circle       className="h-4 w-4 text-muted-foreground" />,
   in_progress: <Clock        className="h-4 w-4 text-blue-500" />,
-  review:      <AlertCircle  className="h-4 w-4 text-amber-500" />,
-  done:        <CheckCircle2 className="h-4 w-4 text-green-500" />,
+  on_hold:     <AlertCircle  className="h-4 w-4 text-violet-500" />,
+  completed:   <CheckCircle2 className="h-4 w-4 text-green-500" />,
+  cancelled:   <XCircle      className="h-4 w-4 text-rose-500" />,
 };
 
 // ─── KPI Card ─────────────────────────────────────────────────────────────────
@@ -294,7 +296,7 @@ function ProjectDetailSheet({ project, open, onClose, onReload }: {
   const handleAddTask = async () => {
     if (!newTaskTitle.trim()) return;
     setAddingTask(true);
-    await addTask({ projectId: project.id, title: newTaskTitle.trim(), due: new Date().toISOString(), status: "todo", priority: "med", recurrence: "none" });
+    await addTask({ projectId: project.id, title: newTaskTitle.trim(), due: new Date().toISOString(), status: "not_started", priority: "med", recurrence: "none" });
     setNewTaskTitle(""); setAddingTask(false);
   };
 
@@ -502,9 +504,9 @@ function ProjectDetailSheet({ project, open, onClose, onReload }: {
                       const entries: Entry[] = [
                         ...projectTasks.map(t => ({
                           id: `task-${t.id}`, at: new Date(t.due),
-                          icon: t.status === "done" ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Circle className="h-3.5 w-3.5" />,
-                          tone: t.status === "done" ? "bg-green-500/10 text-green-600" : "bg-blue-500/10 text-blue-600",
-                          title: t.status === "done" ? `Completed: ${t.title}` : `Task: ${t.title}`,
+                          icon: t.status === "completed" ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Circle className="h-3.5 w-3.5" />,
+                          tone: t.status === "completed" ? "bg-green-500/10 text-green-600" : "bg-blue-500/10 text-blue-600",
+                          title: t.status === "completed" ? `Completed: ${t.title}` : `Task: ${t.title}`,
                           sub: t.priority !== "med" ? `${t.priority} priority` : undefined,
                         })),
                         ...activityNotes.map(n => ({
@@ -616,8 +618,8 @@ function ProjectDetailSheet({ project, open, onClose, onReload }: {
                 <div className="space-y-1">
                   {projectTasks.map(task => (
                     <div key={task.id} className="group flex items-center gap-3 rounded-lg border border-border bg-background px-3 py-2.5 hover:bg-secondary/30">
-                      <button onClick={() => void updateTask(task.id, { status: task.status === "done" ? "todo" : "done" })} className="shrink-0">{STATUS_ICONS[task.status]}</button>
-                      <span className={cn("flex-1 text-sm", task.status === "done" && "line-through text-muted-foreground")}>{task.title}</span>
+                      <button onClick={() => void updateTask(task.id, { status: task.status === "completed" ? "not_started" : "completed" })} className="shrink-0">{STATUS_ICONS[task.status]}</button>
+                      <span className={cn("flex-1 text-sm", task.status === "completed" && "line-through text-muted-foreground")}>{task.title}</span>
                       <Flag className={cn("h-3.5 w-3.5 shrink-0", PRIORITY_COLORS[task.priority])} />
                       {task.due && <span className="text-[11px] text-muted-foreground shrink-0">{new Date(task.due).toLocaleDateString("en-US", { month: "short", day: "numeric" })}</span>}
                       <button onClick={() => void deleteTask(task.id)} className="shrink-0 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive transition-opacity"><Trash2 className="h-3.5 w-3.5" /></button>
@@ -627,9 +629,9 @@ function ProjectDetailSheet({ project, open, onClose, onReload }: {
               )}
               {projectTasks.length > 0 && (
                 <div className="flex items-center gap-4 rounded-lg bg-secondary/40 px-3 py-2 text-[11px] text-muted-foreground">
-                  <span>{projectTasks.filter(t => t.status === "done").length} / {projectTasks.length} done</span>
+                  <span>{projectTasks.filter(t => t.status === "completed").length} / {projectTasks.length} done</span>
                   <span>{projectTasks.filter(t => t.status === "in_progress").length} in progress</span>
-                  <span>{projectTasks.filter(t => t.priority === "high" && t.status !== "done").length} high priority</span>
+                  <span>{projectTasks.filter(t => t.priority === "high" && t.status !== "completed").length} high priority</span>
                 </div>
               )}
             </div>

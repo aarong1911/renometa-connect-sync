@@ -20,14 +20,15 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { useTasksForEntity, addTask, updateTask, type CreateTaskInput } from "@/lib/tasks-store";
+import { useTasksForEntity, addTask, updateTask, completeTask, reopenTask, type CreateTaskInput } from "@/lib/tasks-store";
 import type { Task, TaskEntityType } from "@/lib/mock-data";
 import { useTeam } from "@/lib/organization";
+import { isActiveStatus } from "@/lib/task-status";
 
 const PRIORITY_LABEL: Record<Task["priority"], string> = { low: "Low", med: "Medium", high: "High" };
 
 function isOverdue(due: string, status: Task["status"]): boolean {
-  if (status === "done") return false;
+  if (!isActiveStatus(status)) return false;
   return new Date(due).getTime() < Date.now();
 }
 
@@ -49,12 +50,12 @@ export function EntityTasksPanel({
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Task | null>(null);
 
-  const open = tasks.filter((t) => t.status !== "done");
-  const done = tasks.filter((t) => t.status === "done");
+  const open = tasks.filter((t) => t.status !== "completed");
+  const done = tasks.filter((t) => t.status === "completed");
 
   const handleToggle = async (task: Task) => {
-    const next = task.status === "done" ? "todo" : "done";
-    await updateTask(task.id, { status: next });
+    const result = task.status === "completed" ? await reopenTask(task.id) : await completeTask(task.id);
+    if (!result.ok) toast.error(task.status === "completed" ? "Could not reopen task" : "Could not complete task");
   };
 
   const openCreate = () => { setEditing(null); setFormOpen(true); };
@@ -98,7 +99,7 @@ export function EntityTasksPanel({
 
 function TaskRow({ task, onToggle, onEdit }: { task: Task; onToggle: () => void; onEdit: () => void }) {
   const overdue = isOverdue(task.due, task.status);
-  const done = task.status === "done";
+  const done = task.status === "completed";
 
   return (
     <div
@@ -172,7 +173,7 @@ function TaskQuickForm({
         title: title.trim(),
         due: new Date(due).toISOString(),
         priority,
-        status: "todo",
+        status: "not_started",
         assignedTo: assignedTo === "unassigned" ? null : assignedTo,
         entityType,
         entityId,

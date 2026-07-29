@@ -240,7 +240,10 @@ export type Task = {
   /** Real profile UUID backing `assignee`'s display name, when known. Null/undefined = unassigned or not yet resolved. */
   assignedTo?: string | null;
   due: string;
-  status: "todo" | "in_progress" | "review" | "done";
+  /** Canonical database values (tasks_status_check) — see src/lib/task-status.ts for labels/order/icons. Never "todo"/"review"/"done" — those never matched the live constraint. */
+  status: "not_started" | "in_progress" | "on_hold" | "completed" | "cancelled";
+  /** Set only while status === "completed" — see getTaskStatusPatch() in task-status.ts, the single place this rule is decided. */
+  completedAt?: string | null;
   priority: "low" | "med" | "high";
   recurrence?: "none" | "daily" | "weekly" | "biweekly" | "monthly";
   /** Optional ISO date — stop generating instances after this date (inclusive). */
@@ -252,6 +255,26 @@ export type Task = {
   /** Phase 10.1 — generic CRM entity link (lead/deal today). Undefined = unlinked. */
   entityType?: TaskEntityType;
   entityId?: string;
+};
+
+/** Centralized aliases (Phase 10.2) — named references to Task's own existing literal unions, not a new/parallel vocabulary. Use these instead of re-typing the union elsewhere. */
+export type TaskStatus = Task["status"];
+export type TaskPriority = Task["priority"];
+
+/** Phase 10.2 — one real, structured task_activities row. `actorId` is null for a service-role-originated write (workflow/agentic) with no session — display as "System", not blank or a guessed name. */
+export type TaskActivityType =
+  | "created" | "completed" | "reopened" | "assigned" | "unassigned"
+  | "due_date_changed" | "priority_changed" | "relationship_changed"
+  | "cancelled" | "restored";
+
+export type TaskActivity = {
+  id: string;
+  taskId: string;
+  actorId: string | null;
+  activityType: TaskActivityType;
+  summary: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
 };
 
 export type Conversation = {
@@ -776,7 +799,7 @@ export const mockTasks: Task[] = Array.from({ length: 30 }, (_, i) => {
     assignee: owners[ownerIdx],
     assigneeInitials: ownerInitials[ownerIdx],
     due: isoDaysAgo(-((i * 2) % 21) - 1),
-    status: (["todo", "in_progress", "review", "done"] as const)[i % 4],
+    status: (["not_started", "in_progress", "on_hold", "completed"] as const)[i % 4],
     priority: (["low", "med", "high"] as const)[i % 3],
   };
 });

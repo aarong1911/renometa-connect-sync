@@ -2,6 +2,7 @@
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import nodemailer from "nodemailer";
+import { createServerTask, type ServerTaskPriority } from "../lib/tasks";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -211,17 +212,35 @@ async function executeNode(
     }
 
     case "create_task": {
+      // Phase 10.2 fix: this previously wrote `due`/`assignee`/status:"todo"
+      // — none of which are real tasks columns/values (canonical columns
+      // are due_date/assigned_to; canonical statuses are not_started/
+      // in_progress/review/done) — so every workflow-created task either
+      // silently failed or wrote garbage. Routed through the shared
+      // createServerTask() helper (netlify/lib/tasks.ts), which validates
+      // and throws on failure — executeNode's caller (walk(), above)
+      // already catches, logs, and marks the node failed, so no fake
+      // success is reported here.
       const unitMs: Record<string, number> = { minutes: 60_000, hours: 3_600_000, days: 86_400_000, weeks: 604_800_000 };
       const dueMs = ((config.due_in ?? 1) as number) * (unitMs[config.due_unit ?? "days"] ?? 86_400_000);
-      await supabaseAdmin.from("tasks").insert({
-        org_id: orgId,
+      const priority: ServerTaskPriority =
+        config.priority === "low" || config.priority === "high" ? config.priority : "medium";
+      // Workflows have no deal context today (only lead/project) — link to
+      // the lead if this run has one, otherwise preserve the existing
+      // project-linked/unlinked behavior. Not inventing a Deal option here.
+      const leadId = ctx.lead?.id ?? ctx.triggerData?.lead_id ?? null;
+      const projectIdForTask = ctx.project?.id ?? ctx.triggerData?.project_id ?? null;
+      const { taskId } = await createServerTask(supabaseAdmin, {
+        orgId,
         title: interpolate(config.title ?? "Workflow task", ctx),
-        status: "todo",
-        priority: config.priority ?? "medium",
-        due: new Date(Date.now() + dueMs).toISOString(),
-        assignee: config.assignee === "specific" ? (config.member_id || null) : null,
+        priority,
+        dueDate: new Date(Date.now() + dueMs).toISOString().slice(0, 10),
+        assignedTo: config.assignee === "specific" ? (config.member_id || null) : null,
+        projectId: leadId ? null : projectIdForTask,
+        entityType: leadId ? "lead" : null,
+        entityId: leadId ?? null,
       });
-      break;
+      return { ctxPatch: { createdTaskId: taskId } };
     }
 
     case "assign_member": {
