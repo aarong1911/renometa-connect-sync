@@ -34,6 +34,23 @@ function IntegrationsSettings() {
   const [integrations, setIntegrations] = useState<Integration[]>(INTEGRATIONS);
   const [disconnectTarget, setDisconnectTarget] = useState<Integration | null>(null);
 
+  // ── Google Calendar — read-only status (Phase 10.3) ─────────────────────
+  // No OAuth connect/callback flow exists in this repo for Google Calendar
+  // (see the Phase 10.3 audit) — the two live-connected `integrations`
+  // rows (provider='gcal') that netlify/functions/vapi-webhook.ts already
+  // reads from were established outside this app's UI. Rather than
+  // fabricate a Connect button that can't actually complete an OAuth
+  // handshake, this card shows the REAL status (safe columns only — never
+  // the encrypted token columns) and defers Connect/Reconnect honestly.
+  type GcalStatus = {
+    connected: boolean;
+    accountEmail: string | null;
+    lastSyncAt: string | null;
+    lastSyncStatus: string | null;
+    syncError: string | null;
+  };
+  const [gcalStatus, setGcalStatus] = useState<GcalStatus | null>(null);
+
   // ── Gmail "SEND EMAIL" state (SMTP App Password) ───────────────────────
   // Real — organizations.integration_settings.gmail is read directly by
   // send-inbox-message.ts's email branch to actually send mail. This is
@@ -279,6 +296,25 @@ function IntegrationsSettings() {
         }
       }
 
+      if (!MOCK_MODE) {
+        const { data: gcalRow } = await supabase
+          .from("integrations")
+          .select("status, provider_account_email, last_sync_at, last_sync_status, sync_error")
+          .eq("org_id", orgId)
+          .eq("provider", "gcal")
+          .order("updated_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        setGcalStatus({
+          connected: gcalRow?.status === "connected",
+          accountEmail: gcalRow?.provider_account_email ?? null,
+          lastSyncAt: gcalRow?.last_sync_at ?? null,
+          lastSyncStatus: gcalRow?.last_sync_status ?? null,
+          syncError: gcalRow?.sync_error ?? null,
+        });
+        updateConnectionStatus("google-calendar", gcalRow?.status === "connected");
+      }
+
       const metaProductMap: Record<string, string> = {
         whatsapp: "whatsapp",
         "fb-messenger": "messenger",
@@ -289,6 +325,12 @@ function IntegrationsSettings() {
 
       setIntegrations((prev) =>
         prev.map((i) => {
+          // google-calendar's real connected status was already set above
+          // via updateConnectionStatus() from the `integrations` table
+          // directly — must not be overwritten by the generic
+          // integration_settings-object heuristic below (there is no
+          // `integration_settings.google_calendar` key to read).
+          if (i.id === "google-calendar") return i;
           if (metaProductMap[i.id]) {
             return { ...i, connected: connectedProducts.includes(metaProductMap[i.id]) };
           }
@@ -542,6 +584,41 @@ function IntegrationsSettings() {
                           )}
                         </div>
                       </div>
+                    </div>
+                  ) : i.id === "google-calendar" && !MOCK_MODE ? (
+                    /* Phase 10.3 — read-only. No OAuth connect/callback flow
+                       exists in this repo for Google Calendar; the app
+                       already writes real events server-side (see
+                       netlify/functions/vapi-webhook.ts) against
+                       `integrations` rows established outside this UI.
+                       Showing a working-looking Connect button here would
+                       be a false promise, so this card reports the real
+                       status only and defers Connect/Reconnect. */
+                    <div className="mt-auto space-y-1.5 pt-3">
+                      <span className={cn(
+                        "inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[10.5px] font-semibold ring-1",
+                        gcalStatus?.connected
+                          ? "bg-success-soft text-success ring-success/20"
+                          : "bg-secondary text-muted-foreground ring-border",
+                      )}>
+                        {gcalStatus?.connected ? <CheckCircle2 className="h-3 w-3" /> : <Circle className="h-2.5 w-2.5" />}
+                        {gcalStatus?.connected ? "Connected" : "Not connected"}
+                      </span>
+                      {gcalStatus?.connected && (
+                        <div className="space-y-0.5 text-[11px] text-foreground">
+                          {gcalStatus.accountEmail && <p><span className="font-semibold">Account:</span> {gcalStatus.accountEmail}</p>}
+                          <p>
+                            <span className="font-semibold">Last sync:</span> {fmtGmailTimestamp(gcalStatus.lastSyncAt)}
+                            {gcalStatus.lastSyncStatus ? ` · ${gcalStatus.lastSyncStatus}` : ""}
+                          </p>
+                          {gcalStatus.syncError && <p className="text-destructive">{gcalStatus.syncError}</p>}
+                        </div>
+                      )}
+                      <p className="text-[10.5px] text-muted-foreground">
+                        {gcalStatus?.connected
+                          ? "Managed connection — contact RenoMeta support to reconnect or disconnect."
+                          : "Not connected. Contact RenoMeta support to set up Google Calendar sync."}
+                      </p>
                     </div>
                   ) : (
                     <div className="mt-auto flex items-center justify-between gap-2 pt-3">

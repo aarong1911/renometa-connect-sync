@@ -29,6 +29,7 @@ import {
   StickyNote,
   Smile,
   Video,
+  CalendarPlus,
   Tag,
   Clock,
   ExternalLink,
@@ -72,6 +73,7 @@ import { useOrganization, useTeam } from "@/lib/organization";
 import { updateContact, useContacts } from "@/lib/contacts-store";
 import { useContactActivity } from "@/lib/contact-activity";
 import { NewDealDialog } from "@/components/sales/new-deal-dialog";
+import { AppointmentDialog } from "@/components/calendar/appointment-dialog";
 import { DealDetailDrawer } from "@/components/sales/deal-detail-drawer";
 import {
   deleteDeal as storeDeleteDeal, updateDeal as storeUpdateDeal,
@@ -270,6 +272,7 @@ function InboxPage() {
 
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduleDateTime, setScheduleDateTime] = useState("");
+  const [appointmentDialogOpen, setAppointmentDialogOpen] = useState(false);
   const [starredIds, setStarredIds] = useState<Set<string>>(new Set());
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(new Set());
   const [aiDrafting, setAiDrafting] = useState(false);
@@ -1459,6 +1462,10 @@ function InboxPage() {
                     onClick={() => toast.info("Video calling coming soon")}>
                     <Video className="h-4 w-4" />
                   </Button>
+                  <Button variant="ghost" size="sm" className="h-8 px-2" title="Schedule appointment"
+                    onClick={() => setAppointmentDialogOpen(true)}>
+                    <CalendarPlus className="h-4 w-4" />
+                  </Button>
                   <span className="mx-1 h-5 w-px bg-border" />
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
@@ -2434,6 +2441,30 @@ function InboxPage() {
       onOpenChange={setDealDialogOpen}
       initialValues={dealPrefill}
       onCreated={handleDealCreated}
+    />
+
+    {/* Phase 10.3 — real "Schedule appointment" action, distinct from the
+        composer's "Schedule" button above (which schedules a message SEND,
+        not a calendar appointment). Prefills the customer from the active
+        conversation's matched Contact when one exists. */}
+    <AppointmentDialog
+      open={appointmentDialogOpen}
+      onOpenChange={setAppointmentDialogOpen}
+      prefill={active ? {
+        // Best available CRM relation: the matched Contact when one truly
+        // exists, otherwise the Contact's linked Account/Company when
+        // known, otherwise left unlinked — there is no lead↔conversation
+        // link in this codebase to fall back to honestly.
+        entityType: activeContactHasRealId ? "contact" : contactCompanyId ? "company" : undefined,
+        entityId: activeContactHasRealId ? active.contactId : contactCompanyId ?? undefined,
+        contactName: active.contactName,
+        contactEmail: contact?.email || active.senderEmail || undefined,
+        contactPhone: contact?.phone || undefined,
+        address: (contact as { address?: string } | undefined)?.address || undefined,
+        source: "inbox",
+        metadata: { conversationId: active.id },
+      } : undefined}
+      onSaved={() => toast.success("Appointment scheduled")}
     />
 
     <DealDetailDrawer

@@ -1,100 +1,65 @@
 // src/routes/calendar.tsx
+//
+// Phase 10.3 — Calendar and Appointments Completion. Reads/writes the
+// canonical public.appointments table via src/lib/appointments-store.ts.
+// New appointment / Edit / Delete are now real (see appointment-dialog.tsx
+// and appointment-detail-sheet.tsx) — the old page had all three wired to
+// nothing but toasts (New event had no handler at all; Edit showed "coming
+// soon"; Delete showed "Event deleted" without ever calling Supabase).
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Checkbox } from "@/components/ui/checkbox";
+import { PageHeader } from "@/components/layout/app-shell";
 import {
   ChevronLeft, ChevronRight, RefreshCw, Plus, CheckCircle2,
-  Calendar as CalendarIcon, Pencil, Trash2, ExternalLink, Users,
-  Clock, Loader2, Phone, Mail, MapPin, DollarSign, StickyNote,
+  Calendar as CalendarIcon, Loader2, Clock, AlertTriangle, ListChecks,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { useOrganization } from "@/lib/organization";
-import { supabase } from "@/lib/supabase";
+import { useOrganization, useTeam } from "@/lib/organization";
+import {
+  listAppointments, getAppointment, type Appointment,
+} from "@/lib/appointments-store";
+import {
+  APPOINTMENT_STATUS_ORDER, APPOINTMENT_STATUS_LABELS, APPOINTMENT_STATUS_TINT,
+  APPOINTMENT_TYPE_ORDER, APPOINTMENT_TYPE_LABELS, APPOINTMENT_TYPE_ICONS,
+  APPOINTMENT_ENTITY_TYPE_LABELS, isActiveAppointmentStatus,
+  type AppointmentStatus, type AppointmentType, type AppointmentEntityType,
+} from "@/lib/appointment-status";
+import { AppointmentDialog } from "@/components/calendar/appointment-dialog";
+import { AppointmentDetailSheet } from "@/components/calendar/appointment-detail-sheet";
 
 export const Route = createFileRoute("/calendar")({
   component: CalendarPage,
 });
 
-// ── Types ──
-
-type EventType = "site-visit" | "client-meeting" | "install" | "inspection" | "internal";
-
-type CalEvent = {
-  id: string;
-  title: string;
-  date: string;       // YYYY-MM-DD
-  start: string;      // HH:mm
-  end: string;        // HH:mm
-  type: EventType;
-  project?: string;
-  attendees: string[];
-  source: "google" | "internal" | "voice-ai";
-  // Contact / appointment details
-  contactName: string;
-  contactPhone: string | null;
-  contactEmail: string | null;
-  address: string | null;
-  budget: string | null;
-  notes: string | null;
-  status: string;
-};
-
-const TYPE_STYLES: Record<EventType, string> = {
-  "site-visit":     "bg-primary/15 text-primary border-primary/30",
-  "client-meeting": "bg-success/15 text-success border-success/30",
-  install:          "bg-warning/15 text-warning border-warning/30",
-  inspection:       "bg-destructive/15 text-destructive border-destructive/30",
-  internal:         "bg-muted text-muted-foreground border-border",
-};
-
-const TYPE_LABEL: Record<EventType, string> = {
-  "site-visit":     "Site visit",
-  "client-meeting": "Client meeting",
-  install:          "Install",
-  inspection:       "Inspection",
-  internal:         "Internal",
-};
-
-// ── Helpers ──
+// ── date helpers ──
 
 function ymd(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
-
 function parseYmd(s: string): Date {
   const [y, m, d] = s.split("-").map(Number);
   return new Date(y, m - 1, d);
 }
-
 function buildWeekDays(anchor: Date): Date[] {
   const day = anchor.getDay();
   const offset = (day + 6) % 7;
   const start = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() - offset);
-  return Array.from({ length: 7 }, (_, i) => {
-    const d = new Date(start);
-    d.setDate(start.getDate() + i);
-    return d;
-  });
+  return Array.from({ length: 7 }, (_, i) => { const d = new Date(start); d.setDate(start.getDate() + i); return d; });
 }
-
 function buildMonthGrid(anchor: Date): Date[] {
   const first = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
   const startOffset = (first.getDay() + 6) % 7;
   const start = new Date(first);
   start.setDate(first.getDate() - startOffset);
-  return Array.from({ length: 42 }, (_, i) => {
-    const d = new Date(start);
-    d.setDate(start.getDate() + i);
-    return d;
-  });
+  return Array.from({ length: 42 }, (_, i) => { const d = new Date(start); d.setDate(start.getDate() + i); return d; });
 }
-
 function formatRelative(d: Date, now: Date): string {
   const diff = Math.floor((now.getTime() - d.getTime()) / 1000);
   if (diff < 60) return "just now";
@@ -102,121 +67,57 @@ function formatRelative(d: Date, now: Date): string {
   if (diff < 86400) return `${Math.floor(diff / 3600)} hr ago`;
   return `${Math.floor(diff / 86400)} d ago`;
 }
-
-function toMinutes(hhmm: string): number {
-  const [h, m] = hhmm.split(":").map(Number);
+function apptDateKey(a: Appointment): string {
+  return new Date(a.scheduledAt).toLocaleDateString("en-CA", { timeZone: a.timeZone });
+}
+function apptTimeLabel(iso: string, tz: string): string {
+  return new Date(iso).toLocaleTimeString("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false });
+}
+function apptMinutes(iso: string, tz: string): number {
+  const [h, m] = apptTimeLabel(iso, tz).split(":").map(Number);
   return h * 60 + m;
 }
 
-// ── Org ID helper ──
+type ViewMode = "month" | "week" | "day" | "agenda";
+type EntityFilter = "all" | "unlinked" | AppointmentEntityType;
 
-async function getOrgId(): Promise<string | null> {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return null;
-  const { data: profile } = await supabase
-    .from("profiles").select("organization_id").eq("id", user.id).maybeSingle();
-  if (profile?.organization_id) return profile.organization_id;
-  const { data: membership } = await supabase
-    .from("org_memberships").select("org_id").eq("member_id", user.id).maybeSingle();
-  return membership?.org_id ?? null;
-}
-
-// ── Classify service → event type ──
-
-function classifyService(service: string): EventType {
-  const s = (service ?? "").toLowerCase();
-  if (s.includes("visit") || s.includes("walkthrough") || s.includes("punch")) return "site-visit";
-  if (s.includes("install")) return "install";
-  if (s.includes("inspect")) return "inspection";
-  if (s.includes("internal") || s.includes("sync") || s.includes("meeting")) return "internal";
-  return "client-meeting";
-}
-
-// ── Map Supabase row → CalEvent ──
-
-function mapAppointment(row: any, tz: string): CalEvent {
-  const scheduled = new Date(row.scheduled_at);
-  const durationMin = row.duration_min ?? 60;
-
-  const dateStr = scheduled.toLocaleDateString("en-CA", { timeZone: tz });
-  const startH = scheduled.toLocaleTimeString("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false });
-  const endDate = new Date(scheduled.getTime() + durationMin * 60000);
-  const endH = endDate.toLocaleTimeString("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false });
-
-  const contactName = row.contact_name || "—";
-  const service = row.service || "Appointment";
-  const title = `${service} — ${contactName}`;
-
-  return {
-    id: row.id,
-    title,
-    date: dateStr,
-    start: startH,
-    end: endH,
-    type: classifyService(service),
-    project: undefined,
-    attendees: [],
-    source: row.source === "Voice AI" ? "voice-ai" : "internal",
-    contactName,
-    contactPhone: row.contact_phone || null,
-    contactEmail: row.contact_email || null,
-    address: row.address || null,
-    budget: row.budget || null,
-    notes: row.notes || null,
-    status: row.status || "scheduled",
-  };
-}
-
-// ── View mode ──
-
-type ViewMode = "month" | "week" | "day";
-
-// ── Main page ──
+// ── main page ──
 
 function CalendarPage() {
   const org = useOrganization();
-  const today = useMemo(() => {
-    const now = new Date();
-    return new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  }, []);
+  const teamMembers = useTeam().filter((m) => m.status === "active");
 
+  const today = useMemo(() => { const now = new Date(); return new Date(now.getFullYear(), now.getMonth(), now.getDate()); }, []);
   const [cursor, setCursor] = useState(new Date(today.getFullYear(), today.getMonth(), 1));
   const [view, setView] = useState<ViewMode>("week");
-  const [typeFilter, setTypeFilter] = useState<EventType | "all">("all");
+  const [selectedDay, setSelectedDay] = useState<string>(() => ymd(new Date()));
+  const [nowTick, setNowTick] = useState<Date | null>(null);
+
+  const [statusFilter, setStatusFilter] = useState<AppointmentStatus | "all">("all");
+  const [typeFilter, setTypeFilter] = useState<AppointmentType | "all">("all");
+  const [assigneeFilter, setAssigneeFilter] = useState<string>("all");
+  const [entityFilter, setEntityFilter] = useState<EntityFilter>("all");
+  const [hideCancelled, setHideCancelled] = useState(true);
+
+  const [appointments, setAppointments] = useState<Appointment[]>([]);
+  const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [lastSynced, setLastSynced] = useState<Date | null>(null);
-  const [selectedDay, setSelectedDay] = useState<string>(() => {
-    const now = new Date();
-    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-  });
-  const [nowTick, setNowTick] = useState<Date | null>(null);
-  const [events, setEvents] = useState<CalEvent[]>([]);
-  const [loading, setLoading] = useState(true);
+
+  const [createOpen, setCreateOpen] = useState(false);
+  const [editingAppointment, setEditingAppointment] = useState<Appointment | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(null);
 
   const fetchAppointments = useCallback(async () => {
-    const orgId = await getOrgId();
-    if (!orgId) { setLoading(false); return; }
-
     const rangeStart = new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1);
     const rangeEnd = new Date(cursor.getFullYear(), cursor.getMonth() + 2, 0);
-
-    const { data, error } = await supabase
-      .from("appointments")
-      .select("*")
-      .eq("org_id", orgId)
-      .neq("status", "cancelled")
-      .gte("scheduled_at", rangeStart.toISOString())
-      .lte("scheduled_at", rangeEnd.toISOString())
-      .order("scheduled_at", { ascending: true });
-
-    if (error) { console.error("[calendar] fetch failed:", error); setLoading(false); return; }
-
-    setEvents((data ?? []).map((row: any) => mapAppointment(row, org.timezone)));
+    const rows = await listAppointments(rangeStart, rangeEnd);
+    setAppointments(rows);
     setLoading(false);
     setLastSynced(new Date());
-  }, [cursor, org.timezone]);
+  }, [cursor]);
 
-  useEffect(() => { fetchAppointments(); }, [fetchAppointments]);
+  useEffect(() => { void fetchAppointments(); }, [fetchAppointments]);
 
   useEffect(() => {
     const update = () => setNowTick(new Date());
@@ -225,23 +126,41 @@ function CalendarPage() {
     return () => clearInterval(id);
   }, []);
 
-  const filtered = useMemo(
-    () => typeFilter === "all" ? events : events.filter((e) => e.type === typeFilter),
-    [events, typeFilter],
-  );
+  const handleSync = async () => {
+    setSyncing(true);
+    await fetchAppointments();
+    setSyncing(false);
+    toast.success("Calendar refreshed", { description: `${appointments.length} appointments loaded` });
+  };
+
+  const filtered = useMemo(() => {
+    return appointments.filter((a) => {
+      if (hideCancelled && a.status === "cancelled") return false;
+      if (statusFilter !== "all" && a.status !== statusFilter) return false;
+      if (typeFilter !== "all" && a.appointmentType !== typeFilter) return false;
+      if (assigneeFilter !== "all") {
+        if (assigneeFilter === "unassigned" ? a.assignedTo !== null : a.assignedTo !== assigneeFilter) return false;
+      }
+      if (entityFilter === "unlinked" && a.entityType !== null) return false;
+      if (entityFilter !== "all" && entityFilter !== "unlinked" && a.entityType !== entityFilter) return false;
+      return true;
+    });
+  }, [appointments, hideCancelled, statusFilter, typeFilter, assigneeFilter, entityFilter]);
 
   const eventsByDay = useMemo(() => {
-    const m = new Map<string, CalEvent[]>();
-    filtered.forEach((e) => { const arr = m.get(e.date) ?? []; arr.push(e); m.set(e.date, arr); });
+    const m = new Map<string, Appointment[]>();
+    filtered.forEach((a) => { const key = apptDateKey(a); const arr = m.get(key) ?? []; arr.push(a); m.set(key, arr); });
     return m;
   }, [filtered]);
 
   const selectedDate = useMemo(() => parseYmd(selectedDay), [selectedDay]);
   const weekDays = useMemo(() => buildWeekDays(selectedDate), [selectedDate]);
+  const daysGrid = useMemo(() => buildMonthGrid(cursor), [cursor]);
 
   const headerLabel = useMemo(() => {
     if (view === "month") return cursor.toLocaleString("default", { month: "long", year: "numeric" });
     if (view === "day") return selectedDate.toLocaleDateString("default", { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+    if (view === "agenda") return "Agenda";
     const last = weekDays[6];
     const sameMonth = weekDays[0].getMonth() === last.getMonth();
     const left = weekDays[0].toLocaleDateString("default", { month: "short", day: "numeric" });
@@ -249,11 +168,8 @@ function CalendarPage() {
     return `${left} – ${right}`;
   }, [view, cursor, selectedDate, weekDays]);
 
-  const daysGrid = useMemo(() => buildMonthGrid(cursor), [cursor]);
-  const selectedEvents = (eventsByDay.get(selectedDay) ?? []).slice().sort((a, b) => a.start.localeCompare(b.start));
-
   const shift = (dir: -1 | 1) => {
-    if (view === "month") {
+    if (view === "month" || view === "agenda") {
       setCursor(new Date(cursor.getFullYear(), cursor.getMonth() + dir, 1));
     } else if (view === "week") {
       const d = new Date(selectedDate); d.setDate(d.getDate() + dir * 7);
@@ -263,37 +179,60 @@ function CalendarPage() {
       setSelectedDay(ymd(d)); setCursor(new Date(d.getFullYear(), d.getMonth(), 1));
     }
   };
-
   const goToday = () => { setSelectedDay(ymd(today)); setCursor(new Date(today.getFullYear(), today.getMonth(), 1)); };
 
-  const handleSync = async () => {
-    setSyncing(true);
-    await fetchAppointments();
-    setSyncing(false);
-    toast.success("Calendar refreshed", { description: `${events.length} appointments loaded` });
+  const openDetail = (id: string) => setDetailId(id);
+  const openEdit = async (id: string) => {
+    const appt = await getAppointment(id);
+    if (!appt) { toast.error("Could not load this appointment"); return; }
+    setDetailId(null);
+    setEditingAppointment(appt);
   };
+  const handleSaved = () => { void fetchAppointments(); };
 
-  const counts = useMemo(() => {
-    const c: Record<EventType, number> = { "site-visit": 0, "client-meeting": 0, install: 0, inspection: 0, internal: 0 };
-    events.forEach((e) => (c[e.type] += 1));
-    return c;
-  }, [events]);
+  // ── KPI cards (Part 16 / 38) — computed over the loaded 3-month window,
+  // same range the page already queries; "Today"/"Upcoming"/"Confirmed" are
+  // effectively exact since that window always covers the current month.
+  const kpis = useMemo(() => {
+    const now = nowTick ?? new Date();
+    const todayKey = ymd(now);
+    const todayCount = appointments.filter((a) => a.status !== "cancelled" && apptDateKey(a) === todayKey).length;
+    const upcoming = appointments.filter((a) => isActiveAppointmentStatus(a.status) && new Date(a.scheduledAt).getTime() >= now.getTime());
+    const confirmed = appointments.filter((a) => a.status === "confirmed" && new Date(a.scheduledAt).getTime() >= new Date(todayKey).getTime());
+    const needsAttention = appointments.filter((a) =>
+      a.googleSyncStatus === "failed" ||
+      (isActiveAppointmentStatus(a.status) && !a.assignedTo && new Date(a.scheduledAt).getTime() >= now.getTime()),
+    );
+    return { today: todayCount, upcoming: upcoming.length, confirmed: confirmed.length, needsAttention: needsAttention.length };
+  }, [appointments, nowTick]);
+
+  const selectedEvents = (eventsByDay.get(selectedDay) ?? []).slice().sort((a, b) => a.scheduledAt.localeCompare(b.scheduledAt));
 
   if (loading) {
     return <div className="flex items-center justify-center py-12"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>;
   }
 
   return (
-    <div className="flex h-[calc(100vh-160px)] flex-col gap-3">
-      {/* Header */}
-      <div className="flex shrink-0 items-center gap-3">
-        <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-cyan-soft ring-1 ring-black/5">
-          <CalendarIcon className="h-4 w-4 text-cyan-soft-foreground" />
-        </div>
-        <div>
-          <h1 className="text-[17px] font-semibold leading-tight tracking-tight">Calendar</h1>
-          <p className="text-[11.5px] text-muted-foreground">Manage bookings, appointments, and your team's schedule.</p>
-        </div>
+    <div className="flex h-[calc(100vh-190px)] flex-col gap-3">
+      <PageHeader
+        title="Calendar"
+        subtitle="Schedule appointments, manage availability, and coordinate customer meetings."
+        icon={CalendarIcon}
+        iconBg="bg-cyan-soft"
+        iconColor="text-cyan-soft-foreground"
+        actions={
+          <Button size="sm" className="h-8" onClick={() => setCreateOpen(true)}>
+            <Plus className="h-3.5 w-3.5" /><span className="text-xs">New appointment</span>
+          </Button>
+        }
+      />
+
+      {/* KPI cards */}
+      <div className="grid flex-shrink-0 grid-cols-2 gap-2 sm:grid-cols-4">
+        <KpiCard label="Today" value={kpis.today} icon={CalendarIcon} tint="text-blue-600 bg-blue-50 dark:text-blue-400 dark:bg-blue-500/10" />
+        <KpiCard label="Upcoming" value={kpis.upcoming} icon={Clock} tint="text-cyan-600 bg-cyan-50 dark:text-cyan-400 dark:bg-cyan-500/10" />
+        <KpiCard label="Confirmed" value={kpis.confirmed} icon={CheckCircle2} tint="text-emerald-600 bg-emerald-50 dark:text-emerald-400 dark:bg-emerald-500/10" />
+        <KpiCard label="Needs Attention" value={kpis.needsAttention} icon={AlertTriangle} tint="text-amber-600 bg-amber-50 dark:text-amber-400 dark:bg-amber-500/10" />
       </div>
 
       {/* Toolbar */}
@@ -306,58 +245,73 @@ function CalendarPage() {
           </div>
           <h2 className="text-base font-semibold">{headerLabel}</h2>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <ToggleGroup type="single" value={view} onValueChange={(v) => v && setView(v as ViewMode)} className="h-8 rounded-md border border-border p-0.5">
             <ToggleGroupItem value="month" className="h-7 px-2.5 text-xs data-[state=on]:bg-secondary">Month</ToggleGroupItem>
-            <ToggleGroupItem value="week"  className="h-7 px-2.5 text-xs data-[state=on]:bg-secondary">Week</ToggleGroupItem>
-            <ToggleGroupItem value="day"   className="h-7 px-2.5 text-xs data-[state=on]:bg-secondary">Day</ToggleGroupItem>
+            <ToggleGroupItem value="week" className="h-7 px-2.5 text-xs data-[state=on]:bg-secondary">Week</ToggleGroupItem>
+            <ToggleGroupItem value="day" className="h-7 px-2.5 text-xs data-[state=on]:bg-secondary">Day</ToggleGroupItem>
+            <ToggleGroupItem value="agenda" className="h-7 px-2.5 text-xs data-[state=on]:bg-secondary"><ListChecks className="h-3 w-3" /></ToggleGroupItem>
           </ToggleGroup>
-          <Select value={typeFilter} onValueChange={(v) => setTypeFilter(v as EventType | "all")}>
-            <SelectTrigger className="h-8 w-[160px] text-xs"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All types</SelectItem>
-              <SelectItem value="site-visit">Site visits</SelectItem>
-              <SelectItem value="client-meeting">Client meetings</SelectItem>
-              <SelectItem value="install">Installs</SelectItem>
-              <SelectItem value="inspection">Inspections</SelectItem>
-              <SelectItem value="internal">Internal</SelectItem>
-            </SelectContent>
-          </Select>
           <Button variant="outline" size="sm" className="h-8" onClick={handleSync} disabled={syncing}>
             <RefreshCw className={cn("h-3.5 w-3.5", syncing && "animate-spin")} />
             <span className="text-xs">{syncing ? "Syncing…" : "Refresh"}</span>
           </Button>
-          <Button size="sm" className="h-8"><Plus className="h-3.5 w-3.5" /><span className="text-xs">New event</span></Button>
         </div>
       </div>
 
-      {/* Status bar */}
-      <div className="flex flex-shrink-0 flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-        <CheckCircle2 className="h-3.5 w-3.5 text-success" />
-        <span>
-          {lastSynced ? `Last refreshed ${nowTick ? formatRelative(lastSynced, nowTick) : "recently"}` : "Loading…"} · {events.length} appointments
+      {/* Filters */}
+      <div className="flex flex-shrink-0 flex-wrap items-center gap-2">
+        <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as AppointmentStatus | "all")}>
+          <SelectTrigger className="h-8 w-[140px] text-xs"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All statuses</SelectItem>
+            {APPOINTMENT_STATUS_ORDER.map((s) => <SelectItem key={s} value={s}>{APPOINTMENT_STATUS_LABELS[s]}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <Select value={typeFilter} onValueChange={(v) => setTypeFilter(v as AppointmentType | "all")}>
+          <SelectTrigger className="h-8 w-[150px] text-xs"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All types</SelectItem>
+            {APPOINTMENT_TYPE_ORDER.map((t) => <SelectItem key={t} value={t}>{APPOINTMENT_TYPE_LABELS[t]}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <Select value={assigneeFilter} onValueChange={setAssigneeFilter}>
+          <SelectTrigger className="h-8 w-[150px] text-xs"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All assignees</SelectItem>
+            <SelectItem value="unassigned">Unassigned</SelectItem>
+            {teamMembers.map((m) => <SelectItem key={m.id} value={m.id}>{m.name}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <Select value={entityFilter} onValueChange={(v) => setEntityFilter(v as EntityFilter)}>
+          <SelectTrigger className="h-8 w-[150px] text-xs"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All related records</SelectItem>
+            <SelectItem value="unlinked">Unlinked</SelectItem>
+            {(Object.keys(APPOINTMENT_ENTITY_TYPE_LABELS) as AppointmentEntityType[]).map((e) => (
+              <SelectItem key={e} value={e}>{APPOINTMENT_ENTITY_TYPE_LABELS[e]}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Checkbox checked={!hideCancelled} onCheckedChange={(v) => setHideCancelled(!v)} /> Show cancelled
+        </label>
+        <span className="ml-auto flex items-center gap-1.5 text-[11px] text-muted-foreground">
+          <CheckCircle2 className="h-3.5 w-3.5 text-success" />
+          {lastSynced ? `Last refreshed ${nowTick ? formatRelative(lastSynced, nowTick) : "recently"}` : "Loading…"} · {filtered.length} appointments
         </span>
-        <span className="mx-1 text-border">|</span>
-        {(Object.keys(TYPE_LABEL) as EventType[]).map((t) => (
-          <span key={t} className="inline-flex items-center gap-1">
-            <span className={cn("h-2 w-2 rounded-sm border", TYPE_STYLES[t])} />
-            <span>{TYPE_LABEL[t]} ({counts[t]})</span>
-          </span>
-        ))}
       </div>
 
       {/* Main grid */}
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-[1fr_320px]">
-
-        {/* Calendar view */}
         {view === "month" && (
           <Card className="flex flex-col overflow-hidden p-0">
             <div className="grid flex-shrink-0 grid-cols-7 border-b border-border bg-secondary/40">
-              {["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].map((d) => (
+              {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d) => (
                 <div key={d} className="px-2 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{d}</div>
               ))}
             </div>
-            <div className="grid flex-1 grid-cols-7 auto-rows-fr">
+            <div className="grid flex-1 grid-cols-7 auto-rows-fr overflow-y-auto">
               {daysGrid.map((cell, i) => {
                 const inMonth = cell.getMonth() === cursor.getMonth();
                 const key = ymd(cell);
@@ -381,9 +335,10 @@ function CalendarPage() {
                       {dayEvents.length > 0 && <span className="text-[10px] text-muted-foreground">{dayEvents.length}</span>}
                     </div>
                     <div className="space-y-0.5">
-                      {dayEvents.slice(0, 3).map((e) => (
-                        <div key={e.id} className={cn("truncate rounded border px-1 py-0.5 text-[10px] font-medium", TYPE_STYLES[e.type])}>
-                          {e.start} {e.title}
+                      {dayEvents.slice(0, 3).map((a) => (
+                        <div key={a.id} onClick={(e) => { e.stopPropagation(); openDetail(a.id); }}
+                          className={cn("truncate rounded border px-1 py-0.5 text-[10px] font-medium", APPOINTMENT_STATUS_TINT[a.status].chip)}>
+                          {apptTimeLabel(a.scheduledAt, a.timeZone)} {a.title}
                         </div>
                       ))}
                       {dayEvents.length > 3 && <div className="px-1 text-[10px] text-muted-foreground">+{dayEvents.length - 3} more</div>}
@@ -396,189 +351,120 @@ function CalendarPage() {
         )}
 
         {view === "week" && (
-          <TimeGrid days={weekDays} today={today} now={nowTick} selectedDay={selectedDay} onSelectDay={setSelectedDay} eventsByDay={eventsByDay} />
+          <TimeGrid days={weekDays} today={today} now={nowTick} selectedDay={selectedDay} onSelectDay={setSelectedDay} eventsByDay={eventsByDay} onOpen={openDetail} />
         )}
         {view === "day" && (
-          <TimeGrid days={[selectedDate]} today={today} now={nowTick} selectedDay={selectedDay} onSelectDay={setSelectedDay} eventsByDay={eventsByDay} />
+          <TimeGrid days={[selectedDate]} today={today} now={nowTick} selectedDay={selectedDay} onSelectDay={setSelectedDay} eventsByDay={eventsByDay} onOpen={openDetail} />
+        )}
+        {view === "agenda" && (
+          <AgendaView appointments={filtered} onOpen={openDetail} />
         )}
 
-        {/* ── Improved side card ── */}
-        <Card className="min-h-0 overflow-y-auto p-3">
-          <div className="mb-3 flex items-center gap-2">
-            <CalendarIcon className="h-4 w-4 text-muted-foreground" />
-            <h3 className="text-sm font-semibold">
-              {parseYmd(selectedDay).toLocaleDateString("default", { weekday: "long", month: "short", day: "numeric" })}
-            </h3>
-            <span className="ml-auto text-[11px] text-muted-foreground">
-              {selectedEvents.length === 0 ? "No events" : `${selectedEvents.length} event${selectedEvents.length !== 1 ? "s" : ""}`}
-            </span>
-          </div>
-
-          {selectedEvents.length === 0 ? (
-            <div className="flex flex-col items-center gap-2 py-10 text-center">
-              <CalendarIcon className="h-7 w-7 text-muted-foreground/40" />
-              <p className="text-xs text-muted-foreground">No appointments scheduled</p>
-              <Button size="sm" variant="outline" className="mt-1 h-7 text-xs">
-                <Plus className="h-3 w-3" /> New Event
-              </Button>
+        {/* Side card — day detail (Month/Week/Day views only; Agenda already shows everything) */}
+        {view !== "agenda" && (
+          <Card className="min-h-0 overflow-y-auto p-3">
+            <div className="mb-3 flex items-center gap-2">
+              <CalendarIcon className="h-4 w-4 text-muted-foreground" />
+              <h3 className="text-sm font-semibold">
+                {parseYmd(selectedDay).toLocaleDateString("default", { weekday: "long", month: "short", day: "numeric" })}
+              </h3>
+              <span className="ml-auto text-[11px] text-muted-foreground">
+                {selectedEvents.length === 0 ? "No events" : `${selectedEvents.length} event${selectedEvents.length !== 1 ? "s" : ""}`}
+              </span>
             </div>
-          ) : (
-            <div className="space-y-3">
-              {selectedEvents.map((e) => (
-                <AppointmentCard key={e.id} event={e} />
-              ))}
-            </div>
-          )}
-        </Card>
-      </div>
-    </div>
-  );
-}
 
-// ── Appointment card (side panel) ──
-
-function AppointmentCard({ event: e }: { event: CalEvent }) {
-  const [editing, setEditing] = useState(false);
-  const [notes, setNotes] = useState(e.notes ?? "");
-  const [saving, setSaving] = useState(false);
-
-  const handleSaveNotes = async () => {
-    setSaving(true);
-    const { error } = await supabase
-      .from("appointments")
-      .update({ notes, updated_at: new Date().toISOString() })
-      .eq("id", e.id);
-    setSaving(false);
-    if (error) { toast.error("Failed to save notes"); return; }
-    toast.success("Notes saved");
-    setEditing(false);
-  };
-
-  return (
-    <div className="rounded-lg border border-border bg-background p-3 space-y-2.5">
-      {/* Header */}
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0 flex-1">
-          <div className="text-xs font-semibold leading-snug">{e.contactName}</div>
-          <div className="mt-0.5 text-[11px] text-muted-foreground">{e.title.split(" — ")[0]}</div>
-        </div>
-        <Badge variant="secondary" className={cn("h-5 shrink-0 rounded border px-1.5 text-[10px]", TYPE_STYLES[e.type])}>
-          {TYPE_LABEL[e.type]}
-        </Badge>
-      </div>
-
-      {/* Time */}
-      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-        <Clock className="h-3 w-3" />
-        <span className="font-medium tabular-nums text-foreground">{e.start}–{e.end}</span>
-        <span>·</span>
-        <span className="capitalize">{e.source === "voice-ai" ? "Voice AI" : e.source}</span>
-      </div>
-
-      {/* Contact details */}
-      <div className="space-y-1.5 border-t border-border pt-2">
-        {e.contactPhone && (
-          <a href={`tel:${e.contactPhone}`} className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground transition-colors">
-            <Phone className="h-3 w-3 shrink-0" />
-            <span>{e.contactPhone}</span>
-          </a>
-        )}
-        {e.contactEmail && (
-          <a href={`mailto:${e.contactEmail}`} className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground transition-colors">
-            <Mail className="h-3 w-3 shrink-0" />
-            <span className="truncate">{e.contactEmail}</span>
-          </a>
-        )}
-        {e.address && (
-          <a
-            href={`https://maps.google.com/?q=${encodeURIComponent(e.address)}`}
-            target="_blank" rel="noopener noreferrer"
-            className="flex items-start gap-1.5 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
-          >
-            <MapPin className="h-3 w-3 mt-0.5 shrink-0" />
-            <span className="line-clamp-2">{e.address}</span>
-          </a>
-        )}
-        {e.budget && (
-          <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-            <DollarSign className="h-3 w-3 shrink-0" />
-            <span>Budget: <span className="text-foreground font-medium">{e.budget}</span></span>
-          </div>
-        )}
-
-        {/* Notes — inline edit */}
-        <div className="flex items-start gap-1.5 text-[11px] text-muted-foreground">
-          <StickyNote className="h-3 w-3 mt-0.5 shrink-0" />
-          {editing ? (
-            <div className="flex-1 space-y-1.5">
-              <textarea
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                rows={3}
-                className="w-full rounded border border-border bg-background px-2 py-1 text-[11px] text-foreground resize-none focus:outline-none focus:ring-1 focus:ring-ring"
-              />
-              <div className="flex gap-1.5">
-                <Button size="sm" className="h-6 text-[10px]" onClick={handleSaveNotes} disabled={saving}>
-                  {saving ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : "Save"}
-                </Button>
-                <Button size="sm" variant="ghost" className="h-6 text-[10px]" onClick={() => { setNotes(e.notes ?? ""); setEditing(false); }}>
-                  Cancel
+            {selectedEvents.length === 0 ? (
+              <div className="flex flex-col items-center gap-2 py-10 text-center">
+                <CalendarIcon className="h-7 w-7 text-muted-foreground/40" />
+                <p className="text-xs text-muted-foreground">No appointments scheduled</p>
+                <Button size="sm" variant="outline" className="mt-1 h-7 text-xs" onClick={() => setCreateOpen(true)}>
+                  <Plus className="h-3 w-3" /> New appointment
                 </Button>
               </div>
-            </div>
-          ) : (
-            <span
-              className="line-clamp-2 cursor-pointer hover:text-foreground transition-colors"
-              onClick={() => setEditing(true)}
-            >
-              {notes || <span className="italic">Add notes…</span>}
-            </span>
-          )}
-        </div>
+            ) : (
+              <div className="space-y-3">
+                {selectedEvents.map((a) => (
+                  <AppointmentCard key={a.id} appointment={a} onOpen={() => openDetail(a.id)} />
+                ))}
+              </div>
+            )}
+          </Card>
+        )}
       </div>
 
-      {/* Action buttons */}
-      <div className="flex gap-1.5 border-t border-border pt-2">
-        {e.contactPhone && (
-          <a
-            href={`tel:${e.contactPhone}`}
-            className="flex-1 inline-flex h-7 items-center justify-center gap-1 rounded-md border border-input bg-background px-2 text-[11px] font-medium hover:bg-accent transition-colors"
-          >
-            <Phone className="h-3 w-3" /> Call
-          </a>
-        )}
-        {e.contactEmail && (
-          <a
-            href={`mailto:${e.contactEmail}`}
-            className="flex-1 inline-flex h-7 items-center justify-center gap-1 rounded-md border border-input bg-background px-2 text-[11px] font-medium hover:bg-accent transition-colors"
-          >
-            <Mail className="h-3 w-3" /> Email
-          </a>
-        )}
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-7 px-2"
-          onClick={() => setEditing(!editing)}
-        >
-          <Pencil className="h-3 w-3" />
-        </Button>
-      </div>
+      <AppointmentDialog open={createOpen} onOpenChange={setCreateOpen} onSaved={handleSaved} />
+      <AppointmentDialog
+        open={!!editingAppointment}
+        onOpenChange={(o) => { if (!o) setEditingAppointment(null); }}
+        appointment={editingAppointment}
+        onSaved={handleSaved}
+      />
+      <AppointmentDetailSheet
+        open={!!detailId}
+        onOpenChange={(o) => { if (!o) setDetailId(null); }}
+        appointmentId={detailId}
+        onEdit={() => detailId && void openEdit(detailId)}
+        onChanged={handleSaved}
+      />
     </div>
   );
 }
 
-// ── Time grid ──
+// ── KPI card ──
+
+function KpiCard({ label, value, icon: Icon, tint }: { label: string; value: number; icon: typeof CalendarIcon; tint: string }) {
+  return (
+    <Card className="flex items-center gap-2.5 p-2.5">
+      <div className={cn("grid h-8 w-8 shrink-0 place-items-center rounded-lg", tint)}>
+        <Icon className="h-4 w-4" />
+      </div>
+      <div className="min-w-0">
+        <div className="text-lg font-semibold leading-tight">{value}</div>
+        <div className="truncate text-[10px] font-medium uppercase tracking-wide text-muted-foreground">{label}</div>
+      </div>
+    </Card>
+  );
+}
+
+// ── appointment side card ──
+
+function AppointmentCard({ appointment: a, onOpen }: { appointment: Appointment; onOpen: () => void }) {
+  const TypeIcon = APPOINTMENT_TYPE_ICONS[a.appointmentType];
+  const tint = APPOINTMENT_STATUS_TINT[a.status];
+  return (
+    <button onClick={onOpen} className="w-full rounded-lg border border-border bg-background p-3 text-left space-y-2 hover:bg-secondary/30 transition-colors">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0 flex-1">
+          <div className="text-xs font-semibold leading-snug">{a.contactName || a.title}</div>
+          <div className="mt-0.5 flex items-center gap-1 text-[11px] text-muted-foreground">
+            <TypeIcon className="h-3 w-3" /> {APPOINTMENT_TYPE_LABELS[a.appointmentType]}
+          </div>
+        </div>
+        <Badge variant="outline" className={cn("h-5 shrink-0 rounded border px-1.5 text-[10px]", tint.badge)}>
+          {APPOINTMENT_STATUS_LABELS[a.status]}
+        </Badge>
+      </div>
+      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+        <Clock className="h-3 w-3" />
+        <span className="font-medium tabular-nums text-foreground">{apptTimeLabel(a.scheduledAt, a.timeZone)}–{apptTimeLabel(a.endsAt, a.timeZone)}</span>
+        {a.assigneeName && <><span>·</span><span className="truncate">{a.assigneeName}</span></>}
+      </div>
+    </button>
+  );
+}
+
+// ── time grid (Week/Day) ──
 
 const HOUR_PX = 44;
 const HOURS = Array.from({ length: 24 }, (_, i) => i);
 
 function TimeGrid({
-  days, today, now, selectedDay, onSelectDay, eventsByDay,
+  days, today, now, selectedDay, onSelectDay, eventsByDay, onOpen,
 }: {
   days: Date[]; today: Date; now: Date | null;
   selectedDay: string; onSelectDay: (d: string) => void;
-  eventsByDay: Map<string, CalEvent[]>;
+  eventsByDay: Map<string, Appointment[]>;
+  onOpen: (id: string) => void;
 }) {
   const todayKey = ymd(today);
   const nowMinutes = now ? now.getHours() * 60 + now.getMinutes() : null;
@@ -615,29 +501,27 @@ function TimeGrid({
           </div>
           {days.map((d) => {
             const key = ymd(d);
-            const dayEvents = (eventsByDay.get(key) ?? []).slice().sort((a, b) => a.start.localeCompare(b.start));
+            const dayEvents = (eventsByDay.get(key) ?? []).slice().sort((a, b) => a.scheduledAt.localeCompare(b.scheduledAt));
             const showNow = nowMinutes !== null && key === todayKey;
             return (
               <div key={key} className="relative border-l border-border" style={{ height: HOUR_PX * 24 }}>
                 {HOURS.map((h) => (<div key={h} className="absolute inset-x-0 border-t border-border/60" style={{ top: h * HOUR_PX }} />))}
-                {dayEvents.map((e) => {
-                  const startMin = toMinutes(e.start);
-                  const endMin = Math.max(toMinutes(e.end), startMin + 30);
+                {dayEvents.map((a) => {
+                  const startMin = apptMinutes(a.scheduledAt, a.timeZone);
+                  const endMin = Math.max(apptMinutes(a.endsAt, a.timeZone), startMin + 30);
                   const top = (startMin / 60) * HOUR_PX;
                   const height = ((endMin - startMin) / 60) * HOUR_PX - 2;
                   return (
-                    <Popover key={e.id}>
-                      <PopoverTrigger asChild>
-                        <button type="button"
-                          className={cn("absolute left-1 right-1 cursor-pointer overflow-hidden rounded border px-1.5 py-1 text-left text-[10px] shadow-sm transition-shadow hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40", TYPE_STYLES[e.type])}
-                          style={{ top, height }}
-                        >
-                          <div className="truncate font-semibold">{e.contactName}</div>
-                          <div className="truncate opacity-80">{e.start}–{e.end} · {e.title.split(" — ")[0]}</div>
-                        </button>
-                      </PopoverTrigger>
-                      <EventDetailPopover event={e} />
-                    </Popover>
+                    <button
+                      key={a.id}
+                      type="button"
+                      onClick={() => onOpen(a.id)}
+                      className={cn("absolute left-1 right-1 cursor-pointer overflow-hidden rounded border px-1.5 py-1 text-left text-[10px] shadow-sm transition-shadow hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40", APPOINTMENT_STATUS_TINT[a.status].chip)}
+                      style={{ top, height }}
+                    >
+                      <div className="truncate font-semibold">{a.contactName || a.title}</div>
+                      <div className="truncate opacity-80">{apptTimeLabel(a.scheduledAt, a.timeZone)}–{apptTimeLabel(a.endsAt, a.timeZone)} · {a.title}</div>
+                    </button>
                   );
                 })}
                 {showNow && (
@@ -656,49 +540,61 @@ function TimeGrid({
   );
 }
 
-// ── Event detail popover (hover on time grid) ──
+// ── agenda view ──
 
-function EventDetailPopover({ event: e }: { event: CalEvent }) {
+function AgendaView({ appointments, onOpen }: { appointments: Appointment[]; onOpen: (id: string) => void }) {
+  const grouped = useMemo(() => {
+    const m = new Map<string, Appointment[]>();
+    appointments.forEach((a) => { const key = apptDateKey(a); const arr = m.get(key) ?? []; arr.push(a); m.set(key, arr); });
+    return Array.from(m.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, rows]) => [date, rows.sort((a, b) => a.scheduledAt.localeCompare(b.scheduledAt))] as const);
+  }, [appointments]);
+
+  if (grouped.length === 0) {
+    return (
+      <Card className="flex flex-col items-center justify-center gap-2 p-10 text-center">
+        <CalendarIcon className="h-7 w-7 text-muted-foreground/40" />
+        <p className="text-xs text-muted-foreground">No appointments scheduled</p>
+      </Card>
+    );
+  }
+
   return (
-    <PopoverContent align="start" side="right" className="w-72 p-0">
-      <div className={cn("border-b px-3 py-2", TYPE_STYLES[e.type])}>
-        <div className="flex items-start justify-between gap-2">
-          <div>
-            <h4 className="text-sm font-semibold leading-tight">{e.contactName}</h4>
-            <p className="text-[11px] opacity-80">{e.title.split(" — ")[0]}</p>
+    <Card className="min-h-0 overflow-y-auto p-0">
+      <div className="divide-y divide-border">
+        {grouped.map(([date, rows]) => (
+          <div key={date} className="p-3">
+            <h4 className="mb-2 text-xs font-semibold text-muted-foreground">
+              {parseYmd(date).toLocaleDateString("default", { weekday: "long", month: "short", day: "numeric" })}
+            </h4>
+            <div className="space-y-1.5">
+              {rows.map((a) => {
+                const TypeIcon = APPOINTMENT_TYPE_ICONS[a.appointmentType];
+                const tint = APPOINTMENT_STATUS_TINT[a.status];
+                return (
+                  <button
+                    key={a.id}
+                    onClick={() => onOpen(a.id)}
+                    className="flex w-full items-center gap-3 rounded-md border border-border p-2 text-left hover:bg-secondary/30 transition-colors"
+                  >
+                    <span className="w-16 shrink-0 text-[11px] font-medium tabular-nums text-muted-foreground">
+                      {apptTimeLabel(a.scheduledAt, a.timeZone)}–{apptTimeLabel(a.endsAt, a.timeZone)}
+                    </span>
+                    <TypeIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    <span className="min-w-0 flex-1 truncate text-xs font-medium">{a.title}</span>
+                    {a.assigneeName && <span className="hidden shrink-0 truncate text-[11px] text-muted-foreground sm:inline">{a.assigneeName}</span>}
+                    {a.address && <span className="hidden shrink-0 max-w-[160px] truncate text-[11px] text-muted-foreground md:inline">{a.address}</span>}
+                    <Badge variant="outline" className={cn("h-5 shrink-0 rounded border px-1.5 text-[10px]", tint.badge)}>
+                      {APPOINTMENT_STATUS_LABELS[a.status]}
+                    </Badge>
+                  </button>
+                );
+              })}
+            </div>
           </div>
-          <Badge variant="secondary" className="h-5 shrink-0 rounded border px-1.5 text-[10px]">
-            {TYPE_LABEL[e.type]}
-          </Badge>
-        </div>
+        ))}
       </div>
-      <div className="space-y-2 px-3 py-2.5 text-xs">
-        <div className="flex items-center gap-2 text-muted-foreground">
-          <Clock className="h-3.5 w-3.5" />
-          <span className="tabular-nums">{e.start}–{e.end}</span>
-          <span className="ml-auto text-[10px] capitalize">{e.source === "voice-ai" ? "Voice AI" : e.source}</span>
-        </div>
-        {e.contactPhone && (
-          <div className="flex items-center gap-2"><Phone className="h-3.5 w-3.5 text-muted-foreground" /><a href={`tel:${e.contactPhone}`} className="hover:underline">{e.contactPhone}</a></div>
-        )}
-        {e.contactEmail && (
-          <div className="flex items-center gap-2"><Mail className="h-3.5 w-3.5 text-muted-foreground" /><a href={`mailto:${e.contactEmail}`} className="hover:underline truncate">{e.contactEmail}</a></div>
-        )}
-        {e.address && (
-          <div className="flex items-start gap-2"><MapPin className="h-3.5 w-3.5 mt-0.5 text-muted-foreground" /><a href={`https://maps.google.com/?q=${encodeURIComponent(e.address)}`} target="_blank" rel="noopener noreferrer" className="hover:underline line-clamp-2">{e.address}</a></div>
-        )}
-        {e.budget && (
-          <div className="flex items-center gap-2"><DollarSign className="h-3.5 w-3.5 text-muted-foreground" /><span>Budget: {e.budget}</span></div>
-        )}
-      </div>
-      <div className="flex items-center gap-1 border-t border-border p-1.5">
-        <Button variant="ghost" size="sm" className="h-7 flex-1 text-xs" onClick={() => toast.info(`Edit "${e.title}" — coming soon`)}>
-          <Pencil className="h-3 w-3" /> Edit
-        </Button>
-        <Button variant="ghost" size="sm" className="h-7 flex-1 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive" onClick={() => toast.success("Event deleted", { description: e.title })}>
-          <Trash2 className="h-3 w-3" /> Delete
-        </Button>
-      </div>
-    </PopoverContent>
+    </Card>
   );
 }

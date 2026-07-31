@@ -286,6 +286,68 @@ function ConfigFields({
     );
   }
 
+  if (nodeType === "create_appointment") {
+    return (
+      <>
+        <Field label="Appointment title">
+          <Input value={cfg.title ?? ""} onChange={(e) => setConfig({ title: e.target.value })} placeholder="e.g. Consultation with {contact.first_name}" className="h-8 text-sm" />
+          <TokenBar onInsert={(t) => setConfig({ title: (cfg.title ?? "") + t })} />
+        </Field>
+        <Field label="Type">
+          <Select value={cfg.appointment_type ?? "consultation"} onChange={(v) => setConfig({ appointment_type: v })}
+            options={[
+              { value: "consultation", label: "Consultation" }, { value: "estimate", label: "Estimate" },
+              { value: "site_visit", label: "Site Visit" }, { value: "service", label: "Service" },
+              { value: "follow_up", label: "Follow Up" }, { value: "internal", label: "Internal" }, { value: "other", label: "Other" },
+            ]}
+          />
+        </Field>
+        <Field label="Assign to">
+          <Select
+            value={cfg.assignee ?? "unassigned"}
+            onChange={(v) => setConfig({ assignee: v, member_id: "", member_name: "" })}
+            options={[
+              { value: "unassigned", label: "Unassigned" },
+              { value: "specific", label: "Specific team member" },
+            ]}
+          />
+          {cfg.assignee === "specific" && (
+            activeMembers.length === 0 ? (
+              <p className="mt-1.5 text-[10px] text-amber-600">No active team members found. Add members in Settings → Team.</p>
+            ) : (
+              <select
+                value={cfg.member_id ?? ""}
+                onChange={(e) => {
+                  const m = activeMembers.find((m) => m.id === e.target.value);
+                  setConfig({ member_id: e.target.value, member_name: m?.name ?? "" });
+                }}
+                className="mt-1.5 flex h-8 w-full rounded-md border border-input bg-background px-2.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+              >
+                <option value="">Select a team member…</option>
+                {activeMembers.map((m) => (
+                  <option key={m.id} value={m.id}>{m.name} · {ROLE_LABELS[m.role] ?? m.role}</option>
+                ))}
+              </select>
+            )
+          )}
+        </Field>
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="Starts in">
+            <Input type="number" min={0} value={cfg.start_in ?? 1} onChange={(e) => setConfig({ start_in: Number(e.target.value) })} className="h-8 text-sm" />
+          </Field>
+          <Field label="Unit">
+            <Select value={cfg.start_unit ?? "days"} onChange={(v) => setConfig({ start_unit: v })}
+              options={[{ value: "hours", label: "hours" }, { value: "days", label: "days" }, { value: "weeks", label: "weeks" }]}
+            />
+          </Field>
+        </div>
+        <Field label="Duration (minutes)">
+          <Input type="number" min={15} step={15} value={cfg.duration_min ?? 60} onChange={(e) => setConfig({ duration_min: Number(e.target.value) })} className="h-8 text-sm" />
+        </Field>
+      </>
+    );
+  }
+
   if (nodeType === "update_status") {
     return (
       <>
@@ -581,6 +643,7 @@ function buildSubtitle(nodeType: WfNodeType, cfg: Record<string, any>): string {
     case "send_sms": return `To: ${cfg.to === "custom" ? cfg.custom_phone || "?" : "contact phone"}`;
     case "send_email": return cfg.subject ? `"${cfg.subject}"` : `To: ${cfg.to === "custom" ? cfg.custom_email || "?" : "contact email"}`;
     case "create_task": return cfg.title || "Follow up with contact";
+    case "create_appointment": return cfg.title || "Consultation with contact";
     case "update_status": return `${cfg.entity ?? "lead"} ${cfg.field ?? "status"} → ${cfg.value || "?"}`;
     case "assign_member": return cfg.strategy === "round_robin" ? "Round-robin" : (cfg.member_name || "Select member");
     case "send_portal_invite": return cfg.send_to === "custom" ? (cfg.custom_email || "Custom email") : "To contact email";

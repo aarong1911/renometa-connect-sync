@@ -37,7 +37,7 @@ import {
   Plus, Search, SlidersHorizontal, Mail, Phone, MoreHorizontal, Download, Upload,
   Users, UserPlus, Star, Activity, CalendarClock, Loader2, Pencil, Trash2, Save, X,
   GitMerge, CheckCircle2, AlertTriangle, ArrowRight, Briefcase, FileText as FileTextIcon,
-  Building2, ExternalLink, MessageCircle,
+  Building2, ExternalLink, MessageCircle, CalendarPlus,
 } from "lucide-react";
 import {
   Mail as MailIcon, Phone as PhoneIcon, MessageSquare, FileText, StickyNote,
@@ -58,7 +58,6 @@ import { TagPicker } from "@/components/contacts/tag-picker";
 import { contactSourceLabel, contactSourceComparisonKey } from "@/lib/lead-source";
 import { normalizeEmail, normalizePhoneForComparison, findDuplicateContactCandidates, type ContactDuplicateCandidate } from "@/lib/identity-normalization";
 import { useCompanies } from "@/lib/companies-store";
-import { useTopbarAction } from "@/lib/topbar-action";
 import { refreshDeals } from "@/lib/deals-store";
 import { AddressAutocomplete } from "@/components/ui/address-autocomplete";
 import { formatPhone } from "@/lib/format";
@@ -73,6 +72,7 @@ import {
 import { CSV_MAX_SYNC_IMPORT_ROWS, CSV_WARN_ROW_THRESHOLD } from "@/lib/csv-utils";
 import { createImportJob, logImportRows, completeImportJob, prefetchContactIdentitySets } from "@/lib/import-jobs-store";
 import { ImportHistoryDialog } from "@/components/crm/import-history-dialog";
+import { AppointmentDialog } from "@/components/calendar/appointment-dialog";
 import { History } from "lucide-react";
 import { ensureCompanyContactAssociation } from "@/lib/companies-store";
 import { toast } from "sonner";
@@ -774,12 +774,6 @@ function ContactsPage() {
     toast.success("Bulk delete complete", { description: parts.join(" · ") });
   }
 
-  useTopbarAction(
-    <Button size="sm" onClick={() => setNewOpen(true)}>
-      <Plus className="mr-1.5 h-3.5 w-3.5" /> Add Contact
-    </Button>,
-  );
-
   return (
     <>
       <PageHeader
@@ -789,7 +783,7 @@ function ContactsPage() {
         title="Contacts"
         subtitle="People and homeowners across all your projects."
         actions={
-          <>
+          <div className="flex items-center gap-2">
             <Button variant="outline" size="sm" onClick={() => setDupeOpen(true)}>
               <GitMerge className="mr-1.5 h-3.5 w-3.5" /> Find Duplicates
             </Button>
@@ -805,7 +799,10 @@ function ContactsPage() {
             <Button variant="outline" size="sm" onClick={() => setHistoryOpen(true)}>
               <History className="mr-1.5 h-3.5 w-3.5" /> Import History
             </Button>
-          </>
+            <Button size="sm" onClick={() => setNewOpen(true)}>
+              <Plus className="mr-1.5 h-3.5 w-3.5" /> Add Contact
+            </Button>
+          </div>
         }
       />
       <ImportHistoryDialog
@@ -1445,6 +1442,7 @@ function ContactDrawer({
   const [editing, setEditing] = useState(false);
   const [editForm, setEditForm] = useState(BLANK_FORM);
   const [saving, setSaving] = useState(false);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
 
   // Duplicate check on save (Priority 1) — only re-runs when email/phone
   // actually changed from the contact's current stored values, excluding
@@ -1612,7 +1610,26 @@ function ContactDrawer({
                   + New Deal
                 </Button>
               </div>
+              <Button size="sm" variant="outline" className="w-full" onClick={() => setScheduleOpen(true)}>
+                <CalendarPlus className="mr-1.5 h-3.5 w-3.5" /> Schedule Appointment
+              </Button>
             </SheetHeader>
+
+            <AppointmentDialog
+              open={scheduleOpen}
+              onOpenChange={setScheduleOpen}
+              prefill={{
+                entityType: "contact",
+                entityId: contact.id,
+                entityLabel: contact.name,
+                contactName: contact.name,
+                contactPhone: contact.phone,
+                contactEmail: contact.email,
+                address: contact.address || undefined,
+                source: "contact",
+              }}
+              onSaved={() => toast.success("Appointment scheduled")}
+            />
 
             <Tabs defaultValue="overview" className="mt-4">
               <TabsList className="h-auto w-full flex-wrap justify-start gap-2 bg-transparent p-0">
@@ -1833,7 +1850,13 @@ function ContactDrawer({
               </TabsContent>
 
               <TabsContent value="related" className="mt-4">
-                <ContactRelatedTab contactId={contact.id} />
+                <ContactRelatedTab
+                  contactId={contact.id}
+                  contactName={contact.name}
+                  contactPhone={contact.phone}
+                  contactEmail={contact.email}
+                  contactAddress={contact.address}
+                />
               </TabsContent>
 
               <TabsContent value="notes" className="mt-4">

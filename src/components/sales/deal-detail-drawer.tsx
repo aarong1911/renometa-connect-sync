@@ -43,6 +43,7 @@ import { Input } from "@/components/ui/input";
 import { AddressAutocomplete } from "@/components/ui/address-autocomplete";
 import { Label } from "@/components/ui/label";
 import { EntityTasksPanel } from "@/components/tasks/entity-tasks-panel";
+import { EntityAppointmentsPanel } from "@/components/appointments/entity-appointments-panel";
 import {
   Select,
   SelectContent,
@@ -1459,6 +1460,7 @@ export function DealDetailDrawer({
                 ["contacts", "Contacts"],
                 ["estimate", "Estimate"],
                 ["tasks", "Tasks"],
+                ["appointments", "Appointments"],
                 ["notes", "Notes"],
                 ["files", "Files"],
               ].map(([value, label]) => (
@@ -1880,6 +1882,18 @@ export function DealDetailDrawer({
 
             <TabsContent value="tasks" className="mt-5">
               <EntityTasksPanel entityType="deal" entityId={deal.id} entityLabel="deal" />
+            </TabsContent>
+
+            <TabsContent value="appointments" className="mt-5">
+              <EntityAppointmentsPanel
+                entityType="deal"
+                entityId={deal.id}
+                entityLabel="deal"
+                contactName={deal.contactName || undefined}
+                contactPhone={deal.phone || undefined}
+                contactEmail={deal.email || undefined}
+                address={deal.projectAddress || deal.address || undefined}
+              />
             </TabsContent>
 
             <TabsContent value="notes" className="mt-5">

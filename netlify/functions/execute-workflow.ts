@@ -3,6 +3,7 @@ import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import nodemailer from "nodemailer";
 import { createServerTask, type ServerTaskPriority } from "../lib/tasks";
+import { createServerAppointment, type ServerAppointmentType } from "../lib/appointments";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -241,6 +242,48 @@ async function executeNode(
         entityId: leadId ?? null,
       });
       return { ctxPatch: { createdTaskId: taskId } };
+    }
+
+    case "create_appointment": {
+      // Phase 10.3 — routed through the shared createServerAppointment()
+      // helper (netlify/lib/appointments.ts), the same "validate, insert,
+      // throw" contract create_task above already uses via
+      // createServerTask() — no second independent appointment-insert
+      // implementation for workflows.
+      const unitMs: Record<string, number> = { minutes: 60_000, hours: 3_600_000, days: 86_400_000, weeks: 604_800_000 };
+      const startMs = ((config.start_in ?? 0) as number) * (unitMs[config.start_unit ?? "hours"] ?? 3_600_000);
+      const durationMin = (config.duration_min as number) || 60;
+      const scheduledAt = new Date(Date.now() + startMs);
+      const endsAt = new Date(scheduledAt.getTime() + durationMin * 60_000);
+
+      const { data: orgRow } = await supabaseAdmin.from("organizations").select("timezone").eq("id", orgId).maybeSingle();
+
+      const leadId = ctx.lead?.id ?? ctx.triggerData?.lead_id ?? null;
+      const projectId = ctx.project?.id ?? ctx.triggerData?.project_id ?? null;
+      const contactId = ctx.contact?.id ?? null;
+
+      try {
+        const { appointmentId } = await createServerAppointment(supabaseAdmin, {
+          orgId,
+          title: interpolate(config.title ?? "Workflow appointment", ctx),
+          appointmentType: (config.appointment_type as ServerAppointmentType) || "consultation",
+          source: "workflow",
+          scheduledAt: scheduledAt.toISOString(),
+          endsAt: endsAt.toISOString(),
+          timeZone: orgRow?.timezone || "America/New_York",
+          assignedTo: config.assignee === "specific" ? (config.member_id || null) : null,
+          entityType: leadId ? "lead" : projectId ? "project" : contactId ? "contact" : null,
+          entityId: leadId ?? projectId ?? contactId ?? null,
+          contactId,
+          contactName: ctx.contact?.first_name ? `${ctx.contact.first_name} ${ctx.contact.last_name ?? ""}`.trim() : null,
+          contactPhone: ctx.contact?.phone ?? null,
+          contactEmail: ctx.contact?.email ?? null,
+        });
+        return { ctxPatch: { createdAppointmentId: appointmentId } };
+      } catch (err: any) {
+        console.error("[execute-workflow] create_appointment failed:", err?.message ?? err);
+        return { failed: true };
+      }
     }
 
     case "assign_member": {

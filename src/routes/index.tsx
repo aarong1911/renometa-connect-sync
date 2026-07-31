@@ -7,8 +7,10 @@ import {
   Plus, FileText, CheckSquare, Contact as ContactIcon,
   Sparkles, UserPlus, DollarSign, Briefcase, CalendarDays, Zap, AlertTriangle,
   TrendingUp, Mail, ArrowRight, Clock, MessageCircle, Smartphone, Instagram,
-  Workflow, MessageSquareWarning, Megaphone,
+  Workflow, MessageSquareWarning, Megaphone, CalendarClock, MapPin, User,
+  LayoutDashboard,
 } from "lucide-react";
+import { PageHeader } from "@/components/layout/app-shell";
 import { supabase } from "@/lib/supabase";
 import { useOrganization } from "@/lib/organization";
 import { useTasks } from "@/lib/tasks-store";
@@ -28,6 +30,31 @@ import { NewDealDialog } from "@/components/sales/new-deal-dialog";
 import { normalizePipelineStage } from "@/lib/pipeline-phases";
 import { useBroadcasts } from "@/lib/broadcasts-store";
 import { computeEffectiveEstimateTotals } from "@/lib/estimate-totals";
+import {
+  APPOINTMENT_STATUS_LABELS, APPOINTMENT_STATUS_TINT,
+  type AppointmentStatus,
+} from "@/lib/appointment-status";
+
+// Recent Activity labels for appointment_activities.activity_type — the
+// same deterministic wording the trigger already writes into `summary`
+// (see log_appointment_activity() in the 20260807 migration), duplicated
+// here as a lookup rather than trusting `summary` directly so a future
+// summary wording tweak in the DB can't silently drift the dashboard's
+// copy without a matching intentional update here.
+const APPOINTMENT_ACTIVITY_LABELS: Record<string, string> = {
+  created: "Appointment scheduled",
+  rescheduled: "Appointment rescheduled",
+  confirmed: "Appointment confirmed",
+  started: "Appointment started",
+  completed: "Appointment completed",
+  reopened: "Appointment reopened",
+  cancelled: "Appointment cancelled",
+  restored: "Appointment restored",
+  marked_no_show: "Appointment marked No Show",
+  assigned: "Appointment assigned",
+  unassigned: "Appointment unassigned",
+  relationship_changed: "Appointment relationship changed",
+};
 
 export const Route = createFileRoute("/")({ component: DashboardPage });
 
@@ -471,9 +498,9 @@ function DashboardPage() {
   });
   const [sparklines, setSparklines] = useState<{ leads: number[]; revenue: number[]; bookings: number[]; pipeline: number[]; projects: number[] }>({ leads: [], revenue: [], bookings: [], pipeline: [], projects: [] });
   const [inboxTab, setInboxTab] = useState<"all" | "unread">("all");
-  const [activity, setActivity] = useState<{ id: string; who: string; t: string; s: string; when: string }[]>([]);
+  const [activity, setActivity] = useState<{ id: string; who: string; t: string; s: string; when: string; kind?: string }[]>([]);
   // Connected Gmail account identity + photo (see gmail-connection-status.ts)
-  // — used only so Inbox Preview can render the same real logo/photo the
+  // — used only so Recent Conversations can render the same real logo/photo the
   // Conversations page shows, via the shared GmailSenderAvatar component.
   const [gmailAccountEmail, setGmailAccountEmail] = useState<string | null>(null);
   const [gmailAccountPictureUrl, setGmailAccountPictureUrl] = useState<string | null>(null);
@@ -481,9 +508,15 @@ function DashboardPage() {
   // Estimates card — counted/summed client-side rather than issuing one
   // query per status.
   const [estimateRows, setEstimateRows] = useState<{ id: string; status: string; total: number; updated_at: string; valid_until: string | null; title: string; client_name: string | null }[]>([]);
-  // Real, future-only appointment rows for Today's Tasks' "Next Up" row —
-  // the one narrowly-bounded new query added for this correction pass.
-  const [upcomingAppointments, setUpcomingAppointments] = useState<{ id: string; scheduled_at: string; title: string }[]>([]);
+  // Dedicated "Next Booking" card (Phase 10.3 correction pass) — the
+  // single soonest non-terminal appointment. Deliberately its own card,
+  // never merged into Today's Tasks' nextUp candidates (see the nextUp
+  // memo below) — an appointment is not a task.
+  const [nextBooking, setNextBooking] = useState<{
+    id: string; scheduledAt: string; endsAt: string; durationMin: number;
+    title: string; contactName: string | null; status: string;
+    address: string | null; meetingUrl: string | null; assigneeName: string | null;
+  } | null>(null);
   // Real deal_activities rows (activity_type + occurred_at) — genuine
   // historical pipeline events (created/won/lost/stage_changed), not a
   // fabricated trend. Powers the Pipeline Pulse card.
@@ -536,7 +569,6 @@ function DashboardPage() {
   // removed standalone Upcoming card without restoring it as its own
   // card). Only genuinely future-dated, real data is considered:
   //   - task.due (real)
-  //   - appointment.scheduled_at (real, from the new bounded query above)
   //   - estimate.valid_until for a still-open (sent/viewed) estimate —
   //     deliberately NOT estimate.updated_at, which is a past timestamp and
   //     would be backwards to treat as a future "next up" item. A real
@@ -544,8 +576,14 @@ function DashboardPage() {
   //     ("follow up before this quote expires"). No project-milestone
   //     candidate exists — there is no milestone/date schema on `projects`
   //     to draw from honestly.
+  //
+  // Phase 10.3 correction pass: appointments were previously merged in
+  // here too ("Consultation — Aaron" rendering inside Today's Tasks), which
+  // is wrong — Today's Tasks must be task-only. Appointments now have
+  // their own dedicated "Next Booking" card (see nextBooking state/query
+  // above and the card below) instead.
   const nextUp = useMemo(() => {
-    type NextUpItem = { id: string; kind: "task" | "appointment" | "estimate"; title: string; at: string; href: string };
+    type NextUpItem = { id: string; kind: "task" | "estimate"; title: string; at: string; href: string };
     const now = Date.now();
     const candidates: NextUpItem[] = [];
 
@@ -553,10 +591,6 @@ function DashboardPage() {
       if (!isActiveStatus(t.status)) continue;
       const at = new Date(t.due).getTime();
       if (!isNaN(at) && at >= now) candidates.push({ id: `nu-task-${t.id}`, kind: "task", title: t.title, at: t.due, href: "/tasks" });
-    }
-    for (const a of upcomingAppointments) {
-      const at = new Date(a.scheduled_at).getTime();
-      if (!isNaN(at) && at >= now) candidates.push({ id: `nu-appt-${a.id}`, kind: "appointment", title: a.title, at: a.scheduled_at, href: ROUTES.CALENDAR });
     }
     for (const e of estimateRows) {
       if (e.status !== "sent" && e.status !== "viewed") continue;
@@ -568,7 +602,7 @@ function DashboardPage() {
     if (candidates.length === 0) return null;
     candidates.sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
     return candidates[0];
-  }, [allTasks, upcomingAppointments, estimateRows]);
+  }, [allTasks, estimateRows]);
 
   const pipelineDistribution = useMemo(() => {
     // The donut renders every visible sales phase, including Won. Its
@@ -738,8 +772,31 @@ function DashboardPage() {
       const now = new Date();
       const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
       const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString();
-      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
-      const todayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).toISOString();
+      // Bookings Today (Phase 10.3 correction pass) needs the organization's
+      // own "today", not the visiting browser's — a booking at 11pm org-
+      // local could otherwise be miscounted as tomorrow (or vice versa) if
+      // the two timezones disagree. Scoped to just this one KPI rather than
+      // reworking every other date boundary above (monthStart/todayStart),
+      // which power unrelated cards not reported as broken.
+      //
+      // Reads timezone directly from `organizations` here rather than the
+      // useOrganization() hook value in closure scope: this effect has an
+      // empty dependency array (fires once on mount) and would otherwise
+      // capture whichever `org.timezone` happened to be current at that
+      // exact render — often still the "America/Los_Angeles" store default,
+      // since org data loads asynchronously and may not have resolved yet.
+      const { data: orgTzRow } = await supabase.from("organizations").select("timezone").eq("id", orgId).maybeSingle();
+      const orgTimezone = orgTzRow?.timezone || "America/New_York";
+      const orgTzYmd = now.toLocaleDateString("en-CA", { timeZone: orgTimezone });
+      // Classic no-library timezone-offset trick: the same instant rendered
+      // as a wall-clock string in UTC vs. in the target zone, re-parsed as
+      // local browser time — the difference is how far the zone sits from
+      // UTC at `now` (DST-aware since it uses `now`, not a fixed offset).
+      const orgTzOffsetMs =
+        new Date(now.toLocaleString("en-US", { timeZone: "UTC" })).getTime() -
+        new Date(now.toLocaleString("en-US", { timeZone: orgTimezone })).getTime();
+      const orgTodayStart = new Date(new Date(`${orgTzYmd}T00:00:00Z`).getTime() + orgTzOffsetMs).toISOString();
+      const orgTodayEnd = new Date(new Date(orgTodayStart).getTime() + 86_400_000).toISOString();
       const sparkStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (SPARK_DAYS - 1)).toISOString();
       const pulseStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (PULSE_DAYS - 1)).toISOString();
 
@@ -759,7 +816,8 @@ function DashboardPage() {
         { data: dealActivityPulseRows },
         { count: voiceCallsPulseCount },
         { data: leadSourceRows },
-        { data: upcomingApptRows },
+        { data: nextBookingRows },
+        { data: apptActivityRows },
       ] = await Promise.all([
         supabase.from("projects").select("*", { count: "exact", head: true }).eq("org_id", orgId).in("status", ["planning","contracted","pre-construction","active","punch-list"]),
         supabase.from("projects").select("*", { count: "exact", head: true }).eq("org_id", orgId).in("status", ["planning","contracted","pre-construction","active","punch-list"]).lt("created_at", monthStart),
@@ -769,7 +827,13 @@ function DashboardPage() {
         supabase.from("deals").select("value").eq("org_id", orgId).eq("status", "open").lt("created_at", monthStart),
         supabase.from("invoices").select("total_amount").eq("org_id", orgId).eq("status", "paid").gte("created_at", monthStart),
         supabase.from("invoices").select("total_amount").eq("org_id", orgId).eq("status", "paid").gte("created_at", lastMonthStart).lt("created_at", monthStart),
-        supabase.from("appointments").select("*", { count: "exact", head: true }).eq("org_id", orgId).neq("status", "cancelled").gte("scheduled_at", todayStart).lt("scheduled_at", todayEnd),
+        // BOOKINGS TODAY = every appointment scheduled for today (organization
+        // timezone) except cancelled/no_show — a no-show never happened, so
+        // it doesn't belong in a same-day booking count any more than a
+        // cancellation does. Completed appointments still count (they DID
+        // occur today), matching "every appointment scheduled for today
+        // except cancelled/no_show" rather than an "upcoming only" reading.
+        supabase.from("appointments").select("*", { count: "exact", head: true }).eq("org_id", orgId).not("status", "in", "(cancelled,no_show)").gte("scheduled_at", orgTodayStart).lt("scheduled_at", orgTodayEnd),
         supabase.from("leads").select("created_at").eq("org_id", orgId).gte("created_at", sparkStart),
         supabase.from("invoices").select("created_at, total_amount").eq("org_id", orgId).eq("status", "paid").gte("created_at", sparkStart),
         supabase.from("appointments").select("scheduled_at").eq("org_id", orgId).neq("status", "cancelled").gte("scheduled_at", sparkStart),
@@ -811,11 +875,29 @@ function DashboardPage() {
         // values only, grouped client-side (no existing aggregation for
         // this anywhere in the app). Bounded to a reasonable page size.
         supabase.from("leads").select("source").eq("org_id", orgId).limit(1000),
-        // Today's Tasks "Next Up" row — the one narrowly-bounded new query
-        // for this correction pass (see nextUp memo below). Future
-        // appointments only, soonest first, small cap since only the single
-        // soonest item across all candidate types is ever shown.
-        supabase.from("appointments").select("id, scheduled_at, contact_name, service").eq("org_id", orgId).neq("status", "cancelled").gte("scheduled_at", now.toISOString()).order("scheduled_at", { ascending: true }).limit(5),
+        // Next Booking card (Phase 10.3 correction pass) — the single
+        // soonest non-terminal appointment, with the full detail set the
+        // dedicated card needs (assignee, location/meeting link, duration).
+        // Excludes every terminal status (cancelled/completed/no_show), not
+        // just cancelled — a completed or no-show appointment is not a real
+        // "next booking" even if its scheduled_at is still technically in
+        // the future relative to when it was marked done.
+        supabase.from("appointments")
+          .select("id, scheduled_at, ends_at, duration_min, title, contact_name, service, status, address, meeting_url, assigned_to, assignee:profiles!appointments_assigned_to_fkey(first_name,last_name)")
+          .eq("org_id", orgId)
+          .not("status", "in", "(cancelled,completed,no_show)")
+          .gte("scheduled_at", now.toISOString())
+          .order("scheduled_at", { ascending: true })
+          .limit(1),
+        // Recent Activity — appointment lifecycle events, merged into the
+        // same feed as Task/Lead/Estimate/Invoice/Call events below. Reads
+        // from appointment_activities (Phase 10.3's trigger-owned audit
+        // trail), never from application-side guessing.
+        supabase.from("appointment_activities")
+          .select("id, appointment_id, activity_type, summary, actor_id, created_at, appointments!inner(title, service, contact_name, org_id)")
+          .eq("org_id", orgId)
+          .order("created_at", { ascending: false })
+          .limit(5),
       ]);
 
       const pipelineNow = (openDeals ?? []).reduce((s: number, d: any) => s + Number(d.value ?? 0), 0);
@@ -866,11 +948,28 @@ function DashboardPage() {
 
       setLeadSources((leadSourceRows ?? []).map((r: any) => r.source).filter(Boolean));
 
-      setUpcomingAppointments((upcomingApptRows ?? []).map((a: any) => ({
-        id: a.id,
-        scheduled_at: a.scheduled_at,
-        title: `${a.service || "Appointment"} — ${a.contact_name || "—"}`,
-      })));
+      {
+        const row = (nextBookingRows ?? [])[0] as any;
+        if (row) {
+          const assignee = row.assignee;
+          const assigneeName = assignee ? `${assignee.first_name ?? ""} ${assignee.last_name ?? ""}`.trim() : null;
+          const endsAt = row.ends_at ?? new Date(new Date(row.scheduled_at).getTime() + (row.duration_min ?? 60) * 60000).toISOString();
+          setNextBooking({
+            id: row.id,
+            scheduledAt: row.scheduled_at,
+            endsAt,
+            durationMin: row.duration_min ?? 60,
+            title: row.title || row.service || "Appointment",
+            contactName: row.contact_name ?? null,
+            status: row.status,
+            address: row.address ?? null,
+            meetingUrl: row.meeting_url ?? null,
+            assigneeName: assigneeName || null,
+          });
+        } else {
+          setNextBooking(null);
+        }
+      }
 
       const [{ data: recentLeads }, { data: recentCalls }, { data: recentInvoices }] = await Promise.all([
         supabase.from("leads").select("id, created_at, contacts!contact_id(full_name), source").eq("org_id", orgId).order("created_at", { ascending: false }).limit(3),
@@ -878,7 +977,7 @@ function DashboardPage() {
         supabase.from("invoices").select("id, created_at, total_amount, contacts!client_id(full_name)").eq("org_id", orgId).eq("status", "paid").order("created_at", { ascending: false }).limit(2),
       ]);
 
-      const items: { id: string; who: string; t: string; s: string; when: string; at: string }[] = [];
+      const items: { id: string; who: string; t: string; s: string; when: string; at: string; kind?: string }[] = [];
       for (const l of recentLeads ?? []) {
         const name = (l as any).contacts?.full_name ?? "Someone";
         items.push({ id: `l${l.id}`, who: name, t: "New lead submitted", s: `via ${(l as any).source ?? "website"}`, when: "", at: l.created_at });
@@ -902,6 +1001,20 @@ function DashboardPage() {
       }
       for (const t of (completedTaskRows ?? []).slice(0, 3)) {
         items.push({ id: `t${t.id}`, who: "Task completed", t: t.title, s: "", when: "", at: t.completed_at });
+      }
+      // Appointment lifecycle events (Phase 10.3 correction pass) — reads
+      // appointment_activities (trigger-owned, see
+      // supabase/migrations/20260807_calendar_appointments_completion.sql),
+      // merged into this same time-ordered feed rather than a separate
+      // Calendar-only activity list, so a scheduled/rescheduled/cancelled
+      // appointment shows up next to Lead/Task/Invoice events exactly like
+      // every other Recent Activity source.
+      for (const a of (apptActivityRows ?? []).slice(0, 4)) {
+        const appt = (a as any).appointments;
+        const label = APPOINTMENT_ACTIVITY_LABELS[a.activity_type as string] ?? a.summary;
+        const subject = appt?.title || appt?.service || "Appointment";
+        const who = appt?.contact_name ? `${subject} with ${appt.contact_name}` : subject;
+        items.push({ id: `aa${a.id}`, who, t: label, s: a.actor_id ? "" : "System", when: "", at: a.created_at, kind: "appointment" });
       }
       items.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
       setActivity(items.slice(0, 6).map(it => ({ ...it, when: safeRelativeTime(it.at) })));
@@ -989,8 +1102,8 @@ function DashboardPage() {
   const hasAiActivity = aiAgents.length > 0 || voiceCallsCount > 0;
 
   // Merges SMS/WhatsApp/Messenger/Instagram conversations with real Gmail
-  // threads for the Inbox Preview — reuses both hooks exactly as Conversations
-  // does, no duplicate query. Gmail threads never carry unread=true today
+  // threads for Recent Conversations — reuses both hooks exactly as
+  // Conversations does, no duplicate query. Gmail threads never carry unread=true today
   // (no read/unread tracking exists yet for Gmail — see gmail-conversations.ts),
   // so they simply never appear in the "Unread" tab, which is accurate rather
   // than fabricated.
@@ -1005,23 +1118,6 @@ function DashboardPage() {
     const source = inboxTab === "unread" ? allInboxConversations.filter(c => c.unread) : allInboxConversations;
     return [...source].sort((a, b) => new Date(b.lastAt).getTime() - new Date(a.lastAt).getTime()).slice(0, 3);
   }, [allInboxConversations, inboxTab]);
-
-  // ─── Estimates card — real counts/value only, no fabricated schema ────────
-  const estimatesStats = useMemo(() => {
-    const now = new Date();
-    let draft = 0, sent = 0, viewed = 0, accepted = 0, declined = 0, expired = 0;
-    let acceptedValue = 0, awaitingValue = 0;
-    for (const e of estimateRows) {
-      const isExpired = (e.status === "sent" || e.status === "viewed") && e.valid_until && new Date(e.valid_until) < now;
-      if (isExpired) { expired++; continue; }
-      if (e.status === "draft") draft++;
-      else if (e.status === "sent") { sent++; awaitingValue += e.total; }
-      else if (e.status === "viewed") { viewed++; awaitingValue += e.total; }
-      else if (e.status === "accepted") { accepted++; acceptedValue += e.total; }
-      else if (e.status === "declined") declined++;
-    }
-    return { draft, sent, viewed, accepted, declined, expired, acceptedValue, awaitingValue, total: estimateRows.length };
-  }, [estimateRows]);
 
   // ─── Workflows card — real workflow rows + real workflow_runs, no invented
   // run activity. ─────────────────────────────────────────────────────────
@@ -1095,14 +1191,13 @@ function DashboardPage() {
   return (
     <>
     <div className="space-y-2">
-      <div className="flex items-center justify-between gap-4">
-        <div className="-translate-y-2 leading-tight">
-          <h1 className="text-2xl font-semibold tracking-tight text-foreground">Command Center</h1>
-          <p className="mt-0.5 text-[13px] text-muted-foreground">
-            {greeting}, {userName}. Here's what's happening at {org.companyName || "your business"} today.
-          </p>
-        </div>
-      </div>
+      <PageHeader
+        icon={LayoutDashboard}
+        iconBg="bg-info-soft"
+        iconColor="text-info"
+        title="Command Center"
+        subtitle={`${greeting}, ${userName}. Here's what's happening at ${org.companyName || "your business"} today.`}
+      />
 
       {/* KPI row — 5 tiles + Quick Actions, one 6-col grid, matching Lovable exactly */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3">
@@ -1226,16 +1321,16 @@ function DashboardPage() {
               </div>
             </div>
             <div className="mt-1.5">
-              {/* Next Up — single soonest actionable item across tasks,
-                  appointments, and estimate expirations (see the nextUp
-                  memo above). Replaces the old generic 2-task list; this
-                  is what covers the Upcoming card's job now that it's been
-                  removed, without restoring it as a separate card. */}
+              {/* Next Up — single soonest actionable item across tasks and
+                  estimate expirations (see the nextUp memo above; Phase
+                  10.3: appointments removed from here, task-only card —
+                  see the dedicated Next Booking card instead). Replaces
+                  the old generic 2-task list; this is what covers the
+                  Upcoming card's job now that it's been removed, without
+                  restoring it as a separate card. */}
               {nextUp ? (
                 <Link to={nextUp.href} className="flex items-center gap-2 text-[12.5px] group hover:text-foreground">
-                  {nextUp.kind === "appointment" ? (
-                    <CalendarDays className="h-3.5 w-3.5 text-violet shrink-0" />
-                  ) : nextUp.kind === "estimate" ? (
+                  {nextUp.kind === "estimate" ? (
                     <FileText className="h-3.5 w-3.5 text-info shrink-0" />
                   ) : (
                     <CheckSquare className="h-3.5 w-3.5 text-amber-600 shrink-0" />
@@ -1256,6 +1351,59 @@ function DashboardPage() {
                 </div>
               </div>
             </div>
+          </SectionCard>
+        </div>
+
+        {/* Next Booking (Phase 10.3 correction pass) — dedicated card, was
+            previously only rendered inline inside Today's Tasks' Next Up
+            row (wrong: an appointment is not a task). Added as a new grid
+            item rather than resized into the existing row above, so no
+            other card's width/column-span changes. */}
+        <div className="col-span-1 lg:col-span-12 2xl:col-span-3 h-full">
+          <SectionCard title="Next Booking" icon={CalendarClock} tint="blue" action={<CardAction to={ROUTES.CALENDAR}>View calendar</CardAction>} className="h-full 2xl:min-h-[198px]">
+            {nextBooking ? (
+              <Link to={ROUTES.CALENDAR} className="flex h-full flex-col gap-1.5 group">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="truncate text-[13px] font-semibold text-foreground group-hover:text-primary">{nextBooking.title}</p>
+                    {nextBooking.contactName && <p className="truncate text-[11.5px] text-muted-foreground">{nextBooking.contactName}</p>}
+                  </div>
+                  <span className={cn(
+                    "shrink-0 rounded-full border px-1.5 py-0.5 text-[9.5px] font-semibold",
+                    APPOINTMENT_STATUS_TINT[nextBooking.status as AppointmentStatus]?.badge ?? "border-border bg-secondary text-muted-foreground",
+                  )}>
+                    {APPOINTMENT_STATUS_LABELS[nextBooking.status as AppointmentStatus] ?? nextBooking.status}
+                  </span>
+                </div>
+                <div className="text-[11.5px] text-foreground/85">
+                  {new Date(nextBooking.scheduledAt).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}
+                  <span className="text-muted-foreground"> · </span>
+                  {new Date(nextBooking.scheduledAt).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
+                  –{new Date(nextBooking.endsAt).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
+                </div>
+                {nextBooking.assigneeName && (
+                  <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <User className="h-3 w-3 shrink-0" /> <span className="truncate">{nextBooking.assigneeName}</span>
+                  </div>
+                )}
+                {nextBooking.address && (
+                  <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <MapPin className="h-3 w-3 shrink-0" /> <span className="truncate">{nextBooking.address}</span>
+                  </div>
+                )}
+                <div className="mt-auto pt-1 text-[10.5px] font-medium text-primary">
+                  {formatDistanceToNow(new Date(nextBooking.scheduledAt), { addSuffix: true })}
+                </div>
+              </Link>
+            ) : (
+              <div className="flex h-full flex-col items-center justify-center gap-1.5 text-center">
+                <CalendarClock className="h-5 w-5 text-muted-foreground/40" />
+                <p className="text-[12px] text-muted-foreground">No upcoming appointments</p>
+                <Link to={ROUTES.CALENDAR} className="text-[11px] font-medium text-primary hover:underline">
+                  Schedule appointment
+                </Link>
+              </div>
+            )}
           </SectionCard>
         </div>
 
@@ -1311,7 +1459,7 @@ function DashboardPage() {
         </div>
 
         <div className="col-span-1 lg:col-span-6 2xl:col-span-5 h-full">
-          <SectionCard title="Inbox Preview" icon={Mail} tint="blue" action={<CardAction to="/inbox">View inbox</CardAction>} className="h-full 2xl:min-h-[200px]">
+          <SectionCard title="Recent Conversations" icon={Mail} tint="blue" action={<CardAction to="/inbox">View conversations</CardAction>} className="h-full 2xl:min-h-[200px]">
             <div className="flex items-center gap-3 text-[12.5px] border-b border-border/70 pb-1.5 -mx-3.5 px-3.5 mb-1">
               <button
                 onClick={() => setInboxTab("all")}
@@ -1368,37 +1516,58 @@ function DashboardPage() {
           </SectionCard>
         </div>
 
-        <div className="col-span-1 lg:col-span-6 2xl:col-span-3 h-full">
-          <SectionCard title="Estimates" icon={FileText} tint="orange" action={<CardAction to="/estimates">View all</CardAction>} className="h-full 2xl:min-h-[200px]">
-            {estimatesStats.total === 0 ? (
-              <p className="py-6 text-center text-sm text-muted-foreground">No estimates yet.</p>
+        {/* Recent Activity — relocated here (Phase 10.3 layout correction
+            pass) from a standalone trailing card at the bottom of the page,
+            which had no siblings to share its row with and forced an extra
+            near-empty final row (the page-overflow regression). Takes the
+            former Estimates card's position — Estimates was removed from
+            Command Center (route/sidebar/data untouched, see below) and
+            this card now shares its row with Marketing Activity/Workflows/
+            AI Center using the same col-span breakpoints as those three, so
+            the row totals 12 at 2xl with no orphan card. */}
+        <div className="col-span-1 lg:col-span-6 xl:col-span-4 2xl:col-span-3 h-full">
+          {/* No "View all" action — this feed aggregates leads/calls/
+              invoices/estimates/tasks/appointments, and no single page
+              shows all of that combined. The prior "View all" pointed to
+              Call Logs, which only covers voice calls — a misleading
+              destination for an aggregated feed. Removed rather than link
+              somewhere wrong; restore once a real cross-entity activity
+              page exists. */}
+          {/* Fixed compact height (not just min-h) — this card's list is the
+              only content among the four bottom-row cards that can grow
+              with live data (Marketing/Workflows/AI Center all render a
+              fixed tile grid + a 2-row-capped list, naturally settling
+              around ~170-190px). Without a matching max-h here, a busy
+              activity feed made this card taller than its siblings, which
+              then stretched the whole row (2xl:items-stretch) and
+              reintroduced the page-level scrollbar. min-h-0 + flex-1 on the
+              list (via SectionCard's own body wrapper) + overflow-y-auto
+              here is what makes only the list scroll instead of the card
+              growing. */}
+          <SectionCard title="Recent Activity" icon={Clock} tint="indigo" className="h-full 2xl:min-h-[170px] 2xl:max-h-[198px]">
+            {activity.length === 0 ? (
+              <p className="py-5 text-center text-sm text-muted-foreground">No recent activity yet.</p>
             ) : (
-              <>
-                <div className="grid grid-cols-3 gap-1.5">
-                  {[
-                    { l: "Draft", v: estimatesStats.draft, c: "text-muted-foreground" },
-                    { l: "Awaiting", v: estimatesStats.sent + estimatesStats.viewed, c: "text-info" },
-                    { l: "Accepted", v: estimatesStats.accepted, c: "text-success" },
-                    { l: "Declined", v: estimatesStats.declined, c: "text-destructive" },
-                    { l: "Expired", v: estimatesStats.expired, c: "text-orange" },
-                  ].map((s) => (
-                    <div key={s.l} className="rounded-lg bg-secondary/60 ring-1 ring-border/60 p-1.5">
-                      <div className="text-[9.5px] text-muted-foreground uppercase tracking-wider">{s.l}</div>
-                      <div className={cn("text-base font-semibold mt-0.5 tabular-nums", s.c)}>{s.v}</div>
+              <ul className="-my-0.5 max-h-[132px] min-h-0 overflow-y-auto overflow-x-hidden">
+                {activity.map((it) => (
+                  <li key={it.id} className="flex min-w-0 items-center gap-2.5 py-1.5 hover:bg-secondary/40 -mx-2 px-2 rounded-md transition-colors">
+                    {it.kind === "appointment" ? (
+                      <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-info-soft text-info">
+                        <CalendarClock className="h-4 w-4" />
+                      </span>
+                    ) : (
+                      <ContactAvatar id={it.id} name={it.who} size="sm" />
+                    )}
+                    <div className="flex-1 min-w-0 overflow-hidden">
+                      <div className="truncate text-[12.5px] font-medium">{it.t}</div>
+                      <div className="truncate text-[11px] text-muted-foreground">{it.who}{it.s ? ` · ${it.s}` : ""}</div>
                     </div>
-                  ))}
-                </div>
-                <div className="mt-2 pt-1.5 border-t border-border/70 grid grid-cols-2 gap-2">
-                  <div>
-                    <div className="text-[9.5px] uppercase tracking-wider text-muted-foreground">Awaiting Value</div>
-                    <div className="text-[13px] font-semibold mt-0.5 tabular-nums">{fmtK(estimatesStats.awaitingValue)}</div>
-                  </div>
-                  <div>
-                    <div className="text-[9.5px] uppercase tracking-wider text-muted-foreground">Accepted Value</div>
-                    <div className="text-[13px] font-semibold mt-0.5 tabular-nums text-success">{fmtK(estimatesStats.acceptedValue)}</div>
-                  </div>
-                </div>
-              </>
+                    {it.when && (
+                      <div className="shrink-0 whitespace-nowrap text-[10.5px] text-muted-foreground tabular-nums">{it.when}</div>
+                    )}
+                  </li>
+                ))}
+              </ul>
             )}
           </SectionCard>
         </div>
@@ -1544,35 +1713,6 @@ function DashboardPage() {
                   </ul>
                 )}
               </>
-            )}
-          </SectionCard>
-        </div>
-
-        <div className="col-span-1 lg:col-span-6 xl:col-span-4 2xl:col-span-3 h-full">
-          {/* No "View all" action — this feed aggregates leads/calls/
-              invoices/estimates/tasks, and no single page shows all of
-              that combined. The prior "View all" pointed to Call Logs,
-              which only covers voice calls — a misleading destination for
-              an aggregated feed. Removed rather than link somewhere wrong;
-              restore once a real cross-entity activity page exists. */}
-          <SectionCard title="Recent Activity" icon={Clock} tint="indigo" className="h-full 2xl:min-h-[170px]">
-            {activity.length === 0 ? (
-              <p className="py-5 text-center text-sm text-muted-foreground">No recent activity yet.</p>
-            ) : (
-              <ul className="-my-0.5">
-                {activity.slice(0, 3).map((it) => (
-                  <li key={it.id} className="flex items-center gap-2.5 py-1.5 hover:bg-secondary/40 -mx-2 px-2 rounded-md transition-colors">
-                    <ContactAvatar id={it.id} name={it.who} size="sm" />
-                    <div className="flex-1 min-w-0">
-                      <div className="text-[12.5px] font-medium truncate">{it.t}</div>
-                      <div className="text-[11px] text-muted-foreground truncate">{it.who}{it.s ? ` · ${it.s}` : ""}</div>
-                    </div>
-                    {it.when && (
-                      <div className="text-[10.5px] text-muted-foreground tabular-nums shrink-0">{it.when}</div>
-                    )}
-                  </li>
-                ))}
-              </ul>
             )}
           </SectionCard>
         </div>

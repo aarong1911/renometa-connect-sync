@@ -3,7 +3,6 @@ import { createFileRoute, useNavigate, useSearch } from "@tanstack/react-router"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DragDropContext, Droppable, Draggable, type DropResult } from "@hello-pangea/dnd";
 import { PageHeader } from "@/components/layout/app-shell";
-import { useTopbarAction } from "@/lib/topbar-action";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { MetricCard } from "@/components/ui/metric-card";
@@ -12,6 +11,8 @@ import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { AddressAutocomplete } from "@/components/ui/address-autocomplete";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -23,7 +24,7 @@ import {
   MoreHorizontal, ChevronsUpDown, Check, Mail, Phone, MessageSquare, X,
   TrendingUp, Clock, PauseCircle, DollarSign, Filter, ChevronRight, Calendar,
   User, Circle, CheckCircle2, AlertCircle, XCircle, FileText, Send, Trash2, Flag,
-  ExternalLink, ImageIcon, Camera, FolderOpen,
+  ExternalLink, ImageIcon, Camera, FolderOpen, Building2, UserRound,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -32,7 +33,16 @@ import {
   type Project, type ProjectStatus, type CreateProjectInput,
 } from "@/lib/projects-store";
 import { useContacts } from "@/lib/contacts-store";
+import { useCompanies } from "@/lib/companies-store";
+import { useTeam } from "@/lib/organization";
+import { composeAddress } from "@/lib/address";
+import {
+  PROJECT_TYPE_ORDER, PROJECT_TYPE_LABELS, PROJECT_PRIORITY_ORDER, PROJECT_PRIORITY_LABELS,
+  PROJECT_PRIORITY_TINT, BUDGET_RANGE_ORDER, BUDGET_RANGE_LABELS, budgetRangeMidpoint,
+  type ProjectType, type ProjectPriority, type BudgetRange,
+} from "@/lib/project-status";
 import { useTasks, addTask, updateTask, deleteTask } from "@/lib/tasks-store";
+import { EntityAppointmentsPanel } from "@/components/appointments/entity-appointments-panel";
 import type { Task } from "@/lib/mock-data";
 import { supabase } from "@/lib/supabase";
 import { InviteToPortalModal } from "@/components/portal/InviteToPortalModal";
@@ -141,91 +151,6 @@ const STATUS_ICONS: Record<Task["status"], React.ReactNode> = {
 };
 
 // ─── KPI Card ─────────────────────────────────────────────────────────────────
-
-// ─── Address Input ────────────────────────────────────────────────────────────
-
-type NominatimResult = {
-  place_id: number; display_name: string;
-  address: { house_number?: string; road?: string; city?: string; town?: string; village?: string; state?: string; postcode?: string };
-};
-
-const STATE_ABBR: Record<string, string> = {
-  Alabama:"AL",Alaska:"AK",Arizona:"AZ",Arkansas:"AR",California:"CA",Colorado:"CO",
-  Connecticut:"CT",Delaware:"DE",Florida:"FL",Georgia:"GA",Hawaii:"HI",Idaho:"ID",
-  Illinois:"IL",Indiana:"IN",Iowa:"IA",Kansas:"KS",Kentucky:"KY",Louisiana:"LA",
-  Maine:"ME",Maryland:"MD",Massachusetts:"MA",Michigan:"MI",Minnesota:"MN",
-  Mississippi:"MS",Missouri:"MO",Montana:"MT",Nebraska:"NE",Nevada:"NV",
-  "New Hampshire":"NH","New Jersey":"NJ","New Mexico":"NM","New York":"NY",
-  "North Carolina":"NC","North Dakota":"ND",Ohio:"OH",Oklahoma:"OK",Oregon:"OR",
-  Pennsylvania:"PA","Rhode Island":"RI","South Carolina":"SC","South Dakota":"SD",
-  Tennessee:"TN",Texas:"TX",Utah:"UT",Vermont:"VT",Virginia:"VA",Washington:"WA",
-  "West Virginia":"WV",Wisconsin:"WI",Wyoming:"WY",
-};
-
-function formatNominatimAddress(r: NominatimResult): string {
-  const a = r.address;
-  const street = [a.house_number ?? "", a.road ?? ""].filter(Boolean).join(" ");
-  const city   = a.city ?? a.town ?? a.village ?? "";
-  const st     = a.state ? (STATE_ABBR[a.state] ?? a.state) : "";
-  const zip    = a.postcode ?? "";
-  return [street, city, [st, zip].filter(Boolean).join(" ")].filter(Boolean).join(", ");
-}
-
-function AddressInput({ value, onChange, id, placeholder }: {
-  value: string; onChange: (v: string) => void; id?: string; placeholder?: string;
-}) {
-  const [suggestions, setSuggestions] = useState<NominatimResult[]>([]);
-  const [open, setOpen]     = useState(false);
-  const [loading, setLoad]  = useState(false);
-  const timerRef            = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const containerRef        = useRef<HTMLDivElement>(null);
-
-  const search = useCallback(async (q: string) => {
-    if (q.length < 4) { setSuggestions([]); setOpen(false); return; }
-    setLoad(true);
-    try {
-      const res  = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&addressdetails=1&countrycodes=us&limit=5`, { headers: { "Accept-Language": "en" } });
-      const data: NominatimResult[] = await res.json();
-      setSuggestions(data); setOpen(data.length > 0);
-    } catch { setSuggestions([]); setOpen(false); }
-    finally { setLoad(false); }
-  }, []);
-
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    onChange(e.target.value);
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => search(e.target.value), 400);
-  };
-
-  useEffect(() => {
-    const h = (e: MouseEvent) => { if (containerRef.current && !containerRef.current.contains(e.target as Node)) setOpen(false); };
-    document.addEventListener("mousedown", h);
-    return () => document.removeEventListener("mousedown", h);
-  }, []);
-
-  return (
-    <div ref={containerRef} className="relative">
-      <div className="relative">
-        <MapPin className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground pointer-events-none" />
-        <Input id={id} value={value} onChange={handleChange} placeholder={placeholder ?? "123 Main St, City, ST"} className="pl-8" autoComplete="off" />
-        {loading && <Loader2 className="absolute right-2.5 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-muted-foreground" />}
-      </div>
-      {open && suggestions.length > 0 && (
-        <div className="absolute z-50 mt-1 w-full rounded-md border border-border bg-popover shadow-lg">
-          <ul className="py-1 text-sm">
-            {suggestions.map(r => (
-              <li key={r.place_id} className="flex cursor-pointer items-center gap-2 px-3 py-2 hover:bg-accent"
-                onMouseDown={e => { e.preventDefault(); onChange(formatNominatimAddress(r)); setSuggestions([]); setOpen(false); }}>
-                <MapPin className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                <span className="truncate">{formatNominatimAddress(r)}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-    </div>
-  );
-}
 
 // ─── Project Detail Sheet ─────────────────────────────────────────────────────
 
@@ -634,6 +559,19 @@ function ProjectDetailSheet({ project, open, onClose, onReload }: {
                   <span>{projectTasks.filter(t => t.priority === "high" && t.status !== "completed").length} high priority</span>
                 </div>
               )}
+
+              {/* Linked appointments (Phase 10.3) — real appointments.entity_type="project" rows, shared with the global Calendar page. */}
+              <div className="border-t border-border pt-4">
+                <EntityAppointmentsPanel
+                  entityType="project"
+                  entityId={project.id}
+                  entityLabel="project"
+                  contactName={project.client_name || undefined}
+                  contactPhone={contact?.phone || undefined}
+                  contactEmail={contact?.email || undefined}
+                  address={project.address || contact?.address || undefined}
+                />
+              </div>
             </div>
           )}
 
@@ -1033,112 +971,483 @@ function ListView({ projects, onRowClick, onDelete }: {
 }
 
 // ─── New Project Dialog ───────────────────────────────────────────────────────
+//
+// Project Creation Enhancements pass. Targets the schema added by
+// supabase/migrations/20260808_project_creation_enhancements.sql
+// (project_type/custom_project_type/priority/owner_id/budget_range/lead_id)
+// — requires that migration to be deployed; see the report for the exact
+// deployment sequence. Reuses STAGE_COLUMNS (above) for status labels/
+// descriptions rather than duplicating them.
 
-type NewProjectForm = { name: string; client_id: string; status: ProjectStatus; address: string; budget_total: string; start_date: string; end_date: string };
-const EMPTY_FORM: NewProjectForm = { name: "", client_id: "", status: "planning", address: "", budget_total: "", start_date: "", end_date: "" };
+type CustomerOption =
+  | { kind: "contact"; id: string; name: string; email: string; phone: string; companyName: string | null; address: string | null }
+  | { kind: "company"; id: string; name: string; email: string | null; phone: string | null; address: string | null };
+
+type AddressMode = "customer" | "custom";
+
+type NewProjectForm = {
+  name: string;
+  customer: CustomerOption | null;
+  resolvedClientId: string | null;
+  projectType: ProjectType | "";
+  customProjectType: string;
+  addressMode: AddressMode;
+  address: string;
+  addressTouched: boolean;
+  budgetRange: BudgetRange;
+  customBudget: string;
+  status: ProjectStatus;
+  priority: ProjectPriority;
+  ownerId: string;
+  startDate: string;
+  endDate: string;
+  scope: string;
+};
+
+function emptyProjectForm(defaultOwnerId: string | null): NewProjectForm {
+  return {
+    name: "", customer: null, resolvedClientId: null,
+    projectType: "", customProjectType: "",
+    addressMode: "customer", address: "", addressTouched: false,
+    budgetRange: "not_specified", customBudget: "",
+    status: "planning", priority: "normal", ownerId: defaultOwnerId ?? "unassigned",
+    startDate: "", endDate: "", scope: "",
+  };
+}
+
+/** companies.address/city/state/zip are separate columns — composeAddress avoids the duplicate-looking "city, state, zip, city state zip" output a naive join produces. contacts.address is already one string and needs no composition. */
+function companyAddress(c: { address: string | null; city: string | null; state: string | null; zip: string | null }): string | null {
+  const composed = composeAddress({ street: c.address, city: c.city, state: c.state, zip: c.zip });
+  return composed || null;
+}
 
 function NewProjectDialog({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: () => void }) {
   const contacts = useContacts();
-  const [form, setForm]             = useState<NewProjectForm>(EMPTY_FORM);
-  const [contactOpen, setContactOpen] = useState(false);
-  const [saving, setSaving]         = useState(false);
+  const companies = useCompanies();
+  const teamMembers = useTeam().filter((m) => m.status === "active");
 
-  const set = (field: keyof NewProjectForm) => (e: React.ChangeEvent<HTMLInputElement>) => setForm(f => ({ ...f, [field]: e.target.value }));
-  const selectedContact = contacts.find(c => c.id === form.client_id);
-  const handleClose = () => { setForm(EMPTY_FORM); setContactOpen(false); onClose(); };
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    supabase.auth.getUser().then(({ data }) => setCurrentUserId(data.user?.id ?? null));
+  }, [open]);
+
+  const [form, setForm] = useState<NewProjectForm>(() => emptyProjectForm(null));
+  const [customerOpen, setCustomerOpen] = useState(false);
+  const [customerQuery, setCustomerQuery] = useState("");
+  const [pendingCustomerAddress, setPendingCustomerAddress] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [errors, setErrors] = useState<Partial<Record<keyof NewProjectForm, string>>>({});
+
+  // Default owner = current user, once known and confirmed to be a real
+  // active member of this org (never assumed) — only applied to a still-
+  // untouched, freshly-opened form, never overwriting a user's own choice.
+  useEffect(() => {
+    if (!open || !currentUserId) return;
+    setForm((f) => (f.ownerId === "unassigned" ? { ...f, ownerId: teamMembers.some((m) => m.id === currentUserId) ? currentUserId : f.ownerId } : f));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, currentUserId, teamMembers.length]);
+
+  const handleClose = () => {
+    setForm(emptyProjectForm(null));
+    setCustomerOpen(false);
+    setCustomerQuery("");
+    setPendingCustomerAddress(null);
+    setErrors({});
+    onClose();
+  };
+
+  // ── Customer / Account search — real, org-scoped Contacts + Accounts
+  // already loaded by their own stores, merged and filtered client-side
+  // (same no-extra-query pattern as src/components/appointments/entity-picker.tsx).
+  const customerOptions = useMemo<CustomerOption[]>(() => {
+    const contactOpts: CustomerOption[] = contacts.map((c) => ({
+      kind: "contact", id: c.id, name: c.name, email: c.email, phone: c.phone,
+      companyName: c.companyName ?? (c.company || null),
+      address: c.address || null,
+    }));
+    const companyOpts: CustomerOption[] = companies.map((co) => ({
+      kind: "company", id: co.id, name: co.name, email: co.email, phone: co.phone,
+      address: companyAddress(co),
+    }));
+    return [...contactOpts, ...companyOpts];
+  }, [contacts, companies]);
+
+  const filteredCustomers = useMemo(() => {
+    const q = customerQuery.trim().toLowerCase();
+    if (!q) return customerOptions.slice(0, 50);
+    return customerOptions.filter((o) =>
+      o.name.toLowerCase().includes(q) ||
+      (o.email ?? "").toLowerCase().includes(q) ||
+      (o.phone ?? "").toLowerCase().includes(q) ||
+      (o.kind === "contact" && (o.companyName ?? "").toLowerCase().includes(q)),
+    ).slice(0, 50);
+  }, [customerOptions, customerQuery]);
+
+  /** Resolves the real contacts.id a project's NOT NULL client_id FK requires. Contact -> itself. Company -> its first linked contact (the schema has no direct company_id on projects — see the migration header) — null when the account has no contacts yet. */
+  function resolveClientId(customer: CustomerOption): string | null {
+    if (customer.kind === "contact") return customer.id;
+    const linked = contacts.find((c) => c.company_id === customer.id);
+    return linked?.id ?? null;
+  }
+
+  function applyCustomer(customer: CustomerOption) {
+    const resolvedClientId = resolveClientId(customer);
+    const resolvedAddress = customer.address ?? "";
+
+    setForm((f) => {
+      const hasManualAddress = f.addressTouched && f.address.trim().length > 0;
+      if (hasManualAddress && f.customer) {
+        // Conflict — don't silently overwrite a manually-edited address;
+        // surface the compact inline confirmation instead (Part 20).
+        setPendingCustomerAddress(resolvedAddress || null);
+        return { ...f, customer, resolvedClientId };
+      }
+      return {
+        ...f, customer, resolvedClientId,
+        address: resolvedAddress, addressMode: "customer", addressTouched: false,
+      };
+    });
+    setCustomerOpen(false);
+    setCustomerQuery("");
+  }
+
+  function clearCustomer() {
+    setForm((f) => ({ ...f, customer: null, resolvedClientId: null }));
+    setPendingCustomerAddress(null);
+  }
+
+  const selectedStage = STAGE_COLUMNS.find((c) => c.dbStatus === form.status) ?? STAGE_COLUMNS[0];
+  const startDateObj = form.startDate ? new Date(`${form.startDate}T00:00:00`) : null;
+  const endDateObj = form.endDate ? new Date(`${form.endDate}T00:00:00`) : null;
+
+  function validate(): boolean {
+    const next: Partial<Record<keyof NewProjectForm, string>> = {};
+    const trimmedName = form.name.trim();
+    if (!trimmedName) next.name = "Project name is required.";
+    else if (trimmedName.length > 120) next.name = "Keep the project name under 120 characters.";
+
+    if (!form.customer) next.customer = "Select a Customer / Account.";
+    else if (!form.resolvedClientId) next.customer = "This account has no contacts yet — select a contact instead, or add one to the account first.";
+
+    if (!form.projectType) next.projectType = "Select a project type.";
+    if (form.projectType === "other" && !form.customProjectType.trim()) next.customProjectType = "Enter a custom project type.";
+
+    if (form.budgetRange === "custom") {
+      const n = Number(form.customBudget);
+      if (!form.customBudget.trim() || Number.isNaN(n)) next.customBudget = "Enter an estimated budget.";
+      else if (n < 0) next.customBudget = "Budget cannot be negative.";
+      else if (n > 100_000_000) next.customBudget = "Enter a realistic budget amount.";
+    }
+
+    if (startDateObj && endDateObj && endDateObj.getTime() < startDateObj.getTime()) {
+      next.endDate = "Estimated Completion cannot be earlier than Estimated Start.";
+    }
+
+    if (form.scope.length > 2000) next.scope = "Keep the scope under 2000 characters.";
+
+    setErrors(next);
+    return Object.keys(next).length === 0;
+  }
 
   const handleSubmit = async (e: React.SyntheticEvent<HTMLFormElement>) => {
     e.preventDefault();
-    if (!form.name.trim()) { toast.error("Project name is required"); return; }
-    if (!form.client_id)   { toast.error("Please select a client"); return; }
+    if (saving) return; // duplicate-submit guard (Part 18/26)
+    if (!validate()) { toast.error("Fix the highlighted fields before creating the project."); return; }
+
     setSaving(true);
+
+    const budgetTotal = form.budgetRange === "custom"
+      ? Number(form.customBudget)
+      : budgetRangeMidpoint(form.budgetRange) ?? undefined;
+
     const input: CreateProjectInput = {
-      name: form.name.trim(), client_id: form.client_id, status: form.status,
+      name: form.name.trim(),
+      client_id: form.resolvedClientId!,
+      status: form.status,
       address: form.address.trim() || undefined,
-      budget_total: form.budget_total ? Number(form.budget_total) : undefined,
-      start_date: form.start_date || undefined, end_date: form.end_date || undefined,
+      budget_total: budgetTotal,
+      budgetRange: form.budgetRange,
+      start_date: form.startDate || undefined,
+      end_date: form.endDate || undefined,
+      description: form.scope.trim() || undefined,
+      projectType: form.projectType || undefined,
+      customProjectType: form.projectType === "other" ? form.customProjectType.trim() : undefined,
+      priority: form.priority,
+      ownerId: form.ownerId === "unassigned" ? null : form.ownerId,
     };
+
     const { error } = await createProject(input);
     setSaving(false);
-    if (error) { toast.error("Failed to create project"); return; }
+    if (error) {
+      toast.error("Could not create the project", { description: error.message ?? String(error) });
+      return; // form state is preserved — nothing is reset on failure
+    }
     toast.success(`${form.name} created`);
-    onCreated(); handleClose();
+    onCreated();
+    handleClose();
   };
 
   return (
-    <Dialog open={open} onOpenChange={v => { if (!v) handleClose(); }}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader><DialogTitle>New Project</DialogTitle></DialogHeader>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div className="space-y-1.5">
-            <Label htmlFor="proj-name">Project name <span className="text-destructive">*</span></Label>
-            <Input id="proj-name" value={form.name} onChange={set("name")} placeholder="Kitchen remodel" autoFocus />
-          </div>
-          <div className="space-y-1.5">
-            <Label>Client <span className="text-destructive">*</span></Label>
-            <Popover open={contactOpen} onOpenChange={setContactOpen}>
-              <PopoverTrigger asChild>
-                <Button type="button" variant="outline" className={cn("w-full justify-between font-normal", !selectedContact && "text-muted-foreground")}>
-                  {selectedContact ? selectedContact.name : "Search contacts…"}
-                  <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent className="w-full p-0" align="start">
-                <Command>
-                  <CommandInput placeholder="Search by name…" />
-                  <CommandList>
-                    <CommandEmpty>No contacts found.</CommandEmpty>
-                    <CommandGroup>
-                      {contacts.map(c => (
-                        <CommandItem key={c.id} value={c.name} onSelect={() => { setForm(f => ({ ...f, client_id: c.id })); setContactOpen(false); }}>
-                          <Check className={cn("mr-2 h-4 w-4", form.client_id === c.id ? "opacity-100" : "opacity-0")} />
-                          <div><div className="text-sm font-medium">{c.name}</div>{c.email && <div className="text-xs text-muted-foreground">{c.email}</div>}</div>
-                        </CommandItem>
-                      ))}
-                    </CommandGroup>
-                  </CommandList>
-                </Command>
-              </PopoverContent>
-            </Popover>
-          </div>
-          <div className="space-y-1.5">
-            <Label>Status</Label>
-            <Select value={form.status} onValueChange={v => setForm(f => ({ ...f, status: v as ProjectStatus }))}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="planning">Estimating</SelectItem>
-                <SelectItem value="active">In Progress</SelectItem>
-                <SelectItem value="on-hold">On Hold</SelectItem>
-                <SelectItem value="completed">Completed</SelectItem>
-                <SelectItem value="cancelled">Cancelled</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="proj-address">Address</Label>
-            <AddressInput id="proj-address" value={form.address} onChange={v => setForm(f => ({ ...f, address: v }))} placeholder="123 Main St, City, ST" />
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="proj-budget">Budget ($)</Label>
-            <Input id="proj-budget" type="number" min="0" step="0.01" value={form.budget_total} onChange={set("budget_total")} placeholder="0.00" />
-          </div>
-          <div className="grid grid-cols-2 gap-3">
+    <Dialog open={open} onOpenChange={(v) => { if (!v) handleClose(); }}>
+      <DialogContent className="flex max-h-[85vh] flex-col sm:max-w-xl">
+        <DialogHeader className="shrink-0">
+          <DialogTitle>New Project</DialogTitle>
+        </DialogHeader>
+
+        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-1 py-1">
+            {/* 1. Project Name */}
             <div className="space-y-1.5">
-              <Label htmlFor="proj-start">Start date</Label>
-              <Input id="proj-start" type="date" value={form.start_date} onChange={set("start_date")} />
+              <Label htmlFor="proj-name">Project name <span className="text-destructive">*</span></Label>
+              <Input
+                id="proj-name" value={form.name} autoFocus
+                onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+                placeholder="Kitchen remodel" aria-invalid={!!errors.name} aria-describedby={errors.name ? "proj-name-error" : undefined}
+              />
+              {errors.name && <p id="proj-name-error" className="text-xs text-destructive">{errors.name}</p>}
             </div>
+
+            {/* 2. Customer / Account */}
             <div className="space-y-1.5">
-              <Label htmlFor="proj-end">End date</Label>
-              <Input id="proj-end" type="date" value={form.end_date} onChange={set("end_date")} />
+              <Label>Customer / Account <span className="text-destructive">*</span></Label>
+              {form.customer ? (
+                <div className="flex items-center gap-2 rounded-md border border-border bg-secondary/30 px-3 py-2">
+                  {form.customer.kind === "contact" ? <UserRound className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : <Building2 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5">
+                      <span className="truncate text-sm font-medium">{form.customer.name}</span>
+                      <Badge variant="outline" className="h-4.5 shrink-0 rounded px-1.5 text-[9.5px]">
+                        {form.customer.kind === "contact" ? "Contact" : "Account"}
+                      </Badge>
+                    </div>
+                    {(form.customer.email || form.customer.phone) && (
+                      <div className="truncate text-[11px] text-muted-foreground">
+                        {[form.customer.email, form.customer.phone].filter(Boolean).join(" · ")}
+                        {form.customer.kind === "contact" && form.customer.companyName ? ` · ${form.customer.companyName}` : ""}
+                      </div>
+                    )}
+                  </div>
+                  <Button type="button" variant="ghost" size="icon" className="h-6 w-6 shrink-0" onClick={clearCustomer} aria-label="Clear selected customer">
+                    <X className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              ) : (
+                <Popover open={customerOpen} onOpenChange={setCustomerOpen}>
+                  <PopoverTrigger asChild>
+                    <Button type="button" variant="outline" className={cn("w-full justify-between font-normal text-muted-foreground", errors.customer && "border-destructive")}>
+                      Search contacts or accounts…
+                      <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[--radix-popover-trigger-width] p-0" align="start">
+                    <Command shouldFilter={false}>
+                      <CommandInput placeholder="Search by name, email, phone, or account…" value={customerQuery} onValueChange={setCustomerQuery} />
+                      <CommandList className="max-h-64">
+                        <CommandEmpty>No contacts or accounts found.</CommandEmpty>
+                        <CommandGroup>
+                          {filteredCustomers.map((o) => (
+                            <CommandItem key={`${o.kind}-${o.id}`} value={`${o.kind}-${o.id}`} onSelect={() => applyCustomer(o)}>
+                              {o.kind === "contact" ? <UserRound className="mr-2 h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : <Building2 className="mr-2 h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="truncate text-sm">{o.name}</span>
+                                  <Badge variant="outline" className="h-4 shrink-0 rounded px-1 text-[9px]">{o.kind === "contact" ? "Contact" : "Account"}</Badge>
+                                  {!o.address && <span className="shrink-0 text-[9px] text-muted-foreground">no address</span>}
+                                </div>
+                                {(o.email || o.phone) && <div className="truncate text-xs text-muted-foreground">{[o.email, o.phone].filter(Boolean).join(" · ")}</div>}
+                              </div>
+                            </CommandItem>
+                          ))}
+                        </CommandGroup>
+                      </CommandList>
+                    </Command>
+                  </PopoverContent>
+                </Popover>
+              )}
+              {errors.customer && <p className="text-xs text-destructive">{errors.customer}</p>}
+
+              {pendingCustomerAddress !== null && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900/40 dark:bg-amber-500/10 dark:text-amber-300">
+                  <span>Replace the current project address with the newly selected customer's address?</span>
+                  <div className="flex shrink-0 gap-1.5">
+                    <Button type="button" size="sm" variant="outline" className="h-6 text-[11px]" onClick={() => setPendingCustomerAddress(null)}>Keep current</Button>
+                    <Button type="button" size="sm" className="h-6 text-[11px]" onClick={() => {
+                      setForm((f) => ({ ...f, address: pendingCustomerAddress ?? "", addressMode: "customer", addressTouched: false }));
+                      setPendingCustomerAddress(null);
+                    }}>Use customer address</Button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* 3. Project Type */}
+            <div className="space-y-1.5">
+              <Label htmlFor="proj-type">Project type <span className="text-destructive">*</span></Label>
+              <Select value={form.projectType} onValueChange={(v) => setForm((f) => ({ ...f, projectType: v as ProjectType }))}>
+                <SelectTrigger id="proj-type" aria-invalid={!!errors.projectType}><SelectValue placeholder="Select a project type…" /></SelectTrigger>
+                <SelectContent>
+                  {PROJECT_TYPE_ORDER.map((t) => <SelectItem key={t} value={t}>{PROJECT_TYPE_LABELS[t]}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              {errors.projectType && <p className="text-xs text-destructive">{errors.projectType}</p>}
+              {form.projectType === "other" && (
+                <div className="space-y-1.5 pt-1">
+                  <Label htmlFor="proj-custom-type">Custom project type <span className="text-destructive">*</span></Label>
+                  <Input id="proj-custom-type" value={form.customProjectType} onChange={(e) => setForm((f) => ({ ...f, customProjectType: e.target.value }))} placeholder="e.g. Deck construction" />
+                  {errors.customProjectType && <p className="text-xs text-destructive">{errors.customProjectType}</p>}
+                </div>
+              )}
+            </div>
+
+            {/* 4-5. Project address mode + AddressAutocomplete */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <Label htmlFor="proj-address-mode">Project address</Label>
+                {form.customer && (
+                  <Select value={form.addressMode} onValueChange={(v) => setForm((f) => ({ ...f, addressMode: v as AddressMode, ...(v === "custom" ? { address: "", addressTouched: true } : { address: f.customer?.address ?? "", addressTouched: false }) }))}>
+                    <SelectTrigger id="proj-address-mode" className="h-7 w-[200px] text-xs"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="customer">Use customer address</SelectItem>
+                      <SelectItem value="custom">Enter a different address</SelectItem>
+                    </SelectContent>
+                  </Select>
+                )}
+              </div>
+              {form.customer && !form.customer.address && form.addressMode === "customer" && (
+                <p className="flex items-center gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+                  <AlertCircle className="h-3 w-3 shrink-0" /> No address is available for this customer — enter one below.
+                </p>
+              )}
+              <AddressAutocomplete
+                value={form.address}
+                onChange={(v) => setForm((f) => ({ ...f, address: v, addressTouched: true }))}
+                onSelect={(parts) => setForm((f) => ({ ...f, address: [parts.street, parts.city, `${parts.state} ${parts.zip}`].filter(Boolean).join(", "), addressTouched: true }))}
+                placeholder="Start typing an address…"
+              />
+            </div>
+
+            {/* 6-7. Budget Range + Custom amount */}
+            <div className="space-y-1.5">
+              <Label htmlFor="proj-budget-range">Budget range</Label>
+              <Select value={form.budgetRange} onValueChange={(v) => setForm((f) => ({ ...f, budgetRange: v as BudgetRange }))}>
+                <SelectTrigger id="proj-budget-range"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {BUDGET_RANGE_ORDER.map((r) => <SelectItem key={r} value={r}>{BUDGET_RANGE_LABELS[r]}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              {form.budgetRange === "custom" && (
+                <div className="space-y-1.5 pt-1">
+                  <Label htmlFor="proj-custom-budget">Estimated budget <span className="text-destructive">*</span></Label>
+                  <div className="relative">
+                    <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">$</span>
+                    <Input
+                      id="proj-custom-budget" type="number" min="0" step="0.01" inputMode="decimal"
+                      className="pl-6" value={form.customBudget}
+                      onChange={(e) => setForm((f) => ({ ...f, customBudget: e.target.value }))}
+                      placeholder="75,000" aria-invalid={!!errors.customBudget}
+                    />
+                  </div>
+                  {errors.customBudget && <p className="text-xs text-destructive">{errors.customBudget}</p>}
+                </div>
+              )}
+            </div>
+
+            {/* 8. Status + Priority */}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="proj-status">Status</Label>
+                <Select value={form.status} onValueChange={(v) => setForm((f) => ({ ...f, status: v as ProjectStatus }))}>
+                  <SelectTrigger id="proj-status"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {STAGE_COLUMNS.map((c) => <SelectItem key={c.dbStatus} value={c.dbStatus}>{c.label}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+                <p className="text-[11px] text-muted-foreground">{selectedStage.description}</p>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="proj-priority">Priority</Label>
+                <Select value={form.priority} onValueChange={(v) => setForm((f) => ({ ...f, priority: v as ProjectPriority }))}>
+                  <SelectTrigger id="proj-priority"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {PROJECT_PRIORITY_ORDER.map((p) => (
+                      <SelectItem key={p} value={p}>
+                        <span className="flex items-center gap-1.5">
+                          <Flag className={cn("h-3 w-3", PROJECT_PRIORITY_TINT[p].icon)} /> {PROJECT_PRIORITY_LABELS[p]}
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            {/* 9. Project Owner */}
+            <div className="space-y-1.5">
+              <Label htmlFor="proj-owner">Project owner</Label>
+              <Select value={form.ownerId} onValueChange={(v) => setForm((f) => ({ ...f, ownerId: v }))}>
+                <SelectTrigger id="proj-owner"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="unassigned">Unassigned</SelectItem>
+                  {teamMembers.map((m) => (
+                    <SelectItem key={m.id} value={m.id}>
+                      <span className="flex items-center gap-2">
+                        <ContactAvatarIcon name={m.name} /> {m.name}
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* 10. Estimated Start + Estimated Completion */}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="proj-start">Estimated start</Label>
+                <Input id="proj-start" type="date" value={form.startDate} onChange={(e) => setForm((f) => ({ ...f, startDate: e.target.value }))} />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="proj-end">Estimated completion</Label>
+                <Input id="proj-end" type="date" value={form.endDate} onChange={(e) => setForm((f) => ({ ...f, endDate: e.target.value }))} aria-invalid={!!errors.endDate} />
+                {errors.endDate && <p className="text-xs text-destructive">{errors.endDate}</p>}
+              </div>
+            </div>
+
+            {/* 11. Description / Scope */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <Label htmlFor="proj-scope">Description / Scope</Label>
+                <span className="text-[10px] text-muted-foreground">{form.scope.length}/2000</span>
+              </div>
+              <Textarea
+                id="proj-scope" rows={3} maxLength={2000} value={form.scope}
+                onChange={(e) => setForm((f) => ({ ...f, scope: e.target.value }))}
+                placeholder="Kitchen cabinets, countertops, flooring, lighting, and appliance installation."
+              />
+              {errors.scope && <p className="text-xs text-destructive">{errors.scope}</p>}
             </div>
           </div>
-          <DialogFooter>
+
+          <DialogFooter className="mt-3 shrink-0 border-t border-border pt-3">
             <Button type="button" variant="outline" onClick={handleClose} disabled={saving}>Cancel</Button>
-            <Button type="submit" disabled={saving}>{saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}Create Project</Button>
+            <Button type="submit" disabled={saving}>
+              {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              {saving ? "Creating…" : "Create Project"}
+            </Button>
           </DialogFooter>
         </form>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Tiny inline initials avatar for the owner Select's options — Select item content can't safely host the full ContactAvatar (image loading inside a closed listbox), so this is a lightweight local stand-in. */
+function ContactAvatarIcon({ name }: { name: string }) {
+  const initials = name.split(" ").map((w) => w[0]).join("").toUpperCase().slice(0, 2);
+  return (
+    <span className="grid h-4.5 w-4.5 shrink-0 place-items-center rounded-full bg-secondary text-[8px] font-semibold text-muted-foreground">
+      {initials}
+    </span>
   );
 }
 
@@ -1230,10 +1539,6 @@ function ProjectsPage() {
     { id: "cancelled", label: "Cancelled",       count: counts.cancelled },
   ];
 
-  useTopbarAction(
-    <Button size="sm" onClick={() => setNewProjectOpen(true)}><Plus className="mr-1.5 h-3.5 w-3.5" />New Project</Button>,
-  );
-
   if (loading) return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -1246,10 +1551,26 @@ function ProjectsPage() {
   );
 
   return (
-    <div className="-mb-6 flex h-[calc(100vh-5rem)] flex-col overflow-hidden">
+    // Height ownership: the app shell's <main> (src/components/layout/app-shell.tsx)
+    // is already the exact remaining-viewport box via flexbox (h-dvh column,
+    // Topbar h-16, main flex-1) — its content-box height (after main's own
+    // p-6) is a precise, always-correct value. h-full fills exactly that,
+    // so the board below can own its own scrolling (flex-1 + overflow-hidden,
+    // per-column overflow-y-auto) without main ever needing to scroll too.
+    // Previously this used a hand-guessed h-[calc(100vh-5rem)] (100vh minus
+    // an estimate for the topbar) paired with a -mb-6 to reclaim main's
+    // bottom padding — the estimate didn't quite match the real topbar +
+    // padding total, so the page rendered a few px taller than main's
+    // content box, and main's own overflow-y-auto showed a small page-level
+    // scrollbar for that difference (worse at 90% zoom due to rounding).
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
       <PageHeader icon={FolderOpen} iconBg="bg-info-soft" iconColor="text-info" title="Projects" subtitle={`${counts.active} active · ${formatMoney(kpis.pipelineValue)} pipeline`}
-        breadcrumb={["Workspace", "Projects"]}
-        actions={<Button variant="outline" size="sm" className="h-8"><Download className="mr-1.5 h-3.5 w-3.5" />Export</Button>} />
+        actions={
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm"><Download className="mr-1.5 h-3.5 w-3.5" />Export</Button>
+            <Button size="sm" className="h-8" onClick={() => setNewProjectOpen(true)}><Plus className="mr-1.5 h-3.5 w-3.5" />New Project</Button>
+          </div>
+        } />
 
       <div className="mb-4 flex gap-4 shrink-0">
         <MetricCard icon={TrendingUp} label="Active Pipeline Value" value={formatMoney(kpis.pipelineValue)} sub={`${counts.active} active projects`} tone="info" className="flex-1 min-w-0" />
@@ -1284,7 +1605,18 @@ function ProjectsPage() {
         </div>
       </div>
 
-      <div className="flex-1 overflow-auto pt-4">
+      {/* min-h-0 lets this flex child actually shrink to the remaining
+          space instead of growing to its content's natural height (the
+          classic flexbox trap that would otherwise push the page taller
+          than its parent again). overflow-auto is kept on both axes
+          deliberately: Board view needs horizontal scroll for the 6
+          columns at narrower widths, while List view (the table) has no
+          internal scroll region of its own and relies on this wrapper's
+          vertical scroll for a long project list — Board view never
+          triggers that vertical scrollbar in practice since each column
+          already owns its own overflow-y-auto and the wrapper is correctly
+          height-bounded by the page root above. */}
+      <div className="min-h-0 flex-1 overflow-auto pt-4">
         {view === "board"
           ? <BoardView projects={tabProjects} onCardClick={openDetail} onDragEnd={onDragEnd} onDelete={handleDelete} />
           : <ListView  projects={tabProjects} onRowClick={openDetail}  onDelete={handleDelete} />}

@@ -44,7 +44,6 @@ import { type Lead, type LeadSource, type LeadStatus, type LeadScore } from "@/l
 import { formatMoney, formatDateShort, formatPhone } from "@/lib/format";
 import { formatDistanceToNow } from "date-fns";
 import { toast } from "sonner";
-import { useTopbarAction } from "@/lib/topbar-action";
 import { useTeam, type TeamMember } from "@/lib/organization";
 import {
   useLeads, addLead as storeAddLead, updateLeadStatus as storeUpdateStatus,
@@ -56,6 +55,7 @@ import { useLeadNotes, addLeadNote } from "@/lib/leads-store";
 import { updateLeadNote } from "@/lib/leads-store";
 import { useEntityNotes } from "@/lib/contact-notes";
 import { EntityTasksPanel } from "@/components/tasks/entity-tasks-panel";
+import { EntityAppointmentsPanel } from "@/components/appointments/entity-appointments-panel";
 import { ConvertLeadDialog } from "@/components/leads/convert-lead-dialog";
 import { DealDetailDrawer } from "@/components/sales/deal-detail-drawer";
 import {
@@ -771,12 +771,6 @@ function LeadsPage() {
     });
   }, [leads]);
 
-  useTopbarAction(
-    <Button size="sm" onClick={() => setAddOpen(true)}>
-      <Plus className="mr-1.5 h-3.5 w-3.5" /> Add Lead
-    </Button>,
-  );
-
   return (
     <>
       <PageHeader
@@ -798,6 +792,9 @@ function LeadsPage() {
             </Button>
             <Button size="sm" variant="outline" onClick={() => setHistoryOpen(true)}>
               <History className="mr-1.5 h-3.5 w-3.5" /> Import History
+            </Button>
+            <Button size="sm" onClick={() => setAddOpen(true)}>
+              <Plus className="mr-1.5 h-3.5 w-3.5" /> Add Lead
             </Button>
           </div>
         }
@@ -1649,7 +1646,7 @@ function LeadDetailDrawer({
 
   return (
     <Sheet open={!!lead} onOpenChange={onOpenChange}>
-      <SheetContent className="w-full overflow-y-auto sm:max-w-xl">
+      <SheetContent className="w-full overflow-y-auto sm:max-w-xl [&>button.absolute]:hidden">
         <SheetHeader className="space-y-3 border-b border-border pb-4">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0 flex-1 text-left">
@@ -1764,6 +1761,18 @@ function LeadDetailDrawer({
           {/* Linked tasks (Phase 10.1) — real tasks.entity_type="lead" rows, shared with the global Tasks page. */}
           <Separator />
           <EntityTasksPanel entityType="lead" entityId={lead.id} entityLabel="lead" />
+
+          {/* Linked appointments (Phase 10.3) — real appointments.entity_type="lead" rows, shared with the global Calendar page. */}
+          <Separator />
+          <EntityAppointmentsPanel
+            entityType="lead"
+            entityId={lead.id}
+            entityLabel="lead"
+            contactName={lead.name}
+            contactPhone={lead.phone}
+            contactEmail={lead.email}
+            address={lead.address}
+          />
 
           {/* Internal Notes */}
           <Separator />

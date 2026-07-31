@@ -33,15 +33,9 @@ export function daysFromNow(iso: string) {
 
 /**
  * Format a US phone number as (XXX) XXX-XXXX as the user types.
- * Strips non-digits, caps at 10 digits, and progressively formats.
+ * Re-exports src/lib/phone.ts's formatUsPhone — the single shared
+ * implementation (also handles a leading "1"/"+1" country code, which this
+ * export previously did not) — kept here so existing imports of
+ * `formatPhone` from this module keep working unchanged.
  */
-export function formatPhone(value: string) {
-  const digits = value.replace(/\D/g, "").slice(0, 10);
-  const p1 = digits.slice(0, 3);
-  const p2 = digits.slice(3, 6);
-  const p3 = digits.slice(6, 10);
-  if (digits.length === 0) return "";
-  if (digits.length <= 3) return `(${p1}`;
-  if (digits.length <= 6) return `(${p1}) ${p2}`;
-  return `(${p1}) ${p2}-${p3}`;
-}
+export { formatUsPhone as formatPhone } from "@/lib/phone";

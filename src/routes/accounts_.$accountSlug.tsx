@@ -5,6 +5,7 @@ import {
   Activity,
   BriefcaseBusiness,
   Building2,
+  CalendarClock,
   CalendarDays,
   CircleDollarSign,
   ExternalLink,
@@ -32,6 +33,8 @@ import { toast } from "sonner";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { ContactAvatar } from "@/components/ui/contact-avatar";
 import { NewDealDialog } from "@/components/sales/new-deal-dialog";
+import { EntityAppointmentsPanel } from "@/components/appointments/entity-appointments-panel";
+import { AppointmentDialog } from "@/components/calendar/appointment-dialog";
 import { AccountRelatedDeals } from "@/components/accounts/account-related-deals";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -64,7 +67,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { supabase } from "@/lib/supabase";
-import { useTopbarAction } from "@/lib/topbar-action";
+import { cn } from "@/lib/utils";
 import { formatMoney, formatDateShort } from "@/lib/format";
 import { fetchCompanyBySlug, updateCompany, findCompanyDuplicateCandidates, type CompanyDuplicateCandidate } from "@/lib/companies-store";
 import { useDeals } from "@/lib/deals-store";
@@ -150,6 +153,26 @@ type RelatedProject = { id: string; name: string; status: string; completion_per
 type RelatedEstimate = { id: string; title: string | null; number: string | null; status: string | null; total: number | null; valid_until: string | null; created_at: string };
 type RelatedInvoice = { id: string; invoice_number: string | null; status: string | null; total_amount: number | null; amount_paid: number | null; due_date: string | null };
 type DealActivityRow = { id: string; deal_id: string; activity_type: string; title: string; description: string | null; actor_name: string | null; occurred_at: string };
+type AppointmentActivityRow = {
+  id: string; activity_type: string; actor_id: string | null; created_at: string;
+  appointments: { title: string | null; service: string | null; contact_name: string | null } | null;
+};
+
+const APPOINTMENT_ACTIVITY_LABELS: Record<string, string> = {
+  created: "Appointment scheduled",
+  rescheduled: "Appointment rescheduled",
+  confirmed: "Appointment confirmed",
+  started: "Appointment started",
+  completed: "Appointment completed",
+  reopened: "Appointment reopened",
+  cancelled: "Appointment cancelled",
+  restored: "Appointment restored",
+  marked_no_show: "Appointment marked No Show",
+  assigned: "Appointment assigned",
+  unassigned: "Appointment unassigned",
+  relationship_changed: "Appointment relationship changed",
+  location_changed: "Appointment location changed",
+};
 
 type AddContactMode = "existing" | "new";
 
@@ -175,6 +198,7 @@ const TAB_ITEMS = [
   { value: "activity", label: "Activity", icon: MessageSquareText },
   { value: "opportunities", label: "Opportunities", icon: BriefcaseBusiness },
   { value: "projects", label: "Projects", icon: FolderKanban },
+  { value: "appointments", label: "Appointments", icon: CalendarClock },
   { value: "financials", label: "Financials", icon: WalletCards },
   { value: "files", label: "Files", icon: Paperclip },
   { value: "notes", label: "Notes", icon: StickyNote },
@@ -267,6 +291,7 @@ function AccountDetailsPage() {
   const [estimates, setEstimates] = useState<RelatedEstimate[]>([]);
   const [invoices, setInvoices] = useState<RelatedInvoice[]>([]);
   const [dealActivities, setDealActivities] = useState<DealActivityRow[]>([]);
+  const [appointmentActivities, setAppointmentActivities] = useState<AppointmentActivityRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [activeTab, setActiveTab] = useState<TabValue>("overview");
@@ -372,18 +397,26 @@ function AccountDetailsPage() {
     if (!invoicesResult.error) setInvoices((invoicesResult.data ?? []) as RelatedInvoice[]);
     if (!dealActivityResult.error) setDealActivities((dealActivityResult.data ?? []) as DealActivityRow[]);
 
+    // Appointment activities for this account (Phase 10.3 correction pass)
+    // — appointments.entity_type='company', entity_id=resolvedCompanyId.
+    // Bounded (limit 20) and org+entity-scoped, never an unbounded
+    // organization-wide appointment_activities scan.
+    const { data: apptActivityRows, error: apptActivityError } = await supabase
+      .from("appointment_activities")
+      .select("id, activity_type, actor_id, created_at, appointments!inner(title, service, contact_name, entity_type, entity_id, org_id)")
+      .eq("org_id", orgId)
+      .eq("appointments.entity_type", "company")
+      .eq("appointments.entity_id", resolvedCompanyId)
+      .order("created_at", { ascending: false })
+      .limit(20);
+    if (!apptActivityError) setAppointmentActivities((apptActivityRows ?? []) as unknown as AppointmentActivityRow[]);
+
     setLoading(false);
   }, [accountSlug]);
 
   useEffect(() => {
     void loadAccount();
   }, [loadAccount]);
-
-  useTopbarAction(
-    <Button size="sm" onClick={() => navigate({ to: "/companies" })}>
-      <Plus className="mr-1.5 h-3.5 w-3.5" /> Add Account
-    </Button>,
-  );
 
   const primaryContact = useMemo(
     () => contacts.find((item) => item.is_primary) ?? contacts[0] ?? null,
@@ -435,10 +468,26 @@ function AccountDetailsPage() {
       created_at: d.occurred_at,
       created_by_name: d.actor_name ?? undefined,
     }));
-    return [...activities, ...fromDeals].sort(
+    // Appointment lifecycle events (Phase 10.3 correction pass) — prefixed
+    // "appointment_" so ActivityList can give them a distinct CalendarClock
+    // icon instead of the generic note icon every other row uses.
+    const fromAppointments: CompanyActivity[] = appointmentActivities.map((a) => {
+      const appt = a.appointments;
+      const subject = appt?.title || appt?.service || "Appointment";
+      return {
+        id: `appt-activity-${a.id}`,
+        activity_type: `appointment_${a.activity_type}`,
+        title: APPOINTMENT_ACTIVITY_LABELS[a.activity_type] ?? "Appointment updated",
+        description: appt?.contact_name ? `${subject} with ${appt.contact_name}` : subject,
+        occurred_at: a.created_at,
+        created_at: a.created_at,
+        created_by_name: a.actor_id ? undefined : "System",
+      };
+    });
+    return [...activities, ...fromDeals, ...fromAppointments].sort(
       (a, b) => new Date(b.occurred_at || b.created_at).getTime() - new Date(a.occurred_at || a.created_at).getTime(),
     );
-  }, [activities, dealActivities]);
+  }, [activities, dealActivities, appointmentActivities]);
 
   const recentActivity = mergedActivity.slice(0, 5);
 
@@ -599,21 +648,9 @@ function AccountDetailsPage() {
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center gap-2 text-xs text-muted-foreground">
-        <Link to="/companies" className="hover:text-foreground">
-          CRM
-        </Link>
-        <span>/</span>
-        <Link to="/companies" className="hover:text-foreground">
-          Accounts
-        </Link>
-        <span>/</span>
-        <span className="max-w-56 truncate text-foreground">{company.name}</span>
-      </div>
-
       <Card className="overflow-hidden p-0">
         <div className="flex flex-col gap-4 p-5 lg:flex-row lg:items-center lg:justify-between">
-          <div className="flex min-w-0 items-start gap-4">
+          <div className="flex min-w-0 items-center gap-4">
             <Avatar className="h-20 w-20 rounded-2xl border bg-background">
               <AvatarImage
                 src={company.logo_url || undefined}
@@ -625,7 +662,7 @@ function AccountDetailsPage() {
               </AvatarFallback>
             </Avatar>
 
-            <div className="min-w-0 pt-0.5">
+            <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
                 <h1 className="truncate text-2xl font-semibold tracking-tight">{company.name}</h1>
                 <Badge variant="outline" className={accountTypeClass(company.account_type)}>
@@ -787,6 +824,20 @@ function AccountDetailsPage() {
               <ModuleEmptyState tab="projects" onOpen={() => void navigateToModule("/projects")} />
             )}
           </TabsContent>
+          <TabsContent value="appointments" className="m-0 border-t border-border bg-canvas p-3">
+            <Card className="p-5">
+              <EntityAppointmentsPanel
+                entityType="company"
+                entityId={company.id}
+                entityLabel="account"
+                contactName={primaryContact?.contact?.full_name || company.name}
+                contactPhone={primaryContact?.contact?.phone || undefined}
+                contactEmail={primaryContact?.contact?.email || undefined}
+                address={address || undefined}
+              />
+            </Card>
+          </TabsContent>
+
           <TabsContent value="financials" className="m-0 border-t border-border bg-canvas p-3">
             {(estimates.length > 0 || invoices.length > 0) ? (
               <CompanyFinancialsTab
@@ -880,6 +931,7 @@ function OverviewTab({
   pipelineValue: number;
   activeProjectsCount: number;
 }) {
+  const [scheduleOpen, setScheduleOpen] = useState(false);
   return (
     <div className="grid gap-3 xl:grid-cols-[minmax(0,1.8fr)_minmax(320px,0.9fr)]">
       <div className="space-y-3">
@@ -1055,7 +1107,7 @@ function OverviewTab({
               icon={CalendarDays}
               label="Schedule Appointment"
               tone="cyan"
-              onClick={() => void onNavigate("/calendar")}
+              onClick={() => setScheduleOpen(true)}
             />
             <QuickAction
               icon={Upload}
@@ -1139,6 +1191,22 @@ function OverviewTab({
           })}
         </div>
       </div>
+
+      <AppointmentDialog
+        open={scheduleOpen}
+        onOpenChange={setScheduleOpen}
+        prefill={{
+          entityType: "company",
+          entityId: company.id,
+          entityLabel: company.name,
+          contactName: primaryContact?.contact?.full_name || company.name,
+          contactPhone: primaryContact?.contact?.phone || undefined,
+          contactEmail: primaryContact?.contact?.email || undefined,
+          address: address || undefined,
+          source: "company",
+        }}
+        onSaved={() => toast.success("Appointment scheduled")}
+      />
     </div>
   );
 }
@@ -1477,10 +1545,15 @@ function ActivityList({
       {activities.map((item) => {
         const activityDate = item.occurred_at || item.created_at;
 
+        const isAppointment = item.activity_type.startsWith("appointment_");
+
         return (
           <div key={item.id} className="grid grid-cols-[32px_1fr_auto] gap-3 py-2">
-            <span className="grid h-8 w-8 place-items-center rounded-full bg-blue-50 text-blue-700">
-              <MessageSquareText className="h-4 w-4" />
+            <span className={cn(
+              "grid h-8 w-8 place-items-center rounded-full",
+              isAppointment ? "bg-info-soft text-info" : "bg-blue-50 text-blue-700",
+            )}>
+              {isAppointment ? <CalendarClock className="h-4 w-4" /> : <MessageSquareText className="h-4 w-4" />}
             </span>
 
             <div className="min-w-0">

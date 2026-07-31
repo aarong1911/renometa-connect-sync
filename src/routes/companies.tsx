@@ -29,6 +29,7 @@ import {
   UserPlus,
   Users,
   X,
+  CalendarPlus,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -75,7 +76,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { supabase } from "@/lib/supabase";
-import { useTopbarAction } from "@/lib/topbar-action";
+import { AppointmentDialog } from "@/components/calendar/appointment-dialog";
 import {
   useCompanies, useCompaniesLoading, refreshCompanies, deleteCompany as storeDeleteCompany,
   countCompanyLinkedRecords, findCompanyDuplicateCandidates, getOrgId as getCompaniesOrgId,
@@ -392,6 +393,7 @@ function AccountsPage() {
   const [importFilename, setImportFilename] = useState("companies.csv");
   const [historyOpen, setHistoryOpen] = useState(false);
   const [selected, setSelected] = useState<Company | null>(null);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Company | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Company | null>(null);
@@ -667,13 +669,6 @@ function AccountsPage() {
     }
   };
 
-  useTopbarAction(
-    <Button size="sm" onClick={openCreate}>
-      <Plus className="mr-1.5 h-3.5 w-3.5" />
-      Add Account
-    </Button>,
-  );
-
   const customers = companies.filter(
     (c) => c.account_type === "Customer",
   ).length;
@@ -692,7 +687,6 @@ function AccountsPage() {
         iconColor="text-gold-hover"
         title="Accounts"
         subtitle="Manage commercial customers, prospects, vendors, partners, and trade relationships."
-        breadcrumb={["CRM", "Accounts"]}
         actions={
           <div className="flex items-center gap-2">
             <Button size="sm" variant="outline" asChild>
@@ -706,6 +700,10 @@ function AccountsPage() {
             </Button>
             <Button size="sm" variant="outline" onClick={() => setHistoryOpen(true)}>
               <History className="mr-1.5 h-3.5 w-3.5" /> Import History
+            </Button>
+            <Button size="sm" onClick={openCreate}>
+              <Plus className="mr-1.5 h-3.5 w-3.5" />
+              Add Account
             </Button>
           </div>
         }
@@ -1097,7 +1095,26 @@ function AccountsPage() {
                     </Link>
                   </Button>
                 </div>
+                <Button variant="outline" size="sm" className="w-full" onClick={() => setScheduleOpen(true)}>
+                  <CalendarPlus className="mr-1.5 h-3.5 w-3.5" /> Schedule Appointment
+                </Button>
               </SheetHeader>
+
+              <AppointmentDialog
+                open={scheduleOpen}
+                onOpenChange={setScheduleOpen}
+                prefill={{
+                  entityType: "company",
+                  entityId: selected.id,
+                  entityLabel: selected.name,
+                  contactName: selected.name,
+                  contactPhone: selected.phone || undefined,
+                  contactEmail: selected.email || undefined,
+                  address: [selected.address, selected.city, selected.state, selected.zip].filter(Boolean).join(", ") || undefined,
+                  source: "company",
+                }}
+                onSaved={() => toast.success("Appointment scheduled")}
+              />
 
               <div className="space-y-5 py-5 text-sm">
                 <div className="grid grid-cols-2 gap-4 rounded-lg border p-4">

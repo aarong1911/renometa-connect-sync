@@ -4,7 +4,7 @@
 import type { LucideIcon } from "lucide-react";
 import {
   UserPlus, RefreshCw, Briefcase, Receipt, AlertCircle, CheckCircle2,
-  FileText, Calendar, PhoneMissed, UserRound, Play, FileCheck,
+  FileText, Calendar, CalendarClock, PhoneMissed, UserRound, Play, FileCheck,
   MessageSquare, Mail, CheckSquare, ArrowUpRight, UserCheck, Share2, StickyNote,
   GitBranch, Filter, Clock, Sparkles, Webhook,
 } from "lucide-react";
@@ -22,7 +22,7 @@ export type TriggerType =
   | "contact_created" | "manual";
 
 export type ActionType =
-  | "send_sms" | "send_email" | "create_task" | "update_status"
+  | "send_sms" | "send_email" | "create_task" | "create_appointment" | "update_status"
   | "assign_member" | "send_portal_invite" | "add_note";
 
 export type ConditionType = "if_else" | "filter";
@@ -135,6 +135,7 @@ export const NODE_META: WfNodeMeta[] = [
   { type: "send_sms",           category: "action",    icon: MessageSquare, label: "Send SMS",            description: "Send a text message to a contact",        defaultSubtitle: "To: contact phone",        defaultConfig: { to: "contact_phone", message: "Hi {contact.first_name}, " } },
   { type: "send_email",         category: "action",    icon: Mail,          label: "Send Email",          description: "Send an email to a contact",              defaultSubtitle: "To: contact email",        defaultConfig: { to: "contact_email", subject: "Following up from {org.name}", body: "Hi {contact.first_name},\n\n" } },
   { type: "create_task",        category: "action",    icon: CheckSquare,   label: "Create Task",         description: "Create a task and assign to a team member",defaultSubtitle: "Assign to owner",         defaultConfig: { title: "Follow up with {contact.first_name}", assignee: "owner", member_id: "", member_name: "", due_in: 1, due_unit: "days", priority: "medium" } },
+  { type: "create_appointment", category: "action",    icon: CalendarClock, label: "Create Appointment",  description: "Schedule an appointment on the Calendar", defaultSubtitle: "Scheduled, 1 hour",       defaultConfig: { title: "Consultation with {contact.first_name}", appointment_type: "consultation", start_in: 1, start_unit: "days", duration_min: 60, assignee: "unassigned", member_id: "", member_name: "" } },
   { type: "update_status",      category: "action",    icon: ArrowUpRight,  label: "Update Status",       description: "Update the status of a lead or project",  defaultSubtitle: "Change stage/status",      defaultConfig: { entity: "lead", field: "status", value: "" } },
   { type: "assign_member",      category: "action",    icon: UserCheck,     label: "Assign Member",       description: "Assign a team member to the record",      defaultSubtitle: "Round-robin",              defaultConfig: { strategy: "round_robin", member_id: "", member_name: "" } },
   { type: "send_portal_invite", category: "action",    icon: Share2,        label: "Send Portal Invite",  description: "Invite the contact to the client portal",  defaultSubtitle: "To contact email",         defaultConfig: { send_to: "contact_email", custom_email: "", note: "" } },
