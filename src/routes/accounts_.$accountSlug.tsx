@@ -34,6 +34,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { ContactAvatar } from "@/components/ui/contact-avatar";
 import { NewDealDialog } from "@/components/sales/new-deal-dialog";
 import { EntityAppointmentsPanel } from "@/components/appointments/entity-appointments-panel";
+import { EntityEstimatesPanel } from "@/components/estimates/entity-estimates-panel";
 import { AppointmentDialog } from "@/components/calendar/appointment-dialog";
 import { AccountRelatedDeals } from "@/components/accounts/account-related-deals";
 import { Badge } from "@/components/ui/badge";
@@ -839,15 +840,11 @@ function AccountDetailsPage() {
           </TabsContent>
 
           <TabsContent value="financials" className="m-0 border-t border-border bg-canvas p-3">
-            {(estimates.length > 0 || invoices.length > 0) ? (
-              <CompanyFinancialsTab
-                estimates={estimates}
-                invoices={invoices}
-                onOpen={() => void navigate({ to: "/financials" })}
-              />
-            ) : (
-              <ModuleEmptyState tab="financials" onOpen={() => void navigate({ to: "/financials" })} />
-            )}
+            <CompanyFinancialsTab
+              companyId={company.id}
+              invoices={invoices}
+              onOpen={() => void navigate({ to: "/financials" })}
+            />
           </TabsContent>
           <TabsContent value="files" className="m-0 border-t border-border bg-canvas p-3">
             <ModuleEmptyState tab="files" onOpen={() => void navigateToModule("/files")} />
@@ -1353,50 +1350,24 @@ function CompanyProjectsTab({ projects, onOpen }: { projects: RelatedProject[]; 
 // financials.invoices.tsx pairing) rather than splitting into two new
 // top-level tabs. ─────────────────────────────────────────────────────────
 function CompanyFinancialsTab({
-  estimates,
+  companyId,
   invoices,
   onOpen,
 }: {
-  estimates: RelatedEstimate[];
+  companyId: string;
   invoices: RelatedInvoice[];
   onOpen: () => void;
 }) {
   return (
     <div className="space-y-4">
-      {estimates.length > 0 && (
-        <Card className="p-5">
-          <div className="mb-4 flex items-center justify-between">
-            <div>
-              <h2 className="font-semibold">Estimates</h2>
-              <p className="text-sm text-muted-foreground">
-                Estimates for contacts linked to this account.
-              </p>
-            </div>
-            <Button size="sm" variant="outline" onClick={onOpen}>Open Financials</Button>
-          </div>
-          <div className="space-y-2">
-            {estimates.map((estimate) => (
-              <div key={estimate.id} className="rounded-xl border bg-white p-3">
-                <div className="flex items-start gap-3">
-                  <div className="flex h-9 w-9 items-center justify-center rounded-full bg-amber-50 text-amber-700">
-                    <FileText className="h-4 w-4" />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-semibold">
-                      {estimate.title || estimate.number || "Untitled Estimate"}
-                    </p>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      {estimate.status || "Draft"}
-                      {estimate.valid_until ? ` · Valid until ${formatDateShort(estimate.valid_until)}` : ""}
-                    </p>
-                  </div>
-                  <span className="shrink-0 text-sm font-semibold">{formatMoney(estimate.total ?? 0)}</span>
-                </div>
-              </div>
-            ))}
-          </div>
-        </Card>
-      )}
+      {/* Phase 10.4: real, org-scoped estimates panel with a working "New
+          estimate" action — now queries estimates.company_id directly
+          (added by the 20260809 migration) instead of the old
+          resolve-through-linked-contacts workaround this comment used to
+          describe. */}
+      <Card className="p-5">
+        <EntityEstimatesPanel entityType="company" entityId={companyId} entityLabel="account" />
+      </Card>
 
       {invoices.length > 0 && (
         <Card className="p-5">

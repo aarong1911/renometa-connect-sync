@@ -197,6 +197,8 @@ export type CreateProjectInput = {
   ownerId?: string | null;
   leadId?: string | null;
   dealId?: string | null;
+  /** projects.estimate_id — set when a Project is created via "Convert to Project" from an approved estimate (Phase 10.4). */
+  estimateId?: string | null;
 };
 
 export async function createProject(input: CreateProjectInput): Promise<{ error: any; project?: Project }> {
@@ -222,6 +224,7 @@ export async function createProject(input: CreateProjectInput): Promise<{ error:
   if (input.ownerId !== undefined) payload.owner_id = input.ownerId;
   if (input.leadId !== undefined) payload.lead_id = input.leadId;
   if (input.dealId !== undefined) payload.deal_id = input.dealId;
+  if (input.estimateId !== undefined) payload.estimate_id = input.estimateId;
 
   const { data, error } = await supabase
     .from("projects")

@@ -11,6 +11,7 @@ import {
 
 import { DealDetailDrawer } from "@/components/sales/deal-detail-drawer";
 import { EntityAppointmentsPanel } from "@/components/appointments/entity-appointments-panel";
+import { EntityEstimatesPanel } from "@/components/estimates/entity-estimates-panel";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   deleteDeal,
@@ -395,49 +396,13 @@ export function ContactRelatedTab({
               </section>
             )}
 
-            {estimates.length > 0 && (
-              <section className="space-y-3">
-                <div>
-                  <h3 className="text-sm font-semibold">Estimates</h3>
-                  <p className="text-xs text-muted-foreground">
-                    Estimates created for this Contact.
-                  </p>
-                </div>
-
-                <div className="space-y-2">
-                  {estimates.map((estimate) => (
-                    <div
-                      key={estimate.id}
-                      className="rounded-xl border bg-white p-3"
-                    >
-                      <div className="flex items-start gap-3">
-                        <div className="flex h-9 w-9 items-center
-                          justify-center rounded-full bg-amber-50
-                          text-amber-700">
-                          <FileText className="h-4 w-4" />
-                        </div>
-
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-sm font-semibold">
-                            {estimate.title ||
-                              estimate.number ||
-                              "Untitled Estimate"}
-                          </p>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            {estimate.status || "Draft"} ·{" "}
-                            {formatDateShort(estimate.created_at)}
-                          </p>
-                        </div>
-
-                        <span className="shrink-0 text-sm font-semibold">
-                          {formatMoney(estimate.total ?? 0)}
-                        </span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </section>
-            )}
+            {/* Phase 10.4: real, org-scoped estimates panel with a working
+                "New estimate" action — replaces the old read-only list
+                (which had no create action and used the legacy status
+                vocabulary directly off the row). */}
+            <section>
+              <EntityEstimatesPanel entityType="contact" entityId={contactId} entityLabel="contact" />
+            </section>
 
             {/* Phase 10.3: real, org-scoped, org-shared appointments panel
                 (create/edit/delete/lifecycle actions) — replaces the old

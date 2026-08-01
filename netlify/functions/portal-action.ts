@@ -92,15 +92,38 @@ export const handler: Handler = async (event) => {
   }
 
   // ── approve_estimate ────────────────────────────────────────────────────────
+  // Phase 10.4 fix: this used to write status: "accepted", a value the live
+  // estimates_status_check constraint (draft/ready/sent/viewed/
+  // changes_requested/approved/rejected/expired/converted/cancelled/
+  // archived) no longer permits — every call here failed with a DB
+  // constraint violation post-migration. Now writes the canonical
+  // "approved" status, is idempotent (a second approval is a no-op, not an
+  // error), and logs the same estimate_activities trail the public
+  // proposal-action.ts approval path writes.
   if (action === "approve_estimate") {
     const { estimateId } = payload ?? {};
     if (!estimateId)
       return { statusCode: 400, headers, body: JSON.stringify({ error: "estimateId required" }) };
 
+    const { data: estimate } = await supabaseAdmin
+      .from("estimates").select("id, org_id, status, version_number").eq("id", estimateId).maybeSingle();
+    if (!estimate) return { statusCode: 404, headers, body: JSON.stringify({ error: "Estimate not found" }) };
+    if (estimate.status === "approved") return { statusCode: 200, headers, body: JSON.stringify({ success: true }) };
+    if (!["sent", "viewed", "changes_requested"].includes(estimate.status))
+      return { statusCode: 409, headers, body: JSON.stringify({ error: "This estimate can no longer be approved." }) };
+
+    const now = new Date().toISOString();
     const { error } = await supabaseAdmin.from("estimates")
-      .update({ status: "accepted", esign_status: "signed", signed_at: new Date().toISOString() })
-      .eq("id", estimateId);
+      .update({ status: "approved", approved_at: now, esign_status: "signed", signed_at: now })
+      .eq("id", estimateId).eq("status", estimate.status);
     if (error) return { statusCode: 500, headers, body: JSON.stringify({ error: error.message }) };
+
+    await supabaseAdmin.from("estimate_activities").insert({
+      org_id: estimate.org_id, estimate_id: estimateId, version_number: estimate.version_number,
+      activity_type: "approved", actor_type: "customer", title: "Proposal approved",
+      description: "Approved via the client portal",
+    });
+
     return { statusCode: 200, headers, body: JSON.stringify({ success: true }) };
   }
 
@@ -136,7 +159,7 @@ export const handler: Handler = async (event) => {
       return { statusCode: 200, headers, body: JSON.stringify({ success: true, message: "Payment request sent to contractor" }) };
     }
 
-    const stripe  = new Stripe(stripeKey, { apiVersion: "2026-04-22.dahlia" });
+    const stripe = new Stripe(stripeKey);
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
       line_items: [{

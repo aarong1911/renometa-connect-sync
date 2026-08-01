@@ -78,7 +78,6 @@ import type {
   SalesPipelineStage,
   StageOutcome,
 } from "@/lib/sales/types";
-import { useTopbarAction } from "@/lib/topbar-action";
 
 type PipelineSearch = {
   dealId?: string;
@@ -297,17 +296,6 @@ function PipelinePage() {
     searchParams.pName,
     searchParams.pPhone,
   ]);
-
-  useTopbarAction(
-    <Button
-      size="sm"
-      className="bg-blue-600 text-white hover:bg-blue-700"
-      onClick={() => setAddOpen(true)}
-    >
-      <Plus className="mr-1.5 h-4 w-4" />
-      New Deal
-    </Button>,
-  );
 
   const normalizedDeals = useMemo(() => {
     return deals.map((deal) => {
@@ -714,7 +702,11 @@ function PipelinePage() {
         title="Pipeline"
         subtitle="Track every opportunity from first contact to closed revenue."
         actions={
-          <div className="flex h-full items-center">
+          <div className="flex h-full items-center gap-2">
+            <Button size="sm" className="h-9" onClick={() => setAddOpen(true)}>
+              <Plus className="mr-1.5 h-4 w-4" />
+              New Deal
+            </Button>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button
@@ -1332,7 +1324,7 @@ function DealCard({
           }
         >
           {overdue && <AlertTriangle className="h-3 w-3" />}
-          {formatDateShort(deal.expectedClose)}
+          {formatDateShort(deal.expectedClose, "No expected date")}
         </span>
       </div>
 
@@ -1472,7 +1464,7 @@ function PipelineList({
                         : ""
                     }
                   >
-                    {formatDateShort(deal.expectedClose)}
+                    {formatDateShort(deal.expectedClose, "No expected date")}
                   </span>
                 </TableCell>
 

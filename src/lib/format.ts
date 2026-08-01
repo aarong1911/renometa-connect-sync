@@ -16,11 +16,20 @@ const moneyFmt = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 0,
 });
 
-export function formatDate(iso: string) {
-  return dateFmt.format(new Date(iso));
+/** True for a value `new Date()` can actually format — rejects null/undefined/""/"Invalid Date"/malformed strings without throwing. Empty string is the case that bit us: `row.field ?? ""` mappers turn a null DB column into `""`, and `new Date("")` is an Invalid Date (unlike `new Date(null)`, which is the 1970 epoch) — Intl.DateTimeFormat.format() on an Invalid Date throws RangeError: Invalid time value. */
+function isFormattableDate(value: unknown): value is string | Date {
+  if (value === null || value === undefined || value === "") return false;
+  const date = value instanceof Date ? value : new Date(value as string);
+  return !Number.isNaN(date.getTime());
 }
-export function formatDateShort(iso: string) {
-  return dateShortFmt.format(new Date(iso));
+
+export function formatDate(iso: string | Date | null | undefined, fallback = "No date") {
+  if (!isFormattableDate(iso)) return fallback;
+  return dateFmt.format(iso instanceof Date ? iso : new Date(iso));
+}
+export function formatDateShort(iso: string | Date | null | undefined, fallback = "No date") {
+  if (!isFormattableDate(iso)) return fallback;
+  return dateShortFmt.format(iso instanceof Date ? iso : new Date(iso));
 }
 export function formatMoney(n: number) {
   return moneyFmt.format(n);

@@ -57,10 +57,20 @@ CommandInput.displayName = CommandPrimitive.Input.displayName;
 const CommandList = React.forwardRef<
   React.ElementRef<typeof CommandPrimitive.List>,
   React.ComponentPropsWithoutRef<typeof CommandPrimitive.List>
->(({ className, ...props }, ref) => (
+>(({ className, onWheel, ...props }, ref) => (
   <CommandPrimitive.List
     ref={ref}
-    className={cn("max-h-[300px] overflow-y-auto overflow-x-hidden", className)}
+    className={cn("max-h-[300px] overflow-y-auto overflow-x-hidden overscroll-contain touch-pan-y", className)}
+    // When this Command lives inside a modal Dialog/Sheet, Radix's
+    // react-remove-scroll body-lock listens for `wheel` on `document` and
+    // blocks it by default — it only recognizes scrollable regions that
+    // are DOM descendants of the Dialog's own content, but Popover/Select
+    // content portals to a separate document.body sibling, so this list's
+    // wheel events get swallowed before ever reaching the (fully correct)
+    // native overflow-y-auto below. Stopping propagation here — not
+    // preventDefault — keeps native wheel-scroll behavior intact while
+    // keeping the event from ever reaching that document-level listener.
+    onWheel={(e) => { e.stopPropagation(); onWheel?.(e); }}
     {...props}
   />
 ));

@@ -17,7 +17,7 @@ export type WfNodeCategory = "trigger" | "action" | "condition" | "utility";
 
 export type TriggerType =
   | "new_lead" | "lead_status_changed" | "project_status_changed"
-  | "invoice_created" | "invoice_overdue" | "estimate_approved" | "estimate_sent"
+  | "invoice_created" | "invoice_overdue" | "estimate_approved" | "estimate_sent" | "estimate_expired" | "estimate_converted_to_deal"
   | "form_submitted" | "appointment_scheduled" | "missed_call"
   | "contact_created" | "manual";
 
@@ -125,6 +125,8 @@ export const NODE_META: WfNodeMeta[] = [
   { type: "invoice_overdue",        category: "trigger",   icon: AlertCircle,   label: "Invoice Overdue",        description: "Fires when an invoice passes its due date",         defaultSubtitle: "7 days overdue",               defaultConfig: { days_overdue: 7 } },
   { type: "estimate_approved",      category: "trigger",   icon: CheckCircle2,  label: "Estimate Approved",      description: "Fires when a client approves an estimate",          defaultSubtitle: "Any estimate",                 defaultConfig: {} },
   { type: "estimate_sent",          category: "trigger",   icon: FileCheck,     label: "Estimate Sent",          description: "Fires when an estimate is sent to a client",        defaultSubtitle: "Any estimate",                 defaultConfig: {} },
+  { type: "estimate_expired",       category: "trigger",   icon: AlertCircle,   label: "Estimate Expired",       description: "Fires when a sent estimate passes its valid-until date without a response", defaultSubtitle: "Any estimate", defaultConfig: {} },
+  { type: "estimate_converted_to_deal", category: "trigger", icon: Briefcase, label: "Estimate Converted to Deal", description: "Fires when an approved estimate is converted into a Deal", defaultSubtitle: "Any estimate", defaultConfig: {} },
   { type: "form_submitted",         category: "trigger",   icon: FileText,      label: "Form Submitted",         description: "Fires when a lead form is submitted",               defaultSubtitle: "Any form",                     defaultConfig: { form_name: "" } },
   { type: "appointment_scheduled",  category: "trigger",   icon: Calendar,      label: "Appointment Scheduled",  description: "Fires when an appointment is booked",               defaultSubtitle: "Any appointment",              defaultConfig: {} },
   { type: "missed_call",            category: "trigger",   icon: PhoneMissed,   label: "Missed Call",            description: "Fires when an inbound call is unanswered",          defaultSubtitle: "Any caller",                   defaultConfig: {} },

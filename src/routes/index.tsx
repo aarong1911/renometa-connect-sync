@@ -8,7 +8,7 @@ import {
   Sparkles, UserPlus, DollarSign, Briefcase, CalendarDays, Zap, AlertTriangle,
   TrendingUp, Mail, ArrowRight, Clock, MessageCircle, Smartphone, Instagram,
   Workflow, MessageSquareWarning, Megaphone, CalendarClock, MapPin, User,
-  LayoutDashboard,
+  LayoutDashboard, CheckCircle2,
 } from "lucide-react";
 import { PageHeader } from "@/components/layout/app-shell";
 import { supabase } from "@/lib/supabase";
@@ -507,7 +507,7 @@ function DashboardPage() {
   // Real estimate rows (id/status/total/valid_until/updated_at) for the
   // Estimates card — counted/summed client-side rather than issuing one
   // query per status.
-  const [estimateRows, setEstimateRows] = useState<{ id: string; status: string; total: number; updated_at: string; valid_until: string | null; title: string; client_name: string | null }[]>([]);
+  const [estimateRows, setEstimateRows] = useState<{ id: string; status: string; total: number; updated_at: string; valid_until: string | null; title: string; client_name: string | null; converted_deal_id: string | null; converted_project_id: string | null; deposit_amount: number }[]>([]);
   // Dedicated "Next Booking" card (Phase 10.3 correction pass) — the
   // single soonest non-terminal appointment. Deliberately its own card,
   // never merged into Today's Tasks' nextUp candidates (see the nextUp
@@ -747,6 +747,45 @@ function DashboardPage() {
         href: "/estimates", weight: 55 + Math.min(days, 20),
       });
     }
+    // Changes requested — the customer responded, this always outranks a
+    // merely-stale "still waiting" estimate since it needs a real edit.
+    const changesRequested = estimateRows.filter((e) => e.status === "changes_requested");
+    for (const e of changesRequested) {
+      items.push({
+        id: `est-cr-${e.id}`, icon: <FileText className="h-4 w-4" />, color: "text-warning", bg: "bg-warning-soft ring-warning-soft",
+        title: e.title, sub: `${e.client_name ? `${e.client_name} · ` : ""}Changes requested`,
+        badge: "Changes Requested", badgeColor: "bg-warning-soft text-warning-soft-foreground ring-1 ring-warning-soft",
+        href: "/estimates", weight: 90,
+      });
+    }
+    // Proposal expiring within 3 days — still sent/viewed, not yet expired.
+    const expiringSoon = estimateRows.filter((e) => {
+      if (e.status !== "sent" && e.status !== "viewed") return false;
+      if (!e.valid_until) return false;
+      const days = daysBetween(now, new Date(e.valid_until));
+      return new Date(e.valid_until) >= now && days <= 3;
+    });
+    for (const e of expiringSoon) {
+      const days = daysBetween(now, new Date(e.valid_until!));
+      items.push({
+        id: `est-exp-${e.id}`, icon: <Clock className="h-4 w-4" />, color: "text-orange", bg: "bg-orange-soft ring-orange-soft",
+        title: e.title, sub: `${e.client_name ? `${e.client_name} · ` : ""}Expires in ${days} day${days === 1 ? "" : "s"}`,
+        badge: "Expiring Soon", badgeColor: "bg-orange-soft text-orange-soft-foreground ring-1 ring-orange-soft",
+        href: "/estimates", weight: 70,
+      });
+    }
+    // Approved but not yet converted to a Deal or Project, or (once
+    // converted) not yet invoiced for its deposit — real, actionable
+    // follow-ups, not a fabricated reminder.
+    const approvedAwaiting = estimateRows.filter((e) => e.status === "approved" && !e.converted_deal_id && !e.converted_project_id);
+    for (const e of approvedAwaiting) {
+      items.push({
+        id: `est-conv-${e.id}`, icon: <CheckCircle2 className="h-4 w-4" />, color: "text-success", bg: "bg-success-soft ring-success-soft",
+        title: e.title, sub: `${e.client_name ? `${e.client_name} · ` : ""}Approved — ready to convert`,
+        badge: "Approved", badgeColor: "bg-success-soft text-success-soft-foreground ring-1 ring-success-soft",
+        href: "/estimates", weight: 65,
+      });
+    }
     const openDeals = allDeals.filter(d => d.stage !== "won" && d.stage !== "lost");
     for (const d of openDeals) {
       if (d.ageDays >= 14) {
@@ -857,7 +896,7 @@ function DashboardPage() {
         // cap needs either a paginated fetch or a server-side aggregate
         // (e.g. an RPC returning per-status counts/sums), not just a higher
         // limit — deferred rather than attempted in this correction pass.
-        supabase.from("estimates").select("id, status, total, updated_at, valid_until, title, client_name, created_at").eq("org_id", orgId).order("updated_at", { ascending: false }).limit(500),
+        supabase.from("estimates").select("id, status, total, updated_at, valid_until, title, client_name, created_at, converted_deal_id, converted_project_id, deposit_amount").eq("org_id", orgId).order("updated_at", { ascending: false }).limit(500),
         // Tasks card "Completed recently" + Recent Activity — scoped
         // directly by tasks.org_id (Phase 10.1 added a real column here),
         // so this now includes Lead/Deal-linked tasks with no project too,
@@ -937,6 +976,8 @@ function DashboardPage() {
         return {
           id: e.id, status: e.status, total, updated_at: e.updated_at, valid_until: e.valid_until ?? null,
           title: e.title ?? "Untitled", client_name: e.client_name ?? null,
+          converted_deal_id: e.converted_deal_id ?? null, converted_project_id: e.converted_project_id ?? null,
+          deposit_amount: Number(e.deposit_amount ?? 0),
         };
       }));
 
@@ -989,13 +1030,15 @@ function DashboardPage() {
         const name = (inv as any).contacts?.full_name ?? "Client";
         items.push({ id: `i${inv.id}`, who: name, t: "Invoice paid", s: fmtK(Number(inv.total_amount ?? 0)), when: "", at: inv.created_at });
       }
-      // Estimate sent/viewed/accepted — real status + real updated_at, not a
+      // Estimate sent/viewed/approved — real status + real updated_at, not a
       // fabricated "sent" event log (this table has no separate history of
       // status transitions, so "when this row was last updated" is the
-      // honest signal available).
+      // honest signal available). Canonical status vocabulary from
+      // src/lib/estimate-status.ts (Phase 10.4) — "accepted" was dead code,
+      // it never matched a live DB value.
       for (const e of (allEstimateRows ?? []).slice(0, 3)) {
-        if (e.status === "sent" || e.status === "viewed" || e.status === "accepted") {
-          const label = e.status === "accepted" ? "Estimate accepted" : e.status === "viewed" ? "Estimate viewed" : "Estimate sent";
+        if (e.status === "sent" || e.status === "viewed" || e.status === "approved") {
+          const label = e.status === "approved" ? "Estimate approved" : e.status === "viewed" ? "Estimate viewed" : "Estimate sent";
           items.push({ id: `e${e.id}`, who: e.client_name ?? "Client", t: label, s: e.title ?? "", when: "", at: e.updated_at ?? e.created_at });
         }
       }

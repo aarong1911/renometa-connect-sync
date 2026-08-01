@@ -42,6 +42,7 @@ import { Route as SettingsBrandingRouteImport } from './routes/settings.branding
 import { Route as SettingsBillingRouteImport } from './routes/settings.billing'
 import { Route as SettingsApiKeysRouteImport } from './routes/settings.api-keys'
 import { Route as SalesPipelineRouteImport } from './routes/sales.pipeline'
+import { Route as ProposalTokenRouteImport } from './routes/proposal.$token'
 import { Route as ProjectsClientSlugRouteImport } from './routes/projects.$clientSlug'
 import { Route as InsightsReputationRouteImport } from './routes/insights.reputation'
 import { Route as InsightsAnalyticsRouteImport } from './routes/insights.analytics'
@@ -225,6 +226,11 @@ const SalesPipelineRoute = SalesPipelineRouteImport.update({
   path: '/sales/pipeline',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ProposalTokenRoute = ProposalTokenRouteImport.update({
+  id: '/proposal/$token',
+  path: '/proposal/$token',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ProjectsClientSlugRoute = ProjectsClientSlugRouteImport.update({
   id: '/projects/$clientSlug',
   path: '/projects/$clientSlug',
@@ -349,6 +355,7 @@ export interface FileRoutesByFullPath {
   '/insights/analytics': typeof InsightsAnalyticsRoute
   '/insights/reputation': typeof InsightsReputationRoute
   '/projects/$clientSlug': typeof ProjectsClientSlugRoute
+  '/proposal/$token': typeof ProposalTokenRoute
   '/sales/pipeline': typeof SalesPipelineRoute
   '/settings/api-keys': typeof SettingsApiKeysRoute
   '/settings/billing': typeof SettingsBillingRoute
@@ -400,6 +407,7 @@ export interface FileRoutesByTo {
   '/insights/analytics': typeof InsightsAnalyticsRoute
   '/insights/reputation': typeof InsightsReputationRoute
   '/projects/$clientSlug': typeof ProjectsClientSlugRoute
+  '/proposal/$token': typeof ProposalTokenRoute
   '/sales/pipeline': typeof SalesPipelineRoute
   '/settings/api-keys': typeof SettingsApiKeysRoute
   '/settings/billing': typeof SettingsBillingRoute
@@ -453,6 +461,7 @@ export interface FileRoutesById {
   '/insights/analytics': typeof InsightsAnalyticsRoute
   '/insights/reputation': typeof InsightsReputationRoute
   '/projects/$clientSlug': typeof ProjectsClientSlugRoute
+  '/proposal/$token': typeof ProposalTokenRoute
   '/sales/pipeline': typeof SalesPipelineRoute
   '/settings/api-keys': typeof SettingsApiKeysRoute
   '/settings/billing': typeof SettingsBillingRoute
@@ -507,6 +516,7 @@ export interface FileRouteTypes {
     | '/insights/analytics'
     | '/insights/reputation'
     | '/projects/$clientSlug'
+    | '/proposal/$token'
     | '/sales/pipeline'
     | '/settings/api-keys'
     | '/settings/billing'
@@ -558,6 +568,7 @@ export interface FileRouteTypes {
     | '/insights/analytics'
     | '/insights/reputation'
     | '/projects/$clientSlug'
+    | '/proposal/$token'
     | '/sales/pipeline'
     | '/settings/api-keys'
     | '/settings/billing'
@@ -610,6 +621,7 @@ export interface FileRouteTypes {
     | '/insights/analytics'
     | '/insights/reputation'
     | '/projects/$clientSlug'
+    | '/proposal/$token'
     | '/sales/pipeline'
     | '/settings/api-keys'
     | '/settings/billing'
@@ -657,6 +669,7 @@ export interface RootRouteChildren {
   InsightsAnalyticsRoute: typeof InsightsAnalyticsRoute
   InsightsReputationRoute: typeof InsightsReputationRoute
   ProjectsClientSlugRoute: typeof ProjectsClientSlugRoute
+  ProposalTokenRoute: typeof ProposalTokenRoute
   SalesPipelineRoute: typeof SalesPipelineRoute
   ProjectsIndexRoute: typeof ProjectsIndexRoute
 }
@@ -894,6 +907,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SalesPipelineRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/proposal/$token': {
+      id: '/proposal/$token'
+      path: '/proposal/$token'
+      fullPath: '/proposal/$token'
+      preLoaderRoute: typeof ProposalTokenRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/projects/$clientSlug': {
       id: '/projects/$clientSlug'
       path: '/projects/$clientSlug'
@@ -1121,6 +1141,7 @@ const rootRouteChildren: RootRouteChildren = {
   InsightsAnalyticsRoute: InsightsAnalyticsRoute,
   InsightsReputationRoute: InsightsReputationRoute,
   ProjectsClientSlugRoute: ProjectsClientSlugRoute,
+  ProposalTokenRoute: ProposalTokenRoute,
   SalesPipelineRoute: SalesPipelineRoute,
   ProjectsIndexRoute: ProjectsIndexRoute,
 }

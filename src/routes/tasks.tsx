@@ -28,7 +28,6 @@ import {
 import { toast } from "sonner";
 
 import { PageHeader } from "@/components/layout/app-shell";
-import { useTopbarAction } from "@/lib/topbar-action";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { MetricCard } from "@/components/ui/metric-card";
@@ -284,12 +283,6 @@ function TasksPage() {
     void handleStatusMutation(() => updateTask(draggableId, { status: newStatus }), "Could not update task status");
   };
 
-  useTopbarAction(
-    <Button size="sm" onClick={() => setCreateOpen(true)}>
-      <Plus className="h-4 w-4" /> New Task
-    </Button>,
-  );
-
   const hasActiveFilters = query.trim() !== "" || ownerFilter !== "all" || priorityFilter !== "all" || relatedFilter !== "all" || statusFilter !== "all";
   const clearFilters = () => {
     setQuery(""); setOwnerFilter("all"); setPriorityFilter("all"); setRelatedFilter("all"); setStatusFilter("all");
@@ -303,6 +296,11 @@ function TasksPage() {
         iconColor="text-violet"
         title="Tasks"
         subtitle="Plan, assign, and track work across your entire organization."
+        actions={
+          <Button size="sm" onClick={() => setCreateOpen(true)}>
+            <Plus className="h-4 w-4" /> New Task
+          </Button>
+        }
       />
 
       <div className="mb-3 grid grid-cols-2 gap-3 md:grid-cols-4">

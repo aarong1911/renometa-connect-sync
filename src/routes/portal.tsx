@@ -50,6 +50,29 @@ function fmt(date: string | null) {
   if (!date) return "—";
   return new Date(date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
+// Phase 10.4 — compatibility layer for this portal's own estimate display.
+// Normalizes the legacy accepted/declined vocabulary (this portal predates
+// src/lib/estimate-status.ts) to the canonical approved/rejected labels
+// without introducing a second status system or touching the DB — any old
+// row that somehow still had "accepted"/"declined" renders exactly like a
+// canonical "approved"/"rejected" row would.
+const PORTAL_ESTIMATE_STATUS_LABELS: Record<string, string> = {
+  draft: "Draft", ready: "Ready", sent: "Sent", viewed: "Viewed",
+  changes_requested: "Changes Requested", approved: "Approved", accepted: "Approved",
+  rejected: "Rejected", declined: "Rejected", expired: "Expired",
+  converted: "Converted", cancelled: "Cancelled", archived: "Archived",
+};
+function portalEstimateStatusLabel(status: string): string {
+  return PORTAL_ESTIMATE_STATUS_LABELS[status] ?? status;
+}
+function portalEstimateStatusClass(status: string): string {
+  if (status === "approved" || status === "accepted") return "bg-green-50 text-green-600";
+  if (status === "rejected" || status === "declined") return "bg-red-50 text-red-600";
+  if (status === "sent" || status === "viewed") return "bg-blue-50 text-blue-600";
+  if (status === "changes_requested") return "bg-amber-50 text-amber-600";
+  return "bg-gray-50 text-gray-500";
+}
+
 function fmtMoney(n: number) {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(n);
 }
@@ -293,10 +316,10 @@ export function ClientPortal() {
                       ))}
                     </div>
                   )}
-                  {data.estimates.filter(e => e.status === "sent").length > 0 && (
+                  {data.estimates.filter(e => e.status === "sent" || e.status === "viewed").length > 0 && (
                     <div className="rounded-lg border border-blue-100 bg-blue-50 p-4">
                       <p className="text-sm font-medium text-blue-700 mb-2">Awaiting your approval</p>
-                      {data.estimates.filter(e => e.status === "sent").map(est => (
+                      {data.estimates.filter(e => e.status === "sent" || e.status === "viewed").map(est => (
                         <div key={est.id} className="flex items-center justify-between gap-3">
                           <div>
                             <p className="text-sm font-medium text-blue-800">{est.title}</p>
@@ -313,7 +336,7 @@ export function ClientPortal() {
                   )}
                   <div className="grid grid-cols-2 gap-3">
                     {[
-                      { label: "Estimates", val: data.estimates.length, sub: `${data.estimates.filter(e => e.status === "accepted").length} approved` },
+                      { label: "Estimates", val: data.estimates.length, sub: `${data.estimates.filter(e => e.status === "approved" || e.status === "accepted").length} approved` },
                       { label: "Invoices",  val: data.invoices.length,  sub: `${data.invoices.filter(i => i.status === "paid").length} paid` },
                       { label: "Messages",  val: projectNotes.length,   sub: "project updates" },
                       { label: "Files",     val: projectFiles.length,   sub: "documents" },
@@ -333,18 +356,16 @@ export function ClientPortal() {
                 <div className="divide-y divide-gray-50">
                   {data.estimates.length === 0 && <p className="text-sm text-gray-400 text-center py-10">No estimates yet.</p>}
                   {data.estimates.map(est => {
-                    const isPending = est.status === "sent" && est.esign_status !== "signed";
+                    const isPending = (est.status === "sent" || est.status === "viewed") && est.esign_status !== "signed";
                     return (
                       <div key={est.id} className="p-5">
                         <div className="flex items-start justify-between gap-3">
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2">
                               {est.number && <span className="text-xs text-gray-400">#{est.number}</span>}
-                              <span className={`text-xs rounded-full px-2 py-0.5 font-medium ${
-                                est.status === "accepted" ? "bg-green-50 text-green-600"
-                                  : est.status === "sent" ? "bg-blue-50 text-blue-600"
-                                  : "bg-gray-50 text-gray-500"
-                              }`}>{est.status}</span>
+                              <span className={`text-xs rounded-full px-2 py-0.5 font-medium ${portalEstimateStatusClass(est.status)}`}>
+                                {portalEstimateStatusLabel(est.status)}
+                              </span>
                             </div>
                             <p className="text-sm font-semibold text-gray-900 mt-1">{est.title}</p>
                             <p className="text-xs text-gray-400 mt-0.5">Sent {fmt(est.created_at)}{est.valid_until ? ` · Valid until ${fmt(est.valid_until)}` : ""}</p>
