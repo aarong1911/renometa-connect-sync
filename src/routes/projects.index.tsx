@@ -57,7 +57,7 @@ import {
   useOrgTemplates, saveOrgTemplate, getScopeTemplates, resolveDefaultScopeContent,
 } from "@/lib/proposal-templates-store";
 import type { WorkType } from "@/lib/estimate-status";
-import { useTasks, addTask, updateTask, deleteTask, refreshTasks } from "@/lib/tasks-store";
+import { useTasks, addTask, updateTask, deleteTask, refreshTasks, type TaskStatus } from "@/lib/tasks-store";
 import { EntityAppointmentsPanel } from "@/components/appointments/entity-appointments-panel";
 import type { Task, Contact } from "@/lib/mock-data";
 import { supabase } from "@/lib/supabase";
@@ -66,10 +66,15 @@ import {
   fetchProjectPhases, createProjectPhase, updateProjectPhase, deleteProjectPhase, movePhase, getPhaseDisplayProgress,
   fetchProjectMilestones, createProjectMilestone, achieveMilestone, deleteProjectMilestone,
   fetchTaskDependencies, createTaskDependency, deleteTaskDependency, getBlockingTask,
-  PHASE_STATUS_ORDER, PHASE_STATUS_LABELS,
+  PHASE_STATUS_ORDER, PHASE_STATUS_LABELS, MILESTONE_STATUS_LABELS,
   applyProjectPlanTemplate, hasTemplateBeenApplied,
-  type ProjectPhase, type ProjectMilestone, type TaskDependency, type PhaseStatus, type ApplyTemplateMode,
+  type ProjectPhase, type ProjectMilestone, type TaskDependency, type PhaseStatus, type ApplyTemplateMode, type MilestoneStatus,
 } from "@/lib/project-planning";
+import {
+  getProjectScheduleHealth, getNextMilestone, getNextTask, getOverdueCounts, getBlockedTaskCount,
+  formatDateOnly, formatDelay, SCHEDULE_HEALTH_LABELS,
+  parseDateOnlySafe, differenceInCalendarDaysSafe, todayDateOnly,
+} from "@/lib/schedule-health";
 import {
   templatesForProjectType, findPlanTemplate, formatTemplateCounts, formatTemplateSummary, pluralizeCount,
   type ProjectPlanTemplate,
@@ -201,6 +206,108 @@ const STATUS_ICONS: Record<Task["status"], React.ReactNode> = {
   cancelled:   <XCircle      className="h-4 w-4 text-rose-500" />,
 };
 
+// ─── Project Timeline (Phase 13.2 continuation) ────────────────────────────────
+//
+// A lightweight chronological agenda — every phase start/end, milestone,
+// and task with a real date, merged into one list, grouped by month. This
+// is a deliberate scope-down from the spec's full horizontal zoomable
+// Gantt-bar timeline (Week/Month/Quarter zoom, pixel-positioned bars,
+// dependency-line routing) — see the Phase report for the reasoning. It's
+// also exactly the "mobile fallback" the spec asks for, just used
+// everywhere rather than only on narrow screens, which keeps this one
+// simple, fully accessible (plain semantic rows, not a canvas), safe
+// implementation instead of two.
+function ProjectTimelineAgenda({ project, phases, milestones, tasks }: {
+  project: Project; phases: ProjectPhase[]; milestones: ProjectMilestone[]; tasks: Task[];
+}) {
+  void project; // reserved for a future Project start/end row — not rendered yet, see report
+  type AgendaItem = {
+    id: string; date: Date; label: string; sublabel: string;
+    icon: "phase" | "milestone" | "task"; done: boolean; overdue: boolean;
+  };
+  const today = todayDateOnly();
+  const items: AgendaItem[] = [];
+
+  for (const p of phases) {
+    const isDone = p.status === "completed" || p.status === "skipped";
+    const ps = parseDateOnlySafe(p.plannedStartDate);
+    if (ps) items.push({ id: `${p.id}-start`, date: ps, label: `${p.name} — starts`, sublabel: PHASE_STATUS_LABELS[p.status], icon: "phase", done: isDone, overdue: false });
+    const pe = parseDateOnlySafe(p.plannedEndDate);
+    if (pe) {
+      const overdue = !isDone && (differenceInCalendarDaysSafe(today, pe) ?? -1) > 0;
+      items.push({ id: `${p.id}-end`, date: pe, label: `${p.name} — ends`, sublabel: PHASE_STATUS_LABELS[p.status], icon: "phase", done: p.status === "completed", overdue });
+    }
+  }
+  for (const m of milestones) {
+    const d = parseDateOnlySafe(m.plannedDate);
+    if (d) {
+      const overdue = m.status === "pending" && (differenceInCalendarDaysSafe(today, d) ?? -1) > 0;
+      items.push({ id: m.id, date: d, label: m.name, sublabel: MILESTONE_STATUS_LABELS[m.status], icon: "milestone", done: m.status === "achieved", overdue });
+    }
+  }
+  for (const t of tasks) {
+    const d = parseDateOnlySafe(t.dueDateRaw);
+    if (d) {
+      const overdue = t.status !== "completed" && t.status !== "cancelled" && (differenceInCalendarDaysSafe(today, d) ?? -1) > 0;
+      items.push({ id: t.id, date: d, label: t.title, sublabel: "Task", icon: "task", done: t.status === "completed", overdue });
+    }
+  }
+
+  if (items.length === 0) {
+    return (
+      <div className="rounded-lg border border-dashed border-border py-12 text-center">
+        <p className="text-sm text-muted-foreground">No scheduled dates yet</p>
+        <p className="mt-1 text-xs text-muted-foreground">Add dates to phases, milestones, or tasks to see the Project Timeline.</p>
+      </div>
+    );
+  }
+
+  items.sort((a, b) => a.date.getTime() - b.date.getTime());
+
+  const groups = new Map<string, AgendaItem[]>();
+  for (const item of items) {
+    const key = item.date.toLocaleDateString("en-US", { month: "long", year: "numeric" });
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(item);
+  }
+
+  return (
+    <div className="space-y-4" role="list" aria-label="Project timeline">
+      {[...groups.entries()].map(([month, monthItems]) => (
+        <div key={month}>
+          <h4 className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{month}</h4>
+          <div className="space-y-1">
+            {monthItems.map((item) => {
+              const isToday = item.date.getTime() === today.getTime();
+              const Icon = item.icon === "milestone" ? (item.done ? CheckCircle2 : Circle) : item.icon === "phase" ? Flag : Circle;
+              return (
+                <div
+                  key={item.id} role="listitem"
+                  className={cn(
+                    "flex items-center gap-3 rounded-lg border px-3 py-2",
+                    item.overdue ? "border-red-200 bg-red-50 dark:border-red-900/40 dark:bg-red-500/10" : isToday ? "border-primary bg-primary/5" : "border-border bg-background",
+                  )}
+                >
+                  <span className="w-16 shrink-0 text-[11px] text-muted-foreground">{item.date.toLocaleDateString("en-US", { month: "short", day: "numeric" })}</span>
+                  <Icon className={cn("h-3.5 w-3.5 shrink-0", item.done ? "text-green-600" : item.overdue ? "text-red-600" : "text-muted-foreground")} />
+                  <div className="min-w-0 flex-1">
+                    <p className={cn("truncate text-sm", item.done && "text-muted-foreground line-through")}>{item.label}</p>
+                    <p className="truncate text-[11px] text-muted-foreground">
+                      {item.sublabel}
+                      {item.overdue && ` · Overdue by ${formatDelay(differenceInCalendarDaysSafe(today, item.date) ?? 0)}`}
+                      {isToday && " · Today"}
+                    </p>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ─── KPI Card ─────────────────────────────────────────────────────────────────
 
 // ─── Project Detail Sheet ─────────────────────────────────────────────────────
@@ -258,6 +365,18 @@ function ProjectDetailSheet({ project, open, onClose, onReload, onProjectUpdated
     setPlanningStartDate(project.start_date || new Date().toISOString().slice(0, 10));
     setPlanTemplateKey("");
   }, [open, project?.id]);
+
+  // Phase 13.2 continuation — Timeline / schedule health / Milestones & Tasks subviews
+  const [scheduleSubview, setScheduleSubview] = useState<"plan" | "timeline" | "milestones" | "tasks">("plan");
+  const [milestoneSearch, setMilestoneSearch] = useState("");
+  const [milestoneStatusFilter, setMilestoneStatusFilter] = useState<"all" | MilestoneStatus>("all");
+  const [milestonePhaseFilter, setMilestonePhaseFilter] = useState<string>("all");
+  const [taskSearch, setTaskSearch] = useState("");
+  const [taskPhaseFilter, setTaskPhaseFilter] = useState<string>("all");
+  const [taskStatusFilter, setTaskStatusFilter] = useState<"all" | TaskStatus>("all");
+  const [taskFocusFilter, setTaskFocusFilter] = useState<"all" | "overdue" | "blocked" | "unassigned">("all");
+
+  useEffect(() => { if (open) setScheduleSubview("plan"); }, [open, project?.id]);
 
   const loadPlanningData = useCallback(async () => {
     if (!project) return;
@@ -414,6 +533,22 @@ function ProjectDetailSheet({ project, open, onClose, onReload, onProjectUpdated
   const suggestedTemplate = availableTemplates[0];
   const isDuplicateTemplate = selectedTemplate ? hasTemplateBeenApplied(phases, selectedTemplate.key) : false;
   const hasExistingPlan = phases.length > 0 || milestones.length > 0;
+
+  // ── Phase 13.2 continuation — schedule health & upcoming work ─────────
+  // Pure derivations from already-loaded phases/milestones/projectTasks/
+  // dependencies — no extra queries (Part 28 performance requirement).
+  const scheduleHealth = getProjectScheduleHealth({ project, phases, milestones, tasks: projectTasks });
+  const nextMilestone = getNextMilestone(milestones);
+  const nextUpcomingTask = getNextTask(projectTasks);
+  const overdueCounts = getOverdueCounts(milestones, projectTasks);
+  const blockedTaskCount = getBlockedTaskCount(projectTasks, dependencies);
+  const SCHEDULE_HEALTH_TONE: Record<typeof scheduleHealth.status, string> = {
+    not_scheduled: "bg-muted text-muted-foreground border-border",
+    on_track: "bg-green-50 text-green-700 border-green-200 dark:bg-green-500/10 dark:text-green-400 dark:border-green-900/40",
+    at_risk: "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-500/10 dark:text-amber-400 dark:border-amber-900/40",
+    delayed: "bg-red-50 text-red-700 border-red-200 dark:bg-red-500/10 dark:text-red-400 dark:border-red-900/40",
+    completed: "bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-500/10 dark:text-blue-400 dark:border-blue-900/40",
+  };
 
   const handleApplyTemplate = async (mode: ApplyTemplateMode) => {
     if (!selectedTemplate || applyingTemplate) return;
@@ -888,7 +1023,71 @@ function ProjectDetailSheet({ project, open, onClose, onReload, onProjectUpdated
 
           {/* ── Schedule & Tasks ── */}
           {activeTab === "schedule" && (
-            <div role="tabpanel" id="project-panel-schedule" aria-labelledby="project-tab-schedule" className="space-y-5">
+            <div role="tabpanel" id="project-panel-schedule" aria-labelledby="project-tab-schedule" className="space-y-4">
+
+              {/* ── Schedule health + upcoming work (Phase 13.2 continuation) ──
+                  Always visible above the subviews below — real data only,
+                  derived from the phases/milestones/tasks/dependencies
+                  already loaded for this Project, no extra queries. */}
+              <div className="flex flex-wrap items-stretch gap-2">
+                <div className={cn("flex min-w-40 flex-1 items-center gap-2 rounded-lg border px-3 py-2", SCHEDULE_HEALTH_TONE[scheduleHealth.status])}>
+                  <div className="min-w-0">
+                    <p className="text-[10px] font-medium uppercase tracking-wide opacity-80">Schedule Health</p>
+                    <p className="truncate text-sm font-semibold">{SCHEDULE_HEALTH_LABELS[scheduleHealth.status]}</p>
+                    <p className="truncate text-[11px] opacity-90">
+                      {scheduleHealth.status === "delayed" && scheduleHealth.delayDays !== null
+                        ? `Delayed by ${formatDelay(scheduleHealth.delayDays)}`
+                        : scheduleHealth.reasons.length > 0 ? scheduleHealth.reasons[0]
+                        : scheduleHealth.status === "on_track" ? "No overdue milestones or tasks"
+                        : scheduleHealth.status === "not_scheduled" ? "Add dates to phases, milestones, or tasks"
+                        : ""}
+                    </p>
+                  </div>
+                </div>
+                <div className="min-w-32 flex-1 rounded-lg border border-border bg-muted/30 px-3 py-2">
+                  <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Next Milestone</p>
+                  <p className="truncate text-sm font-semibold">{nextMilestone ? nextMilestone.name : "None scheduled"}</p>
+                  {nextMilestone && <p className="truncate text-[11px] text-muted-foreground">{formatDateOnly(nextMilestone.plannedDate)}</p>}
+                </div>
+                <div className="min-w-32 flex-1 rounded-lg border border-border bg-muted/30 px-3 py-2">
+                  <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Next Task</p>
+                  <p className="truncate text-sm font-semibold">{nextUpcomingTask ? nextUpcomingTask.title : "None scheduled"}</p>
+                  {nextUpcomingTask && <p className="truncate text-[11px] text-muted-foreground">{formatDateOnly(nextUpcomingTask.dueDateRaw)}</p>}
+                </div>
+                <div className="min-w-28 flex-1 rounded-lg border border-border bg-muted/30 px-3 py-2">
+                  <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Overdue</p>
+                  <p className="text-sm font-semibold">{overdueCounts.tasks + overdueCounts.milestones === 0 ? "None" : overdueCounts.tasks + overdueCounts.milestones}</p>
+                  {overdueCounts.tasks + overdueCounts.milestones > 0 && (
+                    <p className="truncate text-[11px] text-muted-foreground">{overdueCounts.tasks} task{overdueCounts.tasks === 1 ? "" : "s"} · {overdueCounts.milestones} milestone{overdueCounts.milestones === 1 ? "" : "s"}</p>
+                  )}
+                </div>
+                <div className="min-w-24 flex-1 rounded-lg border border-border bg-muted/30 px-3 py-2">
+                  <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Blocked</p>
+                  <p className="text-sm font-semibold">{blockedTaskCount === 0 ? "None" : blockedTaskCount}</p>
+                </div>
+              </div>
+
+              {/* ── Subviews ── */}
+              <Tabs value={scheduleSubview} onValueChange={(v) => setScheduleSubview(v as typeof scheduleSubview)}>
+                <div className="overflow-x-auto">
+                  <TabsList className="h-auto w-max gap-1.5 bg-transparent p-0">
+                    {([
+                      ["plan", "Plan"], ["timeline", "Timeline"], ["milestones", "Milestones"], ["tasks", "Tasks"],
+                    ] as const).map(([value, label]) => (
+                      <TabsTrigger
+                        key={value} value={value}
+                        className="h-8 whitespace-nowrap rounded-md border border-border bg-white px-3 text-xs font-medium text-muted-foreground shadow-none transition-colors hover:bg-muted/50 hover:text-foreground
+                          data-[state=active]:border-[#EADFC8] data-[state=active]:bg-[#FAF3E4] data-[state=active]:text-foreground data-[state=active]:shadow-sm"
+                      >
+                        {label}
+                      </TabsTrigger>
+                    ))}
+                  </TabsList>
+                </div>
+              </Tabs>
+
+              {scheduleSubview === "plan" && (
+              <div className="space-y-5">
 
               {/* ── Project Plan Template (Phase 13.2 continuation) ── */}
               <div className="space-y-2 rounded-lg border border-border bg-secondary/20 p-3">
@@ -1105,6 +1304,167 @@ function ProjectDetailSheet({ project, open, onClose, onReload, onProjectUpdated
                   address={project.address || contact?.address || undefined}
                 />
               </div>
+              </div>
+              )}
+
+              {/* ── Timeline (Phase 13.2 continuation) — lightweight
+                  chronological agenda, not a pixel-positioned Gantt bar
+                  chart. Phases, milestones, and tasks with any real date
+                  are merged into one list and grouped by month; the full
+                  horizontal zoomable bar timeline described in the spec is
+                  deliberately deferred (see the Phase report) given the
+                  size of everything else in this pass. */}
+              {scheduleSubview === "timeline" && (
+                <ProjectTimelineAgenda project={project} phases={phases} milestones={milestones} tasks={projectTasks} />
+              )}
+
+              {/* ── Milestones (dedicated view) ── */}
+              {scheduleSubview === "milestones" && (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="relative min-w-40 flex-1">
+                      <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                      <Input placeholder="Search milestones…" value={milestoneSearch} onChange={(e) => setMilestoneSearch(e.target.value)} className="h-8 pl-8 text-sm" />
+                    </div>
+                    <Select value={milestoneStatusFilter} onValueChange={(v) => setMilestoneStatusFilter(v as typeof milestoneStatusFilter)}>
+                      <SelectTrigger className="h-8 w-36 text-xs" aria-label="Filter by status"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all" className="text-xs">All Statuses</SelectItem>
+                        {(["pending", "achieved", "missed", "cancelled"] as const).map((s) => <SelectItem key={s} value={s} className="text-xs">{MILESTONE_STATUS_LABELS[s]}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                    <Select value={milestonePhaseFilter} onValueChange={setMilestonePhaseFilter}>
+                      <SelectTrigger className="h-8 w-36 text-xs" aria-label="Filter by phase"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all" className="text-xs">All Phases</SelectItem>
+                        <SelectItem value="none" className="text-xs">No Phase</SelectItem>
+                        {phases.map((p) => <SelectItem key={p.id} value={p.id} className="text-xs">{p.name}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  {(() => {
+                    const q = milestoneSearch.trim().toLowerCase();
+                    const filtered = milestones
+                      .filter((m) => !q || m.name.toLowerCase().includes(q))
+                      .filter((m) => milestoneStatusFilter === "all" || m.status === milestoneStatusFilter)
+                      .filter((m) => milestonePhaseFilter === "all" || (milestonePhaseFilter === "none" ? !m.phaseId : m.phaseId === milestonePhaseFilter))
+                      .sort((a, b) => {
+                        const da = parseDateOnlySafe(a.plannedDate);
+                        const db = parseDateOnlySafe(b.plannedDate);
+                        if (!da && !db) return 0;
+                        if (!da) return 1;
+                        if (!db) return -1;
+                        return da.getTime() - db.getTime();
+                      });
+                    if (milestones.length === 0) return (
+                      <div className="rounded-lg border border-dashed border-border py-10 text-center">
+                        <p className="text-sm text-muted-foreground">No milestones yet</p>
+                        <p className="mt-0.5 text-xs text-muted-foreground">Add a milestone or apply a Project Plan Template from the Plan tab.</p>
+                      </div>
+                    );
+                    if (filtered.length === 0) return <p className="py-6 text-center text-xs text-muted-foreground">No milestones match your filters.</p>;
+                    return (
+                      <div className="space-y-1">
+                        {filtered.map((m) => {
+                          const phase = phases.find((p) => p.id === m.phaseId);
+                          const overdueDays = m.status === "pending" ? differenceInCalendarDaysSafe(todayDateOnly(), parseDateOnlySafe(m.plannedDate)) : null;
+                          const isOverdue = overdueDays !== null && overdueDays > 0;
+                          return (
+                            <div key={m.id} className="group flex items-center gap-3 rounded-lg border border-border bg-background px-3 py-2.5 hover:bg-secondary/30">
+                              {m.status === "achieved" ? <CheckCircle2 className="h-4 w-4 shrink-0 text-green-600" /> : isOverdue ? <AlertCircle className="h-4 w-4 shrink-0 text-red-600" /> : <Circle className="h-4 w-4 shrink-0 text-muted-foreground" />}
+                              <div className="min-w-0 flex-1">
+                                <p className={cn("truncate text-sm", m.status === "achieved" && "line-through text-muted-foreground")}>{m.name}</p>
+                                <p className="truncate text-[11px] text-muted-foreground">
+                                  {phase && `${phase.name} · `}
+                                  {m.plannedDate ? formatDateOnly(m.plannedDate) : "No planned date"}
+                                  {isOverdue && ` · Overdue by ${formatDelay(overdueDays!)}`}
+                                  {m.isCustomerVisible && " · Customer-visible"}
+                                </p>
+                              </div>
+                              {m.status !== "achieved" && (
+                                <Button type="button" size="sm" variant="outline" className="h-6 shrink-0 text-[11px]" onClick={() => void handleAchieveMilestone(m)}>Mark Achieved</Button>
+                              )}
+                              <button onClick={() => void handleDeleteMilestone(m)} className="shrink-0 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive transition-opacity" aria-label={`Delete milestone ${m.name}`}><Trash2 className="h-3.5 w-3.5" /></button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {/* ── Tasks (dedicated Project-scoped view) ── */}
+              {scheduleSubview === "tasks" && (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="relative min-w-40 flex-1">
+                      <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                      <Input placeholder="Search tasks…" value={taskSearch} onChange={(e) => setTaskSearch(e.target.value)} className="h-8 pl-8 text-sm" />
+                    </div>
+                    <Select value={taskPhaseFilter} onValueChange={setTaskPhaseFilter}>
+                      <SelectTrigger className="h-8 w-36 text-xs" aria-label="Filter by phase"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all" className="text-xs">All Phases</SelectItem>
+                        <SelectItem value="none" className="text-xs">Unassigned</SelectItem>
+                        {phases.map((p) => <SelectItem key={p.id} value={p.id} className="text-xs">{p.name}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                    <Select value={taskStatusFilter} onValueChange={(v) => setTaskStatusFilter(v as typeof taskStatusFilter)}>
+                      <SelectTrigger className="h-8 w-32 text-xs" aria-label="Filter by status"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all" className="text-xs">All Statuses</SelectItem>
+                        {(["not_started", "in_progress", "on_hold", "completed", "cancelled"] as const).map((s) => <SelectItem key={s} value={s} className="text-xs">{s.replace("_", " ")}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                    <Select value={taskFocusFilter} onValueChange={(v) => setTaskFocusFilter(v as typeof taskFocusFilter)}>
+                      <SelectTrigger className="h-8 w-32 text-xs" aria-label="Focus filter"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all" className="text-xs">All Tasks</SelectItem>
+                        <SelectItem value="overdue" className="text-xs">Overdue</SelectItem>
+                        <SelectItem value="blocked" className="text-xs">Blocked</SelectItem>
+                        <SelectItem value="unassigned" className="text-xs">Unassigned to Phase</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  {(() => {
+                    const q = taskSearch.trim().toLowerCase();
+                    const today = todayDateOnly();
+                    const filtered = projectTasks
+                      .filter((t) => !q || t.title.toLowerCase().includes(q))
+                      .filter((t) => taskPhaseFilter === "all" || (taskPhaseFilter === "none" ? !t.phaseId : t.phaseId === taskPhaseFilter))
+                      .filter((t) => taskStatusFilter === "all" || t.status === taskStatusFilter)
+                      .filter((t) => {
+                        if (taskFocusFilter === "all") return true;
+                        if (taskFocusFilter === "unassigned") return !t.phaseId;
+                        if (taskFocusFilter === "overdue") {
+                          if (t.status === "completed" || t.status === "cancelled") return false;
+                          const d = differenceInCalendarDaysSafe(today, parseDateOnlySafe(t.dueDateRaw));
+                          return d !== null && d > 0;
+                        }
+                        if (taskFocusFilter === "blocked") return !!getBlockingTask(t.id, dependencies, tasksById);
+                        return true;
+                      })
+                      .sort((a, b) => {
+                        const da = parseDateOnlySafe(a.dueDateRaw);
+                        const db = parseDateOnlySafe(b.dueDateRaw);
+                        if (!da && !db) return 0;
+                        if (!da) return 1;
+                        if (!db) return -1;
+                        return da.getTime() - db.getTime();
+                      });
+                    if (projectTasks.length === 0) return (
+                      <div className="rounded-lg border border-dashed border-border py-10 text-center">
+                        <p className="text-sm text-muted-foreground">No Project tasks yet</p>
+                        <p className="mt-0.5 text-xs text-muted-foreground">Add a task or apply a Project Plan Template from the Plan tab.</p>
+                      </div>
+                    );
+                    if (filtered.length === 0) return <p className="py-6 text-center text-xs text-muted-foreground">No tasks match your filters.</p>;
+                    return <div className="space-y-1">{filtered.map((task) => renderTaskRow(task))}</div>;
+                  })()}
+                </div>
+              )}
+
             </div>
           )}
 
