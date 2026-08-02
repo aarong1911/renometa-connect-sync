@@ -516,6 +516,14 @@ function AccountDetailsPage() {
     await navigate({ to });
   };
 
+  // "Create Project" is a real deep-link into the New Project dialog
+  // pre-filled with this account (Part 27) — previously just navigated to
+  // /projects with no prefill at all, a no-op-feeling broken button.
+  const createProjectForAccount = () => {
+    if (!company) return;
+    void navigate({ to: "/projects", search: { openNew: true, companyId: company.id } });
+  };
+
   // Primary-contact change remains two client-side steps (clear old, set
   // new) — NOT atomic. A transactional set_company_primary_contact RPC was
   // considered for this pass and deliberately deferred: writing a
@@ -783,6 +791,7 @@ function AccountDetailsPage() {
               onShowActivity={() => setActiveTab("activity")}
               onShowNotes={() => setActiveTab("notes")}
               onNavigate={navigateToModule}
+              onCreateProject={createProjectForAccount}
               openDealsCount={companyDealStats.openCount}
               pipelineValue={companyDealStats.openValue}
               activeProjectsCount={activeProjectsCount}
@@ -908,6 +917,7 @@ function OverviewTab({
   onShowActivity,
   onShowNotes,
   onNavigate,
+  onCreateProject,
   openDealsCount,
   pipelineValue,
   activeProjectsCount,
@@ -923,6 +933,7 @@ function OverviewTab({
   onNewDeal: () => void;
   onShowActivity: () => void;
   onShowNotes: () => void;
+  onCreateProject: () => void;
   onNavigate: (to: "/pipeline" | "/projects" | "/calendar" | "/files") => Promise<void>;
   openDealsCount: number;
   pipelineValue: number;
@@ -1098,7 +1109,7 @@ function OverviewTab({
               icon={FolderKanban}
               label="Create Project"
               tone="violet"
-              onClick={() => void onNavigate("/projects")}
+              onClick={onCreateProject}
             />
             <QuickAction
               icon={CalendarDays}

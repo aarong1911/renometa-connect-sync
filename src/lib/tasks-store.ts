@@ -94,6 +94,8 @@ function mapRow(row: any): Task {
     recurrence: "none",
     entityType: isTaskEntityType(row.entity_type) ? row.entity_type : undefined,
     entityId: row.entity_id ?? undefined,
+    phaseId: row.phase_id ?? null,
+    milestoneId: row.milestone_id ?? null,
   };
 }
 
@@ -235,6 +237,8 @@ export async function addTask(task: CreateTaskInput): Promise<Task | null> {
     insertPayload.entity_type = task.entityType;
     insertPayload.entity_id = task.entityId;
   }
+  if (task.phaseId) insertPayload.phase_id = task.phaseId;
+  if (task.milestoneId) insertPayload.milestone_id = task.milestoneId;
 
   const { data, error } = await supabase
     .from("tasks")
@@ -288,6 +292,8 @@ export async function updateTask(id: string, patch: TaskPatch): Promise<{ ok: tr
   if (patch.priority !== undefined) update.priority = toDbPriority(patch.priority);
   if (patch.due !== undefined) update.due_date = patch.due ? patch.due.slice(0, 10) : null;
   if (patch.assignedTo !== undefined) update.assigned_to = patch.assignedTo;
+  if (patch.phaseId !== undefined) update.phase_id = patch.phaseId;
+  if (patch.milestoneId !== undefined) update.milestone_id = patch.milestoneId;
 
   // entityType/entityId are only ever changed together — clearing one
   // without the other would violate the DB's paired-null check constraint.

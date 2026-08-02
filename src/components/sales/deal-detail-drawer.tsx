@@ -1,11 +1,12 @@
 // src/components/sales/deal-detail-drawer.tsx
 
 import { useEffect, useMemo, useState } from "react";
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { formatDistanceToNow } from "date-fns";
 import {
   AlertCircle,
   Bell,
+  Briefcase,
   Building2,
   Calendar,
   CheckCircle2,
@@ -67,6 +68,7 @@ import {
 } from "@/lib/deals-store";
 import { formatDateShort, formatMoney } from "@/lib/format";
 import { supabase } from "@/lib/supabase";
+import { createProject, mapProjectRow, type Project as StoreProject } from "@/lib/projects-store";
 import type {
   Deal,
   DealActivity,
@@ -542,6 +544,7 @@ export function DealDetailDrawer({
   stages = [],
   teamMembers = [],
 }: DealDetailDrawerProps) {
+  const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState("overview");
   const [activities, setActivities] = useState<DealActivity[]>([]);
   const [contacts, setContacts] = useState<DealContact[]>([]);
@@ -560,6 +563,10 @@ export function DealDetailDrawer({
   const [estimates, setEstimates] = useState<LinkedEstimate[]>([]);
   const [loadingEstimates, setLoadingEstimates] = useState(false);
   const [estimatesError, setEstimatesError] = useState<string | null>(null);
+
+  const [linkedProject, setLinkedProject] = useState<StoreProject | null>(null);
+  const [loadingProject, setLoadingProject] = useState(false);
+  const [creatingProject, setCreatingProject] = useState(false);
 
   const [editOpen, setEditOpen] = useState(false);
   const [lostOpen, setLostOpen] = useState(false);
@@ -596,6 +603,7 @@ export function DealDetailDrawer({
       setContacts([]);
       setEstimates([]);
       setEstimatesError(null);
+      setLinkedProject(null);
       return;
     }
 
@@ -604,7 +612,77 @@ export function DealDetailDrawer({
     void loadAccounts();
     void loadContactOptions();
     void loadEstimates(deal.id, deal.orgId);
+    void loadLinkedProject(deal.id, deal.orgId);
   }, [deal?.id]);
+
+  async function loadLinkedProject(dealId: string, orgId: string) {
+    setLoadingProject(true);
+
+    try {
+      const { data, error } = await supabase
+        .from("projects")
+        .select("*, contacts!client_id(full_name), owner_profile:profiles!owner_id(first_name,last_name,email)")
+        .eq("deal_id", dealId)
+        .eq("org_id", orgId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (error) throw error;
+
+      setLinkedProject(data ? mapProjectRow(data) : null);
+    } catch (error) {
+      console.error("[deal-drawer] project load failed:", error);
+    } finally {
+      setLoadingProject(false);
+    }
+  }
+
+  async function handleCreateProject() {
+    if (!deal || linkedProject || creatingProject) return;
+
+    setCreatingProject(true);
+
+    try {
+      const { project, error } = await createProject({
+        name: deal.name,
+        client_id: deal.contactId,
+        status: "planning",
+        address: deal.projectAddress || deal.address || undefined,
+        budget_total: deal.value || undefined,
+        ownerId: deal.ownerId ?? null,
+        dealId: deal.id,
+      });
+
+      if (error || !project) throw error ?? new Error("Project not created");
+
+      setLinkedProject(project);
+
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+
+      await supabase.from("deal_activities").insert({
+        org_id: deal.orgId,
+        deal_id: deal.id,
+        activity_type: "custom",
+        title: "Converted to Project",
+        description: project.name,
+        actor_id: user?.id ?? null,
+        actor_name:
+          teamMembers.find((member) => member.id === user?.id)?.name ?? user?.email ?? "Team member",
+        occurred_at: new Date().toISOString(),
+      });
+
+      toast.success(`Project "${project.name}" created`);
+      void loadActivity(deal.id);
+    } catch (error: any) {
+      console.error("[deal-drawer] create project failed:", error);
+      toast.error(error?.message ?? "Failed to create project");
+    } finally {
+      setCreatingProject(false);
+    }
+  }
 
   async function loadEstimates(dealId: string, orgId: string) {
     setLoadingEstimates(true);
@@ -1458,7 +1536,7 @@ export function DealDetailDrawer({
                 ["overview", "Overview"],
                 ["activity", "Activity"],
                 ["contacts", "Contacts"],
-                ["estimate", "Estimate"],
+                ["estimate", "Estimate / Project"],
                 ["tasks", "Tasks"],
                 ["appointments", "Appointments"],
                 ["notes", "Notes"],
@@ -1808,7 +1886,53 @@ export function DealDetailDrawer({
               )}
             </TabsContent>
 
-            <TabsContent value="estimate" className="mt-5">
+            <TabsContent value="estimate" className="mt-5 space-y-5">
+              <div className="rounded-lg border bg-card p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <Briefcase className="h-4 w-4 text-muted-foreground" />
+                    <p className="text-sm font-semibold">Project</p>
+                  </div>
+                  {linkedProject && (
+                    <StatusBadge tone="muted">{linkedProject.status}</StatusBadge>
+                  )}
+                </div>
+
+                {loadingProject ? (
+                  <p className="mt-2 text-sm text-muted-foreground">Loading project...</p>
+                ) : linkedProject ? (
+                  <>
+                    <p className="mt-2 truncate text-sm font-medium">{linkedProject.name}</p>
+                    <div className="mt-3">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          void navigate({ to: "/projects", search: { projectId: linkedProject.id } })
+                        }
+                      >
+                        <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
+                        Open Project
+                      </Button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <p className="mt-2 text-sm text-muted-foreground">
+                      No project has been created for this deal yet.
+                    </p>
+                    {deal && (
+                      <div className="mt-3">
+                        <Button size="sm" onClick={() => void handleCreateProject()} disabled={creatingProject}>
+                          <Plus className="mr-1.5 h-3.5 w-3.5" />
+                          {creatingProject ? "Creating..." : "Create Project"}
+                        </Button>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+
               {loadingEstimates ? (
                 <p className="py-10 text-center text-sm text-muted-foreground">
                   Loading estimates...

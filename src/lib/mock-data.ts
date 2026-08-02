@@ -255,6 +255,9 @@ export type Task = {
   /** Phase 10.1 — generic CRM entity link (lead/deal today). Undefined = unlinked. */
   entityType?: TaskEntityType;
   entityId?: string;
+  /** Phase 13.2 — optional Project phase/milestone this task belongs to. Null/undefined = unassigned to a phase (still shown, just outside the structured plan). */
+  phaseId?: string | null;
+  milestoneId?: string | null;
 };
 
 /** Centralized aliases (Phase 10.2) — named references to Task's own existing literal unions, not a new/parallel vocabulary. Use these instead of re-typing the union elsewhere. */

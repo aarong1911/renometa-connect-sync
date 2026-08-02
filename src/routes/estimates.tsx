@@ -75,6 +75,8 @@ type EstimatesSearch = {
   companyId?: string;
   dealId?: string;
   projectId?: string;
+  /** Opens the existing Estimate detail sheet by id — e.g. "Open Estimate" from Edit Project. Distinct from `projectId` above, which only prefills a brand-new Estimate. */
+  estimateId?: string;
 };
 
 export const Route = createFileRoute("/estimates")({
@@ -87,6 +89,7 @@ export const Route = createFileRoute("/estimates")({
     companyId: typeof raw.companyId === "string" ? raw.companyId : undefined,
     dealId: typeof raw.dealId === "string" ? raw.dealId : undefined,
     projectId: typeof raw.projectId === "string" ? raw.projectId : undefined,
+    estimateId: typeof raw.estimateId === "string" ? raw.estimateId : undefined,
   }),
   component: EstimatesPage,
 });
@@ -1574,7 +1577,7 @@ type EstimateVersionRow = { id: string; version_number: number; created_at: stri
 
 function EstimateDetailSheet({
   estimate, onClose, onStatusChange, onEdit, onSend, onCopyLink, sending, onConvertDeal, onConvertProject,
-  onCreateInvoice, onCreateDeposit, onCreateRevision, onOpenDeal, busyAction,
+  onCreateInvoice, onCreateDeposit, onCreateRevision, onOpenDeal, onOpenProject, busyAction,
 }: {
   estimate: Estimate | null;
   onClose: () => void;
@@ -1589,6 +1592,7 @@ function EstimateDetailSheet({
   onCreateRevision: (e: Estimate) => void;
   onCreateDeposit: (e: Estimate) => void;
   onOpenDeal: (dealId: string) => void;
+  onOpenProject: (projectId: string) => void;
   busyAction: string | null;
 }) {
   const [activities, setActivities] = useState<EstimateActivityRow[]>([]);
@@ -1680,9 +1684,15 @@ function EstimateDetailSheet({
                     {isBusy("deal") ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Handshake className="mr-1.5 h-3.5 w-3.5" />}Convert to Deal
                   </Button>
                 )}
-                <Button size="sm" variant="outline" onClick={() => onConvertProject(estimate)} disabled={!!estimate.convertedProjectId || isBusy("project")}>
-                  {isBusy("project") ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <FolderKanban className="mr-1.5 h-3.5 w-3.5" />}{estimate.convertedProjectId ? "Project Linked" : "Convert to Project"}
-                </Button>
+                {(estimate.convertedProjectId || estimate.project_id) ? (
+                  <Button size="sm" variant="outline" onClick={() => onOpenProject((estimate.project_id || estimate.convertedProjectId)!)}>
+                    <FolderKanban className="mr-1.5 h-3.5 w-3.5" />Open Project
+                  </Button>
+                ) : (
+                  <Button size="sm" variant="outline" onClick={() => onConvertProject(estimate)} disabled={isBusy("project")}>
+                    {isBusy("project") ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <FolderKanban className="mr-1.5 h-3.5 w-3.5" />}Convert to Project
+                  </Button>
+                )}
                 <Button size="sm" variant="outline" onClick={() => onCreateInvoice(estimate, false)} disabled={isBusy("invoice")}><Receipt className="mr-1.5 h-3.5 w-3.5" />Create Invoice</Button>
                 {estimate.depositAmount > 0 && <Button size="sm" variant="outline" onClick={() => onCreateDeposit(estimate)} disabled={isBusy("deposit")}><Receipt className="mr-1.5 h-3.5 w-3.5" />Create Deposit Invoice</Button>}
                 <Button size="sm" variant="outline" onClick={() => onStatusChange(estimate.id, "archived")}><Archive className="mr-1.5 h-3.5 w-3.5" />Archive</Button>
@@ -1800,7 +1810,7 @@ function EstimateDetailSheet({
 // ── Main Page ─────────────────────────────────────────────────────────────────
 
 function EstimatesPage() {
-  const { openNew, leadId, contactId, companyId, dealId, projectId } = useSearch({ from: "/estimates" });
+  const { openNew, leadId, contactId, companyId, dealId, projectId, estimateId } = useSearch({ from: "/estimates" });
   const navigate = useNavigate({ from: "/estimates" });
   const [estimates, setEstimates] = useState<Estimate[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1850,6 +1860,17 @@ function EstimatesPage() {
 
     void openForLead();
   }, [openNew, leadId, contactId, companyId, dealId, projectId, orgId, navigate]);
+
+  // "Open Estimate" deep link (e.g. from Edit Project's Linked Records) —
+  // opens the existing EstimateDetailSheet by id rather than prefilling a
+  // new Estimate. Waits for the list to finish loading so it doesn't race
+  // an empty `estimates` array on first render.
+  useEffect(() => {
+    if (!estimateId || loading) return;
+    const match = estimates.find((e) => e.id === estimateId);
+    if (match) setSelected(match);
+    navigate({ search: (s) => ({ ...s, estimateId: undefined }), replace: true });
+  }, [estimateId, loading, estimates, navigate]);
 
   useEffect(() => {
     if (!orgId) return;
@@ -2081,8 +2102,12 @@ function EstimatesPage() {
 
   // ── Convert to Project ────────────────────────────────────────────────────
   const handleConvertProject = async (e: Estimate) => {
-    if (e.convertedProjectId) { toast.error("Already converted to a Project"); return; }
+    // Guard on either field, matching the same dual-field pattern used for
+    // Convert to Deal — a row could have one set without the other (e.g. a
+    // hand-repaired record), and either one means a Project already exists.
+    if (e.convertedProjectId || e.project_id) { toast.error("Already converted to a Project"); return; }
     if (!e.client_id) { toast.error("This estimate has no linked contact to create a project for."); return; }
+    if (busyAction === `${e.id}:project`) return; // duplicate-submit guard (double click / retry)
     setBusyAction(`${e.id}:project`);
     try {
       const { project, error } = await createProject({
@@ -2091,13 +2116,29 @@ function EstimatesPage() {
         priority: "normal", ownerId: e.owner_id ?? null, dealId: e.deal_id || e.convertedDealId || undefined, estimateId: e.id,
       });
       if (error || !project) throw error ?? new Error("Project not created");
-      await supabase.from("estimates").update({ converted_project_id: project.id }).eq("id", e.id);
+
+      // Bidirectional link — if this fails, the Project we just created
+      // would be a real, unlinked orphan; compensating cleanup deletes it
+      // rather than leaving one behind and reporting success.
+      const { error: linkErr } = await supabase
+        .from("estimates")
+        .update({ project_id: project.id, converted_project_id: project.id, converted_at: new Date().toISOString() })
+        .eq("id", e.id).eq("org_id", orgId);
+      if (linkErr) {
+        try {
+          await supabase.from("projects").delete().eq("id", project.id).eq("org_id", orgId);
+        } catch {
+          // best-effort cleanup — the user-facing error below already explains what happened
+        }
+        throw new Error(`Project was created but could not be linked back to the estimate (${linkErr.message}). The Project has been removed — please try again.`);
+      }
+
       await supabase.from("estimate_activities").insert({
         org_id: orgId, estimate_id: e.id, version_number: e.version_number, activity_type: "converted_to_project",
         actor_type: "user", title: "Converted to Project", description: project.name,
       });
       toast.success(`Project "${project.name}" created`);
-      setSelected(s => (s?.id === e.id ? { ...s, convertedProjectId: project.id } : s));
+      setSelected(s => (s?.id === e.id ? { ...s, project_id: project.id, convertedProjectId: project.id } : s));
       load();
     } catch (err: any) {
       toast.error(err.message ?? "Failed to convert to Project");
@@ -2314,7 +2355,11 @@ function EstimatesPage() {
                               ) : (
                                 <DropdownMenuItem onClick={() => handleConvertDeal(e)}>Convert to Deal</DropdownMenuItem>
                               )}
-                              <DropdownMenuItem onClick={() => handleConvertProject(e)} disabled={!!e.convertedProjectId}>Convert to Project</DropdownMenuItem>
+                              {(e.convertedProjectId || e.project_id) ? (
+                                <DropdownMenuItem onClick={() => navigate({ to: "/projects", search: { projectId: (e.project_id || e.convertedProjectId)! } })}>Open Project</DropdownMenuItem>
+                              ) : (
+                                <DropdownMenuItem onClick={() => handleConvertProject(e)}>Convert to Project</DropdownMenuItem>
+                              )}
                               <DropdownMenuItem onClick={() => handleCreateInvoice(e, false)}>Create Invoice</DropdownMenuItem>
                               {e.depositAmount > 0 && <DropdownMenuItem onClick={() => handleCreateInvoice(e, true)}>Create Deposit Invoice</DropdownMenuItem>}
                             </>
@@ -2358,6 +2403,7 @@ function EstimatesPage() {
         onConvertProject={handleConvertProject}
         onCreateInvoice={handleCreateInvoice}
         onOpenDeal={dealId => navigate({ to: "/pipeline", search: { dealId } })}
+        onOpenProject={projectId => navigate({ to: "/projects", search: { projectId } })}
         onCreateDeposit={e => handleCreateInvoice(e, true)}
         onCreateRevision={handleCreateRevision}
         busyAction={busyAction}

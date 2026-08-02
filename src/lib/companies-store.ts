@@ -339,6 +339,57 @@ export async function ensureCompanyContactAssociation(orgId: string, companyId: 
   }
 }
 
+export type ResolvedPrimaryContact = {
+  id: string;
+  full_name: string;
+  email: string | null;
+  phone: string | null;
+  avatar_url: string | null;
+  avatar_key: string | null;
+};
+
+/**
+ * Canonical Account → Primary Contact resolver — the SAME query shape
+ * accounts_.$accountSlug.tsx uses to render its "Primary Contact" card
+ * (company_contacts ordered by is_primary desc, first row wins). Any
+ * caller that needs "the Account's Primary Contact" (e.g. Create Project
+ * from an Account) must use this instead of filtering contacts.company_id
+ * directly — per the documented invariant above, company_contacts is the
+ * relationship of record and contacts.company_id is only ever the
+ * contact's single default company, not guaranteed to be set for every
+ * company_contacts row (known gap: convert_lead_to_deal and some manual
+ * "link existing contact" paths write company_contacts only). Falls back
+ * to contacts.company_id only when the Account has zero company_contacts
+ * rows at all, so genuinely contact-less Accounts still report truthfully.
+ */
+export async function resolvePrimaryContactForCompany(
+  companyId: string,
+  orgId: string,
+): Promise<ResolvedPrimaryContact | null> {
+  const { data: linked, error } = await supabase
+    .from("company_contacts")
+    .select("is_primary, contact:contacts(id, full_name, email, phone, avatar_url, avatar_key)")
+    .eq("company_id", companyId)
+    .eq("org_id", orgId)
+    .order("is_primary", { ascending: false })
+    .limit(1);
+
+  if (!error && linked && linked.length > 0) {
+    const contact = (linked[0] as any).contact;
+    if (contact) return contact as ResolvedPrimaryContact;
+  }
+
+  const { data: fallback } = await supabase
+    .from("contacts")
+    .select("id, full_name, email, phone, avatar_url, avatar_key")
+    .eq("company_id", companyId)
+    .eq("org_id", orgId)
+    .limit(1)
+    .maybeSingle();
+
+  return (fallback as ResolvedPrimaryContact | null) ?? null;
+}
+
 export type CompanyLinkedRecordCount = {
   label: string;
   count: number;

@@ -70,7 +70,7 @@ import {
 } from "@/lib/message-templates";
 import { recordTemplateUse } from "@/lib/recent-templates";
 import { useOrganization, useTeam } from "@/lib/organization";
-import { updateContact, useContacts } from "@/lib/contacts-store";
+import { updateContact, useContacts, useContactsLoading } from "@/lib/contacts-store";
 import { useContactActivity } from "@/lib/contact-activity";
 import { NewDealDialog } from "@/components/sales/new-deal-dialog";
 import { AppointmentDialog } from "@/components/calendar/appointment-dialog";
@@ -112,11 +112,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 type ChannelIcon = ComponentType<{ className?: string }>;
 
-type InboxSearch = { templateId?: string };
+type InboxSearch = { templateId?: string; contactId?: string };
 
 export const Route = createFileRoute("/inbox")({
   validateSearch: (raw: Record<string, unknown>): InboxSearch => ({
     templateId: typeof raw.templateId === "string" && raw.templateId ? raw.templateId : undefined,
+    contactId: typeof raw.contactId === "string" && raw.contactId ? raw.contactId : undefined,
   }),
   component: InboxLayout,
 });
@@ -208,8 +209,9 @@ function formatLogTs(iso: string): string {
 }
 
 function InboxPage() {
-  const { templateId } = Route.useSearch();
+  const { templateId, contactId: deepLinkContactId } = Route.useSearch();
   const navigate = useNavigate({ from: "/inbox" });
+  const contactsLoading = useContactsLoading();
   const [folder, setFolder] = useState<FolderId>("all");
   const [channelFilter, setChannelFilter] = useState<ChannelFilter>("all");
   const [activeId, setActiveId] = useState<string | undefined>(undefined);
@@ -429,6 +431,26 @@ function InboxPage() {
     ],
     [realConvs, gmailConvs, placeholderConvs, voiceConvs, localConversations]
   );
+
+  // Deep-link entry (Part 13/14): every Contact always has at least a
+  // placeholder ("sb-<contactId>", channel sms — see placeholderConvs
+  // above) even with zero messages, so "find the best conversation for
+  // this contactId" doubles as the compose fallback with no separate
+  // branch needed — a real thread (sm-/voice-/gm-) is preferred when one
+  // exists, purely by sorting the same way the sidebar already does.
+  // Consumes ?contactId= once (clears it via replace) so refreshing the
+  // resulting /inbox URL doesn't re-trigger selection after the user has
+  // since picked something else; an unknown/inaccessible contactId simply
+  // finds nothing and leaves the existing empty state, no crash.
+  useEffect(() => {
+    if (!deepLinkContactId || contactsLoading) return;
+    const tier = (id: string) => (id.startsWith("sm-") || id.startsWith("voice-") || id.startsWith("gm-") ? 0 : id.startsWith("sb-") ? 1 : 2);
+    const match = allConversations
+      .filter((c) => c.contactId === deepLinkContactId)
+      .sort((a, b) => tier(a.id) - tier(b.id) || new Date(b.lastAt).getTime() - new Date(a.lastAt).getTime())[0];
+    if (match) setActiveId(match.id);
+    navigate({ search: (s) => ({ ...s, contactId: undefined }), replace: true });
+  }, [deepLinkContactId, contactsLoading, allConversations, navigate]);
   const allMessages = useMemo(
     () => [...voiceMsgs, ...realMsgs, ...gmailMsgs],
     [voiceMsgs, realMsgs, gmailMsgs]

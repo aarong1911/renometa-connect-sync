@@ -2,6 +2,7 @@
 import { useEffect, useSyncExternalStore } from "react";
 import { supabase } from "@/lib/supabase";
 import type { ProjectType, ProjectPriority, BudgetRange } from "@/lib/project-status";
+import { getProgressAfterStageChange, isProgressManual } from "@/lib/project-status";
 
 export type ProjectStatus =
   | "planning"
@@ -22,7 +23,8 @@ export type Project = {
   address: string | null;
   budget_total: number;
   actual_cost: number;
-  completion_percentage: number;
+  /** null = never manually set (display falls back to a stage-derived default — see getProjectDisplayProgress in project-status.ts); a real stored number, including 0, is a manual value and displayed as-is. */
+  completion_percentage: number | null;
   start_date: string | null;
   end_date: string | null;
   slug: string | null;
@@ -38,6 +40,8 @@ export type Project = {
   ownerName: string | null;
   leadId: string | null;
   dealId: string | null;
+  /** projects.estimate_id — written by createProject() on Estimate→Project conversion but, until now, never read back onto this type; needed so Project detail can show/link the originating Estimate and so conversion handlers can detect an existing Project by estimate_id, not just the estimate's own converted_project_id flag. */
+  estimateId: string | null;
 };
 
 async function getOrgId(): Promise<string | null> {
@@ -66,7 +70,7 @@ async function getOrgId(): Promise<string | null> {
 
 const VALID_PRIORITIES: ProjectPriority[] = ["low", "normal", "high", "urgent"];
 
-function mapProject(row: any): Project {
+export function mapProjectRow(row: any): Project {
   const ownerProfile = row.owner_profile;
   const ownerName = ownerProfile
     ? `${ownerProfile.first_name ?? ""} ${ownerProfile.last_name ?? ""}`.trim() || ownerProfile.email || null
@@ -81,7 +85,7 @@ function mapProject(row: any): Project {
     address: row.address ?? null,
     budget_total: Number(row.budget_total ?? 0),
     actual_cost: Number(row.actual_cost ?? 0),
-    completion_percentage: Number(row.completion_percentage ?? 0),
+    completion_percentage: typeof row.completion_percentage === "number" ? row.completion_percentage : null,
     start_date: row.start_date ?? null,
     end_date: row.end_date ?? null,
     slug: row.slug ?? null,
@@ -94,6 +98,7 @@ function mapProject(row: any): Project {
     ownerName,
     leadId: row.lead_id ?? null,
     dealId: row.deal_id ?? null,
+    estimateId: row.estimate_id ?? null,
   };
 }
 
@@ -129,7 +134,7 @@ async function fetchProjects() {
     return;
   }
 
-  projects = (data ?? []).map(mapProject);
+  projects = (data ?? []).map(mapProjectRow);
   loaded = true;
   emit();
 }
@@ -172,10 +177,31 @@ export async function updateProjectStatus(
   status: ProjectStatus,
 ): Promise<{ error: any }> {
   const prev = projects.find((p) => p.id === id);
-  const { error } = await supabase.from("projects").update({ status }).eq("id", id);
+  const nextProgress = getProgressAfterStageChange({ currentProgress: prev?.completion_percentage, nextStatus: status });
+
+  // Ordinary stage movement never writes completion_percentage (stays
+  // whatever it already was, including null) — only "completed" forces a
+  // real 100, which is the one case getProgressAfterStageChange returns a
+  // value different from what's already stored. See project-status.ts.
+  const payload: Record<string, any> = { status };
+  if (status === "completed") payload.completion_percentage = nextProgress;
+
+  const { error } = await supabase.from("projects").update(payload).eq("id", id);
   if (!error && prev) {
+    if (status === "completed" && prev.completion_percentage !== 100) {
+      await supabase.from("project_notes").insert({
+        project_id: id, author: "System", body: "Project marked Completed — progress set to 100%.",
+      }).then(({ error: noteErr }) => { if (noteErr) console.error("[projects-store] completion note failed:", noteErr); });
+    }
+    projects = projects.map((p) => (p.id === id ? { ...p, status, completion_percentage: status === "completed" ? nextProgress : p.completion_percentage } : p));
+    emit();
     const { triggerWorkflow } = await import("@/lib/trigger-workflow");
-    triggerWorkflow("project_status_changed", { project: { id, name: prev.name }, fromStage: prev.status, toStage: status });
+    triggerWorkflow("project_status_changed", {
+      project: { id, name: prev.name }, fromStage: prev.status, toStage: status,
+      previousProgress: prev.completion_percentage, completionPercentage: status === "completed" ? nextProgress : prev.completion_percentage,
+      progressSource: status === "completed" ? "stage-completed" : (isProgressManual(prev) ? "manual" : "stage-derived"),
+      occurredAt: new Date().toISOString(),
+    });
   }
   return { error };
 }
@@ -210,6 +236,12 @@ export async function createProject(input: CreateProjectInput): Promise<{ error:
     name: input.name,
     client_id: input.client_id,
     status: input.status,
+    // completion_percentage DEFAULTs to 0 (not null) at the DB level —
+    // explicitly overriding it to null on every create is what lets new
+    // Projects distinguish "never set" (stage-derived display) from a
+    // genuine manual 0, per the Phase 13.4 progress model. Manual/Estimate/
+    // Deal creation all intentionally start with no stored progress.
+    completion_percentage: null,
   };
 
   if (input.address) payload.address = input.address;
@@ -237,8 +269,81 @@ export async function createProject(input: CreateProjectInput): Promise<{ error:
     return { error: error ?? new Error("No row returned") };
   }
 
-  const project = mapProject(data);
+  const project = mapProjectRow(data);
   projects = [project, ...projects];
   emit();
+  return { error: null, project };
+}
+
+export type UpdateProjectInput = Partial<{
+  name: string;
+  /** projects.client_id is NOT NULL — never pass an empty string; omit the key entirely if it shouldn't change. */
+  clientId: string;
+  /** null clears to Unassigned — the column allows it (ON DELETE SET NULL FK). */
+  ownerId: string | null;
+  projectType: ProjectType;
+  customProjectType: string | null;
+  description: string | null;
+  /** null clears back to "never set" (display falls back to the stage default); a number 0-100 is a manual value — see project-status.ts. */
+  completionPercentage: number | null;
+  address: string | null;
+  /** null clears the date — omit the key to leave it unchanged. */
+  startDate: string | null;
+  endDate: string | null;
+  budgetTotal: number;
+  actualCost: number;
+  priority: ProjectPriority;
+}>;
+
+/** Canonical partial-update writer for an existing Project — Phase 13.5 expanded this to the full editable field set (Phase 13.2's Description/Scope + Project Type and 13.4's Completion Percentage were the only fields before). Status is deliberately NOT here — updateProjectStatus() owns status transitions, progress-on-completion, and the one status activity note, so callers changing status must call that separately rather than smuggling `status` through this payload (see the Phase 13.5 report). */
+export async function updateProject(id: string, patch: UpdateProjectInput): Promise<{ error: any; project?: Project }> {
+  const prev = projects.find((p) => p.id === id);
+  const payload: Record<string, any> = {};
+  if (patch.name !== undefined) payload.name = patch.name;
+  if (patch.clientId !== undefined) payload.client_id = patch.clientId;
+  if (patch.ownerId !== undefined) payload.owner_id = patch.ownerId;
+  if (patch.projectType !== undefined) payload.project_type = patch.projectType;
+  if (patch.customProjectType !== undefined) payload.custom_project_type = patch.customProjectType || null;
+  if (patch.description !== undefined) payload.description = patch.description || null;
+  if (patch.completionPercentage !== undefined) {
+    payload.completion_percentage = patch.completionPercentage === null
+      ? null
+      : Math.min(100, Math.max(0, Math.round(patch.completionPercentage)));
+  }
+  if (patch.address !== undefined) payload.address = patch.address || null;
+  if (patch.startDate !== undefined) payload.start_date = patch.startDate || null;
+  if (patch.endDate !== undefined) payload.end_date = patch.endDate || null;
+  if (patch.budgetTotal !== undefined) payload.budget_total = Math.max(0, patch.budgetTotal);
+  if (patch.actualCost !== undefined) payload.actual_cost = Math.max(0, patch.actualCost);
+  if (patch.priority !== undefined) payload.priority = patch.priority;
+
+  const { data, error } = await supabase
+    .from("projects")
+    .update(payload)
+    .eq("id", id)
+    .select("*, contacts!client_id(full_name), owner_profile:profiles!owner_id(first_name,last_name,email)")
+    .single();
+
+  if (error || !data) {
+    console.error("[projects-store] update failed:", JSON.stringify(error, null, 2));
+    return { error: error ?? new Error("No row returned") };
+  }
+
+  const project = mapProjectRow(data);
+  projects = projects.map((p) => (p.id === id ? project : p));
+  emit();
+
+  // One activity note per manual progress change — never alongside the
+  // separate "marked Completed" note updateProjectStatus() writes, since
+  // this path (the Edit form) and that one (status transitions) never fire
+  // for the same change.
+  if (patch.completionPercentage !== undefined && prev && prev.completion_percentage !== project.completion_percentage) {
+    const from = prev.completion_percentage === null ? "unset" : `${prev.completion_percentage}%`;
+    const to = project.completion_percentage === null ? "unset" : `${project.completion_percentage}%`;
+    await supabase.from("project_notes").insert({
+      project_id: id, author: "System", body: `Project progress updated — ${from} to ${to}.`,
+    }).then(({ error: noteErr }) => { if (noteErr) console.error("[projects-store] progress note failed:", noteErr); });
+  }
+
   return { error: null, project };
 }
