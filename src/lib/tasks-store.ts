@@ -96,6 +96,7 @@ function mapRow(row: any): Task {
     entityId: row.entity_id ?? undefined,
     phaseId: row.phase_id ?? null,
     milestoneId: row.milestone_id ?? null,
+    dueDateRaw: row.due_date ?? null,
   };
 }
 
