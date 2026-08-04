@@ -80,6 +80,8 @@ import {
   type ProjectPlanTemplate,
 } from "@/lib/project-plan-templates";
 import { ProjectTimelineGantt } from "@/components/projects/ProjectTimelineGantt";
+import { ProjectDailyLogsTab } from "@/components/projects/ProjectDailyLogsTab";
+import { ProjectPhotoGallery } from "@/components/projects/ProjectPhotoGallery";
 import { InviteToPortalModal } from "@/components/portal/InviteToPortalModal";
 import { InvoiceModal } from "@/components/projects/InvoiceModal";
 import { InvoiceDetailModal } from "@/components/projects/InvoiceDetailModal";
@@ -137,11 +139,6 @@ type Invoice = {
 };
 
 type Note = { id: string; body: string; created_at: string; author: string };
-
-type ProjectFile = {
-  id: string; file_name: string; file_path: string; file_type: string | null;
-  mime_type: string | null; description: string | null; created_at: string;
-};
 
 // ─── Stage columns ────────────────────────────────────────────────────────────
 
@@ -347,7 +344,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
   const allTasks = useTasks();
   const navigate = useNavigate({ from: "/projects/" });
 
-  const [activeTab,        setActiveTab]        = useState<"overview" | "financials" | "schedule" | "communications" | "photos">("overview");
+  const [activeTab,        setActiveTab]        = useState<"overview" | "financials" | "schedule" | "daily-logs" | "communications" | "photos">("overview");
   const [newTaskTitle,     setNewTaskTitle]      = useState("");
   const [addingTask,       setAddingTask]        = useState(false);
   const [invoices,         setInvoices]          = useState<Invoice[]>([]);
@@ -359,11 +356,6 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
   const [portalInviteOpen, setPortalInviteOpen]  = useState(false);
   const [invoiceModalOpen, setInvoiceModalOpen]  = useState(false);
   const [selectedInvoiceId, setSelectedInvoiceId] = useState<string | null>(null);
-  const [lightboxPhoto,      setLightboxPhoto]      = useState<{ url: string; name: string } | null>(null);
-  const [photos,           setPhotos]            = useState<ProjectFile[]>([]);
-  const [photosLoading,    setPhotosLoading]     = useState(false);
-  const [uploading,        setUploading]         = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Phase 13.2 — Project Planning (phases/milestones/dependencies)
   const [phases,           setPhases]            = useState<ProjectPhase[]>([]);
@@ -450,16 +442,6 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
     supabase.from("project_notes").select("id, body, created_at, author")
       .eq("project_id", project.id).order("created_at", { ascending: false })
       .then(({ data }) => setNotes((data ?? []) as Note[]));
-  }, [activeTab, project?.id]);
-
-  useEffect(() => {
-    if (activeTab !== "photos" || !project) return;
-    setPhotosLoading(true);
-    supabase.from("project_files").select("*")
-      .eq("project_id", project.id)
-      .or("mime_type.ilike.image/%,file_type.eq.image")
-      .order("created_at", { ascending: false })
-      .then(({ data }) => { setPhotos((data ?? []) as ProjectFile[]); setPhotosLoading(false); });
   }, [activeTab, project?.id]);
 
   if (!project) return null;
@@ -674,57 +656,18 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
     setNoteInput(""); setSavingNote(false);
   };
 
-  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    if (!files.length) return;
-    setUploading(true);
-    const { data: { user } } = await supabase.auth.getUser();
-    // Resolve orgId — prefer from project obj, fall back to user profile
-    let uploadOrgId: string | null = (project as any).org_id ?? null;
-    if (!uploadOrgId && user) {
-      const { data: prof } = await supabase.from("profiles").select("organization_id").eq("id", user.id).maybeSingle();
-      uploadOrgId = prof?.organization_id ?? null;
-    }
-    for (const file of files) {
-      if (!file.type.startsWith("image/")) continue;
-      const ext  = file.name.split(".").pop();
-      const path = `${project.id}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
-      const { error: upErr } = await supabase.storage.from("project-photos").upload(path, file, { contentType: file.type });
-      if (upErr) { toast.error(`Failed to upload ${file.name}`); continue; }
-      const { error: dbErr } = await supabase.from("project_files").insert({
-        org_id:     uploadOrgId,
-        project_id: project.id,
-        file_name:  file.name,
-        file_path:  path,
-        file_type:  "image",
-        mime_type:  file.type,
-        file_size:  file.size,
-        uploaded_by: user?.id,
-      });
-      if (dbErr) console.error("[photo upload] db insert failed:", dbErr.message);
-    }
-    const { data } = await supabase.from("project_files").select("*")
-      .eq("project_id", project.id)
-      .or("mime_type.ilike.image/%,file_type.eq.image")
-      .order("created_at", { ascending: false });
-    setPhotos((data ?? []) as ProjectFile[]);
-    setUploading(false);
-    toast.success(`${files.length} photo${files.length > 1 ? "s" : ""} uploaded`);
-    if (fileInputRef.current) fileInputRef.current.value = "";
-  };
-
   const col        = getColumnForStatus(project.status);
   const stepperIdx = getStepperIndex(project.status);
   const cityLine   = getCityFromAddress(project.address);
   const remaining  = project.budget_total - project.actual_cost;
   const budgetPct  = project.budget_total > 0 ? Math.min(100, Math.round((project.actual_cost / project.budget_total) * 100)) : 0;
   const projId     = `#PRJ-${project.id.slice(0, 6).toUpperCase()}`;
-  const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string;
 
   const SHEET_TABS = [
     { id: "overview",       label: "Overview" },
     { id: "financials",     label: "Financials" },
     { id: "schedule",       label: "Schedule & Tasks" },
+    { id: "daily-logs",     label: "Daily Logs" },
     { id: "communications", label: "Communications" },
     { id: "photos",         label: "Photos" },
   ] as const;
@@ -1630,63 +1573,11 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
             </div>
           )}
 
-          {/* ── Photos ── */}
-          {activeTab === "photos" && (
-            <div role="tabpanel" id="project-panel-photos" aria-labelledby="project-tab-photos" className="space-y-4">
-              <div className="flex items-center justify-between">
-                <p className="text-xs text-muted-foreground">{photos.length} photo{photos.length !== 1 ? "s" : ""}</p>
-                <div>
-                  <input ref={fileInputRef} type="file" accept="image/*" multiple className="hidden" onChange={handlePhotoUpload} />
-                  <Button size="sm" className="h-8 gap-1.5" disabled={uploading} onClick={() => fileInputRef.current?.click()}>
-                    {uploading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Camera className="h-3.5 w-3.5" />}
-                    {uploading ? "Uploading…" : "Upload photos"}
-                  </Button>
-                </div>
-              </div>
-              {photosLoading ? (
-                <div className="grid grid-cols-3 gap-2">
-                  {[...Array(6)].map((_, i) => <Skeleton key={i} className="aspect-square rounded-lg" />)}
-                </div>
-              ) : photos.length === 0 ? (
-                <div className="rounded-lg border border-dashed border-border py-14 text-center cursor-pointer hover:bg-secondary/20 transition"
-                  onClick={() => fileInputRef.current?.click()}>
-                  <ImageIcon className="mx-auto h-10 w-10 text-muted-foreground/30 mb-3" />
-                  <p className="text-sm font-medium text-muted-foreground">No photos yet</p>
-                  <p className="text-xs text-muted-foreground mt-1">Click to upload site photos</p>
-                </div>
-              ) : (
-                <div className="grid grid-cols-3 gap-2">
-                  {photos.map(photo => {
-                    const url = `${supabaseUrl}/storage/v1/object/public/project-photos/${photo.file_path}`;
-                    return (
-                      <div key={photo.id} className="group relative aspect-square overflow-hidden rounded-lg border border-border bg-secondary cursor-pointer"
-                        onClick={() => setLightboxPhoto({ url, name: photo.file_name })}>
-                        <img src={url} alt={photo.file_name}
-                          className="h-full w-full object-cover transition duration-300 group-hover:scale-105"
-                          onError={e => { (e.target as HTMLImageElement).style.display = "none"; }} />
-                        <div className="absolute inset-x-0 bottom-0 bg-linear-to-t from-black/60 to-transparent p-2 opacity-0 group-hover:opacity-100 transition">
-                          <p className="text-[10px] text-white truncate">{photo.file_name}</p>
-                        </div>
-                        {/* Delete button */}
-                        <button
-                          onClick={async e => {
-                            e.stopPropagation();
-                            if (!confirm("Delete this photo?")) return;
-                            await supabase.storage.from("project-photos").remove([photo.file_path]);
-                            await supabase.from("project_files").delete().eq("id", photo.id);
-                            setPhotos(prev => prev.filter(p => p.id !== photo.id));
-                            toast.success("Photo deleted");
-                          }}
-                          className="absolute top-1.5 right-1.5 h-6 w-6 rounded-full bg-black/60 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition hover:bg-destructive">
-                          <X className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
+          {/* ── Daily Logs (Phase 13.3A) ── */}
+          {activeTab === "daily-logs" && <ProjectDailyLogsTab projectId={project.id} />}
+
+          {/* ── Photos (Phase 13.3A — real gallery, see ProjectPhotoGallery) ── */}
+          {activeTab === "photos" && <ProjectPhotoGallery projectId={project.id} phases={phases} />}
         </div>
       </SheetContent>
 
@@ -1804,18 +1695,6 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
         </DialogContent>
       </Dialog>
 
-      {lightboxPhoto && (
-        <div className="fixed inset-0 z-100 flex items-center justify-center bg-black/90 p-4 backdrop-blur-sm"
-          onClick={() => setLightboxPhoto(null)}>
-          <button className="absolute right-4 top-4 rounded-full bg-white/10 p-2 text-white hover:bg-white/20"
-            onClick={() => setLightboxPhoto(null)}>
-            <X className="h-5 w-5" />
-          </button>
-          <img src={lightboxPhoto.url} alt={lightboxPhoto.name}
-            className="max-h-[90vh] max-w-full rounded-xl object-contain shadow-2xl"
-            onClick={e => e.stopPropagation()} />
-        </div>
-      )}
     </Sheet>
   );
 }
