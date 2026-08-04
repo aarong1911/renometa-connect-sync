@@ -79,6 +79,7 @@ import {
   templatesForProjectType, findPlanTemplate, formatTemplateCounts, formatTemplateSummary, pluralizeCount,
   type ProjectPlanTemplate,
 } from "@/lib/project-plan-templates";
+import { ProjectTimelineGantt } from "@/components/projects/ProjectTimelineGantt";
 import { InviteToPortalModal } from "@/components/portal/InviteToPortalModal";
 import { InvoiceModal } from "@/components/projects/InvoiceModal";
 import { InvoiceDetailModal } from "@/components/projects/InvoiceDetailModal";
@@ -91,7 +92,16 @@ type ProjectsSearch = {
   openNew?: boolean;
   contactId?: string;
   companyId?: string;
+  /** Phase 13.2B — Calendar → Project deep links (Part 28/29). tab=schedule opens Schedule & Tasks directly; subview picks Plan/Timeline/Milestones/Tasks; task/milestone/phase are informational hints consumed by the relevant subview (no highlighting/scrolling implemented in this pass — see report). */
+  tab?: "overview" | "financials" | "schedule" | "communications" | "photos";
+  subview?: "plan" | "timeline" | "milestones" | "tasks";
+  task?: string;
+  milestone?: string;
+  phase?: string;
 };
+
+const PROJECT_TABS = ["overview", "financials", "schedule", "communications", "photos"] as const;
+const SCHEDULE_SUBVIEWS = ["plan", "timeline", "milestones", "tasks"] as const;
 
 export const Route = createFileRoute("/projects/")({
   validateSearch: (raw: Record<string, unknown>): ProjectsSearch => ({
@@ -100,6 +110,11 @@ export const Route = createFileRoute("/projects/")({
     openNew: raw.openNew === true || raw.openNew === "1" ? true : undefined,
     contactId: typeof raw.contactId === "string" ? raw.contactId : undefined,
     companyId: typeof raw.companyId === "string" ? raw.companyId : undefined,
+    tab: typeof raw.tab === "string" && (PROJECT_TABS as readonly string[]).includes(raw.tab) ? (raw.tab as ProjectsSearch["tab"]) : undefined,
+    subview: typeof raw.subview === "string" && (SCHEDULE_SUBVIEWS as readonly string[]).includes(raw.subview) ? (raw.subview as ProjectsSearch["subview"]) : undefined,
+    task: typeof raw.task === "string" ? raw.task : undefined,
+    milestone: typeof raw.milestone === "string" ? raw.milestone : undefined,
+    phase: typeof raw.phase === "string" ? raw.phase : undefined,
   }),
   component: ProjectsPage,
 });
@@ -312,9 +327,20 @@ function ProjectTimelineAgenda({ project, phases, milestones, tasks }: {
 
 // ─── Project Detail Sheet ─────────────────────────────────────────────────────
 
-function ProjectDetailSheet({ project, open, onClose, onReload, onProjectUpdated }: {
+/**
+ * Canonical Project detail drawer — also reused directly by Calendar
+ * (Phase 13.2D, Part 3) for milestone/phase/Project-date clicks, so those
+ * events open this exact component in place instead of navigating to
+ * /projects or forking a second Project detail UI. Given its size, this is
+ * exported and imported directly rather than extracted into a separate
+ * shared file (unlike the smaller Task drawer) — see the Phase report.
+ */
+export function ProjectDetailSheet({ project, open, onClose, onReload, onProjectUpdated, deepLink, onDeepLinkConsumed }: {
   project: Project | null; open: boolean; onClose: () => void; onReload: () => void;
   onProjectUpdated: (p: Project) => void;
+  /** Phase 13.2B — optional Calendar deep-link context (Part 28/29); consumed once on open, then cleared by the caller so it isn't re-applied on a later reopen. */
+  deepLink?: { tab?: "overview" | "financials" | "schedule" | "communications" | "photos"; subview?: "plan" | "timeline" | "milestones" | "tasks"; taskId?: string; milestoneId?: string; phaseId?: string } | null;
+  onDeepLinkConsumed?: () => void;
 }) {
   const [editOpen, setEditOpen] = useState(false);
   const contacts = useContacts();
@@ -376,7 +402,8 @@ function ProjectDetailSheet({ project, open, onClose, onReload, onProjectUpdated
   const [taskStatusFilter, setTaskStatusFilter] = useState<"all" | TaskStatus>("all");
   const [taskFocusFilter, setTaskFocusFilter] = useState<"all" | "overdue" | "blocked" | "unassigned">("all");
 
-  useEffect(() => { if (open) setScheduleSubview("plan"); }, [open, project?.id]);
+  // deepLink is intentionally read via closure, not listed as a dependency — it should only be applied once, the moment the sheet opens for this project, not re-applied if it changes while already open.
+  useEffect(() => { if (open) setScheduleSubview(deepLink?.subview ?? "plan"); }, [open, project?.id]);
 
   const loadPlanningData = useCallback(async () => {
     if (!project) return;
@@ -396,7 +423,11 @@ function ProjectDetailSheet({ project, open, onClose, onReload, onProjectUpdated
     void loadPlanningData();
   }, [activeTab, project?.id, loadPlanningData]);
 
-  useEffect(() => { if (open) setActiveTab("overview"); }, [open, project?.id]);
+  useEffect(() => {
+    if (!open) return;
+    setActiveTab(deepLink?.tab ?? "overview");
+    if (deepLink) onDeepLinkConsumed?.();
+  }, [open, project?.id]);
 
   useEffect(() => {
     if (!open || !project) return;
@@ -1307,15 +1338,25 @@ function ProjectDetailSheet({ project, open, onClose, onReload, onProjectUpdated
               </div>
               )}
 
-              {/* ── Timeline (Phase 13.2 continuation) — lightweight
-                  chronological agenda, not a pixel-positioned Gantt bar
-                  chart. Phases, milestones, and tasks with any real date
-                  are merged into one list and grouped by month; the full
-                  horizontal zoomable bar timeline described in the spec is
-                  deliberately deferred (see the Phase report) given the
-                  size of everything else in this pass. */}
+              {/* ── Timeline (Phase 13.2B) — real horizontal Gantt-style
+                  timeline on desktop/tablet (phase bars, task bars,
+                  milestone markers, Project start/end, Today line, Week/
+                  Month/Quarter zoom); the existing chronological agenda is
+                  kept as-is and used as the mobile fallback per the spec
+                  (Part 13) rather than squeezing the bar chart into a
+                  narrow viewport. */}
               {scheduleSubview === "timeline" && (
-                <ProjectTimelineAgenda project={project} phases={phases} milestones={milestones} tasks={projectTasks} />
+                <>
+                  <div className="hidden lg:block">
+                    <ProjectTimelineGantt
+                      project={project} phases={phases} milestones={milestones} tasks={projectTasks} dependencies={dependencies}
+                      onSelectSubview={(v) => setScheduleSubview(v)}
+                    />
+                  </div>
+                  <div className="lg:hidden">
+                    <ProjectTimelineAgenda project={project} phases={phases} milestones={milestones} tasks={projectTasks} />
+                  </div>
+                </>
               )}
 
               {/* ── Milestones (dedicated view) ── */}
@@ -3064,7 +3105,7 @@ function ContactAvatarIcon({ name }: { name: string }) {
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 function ProjectsPage() {
-  const { slug, projectId, openNew, contactId, companyId } = useSearch({ from: "/projects/" });
+  const { slug, projectId, openNew, contactId, companyId, tab, subview, task, milestone, phase } = useSearch({ from: "/projects/" });
   const navigate = useNavigate({ from: "/projects/" });
   const { projects, loading, reload } = useProjects();
   const contacts = useContacts();
@@ -3077,6 +3118,8 @@ function ProjectsPage() {
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [optimisticStatuses, setOptimisticStatuses] = useState<Record<string, ProjectStatus>>({});
+  // Phase 13.2B — Calendar → Project deep-link context (Part 28/29), consumed once by ProjectDetailSheet then left alone (not re-applied on every reopen).
+  const [deepLink, setDeepLink] = useState<{ tab?: ProjectsSearch["tab"]; subview?: ProjectsSearch["subview"]; taskId?: string; milestoneId?: string; phaseId?: string } | null>(null);
 
   const openDetail  = useCallback((p: Project) => { setSelectedProject(p); setSheetOpen(true); }, []);
   const closeDetail = useCallback(() => { setSheetOpen(false); }, []);
@@ -3092,13 +3135,20 @@ function ProjectsPage() {
   }, [slug, loading, projects, openDetail, navigate]);
 
   // "Open Project" links from Estimate/Deal detail — by id, since a Project
-  // may not have a slug set.
+  // may not have a slug set. Also carries the optional Calendar deep-link
+  // context (tab/subview/task/milestone/phase) — an unknown/invalid
+  // project id simply finds no match and fails safely (no crash, no sheet).
   useEffect(() => {
     if (!projectId || loading) return;
     const match = projects.find((p) => p.id === projectId);
-    if (match) openDetail(match);
-    navigate({ search: (s) => ({ ...s, projectId: undefined }), replace: true });
-  }, [projectId, loading, projects, openDetail, navigate]);
+    if (match) {
+      if (tab || subview || task || milestone || phase) {
+        setDeepLink({ tab, subview, taskId: task, milestoneId: milestone, phaseId: phase });
+      }
+      openDetail(match);
+    }
+    navigate({ search: (s) => ({ ...s, projectId: undefined, tab: undefined, subview: undefined, task: undefined, milestone: undefined, phase: undefined }), replace: true });
+  }, [projectId, loading, projects, tab, subview, task, milestone, phase, openDetail, navigate]);
 
   // New Project deep-link prefill from Contact/Account detail (Part 26/27) —
   // same shape as the Estimates page's own contactId/companyId/openNew handling.
@@ -3287,7 +3337,10 @@ function ProjectsPage() {
         onCreated={reload}
         initialContext={newProjectContext}
       />
-      <ProjectDetailSheet project={selectedProject} open={sheetOpen} onClose={closeDetail} onReload={reload} onProjectUpdated={setSelectedProject} />
+      <ProjectDetailSheet
+        project={selectedProject} open={sheetOpen} onClose={closeDetail} onReload={reload} onProjectUpdated={setSelectedProject}
+        deepLink={deepLink} onDeepLinkConsumed={() => setDeepLink(null)}
+      />
     </div>
   );
 }

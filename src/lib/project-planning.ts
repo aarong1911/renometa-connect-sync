@@ -96,6 +96,27 @@ export async function fetchProjectPhases(projectId: string): Promise<{ phases: P
   return { phases: (data ?? []).map(mapPhaseRow), error: null };
 }
 
+/**
+ * Phase 13.2B — Calendar integration (Part 35): one org-wide fetch each for
+ * phases/milestones, instead of one query per visible Project. Calendar
+ * already loads every accessible Project via useProjects(); this mirrors
+ * that same "fetch once, filter/group in memory" shape rather than
+ * fetching per-Project like the Project detail drawer does (that fetch is
+ * fine there — it's scoped to exactly one open Project).
+ */
+export async function fetchOrgPhases(): Promise<{ phases: ProjectPhase[]; error: string | null }> {
+  const orgId = await getOrgId();
+  if (!orgId) return { phases: [], error: null };
+
+  const { data, error } = await supabase.from("project_phases").select("*").eq("org_id", orgId);
+  if (error) {
+    if (isMissingTableError(error.message)) return { phases: [], error: null };
+    console.error("[project-planning] fetchOrgPhases failed:", error);
+    return { phases: [], error: error.message };
+  }
+  return { phases: (data ?? []).map(mapPhaseRow), error: null };
+}
+
 export type CreatePhaseInput = {
   projectId: string;
   name: string;
@@ -274,6 +295,20 @@ export async function fetchProjectMilestones(projectId: string): Promise<{ miles
   if (error) {
     if (isMissingTableError(error.message)) return { milestones: [], error: null };
     console.error("[project-planning] fetchProjectMilestones failed:", error);
+    return { milestones: [], error: error.message };
+  }
+  return { milestones: (data ?? []).map(mapMilestoneRow), error: null };
+}
+
+/** Org-wide milestone fetch — see fetchOrgPhases() above for why this exists alongside the per-Project fetchProjectMilestones(). */
+export async function fetchOrgMilestones(): Promise<{ milestones: ProjectMilestone[]; error: string | null }> {
+  const orgId = await getOrgId();
+  if (!orgId) return { milestones: [], error: null };
+
+  const { data, error } = await supabase.from("project_milestones").select("*").eq("org_id", orgId);
+  if (error) {
+    if (isMissingTableError(error.message)) return { milestones: [], error: null };
+    console.error("[project-planning] fetchOrgMilestones failed:", error);
     return { milestones: [], error: error.message };
   }
   return { milestones: (data ?? []).map(mapMilestoneRow), error: null };

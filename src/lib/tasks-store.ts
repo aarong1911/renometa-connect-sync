@@ -3,6 +3,7 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { supabase } from "@/lib/supabase";
 import type { Task, TaskEntityType, TaskActivity, TaskActivityType } from "@/lib/mock-data";
 import { getTaskStatusPatch, type TaskStatus } from "@/lib/task-status";
+import { getTeam } from "@/lib/organization";
 
 export type { TaskStatus, TaskPriority, TaskActivity, TaskActivityType } from "@/lib/mock-data";
 
@@ -58,6 +59,27 @@ function isTaskEntityType(value: unknown): value is TaskEntityType {
   return value === "lead" || value === "deal";
 }
 
+/**
+ * Resolves the display name/initials for a canonical assignee id (the same
+ * `assigned_to` value the Edit Task selector writes) from the already-loaded
+ * team store (src/lib/organization.ts) — no query per task. Used to keep
+ * the local optimistic merge in updateTask() in sync after an assignment
+ * change, since only mapRow() (which re-joins `profiles` server-side) used
+ * to recompute these; a bare `{ ...task, ...patch }` merge left the stale
+ * pre-update name in place even though assigned_to itself was correct,
+ * which is why the drawer kept showing "Unassigned" after a real
+ * assignment. getTeam() is unfiltered by status, so a member who is no
+ * longer active still resolves to their real name; only a truly deleted/
+ * unknown id falls back to a generic label.
+ */
+function resolveAssigneeDisplay(assignedTo: string | null | undefined): { assignee: string; assigneeInitials: string } {
+  if (!assignedTo) return { assignee: "Unassigned", assigneeInitials: "—" };
+  const member = getTeam().find((m) => m.id === assignedTo);
+  if (!member || !member.name.trim()) return { assignee: "Assigned team member", assigneeInitials: "—" };
+  const initials = member.name.trim().split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase();
+  return { assignee: member.name, assigneeInitials: initials || "—" };
+}
+
 function mapRow(row: any): Task {
   const assigneeName =
     row.assignee_profile?.first_name || row.assignee_profile?.last_name
@@ -97,6 +119,7 @@ function mapRow(row: any): Task {
     phaseId: row.phase_id ?? null,
     milestoneId: row.milestone_id ?? null,
     dueDateRaw: row.due_date ?? null,
+    startDateRaw: row.start_date ?? null,
   };
 }
 
@@ -326,6 +349,14 @@ export async function updateTask(id: string, patch: TaskPatch): Promise<{ ok: tr
     if (resolvedCompletedAt !== undefined) next.completedAt = resolvedCompletedAt;
     if (entityType !== undefined) next.entityType = entityType ?? undefined;
     if (entityId !== undefined) next.entityId = entityId ?? undefined;
+    // assignee/assigneeInitials are cached display fields derived from
+    // assigned_to — the plain spread above only updates the id, so they
+    // must be recomputed here or the UI keeps showing the pre-update name.
+    if (patch.assignedTo !== undefined) {
+      const { assignee, assigneeInitials } = resolveAssigneeDisplay(patch.assignedTo);
+      next.assignee = assignee;
+      next.assigneeInitials = assigneeInitials;
+    }
     return next;
   });
   emit();

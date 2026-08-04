@@ -260,6 +260,8 @@ export type Task = {
   milestoneId?: string | null;
   /** Phase 13.2 continuation — the raw tasks.due_date column, distinct from `due` above. `due` always has a value (falls back to created_at when due_date is null, for sort/display purposes elsewhere in the app) — schedule-health/overdue calculations need to know whether a due date was ever actually set, so they read this instead of `due`. Null = no due date was set. */
   dueDateRaw?: string | null;
+  /** Phase 13.2B — the raw tasks.start_date column (previously unmapped). Powers Project Timeline duration bars (start_date + due_date) and Calendar. Null = no start date was set. */
+  startDateRaw?: string | null;
 };
 
 /** Centralized aliases (Phase 10.2) — named references to Task's own existing literal unions, not a new/parallel vocabulary. Use these instead of re-typing the union elsewhere. */

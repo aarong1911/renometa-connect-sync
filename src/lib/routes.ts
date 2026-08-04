@@ -52,3 +52,32 @@ export const dealDetailLink = (dealId: string) =>
     to: "/pipeline",
     search: { dealId },
   });
+
+/** Type-safe link options for opening a specific project's detail drawer (global Tasks page — "View Project Plan" quick action). */
+export const projectDetailLink = (projectId: string) =>
+  linkOptions({
+    to: "/projects",
+    search: { projectId },
+  });
+
+/**
+ * Deep-link into a Project's Schedule & Tasks tab, optionally landing on a
+ * specific subview and/or highlighting a specific phase/milestone/task —
+ * used by Calendar (Phase 13.2B) so a planning event opens the exact
+ * relevant context instead of just the Project's Overview.
+ */
+export const projectScheduleLink = (
+  projectId: string,
+  opts?: { subview?: "plan" | "timeline" | "milestones" | "tasks"; taskId?: string; milestoneId?: string; phaseId?: string },
+) =>
+  linkOptions({
+    to: "/projects",
+    search: {
+      projectId,
+      tab: "schedule",
+      subview: opts?.subview,
+      task: opts?.taskId,
+      milestone: opts?.milestoneId,
+      phase: opts?.phaseId,
+    },
+  });
