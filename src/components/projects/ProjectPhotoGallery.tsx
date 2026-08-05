@@ -8,7 +8,7 @@
 // the migration header for why this isn't a separate project_photos table.
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Camera, ChevronLeft, ChevronRight, Download, Image as ImageIcon, Loader2, MoreHorizontal, Star, Trash2, X,
+  Camera, ChevronLeft, ChevronRight, Download, Image as ImageIcon, Loader2, MoreHorizontal, RefreshCw, Star, Trash2, X,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -28,10 +28,18 @@ import { cn } from "@/lib/utils";
 import type { ProjectPhase } from "@/lib/project-planning";
 import { VisibilityBadge } from "@/components/projects/VisibilityBadge";
 import {
-  fetchProjectPhotos, uploadProjectPhoto, updatePhotoDetails, setCoverPhoto, deleteProjectPhoto, getPhotoUrl,
+  fetchProjectPhotos, uploadProjectPhoto, updatePhotoDetails, setCoverPhoto, deleteProjectPhoto, refreshPhotoUrl,
   PHOTO_CATEGORY_ORDER, PHOTO_CATEGORY_LABELS, MAX_PHOTO_BYTES,
   type ProjectPhoto, type PhotoCategory,
 } from "@/lib/project-photos";
+
+/** Signed URLs are refreshed this far ahead of expiry — matches the domain layer's own REFRESH_MARGIN_MS so the UI never shows a URL Storage would already reject. */
+const URL_EXPIRY_REFRESH_MARGIN_MS = 5 * 60 * 1000;
+
+function isUrlNearExpiry(photo: ProjectPhoto): boolean {
+  if (!photo.urlExpiresAt) return false;
+  return Date.now() > photo.urlExpiresAt - URL_EXPIRY_REFRESH_MARGIN_MS;
+}
 
 export function ProjectPhotoGallery({ projectId, phases }: { projectId: string; phases: ProjectPhase[] }) {
   const [photos, setPhotos] = useState<ProjectPhoto[]>([]);
@@ -87,9 +95,17 @@ export function ProjectPhotoGallery({ projectId, phases }: { projectId: string; 
   const handleUpdateDetails = async (id: string, patch: Parameters<typeof updatePhotoDetails>[1]) => {
     const { photo, error } = await updatePhotoDetails(id, patch);
     if (error || !photo) { toast.error("Could not update photo", { description: error ?? undefined }); return; }
-    setPhotos((prev) => prev.map((p) => (p.id === id ? photo : p)));
+    // Metadata-only update never touches Storage — preserve the already-resolved URL instead of losing it (Part 16).
+    setPhotos((prev) => prev.map((p) => (p.id === id ? { ...photo, resolvedUrl: p.resolvedUrl, urlExpiresAt: p.urlExpiresAt } : p)));
     toast.success("Photo updated");
     setEditingPhoto(null);
+  };
+
+  /** Retry for a card/lightbox whose signed URL failed to resolve, or whose URL is nearing expiry (Part 12/13). */
+  const handleRefreshUrl = async (photo: ProjectPhoto) => {
+    const { url, expiresAt } = await refreshPhotoUrl(photo);
+    setPhotos((prev) => prev.map((p) => (p.id === photo.id ? { ...p, resolvedUrl: url, urlExpiresAt: expiresAt } : p)));
+    return url;
   };
 
   const hasActiveFilters = categoryFilter !== "all" || phaseFilter !== "all" || search.trim() !== "";
@@ -150,6 +166,7 @@ export function ProjectPhotoGallery({ projectId, phases }: { projectId: string; 
               key={photo.id} photo={photo} phaseName={photo.phaseId ? phasesById.get(photo.phaseId)?.name : undefined}
               onView={() => setLightboxIndex(i)} onEdit={() => setEditingPhoto(photo)}
               onSetCover={() => void handleSetCover(photo)} onDelete={() => void handleDelete(photo)}
+              onRetryUrl={() => void handleRefreshUrl(photo)}
             />
           ))}
         </div>
@@ -168,6 +185,7 @@ export function ProjectPhotoGallery({ projectId, phases }: { projectId: string; 
           onNavigate={setLightboxIndex}
           onEdit={(p) => { setLightboxIndex(null); setEditingPhoto(p); }}
           onDelete={(p) => void handleDelete(p)}
+          onRefreshUrl={handleRefreshUrl}
         />
       )}
     </div>
@@ -175,26 +193,43 @@ export function ProjectPhotoGallery({ projectId, phases }: { projectId: string; 
 }
 
 function ProjectPhotoCard({
-  photo, phaseName, onView, onEdit, onSetCover, onDelete,
+  photo, phaseName, onView, onEdit, onSetCover, onDelete, onRetryUrl,
 }: {
   photo: ProjectPhoto; phaseName?: string;
   onView: () => void; onEdit: () => void; onSetCover: () => void; onDelete: () => void;
+  onRetryUrl: () => void;
 }) {
-  const url = getPhotoUrl(photo);
+  const handleDownload = async () => {
+    // Always fetch a guaranteed-fresh URL for download rather than trusting a possibly-stale cached one (Part 14).
+    const fresh = await refreshPhotoUrl(photo);
+    if (!fresh.url) { toast.error("Could not generate a download link"); return; }
+    window.open(fresh.url, "_blank", "noopener,noreferrer");
+  };
+
   return (
     <div className="group relative overflow-hidden rounded-lg border border-border bg-secondary">
-      <button
-        type="button" onClick={onView}
-        className="block aspect-square w-full cursor-pointer"
-        aria-label={`View photo${photo.caption ? `: ${photo.caption}` : ""}`}
-      >
-        <img
-          src={url} alt={photo.caption || photo.fileName}
-          className="h-full w-full object-cover transition duration-300 group-hover:scale-105"
-          loading="lazy"
-          onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
-        />
-      </button>
+      {photo.resolvedUrl ? (
+        <button
+          type="button" onClick={onView}
+          className="block aspect-square w-full cursor-pointer"
+          aria-label={`View photo${photo.caption ? `: ${photo.caption}` : ""}`}
+        >
+          <img
+            src={photo.resolvedUrl} alt={photo.caption || photo.fileName}
+            className="h-full w-full object-cover transition duration-300 group-hover:scale-105"
+            loading="lazy"
+            onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+          />
+        </button>
+      ) : (
+        <div className="flex aspect-square w-full flex-col items-center justify-center gap-2 text-center">
+          <ImageIcon className="h-6 w-6 text-muted-foreground/40" />
+          <p className="px-2 text-[10px] text-muted-foreground">Couldn't load image</p>
+          <Button size="sm" variant="outline" className="h-6 gap-1 text-[10px]" onClick={onRetryUrl}>
+            <RefreshCw className="h-2.5 w-2.5" /> Retry
+          </Button>
+        </div>
+      )}
       <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-linear-to-t from-black/70 to-transparent p-2 pt-6">
         <div className="flex items-center gap-1">
           <Badge variant="outline" className="h-4.5 rounded border-white/30 bg-black/40 px-1.5 text-[9.5px] text-white">{PHOTO_CATEGORY_LABELS[photo.category]}</Badge>
@@ -213,7 +248,7 @@ function ProjectPhotoCard({
             <DropdownMenuItem onClick={onView}>View</DropdownMenuItem>
             <DropdownMenuItem onClick={onEdit}>Edit details</DropdownMenuItem>
             {!photo.isCover && <DropdownMenuItem onClick={onSetCover}>Set as cover</DropdownMenuItem>}
-            <DropdownMenuItem onClick={() => window.open(url, "_blank", "noopener,noreferrer")}>Download</DropdownMenuItem>
+            <DropdownMenuItem onClick={() => void handleDownload()}>Download</DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={onDelete}>
               <Trash2 className="h-3.5 w-3.5" /> Delete
@@ -348,7 +383,11 @@ function PhotoDetailsDialog({
       <DialogContent className="max-w-md">
         <DialogHeader><DialogTitle>Edit Photo</DialogTitle></DialogHeader>
         <div className="space-y-3">
-          <img src={getPhotoUrl(photo)} alt={photo.caption || photo.fileName} className="max-h-48 w-full rounded-lg object-cover" />
+          {photo.resolvedUrl ? (
+            <img src={photo.resolvedUrl} alt={photo.caption || photo.fileName} className="max-h-48 w-full rounded-lg object-cover" />
+          ) : (
+            <div className="flex h-32 w-full items-center justify-center rounded-lg bg-secondary text-xs text-muted-foreground">Image unavailable</div>
+          )}
           <div className="space-y-1.5">
             <Label>Caption</Label>
             <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="Optional caption" />
@@ -393,13 +432,15 @@ function PhotoDetailsDialog({
 }
 
 function ProjectPhotoLightbox({
-  photos, index, onClose, onNavigate, onEdit, onDelete,
+  photos, index, onClose, onNavigate, onEdit, onDelete, onRefreshUrl,
 }: {
   photos: ProjectPhoto[]; index: number;
   onClose: () => void; onNavigate: (i: number) => void;
   onEdit: (photo: ProjectPhoto) => void; onDelete: (photo: ProjectPhoto) => void;
+  onRefreshUrl: (photo: ProjectPhoto) => Promise<string | null>;
 }) {
   const photo = photos[index];
+  const [downloading, setDownloading] = useState(false);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -411,8 +452,20 @@ function ProjectPhotoLightbox({
     return () => window.removeEventListener("keydown", handler);
   }, [index, photos.length, onClose, onNavigate]);
 
+  // Opening a photo (or navigating to one) whose signed URL is near expiry refreshes it automatically (Part 13).
+  useEffect(() => {
+    if (photo && isUrlNearExpiry(photo)) void onRefreshUrl(photo);
+  }, [photo, onRefreshUrl]);
+
   if (!photo) return null;
-  const url = getPhotoUrl(photo);
+
+  const handleDownload = async () => {
+    setDownloading(true);
+    const url = await onRefreshUrl(photo);
+    setDownloading(false);
+    if (!url) { toast.error("Could not generate a download link"); return; }
+    window.open(url, "_blank", "noopener,noreferrer");
+  };
 
   return (
     <div className="fixed inset-0 z-100 flex items-center justify-center bg-black/90 p-4 backdrop-blur-sm" onClick={onClose} role="dialog" aria-modal="true" aria-label={`Photo: ${photo.caption || photo.fileName}`}>
@@ -430,7 +483,17 @@ function ProjectPhotoLightbox({
         </button>
       )}
       <div className="flex max-h-[90vh] max-w-4xl flex-col items-center gap-3" onClick={(e) => e.stopPropagation()}>
-        <img src={url} alt={photo.caption || photo.fileName} className="max-h-[70vh] max-w-full rounded-xl object-contain shadow-2xl" />
+        {photo.resolvedUrl ? (
+          <img src={photo.resolvedUrl} alt={photo.caption || photo.fileName} className="max-h-[70vh] max-w-full rounded-xl object-contain shadow-2xl" />
+        ) : (
+          <div className="flex h-64 w-full max-w-md flex-col items-center justify-center gap-3 rounded-xl bg-white/5 text-white">
+            <ImageIcon className="h-8 w-8 text-white/40" />
+            <p className="text-sm text-white/70">Couldn't load image</p>
+            <Button size="sm" variant="secondary" className="h-7 gap-1 text-xs" onClick={() => void onRefreshUrl(photo)}>
+              <RefreshCw className="h-3 w-3" /> Retry
+            </Button>
+          </div>
+        )}
         <div className="flex w-full flex-wrap items-center justify-between gap-2 rounded-lg bg-black/40 px-3 py-2 text-white">
           <div className="min-w-0">
             <p className="truncate text-sm font-medium">{photo.caption || photo.fileName}</p>
@@ -442,8 +505,8 @@ function ProjectPhotoLightbox({
           </div>
           <div className="flex shrink-0 gap-1.5">
             <Button size="sm" variant="secondary" className="h-7 text-xs" onClick={() => onEdit(photo)}>Edit</Button>
-            <Button size="sm" variant="secondary" className="h-7 text-xs" onClick={() => window.open(url, "_blank", "noopener,noreferrer")}>
-              <Download className="h-3 w-3" /> Download
+            <Button size="sm" variant="secondary" className="h-7 text-xs" disabled={downloading} onClick={() => void handleDownload()}>
+              {downloading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />} Download
             </Button>
             <Button size="sm" variant="destructive" className="h-7 text-xs" onClick={() => onDelete(photo)}>Delete</Button>
           </div>
