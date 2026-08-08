@@ -6,10 +6,13 @@
 // check constraints added by
 // supabase/migrations/20260808_project_creation_enhancements.sql).
 //
-// Deliberately does NOT redefine project *status* (Estimating/Contracted/
-// Pre-Construction/In Progress/Punch List/Completed) — that configuration
-// already exists as STAGE_COLUMNS in src/routes/projects.index.tsx and is
-// reused directly rather than duplicated here.
+// Project *status* config (Estimating/Contracted/Pre-Construction/In
+// Progress/Punch List/Completed) mostly lives as STAGE_COLUMNS in
+// src/routes/projects.index.tsx (dot colors, descriptions, stepper order —
+// UI-detail-page-specific). PROJECT_STATUS_LABELS below is the one
+// exception: just the label text, promoted here so other surfaces (e.g.
+// the Pipeline Deal drawer's linked-Project card) can show the same label
+// without importing the whole detail-page module.
 
 export type ProjectType =
   | "kitchen_remodel" | "bathroom_remodel" | "full_home_remodel" | "home_addition"
@@ -165,6 +168,27 @@ export const PROJECT_STAGE_MINIMUM_PROGRESS: Record<ProjectStatus, number> = {
 export function getStageMinimumProgress(status: ProjectStatus): number {
   return PROJECT_STAGE_MINIMUM_PROGRESS[status] ?? 0;
 }
+
+// Part 4/10 (Phase 13.3B Pipeline audit) — the ONE canonical Project status
+// -> display label mapping. Previously src/routes/projects.index.tsx's
+// STAGE_COLUMNS/STEPPER_STAGES held the only label text ("planning" ->
+// "Estimating" etc.), and src/components/sales/deal-detail-drawer.tsx's
+// Pipeline "Estimate / Project" tab printed the raw `status` enum value
+// instead (CSS-capitalized, so "planning" rendered as "Planning") — same
+// underlying projects.status column, two different label sets, which is
+// why a Bathroom Remodel Project showed "Estimating" on its own detail page
+// but "Planning" on its linked Deal's Pipeline card. Both surfaces must
+// import this map rather than defining their own label text.
+export const PROJECT_STATUS_LABELS: Record<ProjectStatus, string> = {
+  planning: "Estimating",
+  contracted: "Contracted",
+  "pre-construction": "Pre-Construction",
+  active: "In Progress",
+  "punch-list": "Punch List",
+  completed: "Completed",
+  "on-hold": "On Hold",
+  cancelled: "Cancelled",
+};
 
 /** True once a user (or the completed-stage write) has set a real completion_percentage — null/undefined means the display value below is stage-derived, not stored. */
 export function isProgressManual(project: { completion_percentage: number | null | undefined }): boolean {

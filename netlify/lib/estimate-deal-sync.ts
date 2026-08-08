@@ -67,6 +67,24 @@ const TRIGGER_TARGET_CATEGORY: Record<DealSyncTrigger, StageCategory> = {
 // "rejected" deliberately excluded — Part 3/15: never create a Deal solely from a rejection.
 const CREATES_DEAL_ON: Set<DealSyncTrigger> = new Set(["sent", "viewed", "changes_requested", "approved"]);
 
+// Part 2/3 (Pipeline Won-action audit) — deals.status is meant to be
+// derived from a stage's outcome everywhere a Deal is moved, per the
+// "single source of truth" convention documented next to
+// resolveDealStatusForOutcome() in src/lib/deals-store.ts. This sync
+// service moves deals.stage_id directly via the admin client (it doesn't
+// go through updateDeal()), so without this it was the one write path that
+// never wrote deals.status/actual_close_date at all — leaving `status`
+// stuck at its previous value (usually "open") even after stage_id moved
+// into a Won/Lost stage. That produced deals whose header badge (stage-
+// name-derived) read "Won" while the action bar's `status === "open"` gate
+// still showed "Mark Won", because the two read different columns that had
+// silently drifted apart.
+function statusForCategory(category: StageCategory): "open" | "won" | "lost" {
+  if (category === "won") return "won";
+  if (category === "lost") return "lost";
+  return "open";
+}
+
 function resolveStageForCategory(stages: StageRow[], pipelineId: string, category: StageCategory): StageRow | null {
   const inPipeline = stages.filter((s) => s.pipeline_id === pipelineId);
   if (category === "won") return inPipeline.find((s) => s.outcome === "won") ?? null;
@@ -108,6 +126,23 @@ function resolveExpectedCloseDate(validUntil: unknown): string {
   return new Date(Date.now() + 30 * 86_400_000).toISOString().slice(0, 10);
 }
 
+// Part 8 — the ONE place that keeps projects.deal_id (the canonical
+// Project<->Deal link; deals has no reciprocal project_id column, see
+// audit notes) in sync with whichever Deal an estimate resolves to here.
+// Guarded with `.is("deal_id", null)` so an already-linked Project is
+// never silently repointed at a different Deal — matches the same
+// first-write-wins convention as projects.estimate_id
+// (20260816_estimate_project_contract_link.sql). Fixes the case where a
+// Project is converted from an Estimate BEFORE that Estimate has a Deal
+// (so createProject() never receives a dealId), and the Deal is only
+// created/linked afterward by this same sync — without this, projects.
+// deal_id would stay NULL forever with no other write path to fill it in.
+async function backfillProjectDealLink(admin: SupabaseClient, orgId: string, projectId: string | null | undefined, dealId: string) {
+  if (!projectId) return;
+  const { error } = await admin.from("projects").update({ deal_id: dealId }).eq("id", projectId).eq("org_id", orgId).is("deal_id", null);
+  if (error) logDealSyncWarning("project deal_id backfill failed", { orgId, projectId, dealId, error: error.message });
+}
+
 export function logDealSyncWarning(stage: string, detail: Record<string, unknown>) {
   // Structured, deliberately excludes tokens/keys/proposal content —
   // callers only ever pass estimateId/orgId/status/dealIds/stage info.
@@ -129,7 +164,7 @@ export async function syncEstimateDeal(
 
   const { data: estimate, error: estErr } = await admin
     .from("estimates")
-    .select("id, org_id, title, number, total, client_id, company_id, owner_id, deal_id, converted_deal_id, version_number, metadata, valid_until")
+    .select("id, org_id, title, number, total, client_id, company_id, owner_id, deal_id, converted_deal_id, project_id, converted_project_id, version_number, metadata, valid_until")
     .eq("id", estimateId).eq("org_id", orgId).maybeSingle();
   if (estErr || !estimate) return { ok: false, error: estErr?.message ?? "Estimate not found" };
 
@@ -142,11 +177,11 @@ export async function syncEstimateDeal(
   }
 
   let linkedDealId: string | null = estimate.deal_id ?? estimate.converted_deal_id ?? null;
-  let existingDeal: { id: string; org_id: string; pipeline_id: string; stage_id: string; value: number } | null = null;
+  let existingDeal: { id: string; org_id: string; pipeline_id: string; stage_id: string; value: number; status: string; actual_close_date: string | null } | null = null;
 
   if (linkedDealId) {
     const { data: dealRow, error: dealErr } = await admin
-      .from("deals").select("id, org_id, pipeline_id, stage_id, value")
+      .from("deals").select("id, org_id, pipeline_id, stage_id, value, status, actual_close_date")
       .eq("id", linkedDealId).maybeSingle();
     if (dealErr) return { ok: false, error: dealErr.message };
     if (!dealRow || dealRow.org_id !== orgId) {
@@ -159,6 +194,7 @@ export async function syncEstimateDeal(
     if (!estimate.deal_id && estimate.converted_deal_id) {
       await admin.from("estimates").update({ deal_id: dealRow.id }).eq("id", estimateId).eq("org_id", orgId);
     }
+    await backfillProjectDealLink(admin, orgId, estimate.project_id ?? estimate.converted_project_id, dealRow.id);
   }
 
   const targetCategory = TRIGGER_TARGET_CATEGORY[trigger];
@@ -193,6 +229,8 @@ export async function syncEstimateDeal(
       .insert({
         org_id: orgId, pipeline_id: pipelineId, stage_id: targetStage.id,
         title: estimate.title, value: Number(estimate.total ?? 0), probability,
+        status: statusForCategory(targetCategory),
+        actual_close_date: targetCategory === "won" || targetCategory === "lost" ? new Date().toISOString().slice(0, 10) : null,
         contact_id: estimate.client_id, company_id: estimate.company_id, assigned_to: estimate.owner_id,
         source: "estimate", project_address: (estimate.metadata as { serviceAddress?: string } | null)?.serviceAddress ?? null,
         expected_close_date: resolveExpectedCloseDate(estimate.valid_until),
@@ -211,6 +249,8 @@ export async function syncEstimateDeal(
       await admin.from("deals").delete().eq("id", newDeal.id).eq("org_id", orgId);
       return { ok: false, error: `Deal created but could not be linked back to the estimate (${linkErr.message}); the Deal was removed.` };
     }
+
+    await backfillProjectDealLink(admin, orgId, estimate.project_id ?? estimate.converted_project_id, newDeal.id);
 
     await admin.from("estimate_activities").insert({
       org_id: orgId, estimate_id: estimateId, version_number: estimate.version_number,
@@ -252,7 +292,7 @@ export async function syncEstimateDeal(
     return { ok: true, skipped: true, reason: `Deal already at or beyond "${targetCategory}" (currently "${currentCategory}")`, dealId: existingDeal.id };
   }
 
-  const updatePayload: Record<string, unknown> = { stage_id: targetStage.id };
+  const updatePayload: Record<string, unknown> = { stage_id: targetStage.id, status: statusForCategory(targetCategory) };
   if (targetCategory === "won") updatePayload.probability = 100;
   else if (targetCategory === "lost") updatePayload.probability = 0;
   else if (typeof targetStage.probability === "number") updatePayload.probability = targetStage.probability;
@@ -260,6 +300,12 @@ export async function syncEstimateDeal(
   // rejection, which intentionally preserves whatever value the Deal
   // already had (Part 17).
   if (targetCategory !== "lost") updatePayload.value = Number(estimate.total ?? 0);
+  // Mirrors resolveDealStatusForOutcome()'s actual_close_date rule (src/lib/
+  // deals-store.ts): populate it on entering won/lost only if not already
+  // set, leave it untouched for any non-terminal category.
+  if ((targetCategory === "won" || targetCategory === "lost") && !existingDeal.actual_close_date) {
+    updatePayload.actual_close_date = new Date().toISOString().slice(0, 10);
+  }
 
   const { error: moveErr } = await admin.from("deals").update(updatePayload).eq("id", existingDeal.id).eq("org_id", orgId);
   if (moveErr) return { ok: false, error: moveErr.message };

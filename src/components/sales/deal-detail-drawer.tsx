@@ -1,7 +1,6 @@
 // src/components/sales/deal-detail-drawer.tsx
 
 import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate } from "@tanstack/react-router";
 import { formatDistanceToNow } from "date-fns";
 import {
   AlertCircle,
@@ -69,6 +68,12 @@ import {
 import { formatDateShort, formatMoney } from "@/lib/format";
 import { supabase } from "@/lib/supabase";
 import { createProject, mapProjectRow, type Project as StoreProject } from "@/lib/projects-store";
+import { PROJECT_STATUS_LABELS } from "@/lib/project-status";
+// Contextual-drawer principle (Bug 2) — the exact same Project detail Sheet
+// the Projects page and Calendar already reuse, never a second Project
+// detail implementation.
+import { ProjectDetailSheet } from "@/routes/projects.index";
+import { EstimateFormSheet, fetchEstimateById, type Estimate as FullEstimate } from "@/routes/estimates";
 import type {
   Deal,
   DealActivity,
@@ -544,7 +549,6 @@ export function DealDetailDrawer({
   stages = [],
   teamMembers = [],
 }: DealDetailDrawerProps) {
-  const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState("overview");
   const [activities, setActivities] = useState<DealActivity[]>([]);
   const [contacts, setContacts] = useState<DealContact[]>([]);
@@ -567,6 +571,16 @@ export function DealDetailDrawer({
   const [linkedProject, setLinkedProject] = useState<StoreProject | null>(null);
   const [loadingProject, setLoadingProject] = useState(false);
   const [creatingProject, setCreatingProject] = useState(false);
+  // Contextual-drawer principle (Bug 2) — "Open Project" opens the exact
+  // same ProjectDetailSheet the Projects page and Calendar already reuse,
+  // layered over this Deal drawer, instead of navigating to /projects.
+  const [projectSheetOpen, setProjectSheetOpen] = useState(false);
+  // Same principle for "Open Estimate" — reuses the exported EstimateFormSheet
+  // (src/routes/estimates.tsx) in edit mode instead of navigating to
+  // /estimates (which previously didn't even deep-link to the right estimate).
+  const [estimateDrawerOpen, setEstimateDrawerOpen] = useState(false);
+  const [estimateDrawerEstimate, setEstimateDrawerEstimate] = useState<FullEstimate | null>(null);
+  const [estimateDrawerLoading, setEstimateDrawerLoading] = useState(false);
 
   const [editOpen, setEditOpen] = useState(false);
   const [lostOpen, setLostOpen] = useState(false);
@@ -644,6 +658,26 @@ export function DealDetailDrawer({
     setCreatingProject(true);
 
     try {
+      // Part 6 — defensive re-verify against the server immediately before
+      // creating: local `linkedProject` state can be stale (e.g. another
+      // tab/session just converted an Estimate for this Deal into a
+      // Project). Never let a race create a duplicate Project.
+      const { data: existing, error: existingErr } = await supabase
+        .from("projects")
+        .select("*, contacts!client_id(full_name), owner_profile:profiles!owner_id(first_name,last_name,email)")
+        .eq("deal_id", deal.id)
+        .eq("org_id", deal.orgId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (existingErr) throw existingErr;
+      if (existing) {
+        const mapped = mapProjectRow(existing);
+        setLinkedProject(mapped);
+        toast.info(`Project "${mapped.name}" is already linked to this deal`);
+        return;
+      }
+
       const { project, error } = await createProject({
         name: deal.name,
         client_id: deal.contactId,
@@ -681,6 +715,19 @@ export function DealDetailDrawer({
       toast.error(error?.message ?? "Failed to create project");
     } finally {
       setCreatingProject(false);
+    }
+  }
+
+  async function openEstimateDrawer(estimateId: string) {
+    if (!deal) return;
+    setEstimateDrawerLoading(true);
+    try {
+      const est = await fetchEstimateById(deal.orgId, estimateId);
+      if (!est) { toast.error("Could not load this estimate"); return; }
+      setEstimateDrawerEstimate(est);
+      setEstimateDrawerOpen(true);
+    } finally {
+      setEstimateDrawerLoading(false);
     }
   }
 
@@ -1299,6 +1346,14 @@ export function DealDetailDrawer({
 
   async function handleWon() {
     if (!deal) return;
+    // Part 11 — idempotency: the action bar already hides this button once
+    // a deal is Won, but guard the handler itself too (defense in depth
+    // against a stale render / rapid double-click) so a duplicate call can
+    // never re-fire the "marked as Won" toast or side effects.
+    if (deal.status === "won") {
+      toast.info(`${deal.name} is already marked Won`);
+      return;
+    }
 
     try {
       if (onStageChange) {
@@ -1323,6 +1378,12 @@ export function DealDetailDrawer({
 
   async function confirmLost() {
     if (!deal || !lostReason) return;
+    // Part 11 — same idempotency guard as handleWon.
+    if (deal.status === "lost") {
+      toast.info(`${deal.name} is already marked Lost`);
+      setLostOpen(false);
+      return;
+    }
 
     setSaving(true);
 
@@ -1485,30 +1546,35 @@ export function DealDetailDrawer({
                   Edit
                 </Button>
 
-                {deal.status === "open" && (
-                  <>
-                    <Button
-                      size="sm"
-                      className="bg-blue-600 text-white hover:bg-blue-700"
-                      onClick={handleWon}
-                    >
-                      <CheckCircle2 className="mr-1.5 h-4 w-4" />
-                      Mark Won
-                    </Button>
+                {/* Part 2/3 — action buttons represent possible TRANSITIONS out
+                    of the deal's current terminal state, not a single "open"
+                    gate: a Won deal can still be reverted to Lost (and vice
+                    versa); only the transition INTO the deal's own current
+                    state is hidden. */}
+                {deal.status !== "won" && (
+                  <Button
+                    size="sm"
+                    className="bg-blue-600 text-white hover:bg-blue-700"
+                    onClick={handleWon}
+                  >
+                    <CheckCircle2 className="mr-1.5 h-4 w-4" />
+                    Mark Won
+                  </Button>
+                )}
 
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => {
-                        setLostReason("");
-                        setLostNotes("");
-                        setLostOpen(true);
-                      }}
-                    >
-                      <XCircle className="mr-1.5 h-4 w-4" />
-                      Mark Lost
-                    </Button>
-                  </>
+                {deal.status !== "lost" && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      setLostReason("");
+                      setLostNotes("");
+                      setLostOpen(true);
+                    }}
+                  >
+                    <XCircle className="mr-1.5 h-4 w-4" />
+                    Mark Lost
+                  </Button>
                 )}
 
                 {onDelete && (
@@ -1894,7 +1960,7 @@ export function DealDetailDrawer({
                     <p className="text-sm font-semibold">Project</p>
                   </div>
                   {linkedProject && (
-                    <StatusBadge tone="muted">{linkedProject.status}</StatusBadge>
+                    <StatusBadge tone="muted">{PROJECT_STATUS_LABELS[linkedProject.status] ?? linkedProject.status}</StatusBadge>
                   )}
                 </div>
 
@@ -1907,9 +1973,7 @@ export function DealDetailDrawer({
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() =>
-                          void navigate({ to: "/projects", search: { projectId: linkedProject.id } })
-                        }
+                        onClick={() => setProjectSheetOpen(true)}
                       >
                         <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
                         Open Project
@@ -1985,11 +2049,9 @@ export function DealDetailDrawer({
                       </div>
 
                       <div className="mt-3">
-                        <Button variant="outline" size="sm" asChild>
-                          <Link to="/estimates">
-                            <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
-                            Open in Estimates
-                          </Link>
+                        <Button variant="outline" size="sm" onClick={() => void openEstimateDrawer(estimate.id)} disabled={estimateDrawerLoading}>
+                          <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
+                          Open Estimate
                         </Button>
                       </div>
                     </div>
@@ -2041,6 +2103,30 @@ export function DealDetailDrawer({
           </Tabs>
         </SheetContent>
       </Sheet>
+
+      {/* Contextual-drawer principle (Bug 2) — layered directly over this
+          Deal drawer (Sheet-over-Sheet: Radix stacks the newest Portal on
+          top, dismisses independently). Closing it returns to this same
+          Deal drawer/tab; deal state is untouched since it lives entirely
+          in this component, not inside ProjectDetailSheet. */}
+      <ProjectDetailSheet
+        project={linkedProject}
+        open={projectSheetOpen}
+        onClose={() => setProjectSheetOpen(false)}
+        onReload={() => { if (deal) void loadLinkedProject(deal.id, deal.orgId); }}
+        onProjectUpdated={setLinkedProject}
+      />
+
+      {/* Contextual-drawer principle — "Open Estimate" opens the same
+          EstimateFormSheet layered over this Deal drawer instead of
+          navigating to /estimates. */}
+      <EstimateFormSheet
+        open={estimateDrawerOpen}
+        onClose={() => { setEstimateDrawerOpen(false); setEstimateDrawerEstimate(null); }}
+        orgId={deal?.orgId ?? ""}
+        estimate={estimateDrawerEstimate ?? undefined}
+        onSaved={() => { if (deal) void loadEstimates(deal.id, deal.orgId); }}
+      />
 
       <Dialog open={editOpen} onOpenChange={setEditOpen}>
         <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto [&>button.absolute]:hidden">

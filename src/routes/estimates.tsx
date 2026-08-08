@@ -129,7 +129,7 @@ type EstimateItem = {
   is_heading: boolean;
 };
 
-type Estimate = {
+export type Estimate = {
   id: string;
   number: string | null;
   title: string;
@@ -251,6 +251,87 @@ function mapItems(raw: any[]): EstimateItem[] {
         is_heading: !!row.is_heading,
       };
     });
+}
+
+/** Maps one raw `estimates` row + its items + resolved contact/company/owner names into the shared `Estimate` shape. The single place both the list load() and fetchEstimateById() build an Estimate from, so a Project-context fetch (View Contract) never drifts from the Estimates page's own row shape. */
+export function mapEstimateRow(
+  r: any,
+  items: EstimateItem[],
+  contactName?: string | null,
+  companyName?: string | null,
+  ownerName?: string | null,
+): Estimate {
+  return {
+    id: r.id,
+    number: r.number ?? null,
+    title: r.title ?? "Untitled",
+    status: normalizeEstimateStatus(r.status),
+    client_id: r.client_id ?? null,
+    client_name: r.client_name ?? contactName ?? "—",
+    company_id: r.company_id ?? null,
+    company_name: r.company_id ? (companyName ?? null) : null,
+    lead_id: r.lead_id ?? null,
+    deal_id: r.deal_id ?? null,
+    project_id: r.project_id ?? null,
+    owner_id: r.owner_id ?? null,
+    owner_name: r.owner_id ? (ownerName ?? null) : null,
+    notes: r.notes ?? null,
+    scope: r.scope ?? null,
+    customer_note: r.customer_note ?? null,
+    terms: r.terms ?? null,
+    exclusions: r.exclusions ?? null,
+    assumptions: r.assumptions ?? null,
+    service_address: r.metadata?.serviceAddress ?? null,
+    valid_until: r.valid_until ?? null,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    sent_at: r.sent_at ?? null,
+    viewed_at: r.viewed_at ?? null,
+    approved_at: r.approved_at ?? null,
+    rejected_at: r.rejected_at ?? null,
+    expired_at: r.expired_at ?? null,
+    cancelled_at: r.cancelled_at ?? null,
+    changes_requested_at: r.changes_requested_at ?? null,
+    public_token: r.public_token ?? null,
+    version_number: r.version_number ?? 1,
+    currency: r.currency ?? "USD",
+    taxRate: Number(r.tax_rate ?? 0),
+    discountType: r.discount_type ?? null,
+    discountValue: Number(r.discount_value ?? 0),
+    depositType: r.deposit_type ?? null,
+    depositValue: Number(r.deposit_value ?? 0),
+    convertedDealId: r.converted_deal_id ?? null,
+    convertedProjectId: r.converted_project_id ?? null,
+    subtotal: Number(r.subtotal ?? 0),
+    discountTotal: Number(r.discount_total ?? 0),
+    taxTotal: Number(r.tax_total ?? 0),
+    total: Number(r.total ?? 0),
+    depositAmount: Number(r.deposit_amount ?? 0),
+    balanceDue: Number(r.balance_due ?? 0),
+    item_count: items.length,
+    estimate_items: items,
+  };
+}
+
+/** Fetches a single estimate in the exact same shape the Estimates page itself uses, for contexts that need to open EstimateFormSheet in edit/view mode without navigating to /estimates (e.g. Project Financials → View Contract, Part 12). Returns null if not found in this org. */
+export async function fetchEstimateById(orgId: string, estimateId: string): Promise<Estimate | null> {
+  const { data: r, error } = await supabase.from("estimates").select("*").eq("id", estimateId).eq("org_id", orgId).maybeSingle();
+  if (error || !r) return null;
+
+  const { data: itemsData } = await supabase.from("estimate_items").select("*").eq("estimate_id", estimateId);
+  const items = mapItems(itemsData ?? []);
+
+  const [contactRes, companyRes, ownerRes] = await Promise.all([
+    r.client_id ? supabase.from("contacts").select("full_name").eq("id", r.client_id).maybeSingle() : Promise.resolve({ data: null }),
+    r.company_id ? supabase.from("companies").select("name").eq("id", r.company_id).maybeSingle() : Promise.resolve({ data: null }),
+    r.owner_id ? supabase.from("profiles").select("first_name, last_name").eq("id", r.owner_id).maybeSingle() : Promise.resolve({ data: null }),
+  ]);
+
+  const ownerName = ownerRes.data
+    ? [(ownerRes.data as any).first_name, (ownerRes.data as any).last_name].filter(Boolean).join(" ") || "Team member"
+    : null;
+
+  return mapEstimateRow(r, items, (contactRes.data as any)?.full_name ?? null, (companyRes.data as any)?.name ?? null, ownerName);
 }
 
 /** Posts to estimate-send.ts: ensures a public_token, recalculates totals server-side, transitions draft/ready -> sent, and emails the client their proposal link. */
@@ -412,7 +493,15 @@ function TooltipIconButton({
   );
 }
 
-function EstimateFormSheet({
+/**
+ * Exported (Phase 13.3B, Project→Estimate→Contract workflow) so
+ * projects.index.tsx can mount this exact same create/edit Sheet directly
+ * over the Project page instead of navigating to /estimates — this
+ * component was already self-contained (props in, callback out, no
+ * closure over EstimatesPage-level state/handlers), so no duplication was
+ * needed, just this export.
+ */
+export function EstimateFormSheet({
   open, onClose, orgId, onSaved, estimate, initialLead, initialContext,
 }: {
   open: boolean;
@@ -421,7 +510,8 @@ function EstimateFormSheet({
   onSaved: () => void;
   estimate?: Estimate; // undefined = create mode
   initialLead?: { contactId: string; name: string; projectType: string; budget: number; notes: string; leadId: string } | null;
-  initialContext?: { contactId?: string; companyId?: string; dealId?: string; projectId?: string } | null;
+  /** address/title are additive (Project-context prefill) — the pre-existing contactId/companyId/dealId/projectId deep-link shape is unchanged. */
+  initialContext?: { contactId?: string; companyId?: string; dealId?: string; projectId?: string; address?: string; title?: string } | null;
 }) {
   const isEdit = !!estimate;
   const contacts = useContacts();
@@ -560,7 +650,7 @@ function EstimateFormSheet({
       setDepositValue(String(estimate.depositValue ?? 0));
       setItems(estimate.estimate_items.length ? estimate.estimate_items.map(itemToLine) : [newLineItem()]);
     } else {
-      const initialTitle = initialLead?.projectType ? `${initialLead.projectType} Estimate` : "";
+      const initialTitle = initialLead?.projectType ? `${initialLead.projectType} Estimate` : (initialContext?.title ?? "");
       setTitle(initialTitle);
       const matched = matchWorkTypeFromTitle(initialTitle);
       const resolvedWorkType: WorkType = matched === "other" && !initialTitle ? "kitchen_remodel" : matched;
@@ -591,7 +681,7 @@ function EstimateFormSheet({
         setCustomer(null);
       }
       setOwnerId("unassigned");
-      setAddress("");
+      setAddress(initialContext?.address ?? "");
       setValidUntil(plusDays(30));
       setScope(initialLead?.notes || resolveDefaultScopeContent(orgTemplates, resolvedWorkType));
       setInternalNote("");
@@ -1910,56 +2000,7 @@ function EstimatesPage() {
 
     setEstimates(estData.map((r: any) => {
       const items = mapItems(itemsByEstimate.get(r.id) ?? []);
-      return {
-        id: r.id,
-        number: r.number ?? null,
-        title: r.title ?? "Untitled",
-        status: normalizeEstimateStatus(r.status),
-        client_id: r.client_id ?? null,
-        client_name: r.client_name ?? contactMap.get(r.client_id) ?? "—",
-        company_id: r.company_id ?? null,
-        company_name: r.company_id ? (companyMap.get(r.company_id) ?? null) : null,
-        lead_id: r.lead_id ?? null,
-        deal_id: r.deal_id ?? null,
-        project_id: r.project_id ?? null,
-        owner_id: r.owner_id ?? null,
-        owner_name: r.owner_id ? (ownerMap.get(r.owner_id) ?? null) : null,
-        notes: r.notes ?? null,
-        scope: r.scope ?? null,
-        customer_note: r.customer_note ?? null,
-        terms: r.terms ?? null,
-        exclusions: r.exclusions ?? null,
-        assumptions: r.assumptions ?? null,
-        service_address: r.metadata?.serviceAddress ?? null,
-        valid_until: r.valid_until ?? null,
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-        sent_at: r.sent_at ?? null,
-        viewed_at: r.viewed_at ?? null,
-        approved_at: r.approved_at ?? null,
-        rejected_at: r.rejected_at ?? null,
-        expired_at: r.expired_at ?? null,
-        cancelled_at: r.cancelled_at ?? null,
-        changes_requested_at: r.changes_requested_at ?? null,
-        public_token: r.public_token ?? null,
-        version_number: r.version_number ?? 1,
-        currency: r.currency ?? "USD",
-        taxRate: Number(r.tax_rate ?? 0),
-        discountType: r.discount_type ?? null,
-        discountValue: Number(r.discount_value ?? 0),
-        depositType: r.deposit_type ?? null,
-        depositValue: Number(r.deposit_value ?? 0),
-        convertedDealId: r.converted_deal_id ?? null,
-        convertedProjectId: r.converted_project_id ?? null,
-        subtotal: Number(r.subtotal ?? 0),
-        discountTotal: Number(r.discount_total ?? 0),
-        taxTotal: Number(r.tax_total ?? 0),
-        total: Number(r.total ?? 0),
-        depositAmount: Number(r.deposit_amount ?? 0),
-        balanceDue: Number(r.balance_due ?? 0),
-        item_count: items.length,
-        estimate_items: items,
-      };
+      return mapEstimateRow(r, items, contactMap.get(r.client_id) ?? null, r.company_id ? (companyMap.get(r.company_id) ?? null) : null, r.owner_id ? (ownerMap.get(r.owner_id) ?? null) : null);
     }));
     setLoading(false);
   }, [orgId]);

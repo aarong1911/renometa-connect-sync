@@ -19,12 +19,17 @@
 import type { Task } from "@/lib/mock-data";
 import type { ProjectDailyLog } from "@/lib/project-daily-logs";
 import type { ProjectPhoto } from "@/lib/project-photos";
+import type { ChangeOrder } from "@/lib/project-change-orders";
 
 export type ProjectActivitySourceType =
   | "task_created" | "task_completed"
   | "note"
   | "daily_log_created" | "daily_log_published"
-  | "photo_uploaded";
+  | "photo_uploaded"
+  | "change_order_created" | "change_order_ready" | "change_order_sent"
+  | "change_order_viewed" | "change_order_approved" | "change_order_rejected"
+  | "change_order_cancelled" | "change_order_expired" | "change_order_superseded"
+  | "change_order_revision_created" | "change_order_schedule_impact_applied";
 
 export type ProjectActivityEntry = {
   /** Stable derived id: `${sourceType}:${recordId}[:suffix]` — never random, so re-deriving on every render never reshuffles React keys. */
@@ -55,8 +60,10 @@ export function buildProjectActivity(params: {
   notes: NoteLike[];
   dailyLogs: ProjectDailyLog[];
   photos: ProjectPhoto[];
+  /** Phase 13.3B security audit, Part 10 — optional so every existing caller keeps compiling unchanged. */
+  changeOrders?: ChangeOrder[];
 }): ProjectActivityEntry[] {
-  const { projectId, tasks, notes, dailyLogs, photos } = params;
+  const { projectId, tasks, notes, dailyLogs, photos, changeOrders = [] } = params;
   const entries: ProjectActivityEntry[] = [];
 
   for (const t of tasks) {
@@ -100,6 +107,90 @@ export function buildProjectActivity(params: {
       description: p.category, relatedRecordId: p.id,
       isCustomerVisible: p.isCustomerVisible, isFieldVisible: p.isFieldVisible,
     });
+  }
+
+  // Change Orders (Phase 13.3B security audit, Part 10) — every entry below
+  // is derived from a stored timestamp column already on
+  // project_change_orders, the same "derivable, not synthesized" rule the
+  // rest of this file follows (see the header comment). Deliberately NOT
+  // included: filter clicks, preview opens, URL refreshes, or client-side
+  // recalculation — none of those ever touch a persisted column. "created"
+  // doubles as "revision created" when parentChangeOrderId is set, since
+  // both are the same createdAt timestamp on the same row — never two
+  // entries for one event.
+  for (const co of changeOrders) {
+    entries.push({
+      id: `change_order_created:${co.id}`, projectId,
+      sourceType: co.parentChangeOrderId ? "change_order_revision_created" : "change_order_created",
+      occurredAt: new Date(co.createdAt), actor: co.createdBy,
+      title: co.parentChangeOrderId ? `Change Order revision created: ${co.changeOrderNumber} v${co.version}` : `Change Order created: ${co.changeOrderNumber}`,
+      description: co.title, relatedRecordId: co.id,
+      isCustomerVisible: false, isFieldVisible: false,
+    });
+    if (co.sentAt) {
+      entries.push({
+        id: `change_order_sent:${co.id}`, projectId, sourceType: "change_order_sent",
+        occurredAt: new Date(co.sentAt), actor: co.updatedBy,
+        title: `Change Order sent: ${co.changeOrderNumber}`, relatedRecordId: co.id,
+        isCustomerVisible: false, isFieldVisible: false,
+      });
+    }
+    if (co.firstViewedAt) {
+      entries.push({
+        id: `change_order_viewed:${co.id}`, projectId, sourceType: "change_order_viewed",
+        occurredAt: new Date(co.firstViewedAt), actor: null,
+        title: `Change Order viewed by customer: ${co.changeOrderNumber}`, relatedRecordId: co.id,
+        isCustomerVisible: false, isFieldVisible: false,
+      });
+    }
+    if (co.approvedAt) {
+      entries.push({
+        id: `change_order_approved:${co.id}`, projectId, sourceType: "change_order_approved",
+        occurredAt: new Date(co.approvedAt), actor: co.approvedByName,
+        title: `Change Order approved: ${co.changeOrderNumber}`, relatedRecordId: co.id,
+        isCustomerVisible: co.isCustomerVisible, isFieldVisible: co.isFieldVisible,
+      });
+    }
+    if (co.rejectedAt) {
+      entries.push({
+        id: `change_order_rejected:${co.id}`, projectId, sourceType: "change_order_rejected",
+        occurredAt: new Date(co.rejectedAt), actor: co.rejectedByName,
+        title: `Change Order rejected: ${co.changeOrderNumber}`, description: co.rejectionReason ?? undefined,
+        relatedRecordId: co.id, isCustomerVisible: false, isFieldVisible: false,
+      });
+    }
+    if (co.cancelledAt) {
+      entries.push({
+        id: `change_order_cancelled:${co.id}`, projectId, sourceType: "change_order_cancelled",
+        occurredAt: new Date(co.cancelledAt), actor: co.updatedBy,
+        title: `Change Order cancelled: ${co.changeOrderNumber}`, relatedRecordId: co.id,
+        isCustomerVisible: false, isFieldVisible: false,
+      });
+    }
+    if (co.expiredAt) {
+      entries.push({
+        id: `change_order_expired:${co.id}`, projectId, sourceType: "change_order_expired",
+        occurredAt: new Date(co.expiredAt), actor: null,
+        title: `Change Order expired: ${co.changeOrderNumber}`, relatedRecordId: co.id,
+        isCustomerVisible: false, isFieldVisible: false,
+      });
+    }
+    if (co.supersededAt) {
+      entries.push({
+        id: `change_order_superseded:${co.id}`, projectId, sourceType: "change_order_superseded",
+        occurredAt: new Date(co.supersededAt), actor: co.updatedBy,
+        title: `Change Order superseded: ${co.changeOrderNumber}`, relatedRecordId: co.id,
+        isCustomerVisible: false, isFieldVisible: false,
+      });
+    }
+    if (co.scheduleImpactAppliedAt) {
+      entries.push({
+        id: `change_order_schedule_impact_applied:${co.id}`, projectId, sourceType: "change_order_schedule_impact_applied",
+        occurredAt: new Date(co.scheduleImpactAppliedAt), actor: co.scheduleImpactAppliedBy,
+        title: `Schedule impact applied: ${co.changeOrderNumber}`, relatedRecordId: co.id,
+        isCustomerVisible: false, isFieldVisible: co.isFieldVisible,
+      });
+    }
   }
 
   return entries.sort((a, b) => b.occurredAt.getTime() - a.occurredAt.getTime());

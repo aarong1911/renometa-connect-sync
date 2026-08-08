@@ -38,9 +38,18 @@ const sheetVariants = cva(
         top: "inset-x-0 top-0 border-b data-[state=closed]:slide-out-to-top data-[state=open]:slide-in-from-top",
         bottom:
           "inset-x-0 bottom-0 border-t data-[state=closed]:slide-out-to-bottom data-[state=open]:slide-in-from-bottom",
-        left: "inset-y-0 left-0 h-full w-3/4 border-r data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left sm:max-w-sm",
+        // Part 10 (90% zoom scrollbar audit) — `h-full` here was redundant
+        // with `inset-y-0` (top:0 + bottom:0 on a `position:fixed` element
+        // already fully determines its vertical extent) and, at
+        // non-100% browser zoom, two independent height-determining
+        // constraints on the same element can round to a sub-pixel-
+        // different value, which is exactly the kind of thing that
+        // produces a spurious 1px-tall scrollable overflow. `inset-y-0`
+        // alone is sufficient and removes the redundancy; visually
+        // unchanged at 100% zoom.
+        left: "inset-y-0 left-0 w-3/4 border-r data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left sm:max-w-sm",
         right:
-          "inset-y-0 right-0 h-full w-3/4 border-l data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right sm:max-w-sm",
+          "inset-y-0 right-0 w-3/4 border-l data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right sm:max-w-sm",
       },
     },
     defaultVariants: {

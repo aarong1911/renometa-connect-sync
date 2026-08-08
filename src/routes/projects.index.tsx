@@ -49,7 +49,7 @@ import { composeAddress } from "@/lib/address";
 import {
   PROJECT_TYPE_ORDER, PROJECT_TYPE_LABELS, PROJECT_PRIORITY_ORDER, PROJECT_PRIORITY_LABELS,
   PROJECT_PRIORITY_TINT, BUDGET_RANGE_ORDER, BUDGET_RANGE_LABELS, budgetRangeMidpoint,
-  PROJECT_TYPE_TO_WORK_TYPES, getProjectDisplayProgress, isProgressManual,
+  PROJECT_TYPE_TO_WORK_TYPES, getProjectDisplayProgress, isProgressManual, PROJECT_STATUS_LABELS,
   type ProjectType, type ProjectPriority, type BudgetRange,
 } from "@/lib/project-status";
 import { scopePresetsForWorkType, findScopePreset } from "@/lib/scope-of-work-presets";
@@ -57,6 +57,7 @@ import {
   useOrgTemplates, saveOrgTemplate, getScopeTemplates, resolveDefaultScopeContent,
 } from "@/lib/proposal-templates-store";
 import type { WorkType } from "@/lib/estimate-status";
+import { normalizeEstimateStatus, ESTIMATE_STATUS_LABELS, ESTIMATE_STATUS_TINT } from "@/lib/estimate-status";
 import { useTasks, addTask, updateTask, deleteTask, refreshTasks, type TaskStatus } from "@/lib/tasks-store";
 import { EntityAppointmentsPanel } from "@/components/appointments/entity-appointments-panel";
 import type { Task, Contact } from "@/lib/mock-data";
@@ -82,8 +83,14 @@ import {
 import { ProjectTimelineGantt } from "@/components/projects/ProjectTimelineGantt";
 import { ProjectDailyLogsTab } from "@/components/projects/ProjectDailyLogsTab";
 import { ProjectPhotoGallery } from "@/components/projects/ProjectPhotoGallery";
+import { ChangeOrdersTab } from "@/components/projects/ChangeOrdersTab";
+import {
+  fetchProjectChangeOrderFinancialSummary, fetchApprovedChangeOrderTotalsByProject,
+  type ProjectChangeOrderFinancialSummary,
+} from "@/lib/project-change-orders";
 import { InviteToPortalModal } from "@/components/portal/InviteToPortalModal";
 import { InvoiceModal } from "@/components/projects/InvoiceModal";
+import { EstimateFormSheet, fetchEstimateById, type Estimate as FullEstimate } from "@/routes/estimates";
 import { InvoiceDetailModal } from "@/components/projects/InvoiceDetailModal";
 
 type ProjectsSearch = {
@@ -95,14 +102,16 @@ type ProjectsSearch = {
   contactId?: string;
   companyId?: string;
   /** Phase 13.2B — Calendar → Project deep links (Part 28/29). tab=schedule opens Schedule & Tasks directly; subview picks Plan/Timeline/Milestones/Tasks; task/milestone/phase are informational hints consumed by the relevant subview (no highlighting/scrolling implemented in this pass — see report). */
-  tab?: "overview" | "financials" | "schedule" | "communications" | "photos";
+  tab?: "overview" | "financials" | "schedule" | "daily-logs" | "change-orders" | "communications" | "photos";
   subview?: "plan" | "timeline" | "milestones" | "tasks";
   task?: string;
   milestone?: string;
   phase?: string;
+  /** Phase 13.3B — Change Orders deep link (Part 39). Opens the Change Orders tab and, when set, that Change Order's detail drawer. Fails safely (falls back to the tab's list view) if the id doesn't resolve to a real row. */
+  changeOrder?: string;
 };
 
-const PROJECT_TABS = ["overview", "financials", "schedule", "communications", "photos"] as const;
+const PROJECT_TABS = ["overview", "financials", "schedule", "daily-logs", "change-orders", "communications", "photos"] as const;
 const SCHEDULE_SUBVIEWS = ["plan", "timeline", "milestones", "tasks"] as const;
 
 export const Route = createFileRoute("/projects/")({
@@ -117,6 +126,7 @@ export const Route = createFileRoute("/projects/")({
     task: typeof raw.task === "string" ? raw.task : undefined,
     milestone: typeof raw.milestone === "string" ? raw.milestone : undefined,
     phase: typeof raw.phase === "string" ? raw.phase : undefined,
+    changeOrder: typeof raw.changeOrder === "string" ? raw.changeOrder : undefined,
   }),
   component: ProjectsPage,
 });
@@ -140,15 +150,36 @@ type Invoice = {
 
 type Note = { id: string; body: string; created_at: string; author: string };
 
+/** Minimal shape read from `estimates` for the Financials "Contract & Estimates" section — see estimates.tsx for the full Estimate type this is a subset of. */
+type ProjectEstimateSummary = {
+  id: string;
+  number: string | null;
+  title: string;
+  status: string;
+  total: number;
+  clientTotal: number | null;
+  approvedAt: string | null;
+  sentAt: string | null;
+  validUntil: string | null;
+  pdfUrl: string | null;
+  publicToken: string | null;
+  currency: string;
+};
+
 // ─── Stage columns ────────────────────────────────────────────────────────────
 
+// Labels sourced from the canonical PROJECT_STATUS_LABELS (src/lib/
+// project-status.ts) — dot colors/descriptions/stepper order stay here
+// (detail-page-specific), but the label TEXT is shared with every other
+// surface (e.g. the Pipeline Deal drawer's linked-Project card) so the same
+// projects.status value is never worded two different ways (Part 4/10).
 const STAGE_COLUMNS: StageColumn[] = [
-  { id: "estimating",       statuses: ["planning"],         dbStatus: "planning",         label: "Estimating",       dotColor: "bg-sky-500",    description: "Proposal / bid in progress" },
-  { id: "contracted",       statuses: ["contracted"],       dbStatus: "contracted",       label: "Contracted",       dotColor: "bg-violet-500", description: "Signed, deposit received" },
-  { id: "pre-construction", statuses: ["pre-construction"], dbStatus: "pre-construction", label: "Pre-Construction", dotColor: "bg-amber-500",  description: "Permits · materials · scheduling" },
-  { id: "in-progress",      statuses: ["active"],           dbStatus: "active",           label: "In Progress",      dotColor: "bg-green-500",  description: "Active on-site work" },
-  { id: "punch-list",       statuses: ["punch-list"],       dbStatus: "punch-list",       label: "Punch List",       dotColor: "bg-orange-500", description: "Final items · walkthrough" },
-  { id: "completed",        statuses: ["completed"],        dbStatus: "completed",        label: "Completed",        dotColor: "bg-gray-400",   description: "Closed out" },
+  { id: "estimating",       statuses: ["planning"],         dbStatus: "planning",         label: PROJECT_STATUS_LABELS.planning,          dotColor: "bg-sky-500",    description: "Proposal / bid in progress" },
+  { id: "contracted",       statuses: ["contracted"],       dbStatus: "contracted",       label: PROJECT_STATUS_LABELS.contracted,        dotColor: "bg-violet-500", description: "Signed, deposit received" },
+  { id: "pre-construction", statuses: ["pre-construction"], dbStatus: "pre-construction", label: PROJECT_STATUS_LABELS["pre-construction"], dotColor: "bg-amber-500",  description: "Permits · materials · scheduling" },
+  { id: "in-progress",      statuses: ["active"],           dbStatus: "active",           label: PROJECT_STATUS_LABELS.active,            dotColor: "bg-green-500",  description: "Active on-site work" },
+  { id: "punch-list",       statuses: ["punch-list"],       dbStatus: "punch-list",       label: PROJECT_STATUS_LABELS["punch-list"],       dotColor: "bg-orange-500", description: "Final items · walkthrough" },
+  { id: "completed",        statuses: ["completed"],        dbStatus: "completed",        label: PROJECT_STATUS_LABELS.completed,         dotColor: "bg-gray-400",   description: "Closed out" },
 ];
 
 const ACTIVE_STATUSES: ProjectStatus[] = ["planning","contracted","pre-construction","active","punch-list","completed"];
@@ -164,9 +195,25 @@ const STATUS_FILTER_OPTIONS: { id: StatusFilter; label: string }[] = [
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/**
+ * Compact display only — the shared formatter for every Project card/KPI
+ * that shows a rounded-to-thousands value (never used for Financials'
+ * exact figures, which go through formatMoneyFull below). Previously
+ * `.toFixed(0)` on the /1000 value rounded a $300 Change Order increase
+ * away entirely ($5,300 -> "$5k", making an approved Change Order look
+ * like it had no effect) — now rounds to one decimal place first and only
+ * drops that decimal when it's exactly zero, so an exact-thousand value
+ * still reads as "$5k" (not "$5.0k") while $5,300 correctly reads "$5.3k".
+ */
 function formatMoney(n: number) {
-  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000)     return `$${(n / 1_000).toFixed(0)}k`;
+  if (n >= 1_000_000) {
+    const millions = Math.round((n / 1_000_000) * 10) / 10;
+    return `$${Number.isInteger(millions) ? millions.toFixed(0) : millions.toFixed(1)}M`;
+  }
+  if (n >= 1_000) {
+    const thousands = Math.round((n / 1_000) * 10) / 10;
+    return `$${Number.isInteger(thousands) ? thousands.toFixed(0) : thousands.toFixed(1)}k`;
+  }
   return `$${n.toLocaleString()}`;
 }
 function formatMoneyFull(n: number) {
@@ -198,13 +245,13 @@ function getStepperIndex(status: ProjectStatus) {
 }
 
 const STEPPER_STAGES = [
-  { id: "estimating",       label: "Estimating" },
-  { id: "contracted",       label: "Contracted" },
-  { id: "pre-construction", label: "Pre-Construction" },
-  { id: "in-progress",      label: "In Progress" },
-  { id: "punch-list",       label: "Punch List" },
-  { id: "completed",        label: "Completed" },
-] as const;
+  { id: "estimating",       label: PROJECT_STATUS_LABELS.planning },
+  { id: "contracted",       label: PROJECT_STATUS_LABELS.contracted },
+  { id: "pre-construction", label: PROJECT_STATUS_LABELS["pre-construction"] },
+  { id: "in-progress",      label: PROJECT_STATUS_LABELS.active },
+  { id: "punch-list",       label: PROJECT_STATUS_LABELS["punch-list"] },
+  { id: "completed",        label: PROJECT_STATUS_LABELS.completed },
+];
 
 const PRIORITY_COLORS: Record<Task["priority"], string> = {
   high: "text-red-500", med: "text-amber-500", low: "text-slate-400",
@@ -335,8 +382,8 @@ function ProjectTimelineAgenda({ project, phases, milestones, tasks }: {
 export function ProjectDetailSheet({ project, open, onClose, onReload, onProjectUpdated, deepLink, onDeepLinkConsumed }: {
   project: Project | null; open: boolean; onClose: () => void; onReload: () => void;
   onProjectUpdated: (p: Project) => void;
-  /** Phase 13.2B — optional Calendar deep-link context (Part 28/29); consumed once on open, then cleared by the caller so it isn't re-applied on a later reopen. */
-  deepLink?: { tab?: "overview" | "financials" | "schedule" | "communications" | "photos"; subview?: "plan" | "timeline" | "milestones" | "tasks"; taskId?: string; milestoneId?: string; phaseId?: string } | null;
+  /** Phase 13.2B — optional Calendar deep-link context (Part 28/29); consumed once on open, then cleared by the caller so it isn't re-applied on a later reopen. Phase 13.3B adds changeOrderId (Part 39). */
+  deepLink?: { tab?: "overview" | "financials" | "schedule" | "daily-logs" | "change-orders" | "communications" | "photos"; subview?: "plan" | "timeline" | "milestones" | "tasks"; taskId?: string; milestoneId?: string; phaseId?: string; changeOrderId?: string } | null;
   onDeepLinkConsumed?: () => void;
 }) {
   const [editOpen, setEditOpen] = useState(false);
@@ -344,7 +391,29 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
   const allTasks = useTasks();
   const navigate = useNavigate({ from: "/projects/" });
 
-  const [activeTab,        setActiveTab]        = useState<"overview" | "financials" | "schedule" | "daily-logs" | "communications" | "photos">("overview");
+  const [activeTab,        setActiveTab]        = useState<"overview" | "financials" | "schedule" | "daily-logs" | "change-orders" | "communications" | "photos">("overview");
+  const [coFinancialSummary, setCoFinancialSummary] = useState<ProjectChangeOrderFinancialSummary | null>(null);
+  // Contract & Estimates (Financials, Part 1-3) — the accepted estimate is
+  // the existing project_change_orders-adjacent "contract" data model:
+  // projects.estimate_id, set once by createProject() on Estimate→Project
+  // conversion (src/lib/projects-store.ts). Not a second contract model —
+  // reads the same `estimates` table the Estimates page already owns.
+  const [primaryEstimate, setPrimaryEstimate] = useState<ProjectEstimateSummary | null>(null);
+  const [estimateHistory, setEstimateHistory] = useState<ProjectEstimateSummary[]>([]);
+  const [estimatesLoading, setEstimatesLoading] = useState(false);
+  // Part 1 — "Create Estimate" opens the real Estimate creation Sheet
+  // directly over the Project page (EstimateFormSheet, exported from
+  // estimates.tsx) instead of navigating to /estimates.
+  const [newEstimateOpen, setNewEstimateOpen] = useState(false);
+  // Part 12 — "View Contract" opens the SAME EstimateFormSheet in edit
+  // mode directly over Project Financials instead of navigating to
+  // /estimates. contractDrawerEstimate is fetched on demand (fetchEstimateById,
+  // same row-mapping the Estimates page itself uses) so the drawer shows
+  // full detail (line items, totals, approval/activity, existing actions),
+  // not just the compact ProjectEstimateSummary this page already loads.
+  const [contractDrawerOpen, setContractDrawerOpen] = useState(false);
+  const [contractDrawerEstimate, setContractDrawerEstimate] = useState<FullEstimate | null>(null);
+  const [contractDrawerLoading, setContractDrawerLoading] = useState(false);
   const [newTaskTitle,     setNewTaskTitle]      = useState("");
   const [addingTask,       setAddingTask]        = useState(false);
   const [invoices,         setInvoices]          = useState<Invoice[]>([]);
@@ -396,6 +465,8 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
 
   // deepLink is intentionally read via closure, not listed as a dependency — it should only be applied once, the moment the sheet opens for this project, not re-applied if it changes while already open.
   useEffect(() => { if (open) setScheduleSubview(deepLink?.subview ?? "plan"); }, [open, project?.id]);
+  const [deepLinkChangeOrderId, setDeepLinkChangeOrderId] = useState<string | undefined>(undefined);
+  useEffect(() => { if (open) setDeepLinkChangeOrderId(deepLink?.changeOrderId); }, [open, project?.id]);
 
   const loadPlanningData = useCallback(async () => {
     if (!project) return;
@@ -436,6 +507,102 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
       .eq("project_id", project.id).order("issue_date", { ascending: false })
       .then(({ data }) => { setInvoices((data ?? []) as Invoice[]); setInvoicesLoading(false); });
   }, [activeTab, project?.id, invoiceModalOpen]);
+
+  // Contract baseline (Part 3/14): the approved, Project-linked estimate's
+  // customer-facing total when one exists (projects.estimate_id is only
+  // ever set once, by the trusted DB trigger, from an APPROVED estimate —
+  // see 20260816_estimate_project_contract_link.sql — so `primaryEstimate`
+  // being present already implies "approved"; the status check here is
+  // extra defense, not the primary guard). Falls back to
+  // projects.budget_total for every Project that predates having an
+  // approved Estimate on file, so existing Projects never lose their value.
+  const contractBaseline = (primaryEstimate && normalizeEstimateStatus(primaryEstimate.status) === "approved")
+    ? (primaryEstimate.clientTotal ?? primaryEstimate.total)
+    : (project?.budget_total ?? 0);
+
+  // Loaded whenever the sheet is open (not gated to the Financials tab
+  // like invoices/notes above) because the header KPI row's "Revised
+  // Contract" card needs it too, not only the Financials tab's own
+  // Original/Approved/Revised/Pending breakdown.
+  useEffect(() => {
+    if (!open || !project) { setCoFinancialSummary(null); return; }
+    void fetchProjectChangeOrderFinancialSummary(project.id, contractBaseline).then(setCoFinancialSummary);
+  }, [open, project?.id, contractBaseline]);
+
+  // Contract & Estimates — loaded only for the Financials tab (unlike the
+  // Change Order summary above, nothing outside Financials needs this
+  // yet). Reuses the exact `estimates` table/columns the Estimates page
+  // owns; no second contract data model. `project.estimateId` is the
+  // authoritative "this estimate became this Project" link
+  // (projects.estimate_id, set once at conversion); the project_id/
+  // converted_project_id OR-query below additionally surfaces any other
+  // estimate versions/drafts attached to this Project for the compact
+  // history list, mirroring the same OR the dashboard already uses
+  // (src/routes/index.tsx) for the same two columns.
+  const reloadContractEstimates = useCallback(async () => {
+    if (!project) return;
+    setEstimatesLoading(true);
+    const mapRow = (r: any): ProjectEstimateSummary => ({
+      id: r.id, number: r.number, title: r.title, status: r.status,
+      total: Number(r.total ?? 0), clientTotal: r.client_total === null || r.client_total === undefined ? null : Number(r.client_total),
+      approvedAt: r.approved_at, sentAt: r.sent_at, validUntil: r.valid_until,
+      pdfUrl: r.pdf_url, publicToken: r.public_token, currency: r.currency ?? "USD",
+    });
+    try {
+      const [primary, history] = await Promise.all([
+        project.estimateId
+          ? supabase.from("estimates")
+              .select("id, number, title, status, total, client_total, approved_at, sent_at, valid_until, pdf_url, public_token, currency")
+              .eq("id", project.estimateId).maybeSingle()
+          : Promise.resolve({ data: null }),
+        supabase.from("estimates")
+          .select("id, number, title, status, total, client_total, approved_at, sent_at, valid_until, pdf_url, public_token, currency")
+          .or(`project_id.eq.${project.id},converted_project_id.eq.${project.id}`)
+          .order("created_at", { ascending: false }),
+      ]);
+      setPrimaryEstimate(primary.data ? mapRow(primary.data) : null);
+      setEstimateHistory(((history.data ?? []) as any[]).map(mapRow));
+    } finally {
+      setEstimatesLoading(false);
+    }
+  }, [project?.id, project?.estimateId]);
+
+  // Part 12 — "View Contract" / history-row clicks land here instead of
+  // navigating to /estimates. Fetches the full Estimate (same shape/row-
+  // mapping fetchEstimateById shares with the Estimates page's own load())
+  // and opens the identical EstimateFormSheet in edit mode directly over
+  // Project Financials; closing it leaves the user on Project Financials.
+  const openContractDrawer = useCallback(async (estimateId: string) => {
+    const orgId = (project as any)?.org_id;
+    if (!orgId) return;
+    setContractDrawerLoading(true);
+    try {
+      const est = await fetchEstimateById(orgId, estimateId);
+      if (!est) { toast.error("Could not load this estimate"); return; }
+      setContractDrawerEstimate(est);
+      setContractDrawerOpen(true);
+    } finally {
+      setContractDrawerLoading(false);
+    }
+  }, [project]);
+
+  // Contract & Estimates data — loaded whenever the sheet is open (not
+  // gated to the Financials tab), same reasoning as the Change Order
+  // summary above: the header KPI row's "Revised Contract" card needs the
+  // approved-estimate contract baseline too, not only the Financials
+  // tab's own Contract & Estimates section. Reuses the exact `estimates`
+  // table/columns the Estimates page owns; no second contract data model.
+  // `project.estimateId` is the authoritative "this estimate became this
+  // Project" link (projects.estimate_id, set by the trusted DB trigger on
+  // estimate approval — see 20260816_estimate_project_contract_link.sql);
+  // the project_id/converted_project_id OR-query additionally surfaces
+  // any other estimate versions/drafts attached to this Project for the
+  // compact history list, mirroring the same OR the dashboard already
+  // uses (src/routes/index.tsx) for the same two columns.
+  useEffect(() => {
+    if (!open || !project) return;
+    void reloadContractEstimates();
+  }, [activeTab, project?.id, project?.estimateId, reloadContractEstimates]);
 
   useEffect(() => {
     if (activeTab !== "communications" || !project) return;
@@ -668,6 +835,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
     { id: "financials",     label: "Financials" },
     { id: "schedule",       label: "Schedule & Tasks" },
     { id: "daily-logs",     label: "Daily Logs" },
+    { id: "change-orders",  label: "Change Orders" },
     { id: "communications", label: "Communications" },
     { id: "photos",         label: "Photos" },
   ] as const;
@@ -733,9 +901,26 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
         </div>
 
         {/* KPI cards */}
+        {/* Revised Contract card: neither projects.budget_total NOR the
+            linked approved estimate's own row are ever overwritten here --
+            this card only DISPLAYS contractBaseline (the approved,
+            Project-linked estimate's total when one exists, else
+            budget_total -- Part 3/14) + approved Change Order adjustments
+            (from the same project_financial_adjustments ledger the
+            Financials tab reads). Falls back to plain "Budget" wording
+            (unchanged) when there are no approved Change Orders yet, so
+            the common case isn't relabeled for no reason -- but the VALUE
+            underneath still reflects an approved Estimate's total once
+            one is linked, not a stale budget_total. */}
         <div className="grid grid-cols-2 gap-3 px-6 pt-5 pb-5 shrink-0 sm:grid-cols-4">
           {[
-            { label: "Budget",     main: formatMoney(project.budget_total), sub: `${formatMoney(project.actual_cost)} spent` },
+            (coFinancialSummary?.approvedChangeOrdersTotal ?? 0) !== 0
+              ? {
+                  label: "Revised Contract",
+                  main: formatMoney(coFinancialSummary!.revisedContractValue),
+                  sub: `Original ${formatMoney(contractBaseline)} + ${new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(coFinancialSummary!.approvedChangeOrdersTotal)} COs`,
+                }
+              : { label: "Budget", main: formatMoney(contractBaseline), sub: `${formatMoney(project.actual_cost)} spent` },
             { label: "Timeline",   main: project.start_date ? new Date(project.start_date).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "—", sub: project.end_date ? `→ ${new Date(project.end_date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}` : "No end date" },
             { label: "Completion", main: `${displayProgress}%`, progress: true },
             { label: "Stage",      main: col.label, sub: col.description },
@@ -854,7 +1039,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
                       <div className="mt-4 flex flex-wrap gap-2 border-t border-border pt-3">
                         {project.estimateId && (
                           <Button type="button" variant="outline" size="sm" className="h-8 gap-1.5 text-xs"
-                            onClick={() => navigate({ to: "/estimates", search: { estimateId: project.estimateId! } })}>
+                            onClick={() => void openContractDrawer(project.estimateId!)} disabled={contractDrawerLoading}>
                             <ExternalLink className="h-3.5 w-3.5" />Open Estimate
                           </Button>
                         )}
@@ -1455,9 +1640,84 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
           {/* ── Financials ── */}
           {activeTab === "financials" && (
             <div role="tabpanel" id="project-panel-financials" aria-labelledby="project-tab-financials" className="space-y-4">
+              {/* Contract & Estimates — the accepted Estimate is the
+                  source-of-truth DOCUMENT for the original customer
+                  contract; it stays immutable/history-preserving here.
+                  Change Orders (further below) modify the current
+                  CONTRACT VALUE, never this document. */}
+              <div>
+                <p className="mb-2 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Contract & Estimates</p>
+                {estimatesLoading ? (
+                  <Skeleton className="h-20 w-full" />
+                ) : primaryEstimate ? (
+                  (() => {
+                    const est = primaryEstimate;
+                    const estStatus = normalizeEstimateStatus(est.status);
+                    const tint = ESTIMATE_STATUS_TINT[estStatus];
+                    const contractAmount = est.clientTotal ?? est.total;
+                    return (
+                      <div className="space-y-2">
+                        <div className="rounded-lg border border-border bg-background p-3">
+                          <div className="flex flex-wrap items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Original Contract</p>
+                                <Badge variant="outline" className={cn("h-4.5 rounded px-1.5 text-[10px] font-medium", tint.badge)}>{ESTIMATE_STATUS_LABELS[estStatus]}</Badge>
+                              </div>
+                              <p className="mt-0.5 truncate text-sm font-semibold">{est.number ?? "—"} · {est.title}</p>
+                              <p className="mt-0.5 text-lg font-bold tabular-nums">{formatMoneyFull(contractAmount)}</p>
+                              {est.approvedAt && <p className="mt-0.5 text-[11px] text-muted-foreground">Approved {formatDate(est.approvedAt)}</p>}
+                            </div>
+                            <div className="flex shrink-0 flex-col items-end gap-1.5">
+                              <Button type="button" variant="outline" size="sm" className="h-7 gap-1 text-xs"
+                                onClick={() => void openContractDrawer(est.id)} disabled={contractDrawerLoading}>
+                                <ExternalLink className="h-3 w-3" />View Contract
+                              </Button>
+                              {est.pdfUrl && (
+                                <a href={est.pdfUrl} target="_blank" rel="noopener noreferrer" className="text-[11px] font-medium text-primary hover:underline">
+                                  Download PDF
+                                </a>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                        {estimateHistory.length > 1 && (
+                          <div className="space-y-1">
+                            <p className="text-[11px] font-medium text-muted-foreground">Other estimates on this Project</p>
+                            {estimateHistory.filter((e) => e.id !== est.id).map((e) => {
+                              const s = normalizeEstimateStatus(e.status);
+                              const t = ESTIMATE_STATUS_TINT[s];
+                              return (
+                                <button key={e.id} type="button" onClick={() => void openContractDrawer(e.id)}
+                                  className="flex w-full items-center justify-between gap-2 rounded-md border border-border bg-background px-3 py-1.5 text-left text-xs hover:bg-secondary/30">
+                                  <span className="truncate font-medium">{e.number ?? "—"} <span className="font-normal text-muted-foreground">{e.title}</span></span>
+                                  <span className="flex shrink-0 items-center gap-2">
+                                    <span className="tabular-nums">{formatMoneyFull(e.clientTotal ?? e.total)}</span>
+                                    <Badge variant="outline" className={cn("h-4.5 rounded px-1.5 text-[10px] font-medium", t.badge)}>{ESTIMATE_STATUS_LABELS[s]}</Badge>
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()
+                ) : (
+                  <div className="rounded-lg border border-dashed border-border p-4 text-center">
+                    <p className="text-sm font-medium">No contract document linked</p>
+                    <p className="mt-0.5 text-xs text-muted-foreground">This Project has no approved estimate on file.</p>
+                    <Button type="button" variant="outline" size="sm" className="mt-2.5 h-7 gap-1 text-xs"
+                      onClick={() => setNewEstimateOpen(true)}>
+                      <Plus className="h-3 w-3" />Create Estimate
+                    </Button>
+                  </div>
+                )}
+              </div>
+
               <div className="grid grid-cols-3 gap-3">
                 {[
-                  { label: "Contract Value", val: formatMoneyFull(project.budget_total), cls: "" },
+                  { label: "Contract Value", val: formatMoneyFull(contractBaseline), cls: "" },
                   { label: "Invoiced",       val: formatMoneyFull(invoices.reduce((s,i) => s + (i.total_amount ?? 0), 0)), cls: "" },
                   { label: "Collected",      val: formatMoneyFull(invoices.reduce((s,i) => s + (i.amount_paid ?? 0), 0)),  cls: "text-green-600" },
                 ].map(card => (
@@ -1467,6 +1727,34 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
                   </div>
                 ))}
               </div>
+
+              {/* Change Orders financial impact (Phase 13.3B, Part 29) — approved
+                  Change Orders never overwrite budget_total (the Original Contract);
+                  Revised Contract Value is always derived, never stored. */}
+              {coFinancialSummary && (
+                <div>
+                  <div className="mb-2 flex items-center justify-between">
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Change Orders</p>
+                    <Button size="sm" variant="outline" className="h-7 text-xs gap-1" onClick={() => setActiveTab("change-orders")}>
+                      <FileText className="h-3 w-3" />View Change Orders
+                    </Button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                    {[
+                      { label: "Original Contract",  val: formatMoneyFull(coFinancialSummary.originalContractValue), cls: "" },
+                      { label: "Approved Change Orders", val: formatMoneyFull(coFinancialSummary.approvedChangeOrdersTotal), cls: coFinancialSummary.approvedChangeOrdersTotal < 0 ? "text-destructive" : "text-green-600" },
+                      { label: "Revised Contract Value", val: formatMoneyFull(coFinancialSummary.revisedContractValue), cls: "" },
+                      { label: "Pending Change Orders", val: formatMoneyFull(coFinancialSummary.pendingChangeOrdersTotal), cls: "text-amber-600" },
+                    ].map(card => (
+                      <div key={card.label} className="rounded-lg border border-border bg-muted/30 p-3">
+                        <p className="text-[11px] text-muted-foreground font-medium">{card.label}</p>
+                        <p className={cn("mt-1 text-base font-bold tabular-nums", card.cls)}>{card.val}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div>
                 <div className="mb-2 flex items-center justify-between">
                   <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Invoices</p>
@@ -1479,7 +1767,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
                 ) : invoices.length === 0 ? (
                   <div className="rounded-lg border border-dashed border-border py-8 text-center cursor-pointer hover:bg-secondary/20 transition" onClick={() => setInvoiceModalOpen(true)}>
                     <FileText className="mx-auto h-8 w-8 text-muted-foreground/30 mb-2" />
-                    <p className="text-sm text-muted-foreground">No invoices yet</p>
+                    <p className="text-sm font-medium">No invoices yet</p>
                     <p className="text-xs text-muted-foreground mt-1">Click to create one</p>
                   </div>
                 ) : (
@@ -1576,6 +1864,13 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
           {/* ── Daily Logs (Phase 13.3A) ── */}
           {activeTab === "daily-logs" && <ProjectDailyLogsTab projectId={project.id} />}
 
+          {/* ── Change Orders (Phase 13.3B) ── */}
+          {activeTab === "change-orders" && (
+            <div role="tabpanel" id="project-panel-change-orders" aria-labelledby="project-tab-change-orders">
+              <ChangeOrdersTab projectId={project.id} initialOpenId={deepLinkChangeOrderId} />
+            </div>
+          )}
+
           {/* ── Photos (Phase 13.3A — real gallery, see ProjectPhotoGallery) ── */}
           {activeTab === "photos" && <ProjectPhotoGallery projectId={project.id} phases={phases} />}
         </div>
@@ -1602,6 +1897,31 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
           setTimeout(() => setActiveTab("financials"), 50);
         }}
       />
+      {/* Part 1 — Project-scoped Estimate creation. The exact same Sheet
+          /estimates renders for "New Estimate," reused verbatim (never
+          duplicated) — see the export note on EstimateFormSheet in
+          estimates.tsx. Closes back to Project Financials; the Contract &
+          Estimates history list refreshes via onSaved so a new draft
+          appears immediately without navigating away. */}
+      <EstimateFormSheet
+        open={newEstimateOpen}
+        onClose={() => setNewEstimateOpen(false)}
+        orgId={(project as any).org_id ?? ""}
+        onSaved={() => { setNewEstimateOpen(false); void reloadContractEstimates(); }}
+        initialContext={{ contactId: project.client_id, projectId: project.id, address: project.address ?? undefined, title: project.name }}
+      />
+      {/* Problem 1 / Part 12 — "View Contract" opens this SAME EstimateFormSheet
+          in edit mode (estimate prop present) directly over Project Financials —
+          no /estimates navigation, no duplicated drawer implementation. Unmounts
+          its fetched estimate on close so a stale contract doesn't flash on the
+          next open. */}
+      <EstimateFormSheet
+        open={contractDrawerOpen}
+        onClose={() => { setContractDrawerOpen(false); setContractDrawerEstimate(null); void reloadContractEstimates(); }}
+        orgId={(project as any).org_id ?? ""}
+        estimate={contractDrawerEstimate ?? undefined}
+        onSaved={() => { void reloadContractEstimates(); }}
+      />
       <InvoiceDetailModal
         invoiceId={selectedInvoiceId}
         open={!!selectedInvoiceId}
@@ -1612,6 +1932,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
         open={editOpen}
         onClose={() => setEditOpen(false)}
         onSaved={(updated) => { onProjectUpdated(updated); onReload(); }}
+        onOpenEstimate={(estimateId) => { setEditOpen(false); void openContractDrawer(estimateId); }}
       />
 
       {/* Project Plan Template — Preview */}
@@ -1701,11 +2022,20 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
 
 // ─── Project Card ─────────────────────────────────────────────────────────────
 
-function ProjectCard({ project: p, contact, onClick, onDelete }: {
-  project: Project; contact: Contact | null; onClick: () => void; onDelete: () => void;
+function ProjectCard({ project: p, contact, approvedCOTotal = 0, contractBaseline, onClick, onDelete }: {
+  project: Project; contact: Contact | null; approvedCOTotal?: number; contractBaseline?: number; onClick: () => void; onDelete: () => void;
 }) {
   const age      = daysSince((p as any).created_at);
   const cityLine = getCityFromAddress(p.address);
+  // Revised Contract Value display (never overwrites p.budget_total or the
+  // linked estimate's own row) — contractBaseline is the approved, Project-
+  // linked estimate's total when one exists, else p.budget_total (Part 3/
+  // 6/14); see fetchApprovedChangeOrderTotalsByProject() for the CO half.
+  const baseline = contractBaseline ?? p.budget_total;
+  const revisedValue = baseline + approvedCOTotal;
+  const revisedTitle = approvedCOTotal !== 0
+    ? `Original ${formatMoneyFull(baseline)} + ${new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(approvedCOTotal)} approved Change Orders`
+    : undefined;
   const typeTag  = p.name.split(" ")[0] ?? "General";
   const displayProgress = getProjectDisplayProgress(p);
   const progressIsManual = isProgressManual(p);
@@ -1761,7 +2091,7 @@ function ProjectCard({ project: p, contact, onClick, onDelete }: {
         <Progress value={displayProgress} className="h-1.5" aria-label={`${p.name} completion — ${progressIsManual ? "manually set" : "estimated from project stage"}`} />
       </div>
       <div className="mt-2.5 flex items-center justify-between border-t border-border px-3 py-2.5">
-        <span className="text-sm font-semibold tabular-nums text-foreground">{formatMoney(p.budget_total)}</span>
+        <span className="text-sm font-semibold tabular-nums text-foreground" title={revisedTitle}>{formatMoney(revisedValue)}</span>
         <Badge variant="secondary" className="h-5 rounded px-1.5 text-[10px] font-medium">{typeTag}</Badge>
       </div>
     </Card>
@@ -1770,8 +2100,8 @@ function ProjectCard({ project: p, contact, onClick, onDelete }: {
 
 // ─── Board View ───────────────────────────────────────────────────────────────
 
-function BoardView({ projects, contactsById, onCardClick, onDragEnd, onDelete }: {
-  projects: Project[]; contactsById: Map<string, Contact>; onCardClick: (p: Project) => void;
+function BoardView({ projects, contactsById, approvedCOTotals, contractBaselineFor, onCardClick, onDragEnd, onDelete }: {
+  projects: Project[]; contactsById: Map<string, Contact>; approvedCOTotals: Map<string, number>; contractBaselineFor: (p: Project) => number; onCardClick: (p: Project) => void;
   onDragEnd: (result: DropResult) => void; onDelete: (id: string, name: string) => void;
 }) {
   const grouped = useMemo(() => {
@@ -1786,7 +2116,10 @@ function BoardView({ projects, contactsById, onCardClick, onDragEnd, onDelete }:
       <div className="flex h-full gap-3 pb-4">
         {STAGE_COLUMNS.map(col => {
           const items    = grouped[col.id] ?? [];
-          const colValue = items.reduce((s, p) => s + p.budget_total, 0);
+          // Column total reflects Revised Contract Value (contract
+          // baseline + approved Change Orders), same ledger-derived figure
+          // as each card.
+          const colValue = items.reduce((s, p) => s + contractBaselineFor(p) + (approvedCOTotals.get(p.id) ?? 0), 0);
           return (
             <Droppable droppableId={col.id} key={col.id}>
               {(provided, snap) => (
@@ -1809,7 +2142,7 @@ function BoardView({ projects, contactsById, onCardClick, onDragEnd, onDelete }:
                         {(drag, snapshot) => (
                           <div ref={drag.innerRef} {...drag.draggableProps} {...drag.dragHandleProps}
                             className={cn("cursor-grab active:cursor-grabbing rounded-xl outline-none", snapshot.isDragging && "opacity-80 rotate-1 shadow-xl scale-[1.02]")}>
-                            <ProjectCard project={p} contact={contactsById.get(p.client_id) ?? null} onClick={() => onCardClick(p)} onDelete={() => onDelete(p.id, p.name)} />
+                            <ProjectCard project={p} contact={contactsById.get(p.client_id) ?? null} approvedCOTotal={approvedCOTotals.get(p.id) ?? 0} contractBaseline={contractBaselineFor(p)} onClick={() => onCardClick(p)} onDelete={() => onDelete(p.id, p.name)} />
                           </div>
                         )}
                       </Draggable>
@@ -1829,15 +2162,15 @@ function BoardView({ projects, contactsById, onCardClick, onDragEnd, onDelete }:
 
 // ─── List View ────────────────────────────────────────────────────────────────
 
-function ListView({ projects, onRowClick, onDelete }: {
-  projects: Project[]; onRowClick: (p: Project) => void; onDelete: (id: string, name: string) => void;
+function ListView({ projects, approvedCOTotals, contractBaselineFor, onRowClick, onDelete }: {
+  projects: Project[]; approvedCOTotals: Map<string, number>; contractBaselineFor: (p: Project) => number; onRowClick: (p: Project) => void; onDelete: (id: string, name: string) => void;
 }) {
   return (
     <Card className="overflow-hidden p-0">
       <table className="w-full text-sm">
         <thead className="bg-secondary/60 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
           <tr className="border-b border-border">
-            {["Project","Client","Status","Budget","Progress","Dates",""].map((h, i) => (
+            {["Project","Client","Status","Contract Value","Progress","Dates",""].map((h, i) => (
               <th key={i} className={cn("py-2.5 text-left", i === 0 ? "pl-4 pr-3" : "pr-4", i === 6 && "w-10 pr-3")}>{h}</th>
             ))}
           </tr>
@@ -1848,6 +2181,15 @@ function ListView({ projects, onRowClick, onDelete }: {
             const col = getColumnForStatus(p.status);
             const displayProgress = getProjectDisplayProgress(p);
             const progressIsManual = isProgressManual(p);
+            // Revised Contract Value display only — neither p.budget_total
+            // nor the linked estimate's own row is ever overwritten here.
+            // contractBaselineFor(p) is the approved, Project-linked
+            // estimate's total when one exists, else p.budget_total
+            // (Part 3/6/14). See fetchApprovedChangeOrderTotalsByProject()
+            // for the CO half.
+            const approvedCOTotal = approvedCOTotals.get(p.id) ?? 0;
+            const baseline = contractBaselineFor(p);
+            const revisedValue = baseline + approvedCOTotal;
             return (
               <tr key={p.id} className="border-b border-border hover:bg-secondary/30 cursor-pointer" onClick={() => onRowClick(p)}>
                 <td className="py-3 pl-4 pr-3">
@@ -1862,7 +2204,12 @@ function ListView({ projects, onRowClick, onDelete }: {
                   </div>
                 </td>
                 <td className="py-3 pr-4 tabular-nums">
-                  <div className="text-sm font-semibold">{formatMoney(p.budget_total)}</div>
+                  <div className="text-sm font-semibold">{formatMoney(revisedValue)}</div>
+                  {approvedCOTotal !== 0 && (
+                    <div className="text-[11px] text-muted-foreground">
+                      Original {formatMoney(baseline)} + {new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(approvedCOTotal)} COs
+                    </div>
+                  )}
                   {p.actual_cost > 0 && <div className="text-[11px] text-muted-foreground">{formatMoney(p.actual_cost)} spent</div>}
                 </td>
                 <td className="py-3 pr-4">
@@ -2014,12 +2361,14 @@ function SaveProjectScopeTemplateDialog({
 const STATUS_SELECT_OPTIONS: ProjectStatus[] = ["planning", "contracted", "pre-construction", "active", "punch-list", "on-hold", "completed", "cancelled"];
 
 function EditProjectDialog({
-  project, open, onClose, onSaved,
+  project, open, onClose, onSaved, onOpenEstimate,
 }: {
   project: Project | null;
   open: boolean;
   onClose: () => void;
   onSaved: (p: Project) => void;
+  /** Contextual-drawer principle (Bug 1 audit) — when provided, "Open Estimate" opens the same EstimateFormSheet over the Project instead of navigating to /estimates. */
+  onOpenEstimate?: (estimateId: string) => void;
 }) {
   const { templates: orgTemplates, refresh: refreshOrgTemplates } = useOrgTemplates();
   const contacts = useContacts();
@@ -2439,7 +2788,7 @@ function EditProjectDialog({
                 <div className="flex flex-wrap gap-2">
                   {project.estimateId && (
                     <Button type="button" variant="outline" size="sm" className="gap-1.5 text-xs"
-                      onClick={() => navigate({ to: "/estimates", search: { estimateId: project.estimateId! } })}>
+                      onClick={() => onOpenEstimate ? onOpenEstimate(project.estimateId!) : navigate({ to: "/estimates", search: { estimateId: project.estimateId! } })}>
                       <ExternalLink className="h-3.5 w-3.5" />Open Estimate
                     </Button>
                   )}
@@ -2984,7 +3333,7 @@ function ContactAvatarIcon({ name }: { name: string }) {
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 function ProjectsPage() {
-  const { slug, projectId, openNew, contactId, companyId, tab, subview, task, milestone, phase } = useSearch({ from: "/projects/" });
+  const { slug, projectId, openNew, contactId, companyId, tab, subview, task, milestone, phase, changeOrder } = useSearch({ from: "/projects/" });
   const navigate = useNavigate({ from: "/projects/" });
   const { projects, loading, reload } = useProjects();
   const contacts = useContacts();
@@ -2998,10 +3347,42 @@ function ProjectsPage() {
   const [sheetOpen, setSheetOpen] = useState(false);
   const [optimisticStatuses, setOptimisticStatuses] = useState<Record<string, ProjectStatus>>({});
   // Phase 13.2B — Calendar → Project deep-link context (Part 28/29), consumed once by ProjectDetailSheet then left alone (not re-applied on every reopen).
-  const [deepLink, setDeepLink] = useState<{ tab?: ProjectsSearch["tab"]; subview?: ProjectsSearch["subview"]; taskId?: string; milestoneId?: string; phaseId?: string } | null>(null);
+  const [deepLink, setDeepLink] = useState<{ tab?: ProjectsSearch["tab"]; subview?: ProjectsSearch["subview"]; taskId?: string; milestoneId?: string; phaseId?: string; changeOrderId?: string } | null>(null);
 
   const openDetail  = useCallback((p: Project) => { setSelectedProject(p); setSheetOpen(true); }, []);
   const closeDetail = useCallback(() => { setSheetOpen(false); }, []);
+
+  // Approved Change Order totals per Project, one org-scoped query (never
+  // N+1 per card) — Board/List cards show Revised Contract Value
+  // (budget_total + this) instead of the flat, now-stale original
+  // budget_total once a Change Order has been approved. Re-fetches
+  // whenever the Project list itself reloads (new project, status/stage
+  // change, etc.) so it stays reasonably fresh without polling.
+  const [approvedCOTotals, setApprovedCOTotals] = useState<Map<string, number>>(new Map());
+  useEffect(() => {
+    fetchApprovedChangeOrderTotalsByProject().then(setApprovedCOTotals).catch(() => {});
+  }, [projects]);
+
+  // Contract baseline per Project (Part 6/14): the approved, Project-
+  // linked estimate's customer-facing total when projects.estimate_id is
+  // set (that column is only ever written by the trusted DB trigger on
+  // estimate approval), else that Project's own budget_total. One query
+  // for every estimate_id in view — never N+1 per card. Projects with no
+  // linked estimate simply have no entry and fall back to budget_total.
+  const [estimateContractAmounts, setEstimateContractAmounts] = useState<Map<string, number>>(new Map());
+  useEffect(() => {
+    const estimateIds = Array.from(new Set(projects.map((p) => p.estimateId).filter((id): id is string => !!id)));
+    if (estimateIds.length === 0) { setEstimateContractAmounts(new Map()); return; }
+    supabase.from("estimates").select("id, total, client_total").in("id", estimateIds).then(({ data }) => {
+      const m = new Map<string, number>();
+      for (const row of data ?? []) m.set(row.id, Number(row.client_total ?? row.total ?? 0));
+      setEstimateContractAmounts(m);
+    });
+  }, [projects]);
+  const contractBaselineFor = useCallback(
+    (p: Project) => (p.estimateId && estimateContractAmounts.has(p.estimateId) ? estimateContractAmounts.get(p.estimateId)! : p.budget_total),
+    [estimateContractAmounts],
+  );
 
   // Deep-link support: old /projects/$clientSlug links (e.g. from Inbox)
   // now redirect here with ?slug=... so they open the real detail sheet
@@ -3021,13 +3402,13 @@ function ProjectsPage() {
     if (!projectId || loading) return;
     const match = projects.find((p) => p.id === projectId);
     if (match) {
-      if (tab || subview || task || milestone || phase) {
-        setDeepLink({ tab, subview, taskId: task, milestoneId: milestone, phaseId: phase });
+      if (tab || subview || task || milestone || phase || changeOrder) {
+        setDeepLink({ tab, subview, taskId: task, milestoneId: milestone, phaseId: phase, changeOrderId: changeOrder });
       }
       openDetail(match);
     }
-    navigate({ search: (s) => ({ ...s, projectId: undefined, tab: undefined, subview: undefined, task: undefined, milestone: undefined, phase: undefined }), replace: true });
-  }, [projectId, loading, projects, tab, subview, task, milestone, phase, openDetail, navigate]);
+    navigate({ search: (s) => ({ ...s, projectId: undefined, tab: undefined, subview: undefined, task: undefined, milestone: undefined, phase: undefined, changeOrder: undefined }), replace: true });
+  }, [projectId, loading, projects, tab, subview, task, milestone, phase, changeOrder, openDetail, navigate]);
 
   // New Project deep-link prefill from Contact/Account detail (Part 26/27) —
   // same shape as the Estimates page's own contactId/companyId/openNew handling.
@@ -3206,8 +3587,8 @@ function ProjectsPage() {
           height-bounded by the page root above. */}
       <div className="min-h-0 flex-1 overflow-auto pt-4">
         {view === "board"
-          ? <BoardView projects={filteredProjects} contactsById={contactsById} onCardClick={openDetail} onDragEnd={onDragEnd} onDelete={handleDelete} />
-          : <ListView  projects={filteredProjects} onRowClick={openDetail}  onDelete={handleDelete} />}
+          ? <BoardView projects={filteredProjects} contactsById={contactsById} approvedCOTotals={approvedCOTotals} contractBaselineFor={contractBaselineFor} onCardClick={openDetail} onDragEnd={onDragEnd} onDelete={handleDelete} />
+          : <ListView  projects={filteredProjects} approvedCOTotals={approvedCOTotals} contractBaselineFor={contractBaselineFor} onRowClick={openDetail}  onDelete={handleDelete} />}
       </div>
 
       <NewProjectDialog

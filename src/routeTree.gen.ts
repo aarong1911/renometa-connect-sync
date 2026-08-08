@@ -52,6 +52,7 @@ import { Route as FinancialsReportsRouteImport } from './routes/financials.repor
 import { Route as FinancialsPaymentsRouteImport } from './routes/financials.payments'
 import { Route as FinancialsInvoicesRouteImport } from './routes/financials.invoices'
 import { Route as FinancialsEstimatesRouteImport } from './routes/financials.estimates'
+import { Route as ChangeOrderTokenRouteImport } from './routes/change-order.$token'
 import { Route as AutomationWorkflowsRouteImport } from './routes/automation.workflows'
 import { Route as AutomationTriggersRouteImport } from './routes/automation.triggers'
 import { Route as AutomationCallLogsRouteImport } from './routes/automation.call-logs'
@@ -276,6 +277,11 @@ const FinancialsEstimatesRoute = FinancialsEstimatesRouteImport.update({
   path: '/estimates',
   getParentRoute: () => FinancialsRoute,
 } as any)
+const ChangeOrderTokenRoute = ChangeOrderTokenRouteImport.update({
+  id: '/change-order/$token',
+  path: '/change-order/$token',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AutomationWorkflowsRoute = AutomationWorkflowsRouteImport.update({
   id: '/automation/workflows',
   path: '/automation/workflows',
@@ -346,6 +352,7 @@ export interface FileRoutesByFullPath {
   '/automation/call-logs': typeof AutomationCallLogsRoute
   '/automation/triggers': typeof AutomationTriggersRoute
   '/automation/workflows': typeof AutomationWorkflowsRouteWithChildren
+  '/change-order/$token': typeof ChangeOrderTokenRoute
   '/financials/estimates': typeof FinancialsEstimatesRoute
   '/financials/invoices': typeof FinancialsInvoicesRoute
   '/financials/payments': typeof FinancialsPaymentsRoute
@@ -398,6 +405,7 @@ export interface FileRoutesByTo {
   '/automation/agents': typeof AutomationAgentsRoute
   '/automation/call-logs': typeof AutomationCallLogsRoute
   '/automation/triggers': typeof AutomationTriggersRoute
+  '/change-order/$token': typeof ChangeOrderTokenRoute
   '/financials/estimates': typeof FinancialsEstimatesRoute
   '/financials/invoices': typeof FinancialsInvoicesRoute
   '/financials/payments': typeof FinancialsPaymentsRoute
@@ -452,6 +460,7 @@ export interface FileRoutesById {
   '/automation/call-logs': typeof AutomationCallLogsRoute
   '/automation/triggers': typeof AutomationTriggersRoute
   '/automation/workflows': typeof AutomationWorkflowsRouteWithChildren
+  '/change-order/$token': typeof ChangeOrderTokenRoute
   '/financials/estimates': typeof FinancialsEstimatesRoute
   '/financials/invoices': typeof FinancialsInvoicesRoute
   '/financials/payments': typeof FinancialsPaymentsRoute
@@ -507,6 +516,7 @@ export interface FileRouteTypes {
     | '/automation/call-logs'
     | '/automation/triggers'
     | '/automation/workflows'
+    | '/change-order/$token'
     | '/financials/estimates'
     | '/financials/invoices'
     | '/financials/payments'
@@ -559,6 +569,7 @@ export interface FileRouteTypes {
     | '/automation/agents'
     | '/automation/call-logs'
     | '/automation/triggers'
+    | '/change-order/$token'
     | '/financials/estimates'
     | '/financials/invoices'
     | '/financials/payments'
@@ -612,6 +623,7 @@ export interface FileRouteTypes {
     | '/automation/call-logs'
     | '/automation/triggers'
     | '/automation/workflows'
+    | '/change-order/$token'
     | '/financials/estimates'
     | '/financials/invoices'
     | '/financials/payments'
@@ -666,6 +678,7 @@ export interface RootRouteChildren {
   AutomationCallLogsRoute: typeof AutomationCallLogsRoute
   AutomationTriggersRoute: typeof AutomationTriggersRoute
   AutomationWorkflowsRoute: typeof AutomationWorkflowsRouteWithChildren
+  ChangeOrderTokenRoute: typeof ChangeOrderTokenRoute
   InsightsAnalyticsRoute: typeof InsightsAnalyticsRoute
   InsightsReputationRoute: typeof InsightsReputationRoute
   ProjectsClientSlugRoute: typeof ProjectsClientSlugRoute
@@ -977,6 +990,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof FinancialsEstimatesRouteImport
       parentRoute: typeof FinancialsRoute
     }
+    '/change-order/$token': {
+      id: '/change-order/$token'
+      path: '/change-order/$token'
+      fullPath: '/change-order/$token'
+      preLoaderRoute: typeof ChangeOrderTokenRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/automation/workflows': {
       id: '/automation/workflows'
       path: '/automation/workflows'
@@ -1138,6 +1158,7 @@ const rootRouteChildren: RootRouteChildren = {
   AutomationCallLogsRoute: AutomationCallLogsRoute,
   AutomationTriggersRoute: AutomationTriggersRoute,
   AutomationWorkflowsRoute: AutomationWorkflowsRouteWithChildren,
+  ChangeOrderTokenRoute: ChangeOrderTokenRoute,
   InsightsAnalyticsRoute: InsightsAnalyticsRoute,
   InsightsReputationRoute: InsightsReputationRoute,
   ProjectsClientSlugRoute: ProjectsClientSlugRoute,

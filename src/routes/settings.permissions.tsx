@@ -9,84 +9,17 @@ import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
 import { useTeam, memberInitials, ROLE_LABELS, type Role, type TeamMember } from "@/lib/organization";
+import {
+  PERMISSION_ACTIONS as ACTIONS, PERMISSION_SECTIONS as SECTIONS, getRoleDefaultPermission as getRoleDefault,
+  type PermissionAction as Action,
+} from "@/lib/permission-features";
 
 export const Route = createFileRoute("/settings/permissions")({ component: PermissionsPage });
 
-// ── Feature definitions ───────────────────────────────────────────────────────
-
-type Action  = "view" | "create" | "edit" | "delete";
-const ACTIONS: Action[] = ["view", "create", "edit", "delete"];
-
-type Feature = { id: string; label: string; description: string };
-type Section = { label: string; features: Feature[] };
-
-const SECTIONS: Section[] = [
-  { label: "CRM", features: [
-    { id: "contacts",      label: "Contacts",      description: "Client & vendor profiles" },
-    { id: "companies",     label: "Companies",      description: "Business accounts" },
-    { id: "leads",         label: "Leads",          description: "Top-of-funnel pipeline" },
-    { id: "pipeline",      label: "Pipeline",       description: "Sales stages" },
-  ]},
-  { label: "Projects", features: [
-    { id: "projects",      label: "Projects",       description: "Jobs & scopes" },
-    { id: "tasks",         label: "Tasks",          description: "Checklists & schedules" },
-    { id: "calendar",      label: "Calendar",       description: "Scheduling & dispatch" },
-    { id: "files",         label: "Files",          description: "Documents & assets" },
-  ]},
-  { label: "Inbox", features: [
-    { id: "conversations", label: "Conversations",  description: "Client & team messages" },
-    { id: "templates",     label: "Templates",      description: "Message templates" },
-    { id: "broadcasts",    label: "Broadcasts",     description: "Bulk messaging" },
-  ]},
-  { label: "Automation", features: [
-    { id: "workflows",     label: "Workflows",      description: "Automated sequences" },
-    { id: "ai_center",     label: "AI Center",      description: "AI tools & agents" },
-    { id: "triggers",      label: "Triggers",       description: "Event-based actions" },
-  ]},
-  { label: "Financials", features: [
-    { id: "estimates",     label: "Estimates",      description: "Proposals & bids" },
-    { id: "invoices",      label: "Invoices",       description: "Billing & collections" },
-    { id: "payments",      label: "Payments",       description: "Transactions & receipts" },
-  ]},
-  { label: "Insights", features: [
-    { id: "analytics",     label: "Analytics",      description: "Business reporting" },
-    { id: "reputation",    label: "Reputation",     description: "Reviews & ratings" },
-  ]},
-];
-
-// ── Role action defaults ──────────────────────────────────────────────────────
-// Which features each role can access by route, and default actions within them
-
-const ROLE_FEATURE_ACCESS: Record<Role, string[]> = {
-  owner:          ["*"],
-  admin:          ["*"],
-  office_manager: ["contacts","companies","leads","pipeline","projects","tasks","calendar","files","conversations","templates","broadcasts","estimates","invoices","payments"],
-  estimator:      ["contacts","companies","leads","pipeline","conversations","templates","estimates"],
-  sales:          ["contacts","companies","leads","pipeline","conversations","templates","broadcasts","estimates"],
-  project_manager:["contacts","companies","projects","tasks","calendar","files","conversations","templates","estimates"],
-  field_worker:   [],
-  accountant:     ["contacts","companies","estimates","invoices","payments","analytics"],
-  viewer:         [],
-};
-
-const ROLE_ACTION_DEFAULTS: Record<Role, Record<Action, boolean>> = {
-  owner:          { view: true,  create: true,  edit: true,  delete: true  },
-  admin:          { view: true,  create: true,  edit: true,  delete: true  },
-  office_manager: { view: true,  create: true,  edit: true,  delete: false },
-  estimator:      { view: true,  create: true,  edit: true,  delete: false },
-  sales:          { view: true,  create: true,  edit: true,  delete: false },
-  project_manager:{ view: true,  create: true,  edit: true,  delete: false },
-  field_worker:   { view: false, create: false, edit: false, delete: false },
-  accountant:     { view: true,  create: false, edit: false, delete: false },
-  viewer:         { view: false, create: false, edit: false, delete: false },
-};
-
-function getRoleDefault(role: Role, featureId: string, action: Action): boolean {
-  const access = ROLE_FEATURE_ACCESS[role];
-  const hasAccess = access[0] === "*" || access.includes(featureId);
-  if (!hasAccess) return false;
-  return ROLE_ACTION_DEFAULTS[role][action];
-}
+// Feature/action catalog and role defaults now live in
+// src/lib/permission-features.ts (security audit, post-13.3B) so
+// server-side/Netlify permission checks can share the exact same table
+// instead of re-implementing it — see src/lib/change-order-permissions.ts.
 
 // ── Override lookup key ───────────────────────────────────────────────────────
 
