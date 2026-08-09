@@ -19,6 +19,7 @@ import { type Payment } from "@/lib/mock-data";
 import { useScheduledPayments } from "@/lib/scheduled-payments";
 import { fetchReceivedPayments, fetchOutstandingInvoices, fetchInvoicedTotal, type OutstandingInvoice } from "@/lib/received-payments";
 import { formatMoney } from "@/lib/format";
+import { formatPaymentMethod } from "@/lib/payment-method";
 import { TrendingUp, TrendingDown, ArrowUpRight, Wallet, CalendarClock } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
@@ -55,11 +56,14 @@ function ReportsPage() {
   const outstanding = outstandingInvoices.reduce((s, i) => s + (i.total_amount - i.amount_paid), 0);
   const collectionRate = invoicedTotal > 0 ? Math.round((collected / invoicedTotal) * 100) : 0;
 
+  // Phase 13.7B — grouped by each row's own canonical payment_method
+  // (lowercase, from invoice_payments), humanized only at render time.
   const methodTotals = received.reduce<Record<string, number>>((acc, p) => {
-    acc[p.method] = (acc[p.method] ?? 0) + p.amount;
+    const key = (p.method ?? "other").toLowerCase();
+    acc[key] = (acc[key] ?? 0) + p.amount;
     return acc;
   }, {});
-  const methodData = Object.entries(methodTotals).map(([name, value]) => ({ name, value }));
+  const methodData = Object.entries(methodTotals).map(([name, value]) => ({ name: formatPaymentMethod(name), value }));
   const methodColors = [PRIMARY, CHART2, SUCCESS, CHART5];
 
   const aging = useMemo(() => {

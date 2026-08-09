@@ -15,7 +15,7 @@ import {
 interface RouterContext { queryClient: QueryClient }
 
 const PUBLIC_ROUTES  = ["/signin", "/signup", "/forgot-password", "/auth/callback"];
-const PORTAL_ROUTES  = ["/portal", "/proposal", "/change-order"];
+const PORTAL_ROUTES  = ["/portal", "/proposal", "/change-order", "/invoice"];
 
 function NotFoundComponent() {
   return (

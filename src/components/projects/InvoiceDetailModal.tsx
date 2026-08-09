@@ -2,11 +2,16 @@
 import { useEffect, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
-import { Loader2, Printer, X } from "lucide-react";
+import { Loader2, Printer, Send, CircleDollarSign } from "lucide-react";
+import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
 import { useOrganization } from "@/lib/organization";
+import { InvoiceStatusBadge } from "@/components/financials/InvoiceStatusBadge";
+import { RecordPaymentDialog } from "@/components/financials/RecordPaymentDialog";
+import { PaymentHistory } from "@/components/financials/PaymentHistory";
+import { isIssuedInvoice, getInvoiceBalance } from "@/lib/invoice-status";
+import { formatDateOnly } from "@/lib/format";
 
 type InvoiceItem = {
   id: string; description: string; quantity: number; unit_price: number; amount: number;
@@ -25,29 +30,30 @@ type Props = {
   invoiceId: string | null;
   open: boolean;
   onClose: () => void;
+  /** Called after a Send Invoice/Record Payment succeeds with the fields that changed, so the caller can optimistically patch its own invoice list/totals immediately (not just eventually, after its own refetch) without a full drawer close/reopen. */
+  onUpdated?: (patch: { id: string; status?: string; amountPaid?: number }) => void;
 };
 
 function fmt(n: number) {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(n);
 }
+// issue_date/due_date are DATE-ONLY SQL columns — formatDateOnly (never
+// `new Date(s).toLocaleDateString()`, which parses the date-only string as
+// UTC midnight and then renders it in the viewer's local timezone, rolling
+// it back a calendar day west of UTC). See src/lib/format.ts.
 function fmtDate(s: string | null) {
-  if (!s) return "—";
-  return new Date(s).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+  return formatDateOnly(s, "—");
 }
 
-const STATUS_STYLE: Record<string, string> = {
-  paid:    "bg-green-100 text-green-700 border-green-200",
-  overdue: "bg-red-100 text-red-700 border-red-200",
-  sent:    "bg-blue-100 text-blue-700 border-blue-200",
-  draft:   "bg-gray-100 text-gray-600 border-gray-200",
-};
-
-export function InvoiceDetailModal({ invoiceId, open, onClose }: Props) {
+export function InvoiceDetailModal({ invoiceId, open, onClose, onUpdated }: Props) {
   const org = useOrganization();
   const printRef = useRef<HTMLDivElement>(null);
   const [invoice, setInvoice] = useState<InvoiceDetail | null>(null);
   const [items,   setItems]   = useState<InvoiceItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [recordPaymentOpen, setRecordPaymentOpen] = useState(false);
+  const [paymentHistoryKey, setPaymentHistoryKey] = useState(0);
 
   useEffect(() => {
     if (!open || !invoiceId) return;
@@ -78,7 +84,11 @@ export function InvoiceDetailModal({ invoiceId, open, onClose }: Props) {
     if (!printRef.current || !invoice) return;
     const win = window.open("", "_blank", "width=900,height=700");
     if (!win) return;
-    const logoHtml = org.logoUrl ? `<img src="${org.logoUrl}" style="height:48px;object-fit:contain;margin-bottom:4px;" />` : "";
+    // Phase 13.7F — max-width keeps a wide horizontal wordmark (helmet +
+    // business name) from overflowing the print layout while still
+    // scaling proportionally at native resolution (no forced square,
+    // no upscaling of a small source image).
+    const logoHtml = org.logoUrl ? `<img src="${org.logoUrl}" alt="${org.companyName || "Company"} logo" style="height:48px;max-width:220px;width:auto;object-fit:contain;margin-bottom:4px;" />` : "";
     const itemRows = items.map(i => `
       <tr>
         <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;">${i.description}</td>
@@ -151,19 +161,73 @@ ${invoice.notes ? `<div style="margin-top:32px;padding:16px;background:#f9fafb;b
     setTimeout(() => { win.print(); }, 500);
   };
 
-  const balance = invoice ? invoice.total_amount - invoice.amount_paid : 0;
-  const statusStyle = STATUS_STYLE[invoice?.status ?? "draft"] ?? STATUS_STYLE.draft;
+  const handleSend = async () => {
+    if (!invoice || sending) return;
+    setSending(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) throw new Error("You must be signed in to send an invoice");
+      const res = await fetch("/.netlify/functions/invoice-send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ invoiceId: invoice.id }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.error || "Could not send this invoice");
+      const nextStatus = body.status ?? "sent";
+      setInvoice(prev => prev ? { ...prev, status: nextStatus } : prev);
+      toast.success(`Invoice ${invoice.invoice_number} sent to ${body.recipientEmail ?? "the customer"}`);
+      onUpdated?.({ id: invoice.id, status: nextStatus });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not send this invoice");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const handlePaymentRecorded = (result: { status: string; amountPaid: number }) => {
+    if (!invoice) return;
+    setInvoice(prev => prev ? { ...prev, status: result.status, amount_paid: result.amountPaid } : prev);
+    onUpdated?.({ id: invoice.id, status: result.status, amountPaid: result.amountPaid });
+    setPaymentHistoryKey((k) => k + 1);
+  };
+
+  const balance = invoice ? getInvoiceBalance(invoice.total_amount, invoice.amount_paid) : 0;
+  const isDraft = invoice?.status === "draft";
+  const canRecordPayment = Boolean(invoice) && isIssuedInvoice(invoice?.status) && invoice?.status !== "paid" && balance > 0;
+  const hasClientEmail = Boolean(invoice?.client?.email?.trim());
 
   return (
     <Dialog open={open} onOpenChange={v => !v && onClose()}>
-      <DialogContent className="sm:max-w-2xl max-h-[90vh] overflow-y-auto p-0">
+      <DialogContent showCloseButton={false} className="sm:max-w-2xl max-h-[90vh] overflow-y-auto p-0">
         <DialogHeader className="px-6 pt-5 pb-0">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-3">
             <DialogTitle className="text-base font-semibold">Invoice Details</DialogTitle>
-            <Button variant="outline" size="sm" className="h-8 gap-1.5" onClick={handlePrint} disabled={loading || !invoice}>
-              <Printer className="h-3.5 w-3.5" />Download / Print
-            </Button>
+            <div className="flex items-center gap-2">
+              {isDraft && (
+                <Button
+                  size="sm"
+                  className="h-8 gap-1.5"
+                  onClick={handleSend}
+                  disabled={loading || !invoice || sending || !hasClientEmail}
+                  title={!hasClientEmail ? "This customer has no email address on file" : undefined}
+                >
+                  {sending ? <><Loader2 className="h-3.5 w-3.5 animate-spin" />Sending…</> : <><Send className="h-3.5 w-3.5" />Send Invoice</>}
+                </Button>
+              )}
+              {canRecordPayment && (
+                <Button variant="outline" size="sm" className="h-8 gap-1.5" onClick={() => setRecordPaymentOpen(true)}>
+                  <CircleDollarSign className="h-3.5 w-3.5" />Record Payment
+                </Button>
+              )}
+              <Button variant="outline" size="sm" className="h-8 gap-1.5" onClick={handlePrint} disabled={loading || !invoice}>
+                <Printer className="h-3.5 w-3.5" />Download / Print
+              </Button>
+            </div>
           </div>
+          {isDraft && !hasClientEmail && !loading && invoice && (
+            <p className="pt-2 text-xs text-destructive">This customer has no email address on file — add one before sending.</p>
+          )}
         </DialogHeader>
 
         {loading ? (
@@ -175,7 +239,14 @@ ${invoice.notes ? `<div style="margin-top:32px;padding:16px;background:#f9fafb;b
             {/* Header */}
             <div className="flex items-start justify-between gap-4 pt-4">
               <div className="flex items-center gap-3">
-                {org.logoUrl && <img src={org.logoUrl} alt={org.companyName} className="h-10 w-auto object-contain" />}
+                {org.logoUrl && (
+                  <img
+                    src={org.logoUrl}
+                    alt={`${org.companyName} logo`}
+                    className="h-10 w-auto object-contain"
+                    style={{ maxWidth: 220 }}
+                  />
+                )}
                 <div>
                   <p className="font-semibold text-base">{org.companyName}</p>
                   {org.primaryPhone && <p className="text-xs text-muted-foreground">{org.primaryPhone}</p>}
@@ -184,9 +255,7 @@ ${invoice.notes ? `<div style="margin-top:32px;padding:16px;background:#f9fafb;b
               <div className="text-right">
                 <p className="text-3xl font-black tracking-tight text-foreground">INVOICE</p>
                 <p className="text-sm text-muted-foreground mt-0.5">#{invoice.invoice_number}</p>
-                <Badge variant="outline" className={`mt-2 text-[11px] ${statusStyle}`}>
-                  {invoice.status.toUpperCase()}
-                </Badge>
+                <InvoiceStatusBadge status={invoice.status} dueDate={invoice.due_date} className="mt-2" />
               </div>
             </div>
 
@@ -271,6 +340,8 @@ ${invoice.notes ? `<div style="margin-top:32px;padding:16px;background:#f9fafb;b
               </div>
             </div>
 
+            <PaymentHistory invoiceId={invoice.id} refreshKey={paymentHistoryKey} />
+
             {/* Notes */}
             {invoice.notes && (
               <>
@@ -284,6 +355,20 @@ ${invoice.notes ? `<div style="margin-top:32px;padding:16px;background:#f9fafb;b
           </div>
         )}
       </DialogContent>
+
+      {/* Nested over this same modal — same pattern as EstimateFormSheet
+          layering over the Project drawer (later-mounted portal stacks on
+          top). */}
+      {invoice && (
+        <RecordPaymentDialog
+          open={recordPaymentOpen}
+          onClose={() => setRecordPaymentOpen(false)}
+          invoiceId={invoice.id}
+          invoiceNumber={invoice.invoice_number}
+          balance={balance}
+          onRecorded={handlePaymentRecorded}
+        />
+      )}
     </Dialog>
   );
 }

@@ -146,7 +146,11 @@ export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle:
 
   const unreadCount = conversations.filter(c => c.unread).length;
   const displayLogo = logoUrl || org.logoUrl;
-  const companyName = org.companyName || "RenoMeta";
+  // Tenant-derived only — no hardcoded product/company name fallback.
+  // org.companyName itself already resolves from this org's own
+  // organizations.name/public_name (src/lib/organization.ts); an empty
+  // string here just means that hasn't loaded/been set yet.
+  const companyName = org.companyName;
   const displayName = [user?.firstName, user?.lastName].filter(Boolean).join(" ") || user?.email?.split("@")[0] || "Account";
 
   return (
@@ -155,22 +159,39 @@ export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle:
         "fixed left-0 top-0 bottom-0 z-40 flex flex-col border-r border-border bg-card transition-[width] duration-200",
         collapsed ? "w-16" : "w-60",
       )}>
-        {/* Brand — real logo, falls back to a letter tile */}
-        <div className={cn("flex items-center h-16 border-b border-border shrink-0", collapsed ? "justify-center px-2" : "px-4 gap-2.5")}>
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg">
-            {displayLogo ? (
-              <img key={displayLogo} src={displayLogo} alt="logo" className="h-full w-full object-contain" onError={() => setLogoUrl(null)} />
-            ) : (
-              <div className="grid h-full w-full place-items-center rounded-lg bg-gradient-to-br from-primary to-primary/70 text-sm font-bold text-primary-foreground">
-                {companyName[0]?.toUpperCase() ?? "R"}
-              </div>
-            )}
-          </div>
-          {!collapsed && (
-            <div className="min-w-0 leading-tight">
-              <div className="truncate text-sm font-semibold text-foreground">{companyName}</div>
-              <div className="text-[10px] font-medium tracking-widest text-muted-foreground">CONNECT</div>
+        {/* Brand — tenant-only. Expanded state shows the org's own full
+            logo/wordmark (or its name as text) and nothing else; no
+            separate hardcoded product name/tagline is rendered beside it.
+            Collapsed state keeps the existing compact square-tile
+            treatment (real logo, object-contain, never stretched/cropped
+            into a shape it wasn't designed for) with a tenant-derived
+            initial as the only fallback — never a fixed letter. */}
+        <div className={cn("flex items-center h-16 border-b border-border shrink-0", collapsed ? "justify-center px-2" : "px-3")}>
+          {collapsed ? (
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg">
+              {displayLogo ? (
+                <img key={displayLogo} src={displayLogo} alt={`${companyName || "Organization"} logo`} className="h-full w-full object-contain" onError={() => setLogoUrl(null)} />
+              ) : companyName ? (
+                <div className="grid h-full w-full place-items-center rounded-lg bg-gradient-to-br from-primary to-primary/70 text-sm font-bold text-primary-foreground">
+                  {companyName[0].toUpperCase()}
+                </div>
+              ) : (
+                <div className="grid h-full w-full place-items-center rounded-lg bg-gradient-to-br from-primary to-primary/70 text-primary-foreground">
+                  <Building2 className="h-4 w-4" />
+                </div>
+              )}
             </div>
+          ) : displayLogo ? (
+            <img
+              key={displayLogo}
+              src={displayLogo}
+              alt={`${companyName || "Organization"} logo`}
+              className="h-auto w-auto object-contain"
+              style={{ maxWidth: 180, maxHeight: 48 }}
+              onError={() => setLogoUrl(null)}
+            />
+          ) : (
+            <span className="truncate text-base font-semibold text-foreground">{companyName || "Organization"}</span>
           )}
         </div>
 
@@ -214,7 +235,7 @@ export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle:
                   <>
                     <div className="min-w-0 flex-1 text-left">
                       <div className="truncate text-sm font-semibold">{displayName}</div>
-                      <div className="truncate text-xs text-muted-foreground">{companyName}</div>
+                      <div className="truncate text-xs text-muted-foreground">{companyName || "Organization"}</div>
                     </div>
                     <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
                   </>

@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { formatDate, formatMoney, daysFromNow } from "@/lib/format";
 import { type Payment } from "@/lib/mock-data";
+import { formatPaymentMethod, formatPaymentProvider } from "@/lib/payment-method";
 import { useEffect, useMemo, useState } from "react";
 import { logReminder, useReminders } from "@/lib/payment-reminders";
 import { supabase } from "@/lib/supabase";
@@ -79,6 +80,12 @@ function Body({ payment, onClose }: { payment: Payment; onClose: () => void }) {
   const handleSendReminder = () => {
     logReminder(payment.id);
   };
+  // Part 4 — a customer-friendly hierarchy (amount, name, date) leads; the
+  // raw UUID is demoted to a small muted technical reference, preferring
+  // the provider's own transaction id (e.g. a Stripe PaymentIntent) over
+  // our internal invoice_payments.id when one exists.
+  const reference = isScheduled ? null : paymentReference(payment);
+
   return (
     <div className="flex h-full flex-col">
       <SheetHeader className="space-y-0 border-b border-border px-5 py-4">
@@ -89,7 +96,6 @@ function Body({ payment, onClose }: { payment: Payment; onClose: () => void }) {
           >
             {isScheduled ? "Scheduled" : "Payment"}
           </Badge>
-          <span className="font-mono text-xs text-muted-foreground">{payment.id}</span>
           <Badge
             variant="secondary"
             className={`ml-auto h-5 rounded px-1.5 text-[10px] ${
@@ -99,20 +105,21 @@ function Body({ payment, onClose }: { payment: Payment; onClose: () => void }) {
             {isScheduled ? "Scheduled" : "Received"}
           </Badge>
         </div>
-        <SheetTitle className="mt-2 text-lg font-semibold">{payment.client}</SheetTitle>
+        <div className={`mt-2 text-2xl font-semibold tabular-nums ${isScheduled ? "text-primary" : "text-success"}`}>
+          {isScheduled ? "" : "+"}
+          {formatMoney(payment.amount)}
+        </div>
+        <SheetTitle className="mt-0.5 text-base font-semibold">{payment.client}</SheetTitle>
         {isScheduled && payment.milestoneLabel && (
           <div className="mt-0.5 text-xs text-muted-foreground">{payment.milestoneLabel}</div>
         )}
-        <div className="mt-0.5 flex items-baseline justify-between">
-          <div className={`text-2xl font-semibold tabular-nums ${isScheduled ? "text-primary" : "text-success"}`}>
-            {isScheduled ? "" : "+"}
-            {formatMoney(payment.amount)}
-          </div>
+        <div className="mt-1 flex items-center justify-between">
           <div className="text-[11px] text-muted-foreground">
             {isScheduled
               ? `Expected ${formatDate(payment.dueDate ?? payment.receivedAt)}`
               : `Received ${formatDate(payment.receivedAt)}`}
           </div>
+          {reference && <div className="font-mono text-[10px] text-muted-foreground">{reference}</div>}
         </div>
       </SheetHeader>
 
@@ -144,15 +151,20 @@ function Body({ payment, onClose }: { payment: Payment; onClose: () => void }) {
                     </Badge>
                   </div>
                 </div>
+                {/* Part 14 — the invoice UUID is internal metadata with no
+                    customer value; due date and project name are the useful
+                    footer facts here. */}
                 <div className="mt-3 flex items-center gap-3 border-t border-border pt-2 text-[11px] text-muted-foreground">
                   {linkedInvoice.due_date && (
                     <span className="inline-flex items-center gap-1">
                       <Calendar className="h-3 w-3" /> Due {formatDate(linkedInvoice.due_date)}
                     </span>
                   )}
-                  <span className="inline-flex items-center gap-1">
-                    <Hash className="h-3 w-3" /> {linkedInvoice.id}
-                  </span>
+                  {payment.projectName && (
+                    <span className="inline-flex items-center gap-1">
+                      <Hash className="h-3 w-3" /> {payment.projectName}
+                    </span>
+                  )}
                 </div>
               </div>
             ) : (
@@ -162,20 +174,34 @@ function Body({ payment, onClose }: { payment: Payment; onClose: () => void }) {
             )}
           </Section>
 
-          {/* Payment method */}
-          <Section title="Payment method">
-            <div className="rounded-md border border-border p-3">
-              <div className="flex items-center gap-2">
-                <div className={`flex h-8 w-8 items-center justify-center rounded-md ${methodMeta.tone}`}>
-                  <methodMeta.icon className="h-4 w-4" />
+          {/* Payment method — Part 6: method (how) and provider (who
+              processed it) are distinct concepts, shown as two separate
+              lines rather than conflated into one label. */}
+          {!isScheduled && (
+            <Section title="Payment method">
+              <div className="rounded-md border border-border p-3">
+                <div className="flex items-center gap-2">
+                  <div className={`flex h-8 w-8 items-center justify-center rounded-md ${methodMeta.tone}`}>
+                    <methodMeta.icon className="h-4 w-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium">{methodMeta.title}</div>
+                    <div className="text-[11px] text-muted-foreground">
+                      {payment.provider === "stripe"
+                        ? "Processed securely by Stripe"
+                        : `Processed by ${formatPaymentProvider(payment.provider)}`}
+                    </div>
+                  </div>
                 </div>
-                <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium">{methodMeta.title}</div>
-                  <div className="text-[11px] text-muted-foreground">{methodMeta.subtitle}</div>
-                </div>
+                {payment.providerPaymentId && (
+                  <div className="mt-3 border-t border-border pt-2 text-[11px] text-muted-foreground">
+                    {formatPaymentProvider(payment.provider)} transaction
+                    <div className="mt-0.5 font-mono text-[10.5px]">{payment.providerPaymentId}</div>
+                  </div>
+                )}
               </div>
-            </div>
-          </Section>
+            </Section>
+          )}
 
           {/* Activity */}
           <Section title="Activity">
@@ -191,7 +217,15 @@ function Body({ payment, onClose }: { payment: Payment; onClose: () => void }) {
               ) : (
                 <Activity
                   title={`Payment received · ${formatMoney(payment.amount)}`}
-                  actor={payment.client}
+                  // Part 15 — a "<Method> via <Provider>" qualifier only
+                  // for real received transactions with a non-manual
+                  // provider on record; never fabricated for a manual cash
+                  // payment, which just shows the client's name as before.
+                  actor={
+                    payment.provider && payment.provider !== "manual"
+                      ? `${formatPaymentMethod(payment.method)} via ${formatPaymentProvider(payment.provider)}`
+                      : payment.client
+                  }
                   at={payment.receivedAt}
                   icon={CheckCircle2}
                   tone="text-success"
@@ -277,24 +311,42 @@ type MethodMeta = {
   icon: React.ComponentType<{ className?: string }>;
   tone: string;
   title: string;
-  subtitle: string;
 };
+
+/** Truncated technical reference for the header — prefers the provider's own transaction id (e.g. a Stripe PaymentIntent) over our internal invoice_payments.id, since that's the more useful id for support/reconciliation. */
+function paymentReference(payment: Payment): string {
+  if (payment.providerPaymentId) {
+    const id = payment.providerPaymentId;
+    const truncated = id.length > 14 ? `${id.slice(0, 6)}…${id.slice(-4)}` : id;
+    return `${formatPaymentProvider(payment.provider)} · ${truncated}`;
+  }
+  const shortId = payment.id.length > 12 ? `${payment.id.slice(0, 8)}…` : payment.id;
+  return `Payment ID · ${shortId}`;
+}
 
 // No payment processor is integrated for per-transaction detail (card
 // brand/last4, ACH routing/trace IDs, etc.) — this previously fabricated
 // realistic-looking values seeded from the payment ID. Only the real
-// method label is shown now.
-function getMethodMeta(method: Payment["method"]): MethodMeta {
-  switch (method) {
-    case "Card":
-      return { icon: CreditCard, tone: "bg-primary-soft text-primary", title: "Card", subtitle: "Payment method on file" };
-    case "ACH":
-      return { icon: Building2, tone: "bg-chart-2/15 text-chart-2", title: "ACH bank transfer", subtitle: "Payment method on file" };
-    case "Check":
-      return { icon: FileText, tone: "bg-secondary text-secondary-foreground", title: "Check", subtitle: "Manual deposit" };
-    case "Wire":
-      return { icon: Banknote, tone: "bg-chart-5/15 text-chart-5", title: "Wire transfer", subtitle: "Domestic wire" };
+// canonical payment_method value is shown now, humanized via
+// formatPaymentMethod() (Phase 13.7B) — never a hardcoded "Card"/"Other"
+// switch that silently dropped values it didn't recognize.
+function getMethodMeta(method: string): MethodMeta {
+  const key = (method ?? "").toLowerCase();
+  const title = formatPaymentMethod(method);
+  switch (key) {
+    case "card":
+      return { icon: CreditCard, tone: "bg-primary-soft text-primary", title };
+    case "cash":
+      return { icon: Banknote, tone: "bg-success/15 text-success", title };
+    case "ach":
+    case "bank_transfer":
+    case "us_bank_account":
+      return { icon: Building2, tone: "bg-chart-2/15 text-chart-2", title };
+    case "check":
+      return { icon: FileText, tone: "bg-secondary text-secondary-foreground", title };
+    case "wire":
+      return { icon: Banknote, tone: "bg-chart-5/15 text-chart-5", title };
     default:
-      return { icon: Banknote, tone: "bg-muted text-muted-foreground", title: "Payment method not tracked", subtitle: "" };
+      return { icon: Banknote, tone: "bg-muted text-muted-foreground", title };
   }
 }

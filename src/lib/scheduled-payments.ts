@@ -42,7 +42,10 @@ export function scheduleFromInvoice(args: {
   schedule: DraftSchedule;
   defaultMethod?: Payment["method"];
 }) {
-  const { invoiceNumber, client, total, schedule, defaultMethod = "ACH" } = args;
+  // Canonical lowercase vocabulary (Phase 13.7B) — matches invoice_payments.
+  // payment_method so scheduled placeholder rows use the same convention
+  // real transactions do; formatPaymentMethod() renders it for display.
+  const { invoiceNumber, client, total, schedule, defaultMethod = "ach" } = args;
   // Drop any existing scheduled rows for this invoice (re-send case).
   scheduled = scheduled.filter((p) => p.invoice !== invoiceNumber);
   const next: Payment[] = schedule.milestones.map((m, idx) => ({

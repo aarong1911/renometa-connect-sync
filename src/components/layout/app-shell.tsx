@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode, type ComponentType } from "react";
+import { useEffect, useMemo, useState, type ReactNode, type ComponentType } from "react";
 import { useLocation } from "@tanstack/react-router";
 import { Topbar } from "./topbar";
 import { Sidebar } from "./sidebar";
@@ -25,6 +25,24 @@ export function AppShell({ children }: { children: ReactNode }) {
     pathname === "/forgot-password" ||
     pathname === "/onboarding" ||
     pathname.startsWith("/auth/");
+
+  // The app shell is a single fixed-viewport flex box (`h-dvh overflow-
+  // hidden` below) with exactly one scroll container (`main`,
+  // overflow-y-auto). At fractional browser zoom (e.g. 90%) the computed
+  // 100dvh box can round a hair taller than the actual viewport, which —
+  // with no overflow constraint on <html>/<body> — leaked out as a second,
+  // page-level scrollbar alongside `main`'s own. Locking the root element's
+  // overflow while this shell is mounted removes that stray sliver without
+  // touching any real scroll behavior, since `main` already owns all
+  // legitimate content scrolling. Scoped to the shell's own lifecycle (not
+  // a blanket CSS rule) so portal/proposal/change-order and auth pages —
+  // which never mount AppShell and rely on natural document scrolling —
+  // are unaffected.
+  useEffect(() => {
+    if (isAuthRoute) return;
+    document.documentElement.classList.add("app-shell-scroll-lock");
+    return () => document.documentElement.classList.remove("app-shell-scroll-lock");
+  }, [isAuthRoute]);
 
   if (isAuthRoute) {
     return <>{children}</>;

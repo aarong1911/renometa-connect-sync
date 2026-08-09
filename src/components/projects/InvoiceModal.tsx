@@ -34,6 +34,7 @@ export function InvoiceModal({ open, onClose, projectId, clientId, orgId, onCrea
   const [notes,         setNotes]         = useState("");
   const [items,         setItems]         = useState<LineItem[]>([{ ...EMPTY_ITEM }]);
   const [saving,        setSaving]        = useState(false);
+  const [sending,       setSending]       = useState(false);
   const [resolvedOrgId, setResolvedOrgId] = useState<string | null>(orgId ?? null);
   const [selectedProjectId, setSelectedProjectId] = useState(projectId ?? "none");
   const [selectedClientId, setSelectedClientId] = useState(clientId ?? "none");
@@ -85,12 +86,13 @@ export function InvoiceModal({ open, onClose, projectId, clientId, orgId, onCrea
     onClose();
   };
 
-  const handleSave = async () => {
+  const handleSave = async (sendAfterCreate: boolean) => {
     if (!issueDate)         { toast.error("Issue date is required"); return; }
     if (subtotal <= 0)      { toast.error("Add at least one line item with a price"); return; }
     if (!resolvedOrgId)     { toast.error("Organization not found"); return; }
+    if (sendAfterCreate && selectedClientId === "none") { toast.error("Select a customer before sending — the invoice needs an email to send to."); return; }
 
-    setSaving(true);
+    if (sendAfterCreate) setSending(true); else setSaving(true);
 
     const payload: Record<string, any> = {
       org_id:         resolvedOrgId,
@@ -113,7 +115,7 @@ export function InvoiceModal({ open, onClose, projectId, clientId, orgId, onCrea
     if (invErr) {
       console.error("[InvoiceModal] insert error:", invErr);
       toast.error(`Failed to create invoice: ${invErr.message}`);
-      setSaving(false); return;
+      setSaving(false); setSending(false); return;
     }
 
     // Insert line items
@@ -131,11 +133,38 @@ export function InvoiceModal({ open, onClose, projectId, clientId, orgId, onCrea
       await supabase.from("invoice_items").insert(lineItems);
     }
 
-    toast.success(`Invoice ${invoiceNumber} created`);
     import("@/lib/trigger-workflow").then(({ triggerWorkflow }) => {
       triggerWorkflow("invoice_created", { invoice: { id: inv.id, number: invoiceNumber, amount: subtotal }, projectId: selectedProjectId === "none" ? null : selectedProjectId });
     });
+
+    // "Create & Send" reuses the exact same trusted send path as sending an
+    // existing draft (InvoiceDetailModal.tsx's handleSend) — the invoice is
+    // created as a draft first (so it always exists even if sending fails),
+    // then invoice-send.ts does the email, draft->sent transition, secure
+    // public token mint, and invoice-issued accounting entry in one call.
+    if (sendAfterCreate) {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session?.access_token) throw new Error("You must be signed in to send an invoice");
+        const res = await fetch("/.netlify/functions/invoice-send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+          body: JSON.stringify({ invoiceId: inv.id }),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body?.error || "Could not send this invoice");
+        toast.success(`Invoice ${invoiceNumber} sent to ${body.recipientEmail ?? "the customer"}`);
+      } catch (err) {
+        // The invoice itself was created successfully (as a draft) even if
+        // sending failed — say so plainly rather than implying total failure.
+        toast.error(`Invoice ${invoiceNumber} was created as a draft, but sending failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+      }
+    } else {
+      toast.success(`Invoice ${invoiceNumber} saved as draft`);
+    }
+
     setSaving(false);
+    setSending(false);
     onCreated();
     handleClose();
   };
@@ -224,9 +253,12 @@ export function InvoiceModal({ open, onClose, projectId, clientId, orgId, onCrea
         </div>
 
         <DialogFooter>
-          <Button variant="outline" size="sm" onClick={handleClose}>Cancel</Button>
-          <Button size="sm" onClick={handleSave} disabled={saving || !resolvedOrgId}>
-            {saving ? <><Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />Creating…</> : "Create invoice"}
+          <Button variant="outline" size="sm" onClick={handleClose} disabled={saving || sending}>Cancel</Button>
+          <Button variant="outline" size="sm" onClick={() => handleSave(false)} disabled={saving || sending || !resolvedOrgId}>
+            {saving ? <><Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />Saving…</> : "Save as Draft"}
+          </Button>
+          <Button size="sm" onClick={() => handleSave(true)} disabled={saving || sending || !resolvedOrgId}>
+            {sending ? <><Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />Sending…</> : "Create & Send"}
           </Button>
         </DialogFooter>
       </DialogContent>

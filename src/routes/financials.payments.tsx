@@ -14,12 +14,17 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { PaymentDetailDrawer } from "@/components/financials/payment-detail-drawer";
 import { toast } from "sonner";
 import { fetchReceivedPayments } from "@/lib/received-payments";
+import { formatPaymentMethod, PAYMENT_METHOD_FILTERS } from "@/lib/payment-method";
 
 export const Route = createFileRoute("/financials/payments")({
   component: PaymentsPage,
 });
 
-const METHODS: Payment["method"][] = ["ACH", "Card", "Check", "Wire", "Other"];
+// Phase 13.7B — canonical lowercase invoice_payments.payment_method
+// vocabulary (includes Cash, previously missing — Part 13), formatted for
+// display via formatPaymentMethod(). Filter comparisons match the raw
+// canonical value stored on each Payment row, not the display label.
+const METHODS = PAYMENT_METHOD_FILTERS;
 type StatusFilter = "All" | "Received" | "Scheduled" | "Past due";
 
 function isPastDue(p: Payment): boolean {
@@ -29,7 +34,7 @@ function isPastDue(p: Payment): boolean {
 
 function PaymentsPage() {
   const [query, setQuery] = useState("");
-  const [method, setMethod] = useState<Payment["method"] | "All">("All");
+  const [method, setMethod] = useState<string>("All");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("All");
   const [selected, setSelected] = useState<Payment | null>(null);
   const scheduled = useScheduledPayments();
@@ -60,9 +65,12 @@ function PaymentsPage() {
     const total = received.reduce((s, p) => s + p.amount, 0);
     const upcoming = sched.reduce((s, p) => s + p.amount, 0);
     const pastDueAmount = pastDue.reduce((s, p) => s + p.amount, 0);
+    // Part 12 — grouped strictly by each row's own stored payment_method
+    // (canonical, lowercased), never inferred from the invoice.
     const byMethod: Record<string, number> = {};
     received.forEach((p) => {
-      byMethod[p.method] = (byMethod[p.method] ?? 0) + p.amount;
+      const key = (p.method ?? "other").toLowerCase();
+      byMethod[key] = (byMethod[key] ?? 0) + p.amount;
     });
     const top = Object.entries(byMethod).sort((a, b) => b[1] - a[1])[0];
     return {
@@ -86,7 +94,7 @@ function PaymentsPage() {
         } else if (statusFilter !== "All" && status !== statusFilter) {
           return false;
         }
-        if (method !== "All" && p.method !== method) return false;
+        if (method !== "All" && (p.method ?? "").toLowerCase() !== method) return false;
         if (!q) return true;
         return (
           p.client.toLowerCase().includes(q) ||
@@ -120,7 +128,7 @@ function PaymentsPage() {
           icon={AlertTriangle}
           tone="danger"
         />
-        <MetricCard label="Top method" value={stats.top?.[0] ?? "—"} sub={stats.top ? formatMoney(stats.top[1]) : ""} icon={CardIcon} tone="muted" />
+        <MetricCard label="Top method" value={stats.top ? formatPaymentMethod(stats.top[0]) : "—"} sub={stats.top ? formatMoney(stats.top[1]) : ""} icon={CardIcon} tone="muted" />
       </div>
 
       <Card className="overflow-hidden p-0 shadow-sm">
@@ -154,7 +162,7 @@ function PaymentsPage() {
             </FilterChip>
             {METHODS.map((m) => (
               <FilterChip key={m} active={method === m} onClick={() => setMethod(m)}>
-                {m}
+                {formatPaymentMethod(m)}
               </FilterChip>
             ))}
           </div>
@@ -320,17 +328,20 @@ function FilterChip({
 }
 
 
-function MethodBadge({ method }: { method: Payment["method"] }) {
-  const map: Record<Payment["method"], string> = {
-    ACH: "bg-chart-2/15 text-chart-2",
-    Card: "bg-primary-soft text-primary",
-    Check: "bg-secondary text-secondary-foreground",
-    Wire: "bg-chart-5/15 text-chart-5",
-    Other: "bg-muted text-muted-foreground",
+function MethodBadge({ method }: { method: string }) {
+  const key = (method ?? "").toLowerCase();
+  const map: Record<string, string> = {
+    cash: "bg-success/15 text-success",
+    card: "bg-primary-soft text-primary",
+    ach: "bg-chart-2/15 text-chart-2",
+    bank_transfer: "bg-chart-2/15 text-chart-2",
+    check: "bg-secondary text-secondary-foreground",
+    wire: "bg-chart-5/15 text-chart-5",
+    other: "bg-muted text-muted-foreground",
   };
   return (
-    <Badge variant="secondary" className={`h-5 rounded px-1.5 text-[10px] ${map[method]}`}>
-      {method}
+    <Badge variant="secondary" className={`h-5 rounded px-1.5 text-[10px] ${map[key] ?? map.other}`}>
+      {formatPaymentMethod(method)}
     </Badge>
   );
 }

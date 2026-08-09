@@ -1,10 +1,18 @@
 // src/lib/received-payments.ts
-// There is no dedicated payments table — "received" payments are derived
-// from paid/partial invoices (amount_paid, updated_at as the received
-// date). Payment method isn't tracked at the invoice level, so it's
-// reported as "Other" rather than guessed.
-import { supabase } from "@/lib/supabase";
+//
+// Phase 13.7B — fetchReceivedPayments() previously fabricated one row per
+// PAID/PARTIAL INVOICE from invoices.amount_paid, which meant: the "id"
+// shown was actually invoice.id (not a payment id), the method was always
+// hardcoded "Other" (never read from the ledger), and two separate
+// payments on the same invoice collapsed into a single aggregated row.
+// Now a thin adapter over the canonical, transaction-level
+// src/lib/payment-transactions.ts — one Payment row per real
+// invoice_payments.id, with its actual stored payment_method and a proper
+// payment id. Used by both financials.payments.tsx and
+// financials.reports.tsx.
 import type { Payment } from "@/lib/mock-data";
+import { fetchPaymentTransactions } from "@/lib/payment-transactions";
+import { supabase } from "@/lib/supabase";
 
 async function getOrgId(): Promise<string | null> {
   const { data: { user } } = await supabase.auth.getUser();
@@ -16,24 +24,28 @@ async function getOrgId(): Promise<string | null> {
 }
 
 export async function fetchReceivedPayments(): Promise<Payment[]> {
-  const orgId = await getOrgId();
-  if (!orgId) return [];
-  const { data, error } = await supabase
-    .from("invoices")
-    .select(`id, invoice_number, amount_paid, updated_at, contacts!client_id(full_name)`)
-    .eq("org_id", orgId)
-    .in("status", ["paid", "partial"])
-    .gt("amount_paid", 0);
-  if (error) { console.error("[received-payments]", error); return []; }
-  return (data ?? []).map((r: any) => ({
-    id: r.id,
-    invoice: r.invoice_number ?? "—",
-    client: r.contacts?.full_name ?? "—",
-    amount: Number(r.amount_paid ?? 0),
-    method: "Other" as const,
-    receivedAt: r.updated_at,
-    status: "Received" as const,
-  }));
+  const transactions = await fetchPaymentTransactions();
+  return transactions
+    .filter((t) => t.status === "succeeded")
+    .map((t) => ({
+      id: t.id,
+      invoice: t.invoiceNumber,
+      client: t.contactName,
+      amount: t.amount,
+      method: t.paymentMethod,
+      receivedAt: t.paidAt,
+      status: "Received" as const,
+      invoiceId: t.invoiceId,
+      contactId: t.contactId,
+      projectId: t.projectId,
+      projectName: t.projectName,
+      provider: t.provider,
+      providerPaymentId: t.providerPaymentId,
+      source: t.source,
+      currency: t.currency,
+      reference: t.reference,
+      notes: t.notes,
+    }));
 }
 
 export type OutstandingInvoice = {

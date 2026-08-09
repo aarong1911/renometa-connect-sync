@@ -92,6 +92,8 @@ import { InviteToPortalModal } from "@/components/portal/InviteToPortalModal";
 import { InvoiceModal } from "@/components/projects/InvoiceModal";
 import { EstimateFormSheet, fetchEstimateById, type Estimate as FullEstimate } from "@/routes/estimates";
 import { InvoiceDetailModal } from "@/components/projects/InvoiceDetailModal";
+import { InvoiceStatusBadge } from "@/components/financials/InvoiceStatusBadge";
+import { formatDateOnly as formatInvoiceDateOnly } from "@/lib/format";
 
 type ProjectsSearch = {
   slug?: string;
@@ -414,6 +416,16 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
   const [contractDrawerOpen, setContractDrawerOpen] = useState(false);
   const [contractDrawerEstimate, setContractDrawerEstimate] = useState<FullEstimate | null>(null);
   const [contractDrawerLoading, setContractDrawerLoading] = useState(false);
+  // Project (from projects-store's Project type) never carries an org_id
+  // field — `(project as any).org_id` used throughout this drawer silently
+  // resolved to undefined, which is why View Contract (and New Estimate/
+  // Invoice creation from this drawer) previously did nothing. Resolved
+  // once per Project open via the same getOrgId() the rest of the app uses.
+  const [projectOrgId, setProjectOrgId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open || !project) { setProjectOrgId(null); return; }
+    void getOrgId().then(setProjectOrgId);
+  }, [open, project?.id]);
   const [newTaskTitle,     setNewTaskTitle]      = useState("");
   const [addingTask,       setAddingTask]        = useState(false);
   const [invoices,         setInvoices]          = useState<Invoice[]>([]);
@@ -499,14 +511,20 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
       .then(({ data }) => setActivityNotes((data ?? []) as Note[]));
   }, [open, project?.id]);
 
+  const reloadInvoices = useCallback(async () => {
+    if (!project) return;
+    setInvoicesLoading(true);
+    const { data } = await supabase.from("invoices")
+      .select("id, invoice_number, status, issue_date, due_date, total_amount, amount_paid")
+      .eq("project_id", project.id).order("issue_date", { ascending: false });
+    setInvoices((data ?? []) as Invoice[]);
+    setInvoicesLoading(false);
+  }, [project?.id]);
+
   useEffect(() => {
     if (activeTab !== "financials" || !project) return;
-    setInvoicesLoading(true);
-    supabase.from("invoices")
-      .select("id, invoice_number, status, issue_date, due_date, total_amount, amount_paid")
-      .eq("project_id", project.id).order("issue_date", { ascending: false })
-      .then(({ data }) => { setInvoices((data ?? []) as Invoice[]); setInvoicesLoading(false); });
-  }, [activeTab, project?.id, invoiceModalOpen]);
+    void reloadInvoices();
+  }, [activeTab, project?.id, invoiceModalOpen, reloadInvoices]);
 
   // Contract baseline (Part 3/14): the approved, Project-linked estimate's
   // customer-facing total when one exists (projects.estimate_id is only
@@ -573,18 +591,20 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
   // and opens the identical EstimateFormSheet in edit mode directly over
   // Project Financials; closing it leaves the user on Project Financials.
   const openContractDrawer = useCallback(async (estimateId: string) => {
-    const orgId = (project as any)?.org_id;
-    if (!orgId) return;
+    const orgId = projectOrgId ?? (await getOrgId());
+    if (!orgId) { toast.error("Could not load this estimate"); return; }
     setContractDrawerLoading(true);
     try {
       const est = await fetchEstimateById(orgId, estimateId);
       if (!est) { toast.error("Could not load this estimate"); return; }
       setContractDrawerEstimate(est);
       setContractDrawerOpen(true);
+    } catch {
+      toast.error("Could not load this estimate");
     } finally {
       setContractDrawerLoading(false);
     }
-  }, [project]);
+  }, [projectOrgId]);
 
   // Contract & Estimates data — loaded whenever the sheet is open (not
   // gated to the Financials tab), same reasoning as the Change Order
@@ -1716,10 +1736,14 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
               </div>
 
               <div className="grid grid-cols-3 gap-3">
+                {/* "Invoiced"/"Collected" exclude draft invoices — a draft is a
+                    working document, not yet a receivable, so it shouldn't
+                    inflate either figure. Matches the company-wide Financials
+                    dashboard's definitions (src/lib/financials.ts). */}
                 {[
                   { label: "Contract Value", val: formatMoneyFull(contractBaseline), cls: "" },
-                  { label: "Invoiced",       val: formatMoneyFull(invoices.reduce((s,i) => s + (i.total_amount ?? 0), 0)), cls: "" },
-                  { label: "Collected",      val: formatMoneyFull(invoices.reduce((s,i) => s + (i.amount_paid ?? 0), 0)),  cls: "text-green-600" },
+                  { label: "Invoiced",       val: formatMoneyFull(invoices.filter(i => i.status !== "draft").reduce((s,i) => s + (i.total_amount ?? 0), 0)), cls: "" },
+                  { label: "Collected",      val: formatMoneyFull(invoices.filter(i => i.status !== "draft").reduce((s,i) => s + (i.amount_paid ?? 0), 0)),  cls: "text-green-600" },
                 ].map(card => (
                   <div key={card.label} className="rounded-lg border border-border bg-muted/30 p-3">
                     <p className="text-[11px] text-muted-foreground font-medium">{card.label}</p>
@@ -1773,25 +1797,23 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
                 ) : (
                   <div className="space-y-2">
                     {invoices.map(inv => {
-                      const isPaid    = inv.status === "paid";
-                      const isOverdue = !isPaid && inv.due_date && new Date(inv.due_date) < new Date();
                       return (
                         <div key={inv.id} className="flex items-center gap-3 rounded-lg border border-border bg-background px-3 py-2.5 hover:bg-secondary/20 transition cursor-pointer" onClick={() => setSelectedInvoiceId(inv.id)}>
                           <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
                           <div className="flex-1 min-w-0">
                             <p className="text-sm font-medium">{inv.invoice_number || `INV-${inv.id.slice(0,6).toUpperCase()}`}</p>
                             <p className="text-[11px] text-muted-foreground">
-                              {inv.due_date ? `Due ${formatDate(inv.due_date)}` : "No due date"}
+                              {/* due_date is a DATE-ONLY column — this file's own local
+                                  formatDate() is UTC-midnight-then-local-render (fine for
+                                  the real timestamps it's mostly used for elsewhere in this
+                                  file, wrong for a date-only value), so this specific call
+                                  uses the canonical date-only formatter instead. */}
+                              {inv.due_date ? `Due ${formatInvoiceDateOnly(inv.due_date)}` : "No due date"}
                               {inv.amount_paid > 0 && ` · ${formatMoneyFull(inv.amount_paid)} paid`}
                             </p>
                           </div>
                           <p className="text-sm font-semibold tabular-nums shrink-0">{formatMoneyFull(inv.total_amount)}</p>
-                          <Badge variant="outline" className={cn("shrink-0 text-[10px] px-1.5",
-                            isPaid && "border-green-200 bg-green-50 text-green-700",
-                            isOverdue && "border-red-200 bg-red-50 text-red-700",
-                            !isPaid && !isOverdue && "border-amber-200 bg-amber-50 text-amber-700")}>
-                            {isPaid ? "Paid" : isOverdue ? "Overdue" : inv.status}
-                          </Badge>
+                          <InvoiceStatusBadge status={inv.status} dueDate={inv.due_date} className="shrink-0" />
                         </div>
                       );
                     })}
@@ -1890,7 +1912,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
         onClose={() => setInvoiceModalOpen(false)}
         projectId={project.id}
         clientId={(project as any).client_id ?? ""}
-        orgId={(project as any).org_id ?? ""}
+        orgId={projectOrgId ?? ""}
         onCreated={() => {
           setInvoiceModalOpen(false);
           setActiveTab("overview");
@@ -1906,7 +1928,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
       <EstimateFormSheet
         open={newEstimateOpen}
         onClose={() => setNewEstimateOpen(false)}
-        orgId={(project as any).org_id ?? ""}
+        orgId={projectOrgId ?? ""}
         onSaved={() => { setNewEstimateOpen(false); void reloadContractEstimates(); }}
         initialContext={{ contactId: project.client_id, projectId: project.id, address: project.address ?? undefined, title: project.name }}
       />
@@ -1918,7 +1940,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
       <EstimateFormSheet
         open={contractDrawerOpen}
         onClose={() => { setContractDrawerOpen(false); setContractDrawerEstimate(null); void reloadContractEstimates(); }}
-        orgId={(project as any).org_id ?? ""}
+        orgId={projectOrgId ?? ""}
         estimate={contractDrawerEstimate ?? undefined}
         onSaved={() => { void reloadContractEstimates(); }}
       />
@@ -1926,6 +1948,16 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
         invoiceId={selectedInvoiceId}
         open={!!selectedInvoiceId}
         onClose={() => setSelectedInvoiceId(null)}
+        onUpdated={(patch) => {
+          // Optimistic patch first — the invoice row (and the derived
+          // Invoiced/Collected totals below, which reduce() over this same
+          // `invoices` array) update the instant Send/Record Payment
+          // succeeds, with no dependency on a second network round trip.
+          // The reload right after keeps it correct if anything else about
+          // the row (e.g. due-date-driven overdue status) also shifted.
+          setInvoices(prev => prev.map(i => i.id === patch.id ? { ...i, ...(patch.status !== undefined ? { status: patch.status } : {}), ...(patch.amountPaid !== undefined ? { amount_paid: patch.amountPaid } : {}) } : i));
+          void reloadInvoices();
+        }}
       />
       <EditProjectDialog
         project={project}

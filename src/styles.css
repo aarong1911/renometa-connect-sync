@@ -262,6 +262,14 @@
     height: 100%;
   }
 
+  /* Toggled by AppShell (src/components/layout/app-shell.tsx) only while it
+     is mounted — see the comment there for why. Never applied to portal/
+     proposal/change-order/auth pages, which don't mount AppShell and keep
+     relying on natural document scrolling. */
+  html.app-shell-scroll-lock {
+    overflow: hidden;
+  }
+
   body {
     background-color: var(--color-canvas);
     color: var(--color-foreground);

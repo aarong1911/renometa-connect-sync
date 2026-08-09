@@ -396,7 +396,8 @@ export type Payment = {
   invoice: string;
   client: string;
   amount: number;
-  method: "ACH" | "Card" | "Check" | "Wire" | "Other";
+  /** Canonical lowercase value (cash/card/ach/bank_transfer/check/wire/other) for real transactions — format for display with formatPaymentMethod() from @/lib/payment-method. Scheduled milestones use the same vocabulary as a placeholder default. */
+  method: string;
   receivedAt: string;
   /** Optional. When omitted, treated as "Received" for backwards compatibility. */
   status?: "Received" | "Scheduled";
@@ -404,6 +405,21 @@ export type Payment = {
   dueDate?: string;
   /** Optional milestone label (e.g. "Deposit", "Progress payment"). */
   milestoneLabel?: string;
+
+  // Phase 13.7B — canonical invoice_payments passthrough. Only present for
+  // real received transactions (mapped from PaymentTransaction in
+  // src/lib/payment-transactions.ts); never set for scheduled milestones,
+  // which aren't backed by an invoice_payments row yet.
+  invoiceId?: string;
+  contactId?: string | null;
+  projectId?: string | null;
+  projectName?: string | null;
+  provider?: string;
+  providerPaymentId?: string | null;
+  source?: string;
+  currency?: string;
+  reference?: string | null;
+  notes?: string | null;
 };
 
 const owners = ["Alex Romero", "Priya Shah", "Jamal Burke", "Mei Lin", "Sara Holt"];

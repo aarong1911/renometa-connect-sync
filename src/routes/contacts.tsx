@@ -78,7 +78,7 @@ import { ensureCompanyContactAssociation } from "@/lib/companies-store";
 import { toast } from "sonner";
 import React from "react";
 
-type CompanyOption = { id: string; name: string; slug: string };
+export type CompanyOption = { id: string; name: string; slug: string };
 
 // ── Phone formatter ──────────────────────────────────────────────────────────
 function displayPhone(raw: string): string {
@@ -1421,7 +1421,11 @@ function Field({ label, value }: { label: string; value: string }) {
 
 // ── Contact Drawer ────────────────────────────────────────────────────────────
 
-function ContactDrawer({
+// Exported (Phase 13.4 follow-up, Part 15) so Financials' Invoice Details
+// can reuse the exact same Contact detail drawer other contextual views
+// use, instead of a second Contact detail implementation — same principle
+// already used for ProjectDetailSheet (projects.index.tsx).
+export function ContactDrawer({
   contact,
   companies,
   tagOptions,

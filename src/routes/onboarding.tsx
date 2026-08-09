@@ -79,7 +79,26 @@ function OnboardingPage() {
         crmGoals: org.crmGoals.length > 0 ? org.crmGoals : undefined,
       });
 
-      // 2) Upload logo if one was selected
+      // 2) Give the new org its accounting foundation (accounting_settings
+      // row + 36-account default Chart of Accounts, left not_initialized —
+      // Phase 13.6 Part 20). Best-effort/non-blocking, same as the logo
+      // upload right below: a failure here must never stop onboarding, and
+      // ensureAccountingInitialized() is idempotent, so it's safe to leave
+      // for a later retry (e.g. the first time this org opens Financials →
+      // Accounting) rather than block account creation on it.
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (session?.access_token) {
+          await fetch("/.netlify/functions/accounting-initialize-org", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+          });
+        }
+      } catch (accountingErr) {
+        console.error("Accounting initialization failed (non-blocking):", accountingErr);
+      }
+
+      // 3) Upload logo if one was selected
       if (logoFile) {
         try {
           const uploadedLogoUrl = await uploadOrgLogo(orgId, logoFile);
@@ -92,7 +111,7 @@ function OnboardingPage() {
         }
       }
 
-      // 3) Send team invitations
+      // 4) Send team invitations
       const { data: { user: currentUser } } = await supabase.auth.getUser();
       for (const member of team) {
         try {
@@ -112,7 +131,7 @@ function OnboardingPage() {
         }
       }
 
-      // 4) Mark onboarding complete
+      // 5) Mark onboarding complete
       await markOnboardingComplete(orgId);
 
       toast.success("Workspace ready!");

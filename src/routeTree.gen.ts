@@ -49,9 +49,12 @@ import { Route as InsightsAnalyticsRouteImport } from './routes/insights.analyti
 import { Route as InboxTemplatesRouteImport } from './routes/inbox.templates'
 import { Route as InboxBroadcastsRouteImport } from './routes/inbox.broadcasts'
 import { Route as FinancialsReportsRouteImport } from './routes/financials.reports'
+import { Route as FinancialsProjectsRouteImport } from './routes/financials.projects'
 import { Route as FinancialsPaymentsRouteImport } from './routes/financials.payments'
 import { Route as FinancialsInvoicesRouteImport } from './routes/financials.invoices'
+import { Route as FinancialsExpensesRouteImport } from './routes/financials.expenses'
 import { Route as FinancialsEstimatesRouteImport } from './routes/financials.estimates'
+import { Route as FinancialsAccountingRouteImport } from './routes/financials.accounting'
 import { Route as ChangeOrderTokenRouteImport } from './routes/change-order.$token'
 import { Route as AutomationWorkflowsRouteImport } from './routes/automation.workflows'
 import { Route as AutomationTriggersRouteImport } from './routes/automation.triggers'
@@ -60,6 +63,7 @@ import { Route as AutomationAgentsRouteImport } from './routes/automation.agents
 import { Route as AuthCallbackRouteImport } from './routes/auth.callback'
 import { Route as AccountsAccountSlugRouteImport } from './routes/accounts_.$accountSlug'
 import { Route as AutomationWorkflowsIndexRouteImport } from './routes/automation.workflows.index'
+import { Route as InvoicePayTokenRouteImport } from './routes/invoice.pay.$token'
 import { Route as AutomationWorkflowsWorkflowIdRouteImport } from './routes/automation.workflows.$workflowId'
 
 const TasksRoute = TasksRouteImport.update({
@@ -262,6 +266,11 @@ const FinancialsReportsRoute = FinancialsReportsRouteImport.update({
   path: '/reports',
   getParentRoute: () => FinancialsRoute,
 } as any)
+const FinancialsProjectsRoute = FinancialsProjectsRouteImport.update({
+  id: '/projects',
+  path: '/projects',
+  getParentRoute: () => FinancialsRoute,
+} as any)
 const FinancialsPaymentsRoute = FinancialsPaymentsRouteImport.update({
   id: '/payments',
   path: '/payments',
@@ -272,9 +281,19 @@ const FinancialsInvoicesRoute = FinancialsInvoicesRouteImport.update({
   path: '/invoices',
   getParentRoute: () => FinancialsRoute,
 } as any)
+const FinancialsExpensesRoute = FinancialsExpensesRouteImport.update({
+  id: '/expenses',
+  path: '/expenses',
+  getParentRoute: () => FinancialsRoute,
+} as any)
 const FinancialsEstimatesRoute = FinancialsEstimatesRouteImport.update({
   id: '/estimates',
   path: '/estimates',
+  getParentRoute: () => FinancialsRoute,
+} as any)
+const FinancialsAccountingRoute = FinancialsAccountingRouteImport.update({
+  id: '/accounting',
+  path: '/accounting',
   getParentRoute: () => FinancialsRoute,
 } as any)
 const ChangeOrderTokenRoute = ChangeOrderTokenRouteImport.update({
@@ -318,6 +337,11 @@ const AutomationWorkflowsIndexRoute =
     path: '/',
     getParentRoute: () => AutomationWorkflowsRoute,
   } as any)
+const InvoicePayTokenRoute = InvoicePayTokenRouteImport.update({
+  id: '/invoice/pay/$token',
+  path: '/invoice/pay/$token',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AutomationWorkflowsWorkflowIdRoute =
   AutomationWorkflowsWorkflowIdRouteImport.update({
     id: '/$workflowId',
@@ -353,9 +377,12 @@ export interface FileRoutesByFullPath {
   '/automation/triggers': typeof AutomationTriggersRoute
   '/automation/workflows': typeof AutomationWorkflowsRouteWithChildren
   '/change-order/$token': typeof ChangeOrderTokenRoute
+  '/financials/accounting': typeof FinancialsAccountingRoute
   '/financials/estimates': typeof FinancialsEstimatesRoute
+  '/financials/expenses': typeof FinancialsExpensesRoute
   '/financials/invoices': typeof FinancialsInvoicesRoute
   '/financials/payments': typeof FinancialsPaymentsRoute
+  '/financials/projects': typeof FinancialsProjectsRoute
   '/financials/reports': typeof FinancialsReportsRoute
   '/inbox/broadcasts': typeof InboxBroadcastsRoute
   '/inbox/templates': typeof InboxTemplatesRoute
@@ -377,6 +404,7 @@ export interface FileRoutesByFullPath {
   '/settings/templates': typeof SettingsTemplatesRoute
   '/projects/': typeof ProjectsIndexRoute
   '/automation/workflows/$workflowId': typeof AutomationWorkflowsWorkflowIdRoute
+  '/invoice/pay/$token': typeof InvoicePayTokenRoute
   '/automation/workflows/': typeof AutomationWorkflowsIndexRoute
 }
 export interface FileRoutesByTo {
@@ -406,9 +434,12 @@ export interface FileRoutesByTo {
   '/automation/call-logs': typeof AutomationCallLogsRoute
   '/automation/triggers': typeof AutomationTriggersRoute
   '/change-order/$token': typeof ChangeOrderTokenRoute
+  '/financials/accounting': typeof FinancialsAccountingRoute
   '/financials/estimates': typeof FinancialsEstimatesRoute
+  '/financials/expenses': typeof FinancialsExpensesRoute
   '/financials/invoices': typeof FinancialsInvoicesRoute
   '/financials/payments': typeof FinancialsPaymentsRoute
+  '/financials/projects': typeof FinancialsProjectsRoute
   '/financials/reports': typeof FinancialsReportsRoute
   '/inbox/broadcasts': typeof InboxBroadcastsRoute
   '/inbox/templates': typeof InboxTemplatesRoute
@@ -430,6 +461,7 @@ export interface FileRoutesByTo {
   '/settings/templates': typeof SettingsTemplatesRoute
   '/projects': typeof ProjectsIndexRoute
   '/automation/workflows/$workflowId': typeof AutomationWorkflowsWorkflowIdRoute
+  '/invoice/pay/$token': typeof InvoicePayTokenRoute
   '/automation/workflows': typeof AutomationWorkflowsIndexRoute
 }
 export interface FileRoutesById {
@@ -461,9 +493,12 @@ export interface FileRoutesById {
   '/automation/triggers': typeof AutomationTriggersRoute
   '/automation/workflows': typeof AutomationWorkflowsRouteWithChildren
   '/change-order/$token': typeof ChangeOrderTokenRoute
+  '/financials/accounting': typeof FinancialsAccountingRoute
   '/financials/estimates': typeof FinancialsEstimatesRoute
+  '/financials/expenses': typeof FinancialsExpensesRoute
   '/financials/invoices': typeof FinancialsInvoicesRoute
   '/financials/payments': typeof FinancialsPaymentsRoute
+  '/financials/projects': typeof FinancialsProjectsRoute
   '/financials/reports': typeof FinancialsReportsRoute
   '/inbox/broadcasts': typeof InboxBroadcastsRoute
   '/inbox/templates': typeof InboxTemplatesRoute
@@ -485,6 +520,7 @@ export interface FileRoutesById {
   '/settings/templates': typeof SettingsTemplatesRoute
   '/projects/': typeof ProjectsIndexRoute
   '/automation/workflows/$workflowId': typeof AutomationWorkflowsWorkflowIdRoute
+  '/invoice/pay/$token': typeof InvoicePayTokenRoute
   '/automation/workflows/': typeof AutomationWorkflowsIndexRoute
 }
 export interface FileRouteTypes {
@@ -517,9 +553,12 @@ export interface FileRouteTypes {
     | '/automation/triggers'
     | '/automation/workflows'
     | '/change-order/$token'
+    | '/financials/accounting'
     | '/financials/estimates'
+    | '/financials/expenses'
     | '/financials/invoices'
     | '/financials/payments'
+    | '/financials/projects'
     | '/financials/reports'
     | '/inbox/broadcasts'
     | '/inbox/templates'
@@ -541,6 +580,7 @@ export interface FileRouteTypes {
     | '/settings/templates'
     | '/projects/'
     | '/automation/workflows/$workflowId'
+    | '/invoice/pay/$token'
     | '/automation/workflows/'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -570,9 +610,12 @@ export interface FileRouteTypes {
     | '/automation/call-logs'
     | '/automation/triggers'
     | '/change-order/$token'
+    | '/financials/accounting'
     | '/financials/estimates'
+    | '/financials/expenses'
     | '/financials/invoices'
     | '/financials/payments'
+    | '/financials/projects'
     | '/financials/reports'
     | '/inbox/broadcasts'
     | '/inbox/templates'
@@ -594,6 +637,7 @@ export interface FileRouteTypes {
     | '/settings/templates'
     | '/projects'
     | '/automation/workflows/$workflowId'
+    | '/invoice/pay/$token'
     | '/automation/workflows'
   id:
     | '__root__'
@@ -624,9 +668,12 @@ export interface FileRouteTypes {
     | '/automation/triggers'
     | '/automation/workflows'
     | '/change-order/$token'
+    | '/financials/accounting'
     | '/financials/estimates'
+    | '/financials/expenses'
     | '/financials/invoices'
     | '/financials/payments'
+    | '/financials/projects'
     | '/financials/reports'
     | '/inbox/broadcasts'
     | '/inbox/templates'
@@ -648,6 +695,7 @@ export interface FileRouteTypes {
     | '/settings/templates'
     | '/projects/'
     | '/automation/workflows/$workflowId'
+    | '/invoice/pay/$token'
     | '/automation/workflows/'
   fileRoutesById: FileRoutesById
 }
@@ -685,6 +733,7 @@ export interface RootRouteChildren {
   ProposalTokenRoute: typeof ProposalTokenRoute
   SalesPipelineRoute: typeof SalesPipelineRoute
   ProjectsIndexRoute: typeof ProjectsIndexRoute
+  InvoicePayTokenRoute: typeof InvoicePayTokenRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -969,6 +1018,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof FinancialsReportsRouteImport
       parentRoute: typeof FinancialsRoute
     }
+    '/financials/projects': {
+      id: '/financials/projects'
+      path: '/projects'
+      fullPath: '/financials/projects'
+      preLoaderRoute: typeof FinancialsProjectsRouteImport
+      parentRoute: typeof FinancialsRoute
+    }
     '/financials/payments': {
       id: '/financials/payments'
       path: '/payments'
@@ -983,11 +1039,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof FinancialsInvoicesRouteImport
       parentRoute: typeof FinancialsRoute
     }
+    '/financials/expenses': {
+      id: '/financials/expenses'
+      path: '/expenses'
+      fullPath: '/financials/expenses'
+      preLoaderRoute: typeof FinancialsExpensesRouteImport
+      parentRoute: typeof FinancialsRoute
+    }
     '/financials/estimates': {
       id: '/financials/estimates'
       path: '/estimates'
       fullPath: '/financials/estimates'
       preLoaderRoute: typeof FinancialsEstimatesRouteImport
+      parentRoute: typeof FinancialsRoute
+    }
+    '/financials/accounting': {
+      id: '/financials/accounting'
+      path: '/accounting'
+      fullPath: '/financials/accounting'
+      preLoaderRoute: typeof FinancialsAccountingRouteImport
       parentRoute: typeof FinancialsRoute
     }
     '/change-order/$token': {
@@ -1046,6 +1116,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AutomationWorkflowsIndexRouteImport
       parentRoute: typeof AutomationWorkflowsRoute
     }
+    '/invoice/pay/$token': {
+      id: '/invoice/pay/$token'
+      path: '/invoice/pay/$token'
+      fullPath: '/invoice/pay/$token'
+      preLoaderRoute: typeof InvoicePayTokenRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/automation/workflows/$workflowId': {
       id: '/automation/workflows/$workflowId'
       path: '/$workflowId'
@@ -1057,16 +1134,22 @@ declare module '@tanstack/react-router' {
 }
 
 interface FinancialsRouteChildren {
+  FinancialsAccountingRoute: typeof FinancialsAccountingRoute
   FinancialsEstimatesRoute: typeof FinancialsEstimatesRoute
+  FinancialsExpensesRoute: typeof FinancialsExpensesRoute
   FinancialsInvoicesRoute: typeof FinancialsInvoicesRoute
   FinancialsPaymentsRoute: typeof FinancialsPaymentsRoute
+  FinancialsProjectsRoute: typeof FinancialsProjectsRoute
   FinancialsReportsRoute: typeof FinancialsReportsRoute
 }
 
 const FinancialsRouteChildren: FinancialsRouteChildren = {
+  FinancialsAccountingRoute: FinancialsAccountingRoute,
   FinancialsEstimatesRoute: FinancialsEstimatesRoute,
+  FinancialsExpensesRoute: FinancialsExpensesRoute,
   FinancialsInvoicesRoute: FinancialsInvoicesRoute,
   FinancialsPaymentsRoute: FinancialsPaymentsRoute,
+  FinancialsProjectsRoute: FinancialsProjectsRoute,
   FinancialsReportsRoute: FinancialsReportsRoute,
 }
 
@@ -1165,6 +1248,7 @@ const rootRouteChildren: RootRouteChildren = {
   ProposalTokenRoute: ProposalTokenRoute,
   SalesPipelineRoute: SalesPipelineRoute,
   ProjectsIndexRoute: ProjectsIndexRoute,
+  InvoicePayTokenRoute: InvoicePayTokenRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
