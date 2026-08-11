@@ -34,12 +34,17 @@ Vapi phone:   9a024622-c69e-4035-93fa-ffb6b8a3ca00
 
 ## Stack
 
-- React 18 + TypeScript + Vite 7
-- TanStack Router (file-based) + TanStack Query
-- Supabase (auth, DB, storage, realtime)
-- Netlify (hosting + serverless functions)
-- shadcn/ui + Tailwind + Lucide + Sonner
-- **pnpm only** — never npm/yarn
+Frontend: React 18 + TypeScript + Vite 7, TanStack Router (file-based) + TanStack Query, Tailwind + shadcn/ui + Lucide + Sonner.
+Backend: Netlify Functions + Supabase (auth, DB, storage, realtime).
+**pnpm only** — never npm/yarn.
+
+Core rule: React UI → trusted Netlify function for any sensitive write → Supabase → canonical DB constraints/RPCs enforce the invariant. The browser is never the authority for org_id, money, or account mapping — see `secure-backend` and `accounting-integrity`.
+
+## Major domains
+
+CRM (Leads, Accounts/Companies, Contacts, Pipeline) · Projects (planning, execution, photos, daily logs) · Estimates & Change Orders · Financials (Invoices, Payments, Expenses, Vendors, Vendor Bills, A/P, Accounting/GL) · Inbox (SMS/WhatsApp/Messenger/Email) · Calendar · AI Center (Agents + Tools) · Integrations (Meta, Google, Vapi).
+
+Financial/accounting work has its own dedicated skills — `accounting-integrity` (architecture), `database-migrations` (schema), `financial-e2e` (manual verification) — this file stays high-level for that domain rather than duplicating them.
 
 ## Commands
 
@@ -88,7 +93,14 @@ ANTHROPIC_API_KEY          # Claude API for AI Center
 ```
 profiles, organizations, org_memberships, invitations
 projects, project_notes, project_files, contacts, leads
-invoices, invoice_items, estimates, appointments, tasks
+companies, company_contacts                       ← company_id/contact_id are the canonical links
+invoices, invoice_items, invoice_payments, estimates, appointments, tasks
+vendors                                            ← pre-existing live table: company_id/contact_id/
+                                                      vendor_type/is_active — NOT a flat name/email
+                                                      record. See database-migrations skill.
+expenses, vendor_bills, vendor_bill_lines, vendor_payments
+accounting_accounts, accounting_journal_entries, accounting_journal_entry_lines,
+accounting_periods, accounting_settings           ← see accounting-integrity skill
 voice_agents, voice_calls, voice_call_tools
 meta_connections, ad_drafts
 member_permissions    ← per-member action overrides (owner only)

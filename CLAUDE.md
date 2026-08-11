@@ -12,6 +12,20 @@ pnpm build        # Production build
 pnpm tsc          # Type check
 ```
 
+## Skills
+
+Before making significant changes, inspect relevant project skills under `.claude/skills/`. Load the ones matching the task, especially:
+
+- `database-migrations` — any Supabase schema/RPC/trigger/RLS work
+- `accounting-integrity` — any invoice/expense/vendor-bill/payment/journal/reversal/credit work
+- `financial-e2e` — manually verifying accounting/payment changes
+- `verification` — before declaring any implementation task complete
+- `ui-design-system` — any frontend UI change
+- `secure-backend` / `netlify-supabase-functions` — trusted backend work in `netlify/functions/`
+- `meta-integrations` — Meta (Facebook/Instagram/WhatsApp) work
+- `ai-center` — AI Center (Agents/Tools) work
+- `tanstack-router-guards` — routing/auth-guard work
+
 ## Project Identifiers
 
 | Key | Value |

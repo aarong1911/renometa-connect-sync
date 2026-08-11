@@ -16,13 +16,14 @@ import { cn } from "@/lib/utils";
 import { formatMoney, formatCompactMoney, formatDateOnlyShort } from "@/lib/format";
 import {
   fetchVendorsOrgId, fetchVendors, fetchExpenses, fetchVendorBills, fetchExpenseCategoryAccounts,
-  computeApAging, computeExpenseKpis, vendorDisplayName,
+  computeApAging, computeExpenseKpis, vendorDisplayName, getVendorBillEffectiveBalance,
   type Vendor, type Expense, type VendorBill, type ExpenseCategoryAccount,
 } from "@/lib/vendors";
 import { NewVendorModal } from "@/components/financials/NewVendorModal";
 import { NewExpenseModal } from "@/components/financials/NewExpenseModal";
 import { NewBillModal } from "@/components/financials/NewBillModal";
 import { BillDetailSheet } from "@/components/financials/BillDetailSheet";
+import { ExpenseDetailSheet } from "@/components/financials/ExpenseDetailSheet";
 
 export const Route = createFileRoute("/financials/expenses")({ component: ExpensesPage });
 
@@ -36,6 +37,7 @@ const STATUS_STYLES: Record<string, string> = {
   paid: "bg-success-soft text-success",
   overdue: "bg-destructive-soft text-destructive",
   cancelled: "bg-secondary text-muted-foreground",
+  reversed: "bg-destructive-soft text-destructive",
 };
 
 function ExpensesPage() {
@@ -54,6 +56,7 @@ function ExpensesPage() {
   const [expenseModalOpen, setExpenseModalOpen] = useState(false);
   const [billModalOpen, setBillModalOpen] = useState(false);
   const [selectedBill, setSelectedBill] = useState<VendorBill | null>(null);
+  const [selectedExpense, setSelectedExpense] = useState<Expense | null>(null);
 
   const load = async () => {
     setLoading(true);
@@ -176,7 +179,7 @@ function ExpensesPage() {
       {loading ? (
         <Card className="p-8 text-center text-sm text-muted-foreground">Loading…</Card>
       ) : tab === "expenses" ? (
-        <ExpensesTable expenses={filteredExpenses} empty={expenses.length === 0} />
+        <ExpensesTable expenses={filteredExpenses} empty={expenses.length === 0} onSelect={setSelectedExpense} />
       ) : tab === "bills" ? (
         <BillsTable bills={filteredBills} empty={bills.length === 0} onSelect={setSelectedBill} />
       ) : (
@@ -187,6 +190,7 @@ function ExpensesPage() {
       <NewExpenseModal open={expenseModalOpen} onClose={() => setExpenseModalOpen(false)} orgId={orgId} vendors={vendors} categories={categories} onCreated={() => load()} />
       <NewBillModal open={billModalOpen} onClose={() => setBillModalOpen(false)} orgId={orgId} vendors={vendors} categories={categories} onCreated={() => load()} />
       <BillDetailSheet bill={selectedBill} open={Boolean(selectedBill)} onClose={() => setSelectedBill(null)} onChanged={() => { load(); setSelectedBill(null); }} />
+      <ExpenseDetailSheet expense={selectedExpense} open={Boolean(selectedExpense)} onClose={() => setSelectedExpense(null)} onChanged={() => { load(); setSelectedExpense(null); }} />
     </div>
   );
 }
@@ -206,7 +210,7 @@ function KpiCard({ icon: Icon, iconBg, iconColor, label, value, sub }: {
   );
 }
 
-function ExpensesTable({ expenses, empty }: { expenses: Expense[]; empty: boolean }) {
+function ExpensesTable({ expenses, empty, onSelect }: { expenses: Expense[]; empty: boolean; onSelect: (e: Expense) => void }) {
   return (
     <Card className="overflow-hidden">
       <div className="grid grid-cols-[90px_minmax(160px,1.5fr)_120px_110px_90px_90px_90px] gap-4 border-b border-border bg-secondary/40 px-5 py-2.5 text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground">
@@ -217,9 +221,13 @@ function ExpensesTable({ expenses, empty }: { expenses: Expense[]; empty: boolea
       ) : (
         <ul className="divide-y divide-border">
           {expenses.map((e) => (
-            <li key={e.id} className="grid grid-cols-[90px_minmax(160px,1.5fr)_120px_110px_90px_90px_90px] items-center gap-4 px-5 py-3">
+            <li key={e.id} onClick={() => onSelect(e)} role="button" tabIndex={0}
+              className={cn("grid cursor-pointer grid-cols-[90px_minmax(160px,1.5fr)_120px_110px_90px_90px_90px] items-center gap-4 px-5 py-3 transition-colors hover:bg-secondary/50", e.status === "reversed" && "opacity-60")}>
               <div className="text-[12px] tabular-nums text-muted-foreground">{formatDateOnlyShort(e.expenseDate)}</div>
-              <div className="min-w-0 truncate text-[13px] font-medium">{e.description}</div>
+              <div className="min-w-0 truncate text-[13px] font-medium">
+                {e.description}
+                {e.status === "reversed" && <Badge className="ml-1.5 bg-destructive-soft text-[10px] text-destructive">Reversed</Badge>}
+              </div>
               <div className="truncate text-[12.5px] text-muted-foreground">{e.vendorName}</div>
               <div className="truncate text-[12.5px]">
                 {e.accountName}
@@ -247,7 +255,7 @@ function BillsTable({ bills, empty, onSelect }: { bills: VendorBill[]; empty: bo
       ) : (
         <ul className="divide-y divide-border">
           {bills.map((b) => {
-            const balance = Math.max(0, b.totalAmount - b.amountPaid);
+            const balance = getVendorBillEffectiveBalance(b);
             return (
               <li key={b.id} onClick={() => onSelect(b)} role="button" tabIndex={0}
                 className="grid cursor-pointer grid-cols-[110px_minmax(160px,1.5fr)_100px_100px_90px_90px_90px] items-center gap-4 px-5 py-3 transition-colors hover:bg-secondary/50">

@@ -12,6 +12,12 @@ description: >
 
 # Netlify + Supabase Functions Skill
 
+> Boilerplate and integration patterns live here. For the trust-boundary
+> rules (never trust browser org_id, same-org validation, service-role key
+> handling, Stripe/OAuth token trust), see the `secure-backend` skill —
+> those rules aren't repeated in this file. For money-specific amount
+> trust and idempotency, see `accounting-integrity`.
+
 ## Standard Template
 
 ```typescript

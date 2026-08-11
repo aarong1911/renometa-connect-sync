@@ -146,15 +146,16 @@ export type Expense = {
   accountId: string;
   accountName: string;
   isCogs: boolean;
-  status: "draft" | "posted" | "cancelled";
+  status: "draft" | "posted" | "cancelled" | "reversed";
   reference: string | null;
+  reversalReason: string | null;
   createdAt: string;
 };
 
 export async function fetchExpenses(orgId: string): Promise<Expense[] | null> {
   const { data, error } = await supabase
     .from("expenses")
-    .select("id, vendor_id, project_id, expense_date, description, amount, payment_method, account_id, status, reference, created_at, vendors!vendor_id(companies!company_id(name), contacts!contact_id(full_name)), projects!project_id(name), accounting_accounts!account_id(name, account_subtype)")
+    .select("id, vendor_id, project_id, expense_date, description, amount, payment_method, account_id, status, reference, reversal_reason, created_at, vendors!vendor_id(companies!company_id(name), contacts!contact_id(full_name)), projects!project_id(name), accounting_accounts!account_id(name, account_subtype)")
     .eq("org_id", orgId)
     .order("expense_date", { ascending: false });
   if (error) {
@@ -176,6 +177,7 @@ export async function fetchExpenses(orgId: string): Promise<Expense[] | null> {
     isCogs: COGS_SUBTYPES.has(r.accounting_accounts?.account_subtype),
     status: r.status,
     reference: r.reference,
+    reversalReason: r.reversal_reason ?? null,
     createdAt: r.created_at,
   }));
 }
@@ -197,16 +199,17 @@ export type VendorBill = {
   taxAmount: number;
   totalAmount: number;
   amountPaid: number;
-  status: "draft" | "open" | "partial" | "paid" | "overdue" | "cancelled";
+  status: "draft" | "open" | "partial" | "paid" | "overdue" | "cancelled" | "reversed";
   reference: string | null;
   notes: string | null;
+  reversalReason: string | null;
   createdAt: string;
 };
 
 export async function fetchVendorBills(orgId: string): Promise<VendorBill[] | null> {
   const { data, error } = await supabase
     .from("vendor_bills")
-    .select("id, vendor_id, project_id, bill_number, bill_date, due_date, subtotal, tax_amount, total_amount, amount_paid, status, reference, notes, created_at, vendors!vendor_id(companies!company_id(name), contacts!contact_id(full_name)), projects!project_id(name)")
+    .select("id, vendor_id, project_id, bill_number, bill_date, due_date, subtotal, tax_amount, total_amount, amount_paid, status, reference, notes, reversal_reason, created_at, vendors!vendor_id(companies!company_id(name), contacts!contact_id(full_name)), projects!project_id(name)")
     .eq("org_id", orgId)
     .order("bill_date", { ascending: false });
   if (error) {
@@ -224,7 +227,7 @@ export async function fetchVendorBills(orgId: string): Promise<VendorBill[] | nu
       subtotal: Number(r.subtotal ?? 0), taxAmount: Number(r.tax_amount ?? 0),
       totalAmount: Number(r.total_amount ?? 0), amountPaid: Number(r.amount_paid ?? 0),
       status: isOverdue ? "overdue" : r.status,
-      reference: r.reference, notes: r.notes, createdAt: r.created_at,
+      reference: r.reference, notes: r.notes, reversalReason: r.reversal_reason ?? null, createdAt: r.created_at,
     };
   });
 }
@@ -244,16 +247,40 @@ export async function fetchVendorBillLines(billId: string): Promise<VendorBillLi
 
 export type VendorPayment = {
   id: string; amount: number; status: string; paymentMethod: string; paidAt: string; reference: string | null;
+  /** Set only on a reversal row — the original payment it reverses. */
+  reversesPaymentId: string | null;
+  reversalReason: string | null;
+  /** True for the original payment once some OTHER row's reversesPaymentId points at it — computed client-side from the full list, not a stored column. */
+  isReversed: boolean;
 };
 
 export async function fetchVendorPaymentsForBill(billId: string): Promise<VendorPayment[]> {
   const { data, error } = await supabase
     .from("vendor_payments")
-    .select("id, amount, status, payment_method, paid_at, reference")
+    .select("id, amount, status, payment_method, paid_at, reference, reverses_payment_id, reversal_reason")
     .eq("vendor_bill_id", billId)
     .order("paid_at", { ascending: false });
   if (error) { console.error("[vendors]", error); return []; }
-  return (data ?? []).map((r: any) => ({ id: r.id, amount: Number(r.amount ?? 0), status: r.status, paymentMethod: r.payment_method, paidAt: r.paid_at, reference: r.reference }));
+  const reversedIds = new Set((data ?? []).map((r: any) => r.reverses_payment_id).filter(Boolean));
+  return (data ?? []).map((r: any) => ({
+    id: r.id, amount: Number(r.amount ?? 0), status: r.status, paymentMethod: r.payment_method, paidAt: r.paid_at, reference: r.reference,
+    reversesPaymentId: r.reverses_payment_id ?? null, reversalReason: r.reversal_reason ?? null,
+    isReversed: reversedIds.has(r.id),
+  }));
+}
+
+/**
+ * Canonical UI-facing vendor bill balance. A reversed bill's total_amount
+ * and amount_paid stay exactly as posted (historical/audit record — never
+ * rewritten for presentation), but a reversed bill no longer represents an
+ * outstanding payable, so its EFFECTIVE balance is always $0 regardless of
+ * what total_amount/amount_paid happen to say. Every other status falls
+ * back to the normal total-minus-paid figure, floored at 0 so floating-
+ * point noise can never show a negative balance.
+ */
+export function getVendorBillEffectiveBalance(bill: Pick<VendorBill, "status" | "totalAmount" | "amountPaid">): number {
+  if (bill.status === "reversed") return 0;
+  return Math.max(0, round2(bill.totalAmount - bill.amountPaid));
 }
 
 // ── A/P Aging (Part 12) ──────────────────────────────────────────────────

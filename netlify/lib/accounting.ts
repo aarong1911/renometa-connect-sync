@@ -324,6 +324,63 @@ export async function postVendorPaymentSucceeded(admin: SupabaseClient, orgId: s
   });
 }
 
+// ── Phase 13.9 (Tier 1) — journal reversal ──────────────────────────────────
+//
+// The only server-side entry point for reversing a posted journal entry —
+// wraps the reverse_journal_entry() RPC (supabase/migrations/20260823_
+// accounting_reversals_credits.sql), which is itself the only thing
+// allowed to swap debit/credit and post a compensating entry. Never
+// constructs reversal lines here — the RPC reads the ORIGINAL entry's own
+// lines and swaps them, so this module never needs to know the accounting
+// shape of whatever it's reversing.
+
+export type FindJournalEntryResult = { id: string; entryNumber: string; status: string };
+
+/** Looks up the posted journal entry for a given operational event, by its (source_type, source_id, posting_key) identity — the same triple post_journal_entry() uses for idempotency. Returns null if no such entry was ever posted (e.g. accounting wasn't initialized when the original event happened). */
+export async function findJournalEntry(admin: SupabaseClient, orgId: string, sourceType: string, sourceId: string, postingKey: string): Promise<FindJournalEntryResult | null> {
+  const { data, error } = await admin
+    .from("accounting_journal_entries")
+    .select("id, entry_number, status")
+    .eq("org_id", orgId)
+    .eq("source_type", sourceType)
+    .eq("source_id", sourceId)
+    .eq("posting_key", postingKey)
+    .maybeSingle();
+  if (error) throw new Error(`Could not look up journal entry: ${error.message}`);
+  if (!data) return null;
+  return { id: data.id, entryNumber: data.entry_number, status: data.status };
+}
+
+export type ReverseJournalEntryResult = { reversalEntryId: string; reversalEntryNumber: string; originalEntryId: string; alreadyReversed: boolean };
+
+/**
+ * Thin wrapper over reverse_journal_entry() — the RPC itself is the
+ * transactional boundary (locks the original, swaps every line, posts via
+ * post_journal_entry(), links the reversal). Phase 13.9A: the RPC no
+ * longer accepts a caller-supplied source_type/source_id/posting_key — it
+ * derives all three from the entry being reversed (source_type/source_id
+ * from the original entry itself, posting_key hardcoded to 'reversed').
+ * This wrapper's callers only ever supply `entryId` — which entry to
+ * reverse — never its own source identity.
+ */
+export async function reverseJournalEntry(admin: SupabaseClient, input: {
+  orgId: string; entryId: string; reversalDate: string; reason: string; createdBy: string | null;
+}): Promise<ReverseJournalEntryResult> {
+  const { data, error } = await admin.rpc("reverse_journal_entry", {
+    p_org_id: input.orgId,
+    p_entry_id: input.entryId,
+    p_reversal_date: input.reversalDate,
+    p_reason: input.reason,
+    p_created_by: input.createdBy,
+  });
+  if (error) throw new Error(`reverse_journal_entry failed: ${error.message}`);
+  const row = Array.isArray(data) ? data[0] : data;
+  return {
+    reversalEntryId: row.reversal_entry_id, reversalEntryNumber: row.reversal_entry_number,
+    originalEntryId: row.original_entry_id, alreadyReversed: row.already_reversed,
+  };
+}
+
 /**
  * Phase 13.5B Part 20 — new-organization accounting initialization.
  *

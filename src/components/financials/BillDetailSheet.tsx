@@ -11,15 +11,16 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Loader2, Send, CreditCard } from "lucide-react";
+import { Loader2, Send, CreditCard, Undo2 } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
 import { formatMoney, formatDateOnlyShort, todayDateOnlyValue } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import {
-  fetchVendorBillLines, fetchVendorPaymentsForBill,
+  fetchVendorBillLines, fetchVendorPaymentsForBill, getVendorBillEffectiveBalance,
   type VendorBill, type VendorBillLine, type VendorPayment,
 } from "@/lib/vendors";
+import { ReversalReasonDialog } from "@/components/financials/ReversalReasonDialog";
 
 const PAYMENT_METHODS = [
   { value: "cash", label: "Cash" }, { value: "check", label: "Check" }, { value: "card", label: "Card" },
@@ -33,7 +34,14 @@ const STATUS_STYLES: Record<string, string> = {
   paid: "bg-success-soft text-success",
   overdue: "bg-destructive-soft text-destructive",
   cancelled: "bg-secondary text-muted-foreground",
+  reversed: "bg-destructive-soft text-destructive",
 };
+
+async function authHeader(): Promise<Record<string, string>> {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session?.access_token) throw new Error("You must be signed in to do this");
+  return { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` };
+}
 
 type Props = {
   bill: VendorBill | null;
@@ -48,6 +56,8 @@ export function BillDetailSheet({ bill, open, onClose, onChanged }: Props) {
   const [loading, setLoading] = useState(false);
   const [posting, setPosting] = useState(false);
   const [payOpen, setPayOpen] = useState(false);
+  const [reverseBillOpen, setReverseBillOpen] = useState(false);
+  const [reversingPaymentId, setReversingPaymentId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open || !bill) return;
@@ -58,7 +68,7 @@ export function BillDetailSheet({ bill, open, onClose, onChanged }: Props) {
   }, [open, bill?.id]);
 
   if (!bill) return null;
-  const balance = Math.round((bill.totalAmount - bill.amountPaid) * 100) / 100;
+  const balance = getVendorBillEffectiveBalance(bill);
 
   const handlePost = async () => {
     if (posting) return;
@@ -81,6 +91,41 @@ export function BillDetailSheet({ bill, open, onClose, onChanged }: Props) {
       setPosting(false);
     }
   };
+
+  const handleReverseBill = async (reason: string) => {
+    try {
+      const headers = await authHeader();
+      const res = await fetch("/.netlify/functions/vendor-bill-reverse", {
+        method: "POST", headers, body: JSON.stringify({ billId: bill.id, reason }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.error || "Could not reverse this bill");
+      toast.success(body.reversalEntryNumber ? `Bill reversed — ${body.reversalEntryNumber}` : "Bill reversed");
+      setReverseBillOpen(false);
+      onChanged();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not reverse this bill");
+    }
+  };
+
+  const handleReversePayment = async (paymentId: string, reason: string) => {
+    try {
+      const headers = await authHeader();
+      const res = await fetch("/.netlify/functions/vendor-payment-reverse", {
+        method: "POST", headers, body: JSON.stringify({ paymentId, reason }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.error || "Could not reverse this payment");
+      if (body.accountingWarning) toast.warning(body.accountingWarning);
+      else toast.success("Payment reversed");
+      setReversingPaymentId(null);
+      onChanged();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not reverse this payment");
+    }
+  };
+
+  const reversingPayment = payments.find((p) => p.id === reversingPaymentId) ?? null;
 
   return (
     <Sheet open={open} onOpenChange={(v) => !v && onClose()}>
@@ -131,21 +176,45 @@ export function BillDetailSheet({ bill, open, onClose, onChanged }: Props) {
             </div>
           </div>
 
+          {bill.status === "reversed" && bill.reversalReason && (
+            <div className="rounded-md bg-destructive-soft px-3 py-2 text-[12px] text-destructive">
+              <span className="font-medium">Reversed:</span> {bill.reversalReason}
+            </div>
+          )}
+
           {payments.length > 0 && (
             <div>
               <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Payments</p>
               <ul className="space-y-1.5">
-                {payments.map((p) => (
-                  <li key={p.id} className="flex items-center justify-between rounded-md bg-secondary/40 px-3 py-2 text-[12.5px]">
-                    <span className="text-muted-foreground">{formatDateOnlyShort(p.paidAt)} · {p.paymentMethod}</span>
-                    <span className="font-medium tabular-nums">{formatMoney(p.amount)}</span>
-                  </li>
-                ))}
+                {payments.map((p) => {
+                  const isReversal = Boolean(p.reversesPaymentId);
+                  const canReverse = p.status === "succeeded" && !isReversal && !p.isReversed;
+                  return (
+                    <li key={p.id} className={cn("rounded-md px-3 py-2 text-[12.5px]", isReversal ? "bg-destructive-soft/60" : "bg-secondary/40")}>
+                      <div className="flex items-center justify-between">
+                        <span className="text-muted-foreground">
+                          {formatDateOnlyShort(p.paidAt)} · {p.paymentMethod}
+                          {isReversal && <Badge variant="outline" className="ml-1.5 text-[10px]">Reversal</Badge>}
+                          {p.isReversed && <Badge variant="outline" className="ml-1.5 text-[10px]">Reversed</Badge>}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className={cn("font-medium tabular-nums", isReversal && "text-destructive")}>{isReversal ? "−" : ""}{formatMoney(p.amount)}</span>
+                          {canReverse && (
+                            <button title="Reverse this payment" onClick={() => setReversingPaymentId(p.id)} className="rounded p-1 text-muted-foreground hover:bg-secondary hover:text-destructive">
+                              <Undo2 className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      {p.reversalReason && <p className="mt-0.5 text-[11px] text-muted-foreground">Reason: {p.reversalReason}</p>}
+                    </li>
+                  );
+                })}
               </ul>
             </div>
           )}
 
-          <div className="flex gap-2 border-t border-border pt-3">
+          <div className="flex flex-wrap gap-2 border-t border-border pt-3">
             {bill.status === "draft" && (
               <Button size="sm" onClick={handlePost} disabled={posting}>
                 {posting ? <><Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />Posting…</> : <><Send className="mr-1.5 h-3.5 w-3.5" />Post bill</>}
@@ -154,12 +223,31 @@ export function BillDetailSheet({ bill, open, onClose, onChanged }: Props) {
             {(bill.status === "open" || bill.status === "partial" || bill.status === "overdue") && (
               <Button size="sm" onClick={() => setPayOpen(true)}><CreditCard className="mr-1.5 h-3.5 w-3.5" />Record payment</Button>
             )}
+            {bill.status === "open" && bill.amountPaid === 0 && (
+              <Button size="sm" variant="outline" onClick={() => setReverseBillOpen(true)}><Undo2 className="mr-1.5 h-3.5 w-3.5" />Reverse bill</Button>
+            )}
+            {(bill.status === "partial" || bill.status === "paid") && (
+              <p className="self-center text-[11px] text-muted-foreground">Reverse vendor payments first before reversing this bill.</p>
+            )}
             {bill.status === "draft" && <p className="self-center text-[11px] text-muted-foreground">Draft — no accounting entry yet.</p>}
           </div>
         </div>
       </SheetContent>
 
       <RecordBillPaymentDialog open={payOpen} onClose={() => setPayOpen(false)} bill={bill} balance={balance} onRecorded={() => { setPayOpen(false); onChanged(); }} />
+
+      <ReversalReasonDialog
+        open={reverseBillOpen} onClose={() => setReverseBillOpen(false)}
+        title="Reverse Bill" confirmLabel="Reverse bill"
+        description={`This posts a reversing journal entry for ${bill.billNumber ?? "this bill"} and marks it Reversed. It will no longer count toward A/P.`}
+        onConfirm={handleReverseBill}
+      />
+      <ReversalReasonDialog
+        open={Boolean(reversingPayment)} onClose={() => setReversingPaymentId(null)}
+        title="Reverse Payment" confirmLabel="Reverse payment"
+        description={reversingPayment ? `This posts a reversing entry for the ${formatMoney(reversingPayment.amount)} payment made ${formatDateOnlyShort(reversingPayment.paidAt)}. The bill's balance will increase accordingly.` : ""}
+        onConfirm={(reason) => reversingPayment ? handleReversePayment(reversingPayment.id, reason) : Promise.resolve()}
+      />
     </Sheet>
   );
 }

@@ -38,6 +38,11 @@ function AccountingPage() {
 
   return (
     <div className="space-y-4">
+      <div>
+        <h1 className="text-lg font-semibold">Accounting</h1>
+        <p className="text-[13px] text-muted-foreground">Chart of Accounts, General Ledger, and financial statements.</p>
+      </div>
+
       <div className="flex flex-wrap gap-1 border-b border-border pb-2">
         {TABS.map((t) => (
           <button key={t.key} onClick={() => setTab(t.key)}
