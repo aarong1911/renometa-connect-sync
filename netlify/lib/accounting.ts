@@ -24,6 +24,8 @@ const UNDEPOSITED_FUNDS_CODE = "1020";
 const CONSTRUCTION_REVENUE_CODE = "4000";
 const CHANGE_ORDER_REVENUE_CODE = "4100";
 const ACCOUNTS_PAYABLE_CODE = "2000";
+const OPERATING_BANK_CODE = "1010";
+const CREDIT_CARD_CODE = "2100";
 
 export type SystemAccountIds = {
   accountsReceivable: string;
@@ -31,22 +33,38 @@ export type SystemAccountIds = {
   constructionRevenue: string;
   changeOrderRevenue: string;
   accountsPayable: string;
+  operatingBank: string;
+  creditCard: string;
 };
 
-/** Resolves this org's system accounts by their well-known Chart of Accounts code. Throws (not silently falls back) if a required system account is missing — posting must never silently pick the wrong account. */
+/**
+ * Resolves this org's system accounts by their well-known Chart of Accounts
+ * code. Throws (not silently falls back) if a required system account is
+ * missing OR inactive — posting must never silently pick the wrong account.
+ *
+ * Phase 13.8A, Part 11 — 1020/1100/2000/3100/4000/4100 are `is_system=true`
+ * and DB-protected from ever being deactivated (20260820_accounting_
+ * foundation.sql's prevent_system_account_structural_change trigger), so
+ * this check is a no-op for those in practice today. 1010 Operating Bank
+ * and 2100 Credit Cards are NOT system accounts, though, and could be
+ * deactivated by a future Chart of Accounts UI — this guard is what stops
+ * that from silently producing journal entries against an account staff
+ * have marked inactive.
+ */
 export async function resolveSystemAccounts(admin: SupabaseClient, orgId: string): Promise<SystemAccountIds> {
   const { data, error } = await admin
     .from("accounting_accounts")
-    .select("id, code")
+    .select("id, code, is_active")
     .eq("org_id", orgId)
-    .in("code", [AR_CODE, UNDEPOSITED_FUNDS_CODE, CONSTRUCTION_REVENUE_CODE, CHANGE_ORDER_REVENUE_CODE, ACCOUNTS_PAYABLE_CODE]);
+    .in("code", [AR_CODE, UNDEPOSITED_FUNDS_CODE, CONSTRUCTION_REVENUE_CODE, CHANGE_ORDER_REVENUE_CODE, ACCOUNTS_PAYABLE_CODE, OPERATING_BANK_CODE, CREDIT_CARD_CODE]);
   if (error) throw new Error(`Could not load system accounts: ${error.message}`);
 
-  const byCode = new Map((data ?? []).map((r: any) => [r.code, r.id as string]));
+  const byCode = new Map((data ?? []).map((r: any) => [r.code, { id: r.id as string, active: r.is_active as boolean }]));
   const require = (code: string, label: string): string => {
-    const id = byCode.get(code);
-    if (!id) throw new Error(`Org ${orgId} is missing required system account ${code} (${label}) — run seed_default_chart_of_accounts() first.`);
-    return id;
+    const row = byCode.get(code);
+    if (!row) throw new Error(`Org ${orgId} is missing required system account ${code} (${label}) — run seed_default_chart_of_accounts() first.`);
+    if (!row.active) throw new Error(`Org ${orgId}'s ${label} account (${code}) is inactive — reactivate it before posting.`);
+    return row.id;
   };
 
   return {
@@ -55,7 +73,36 @@ export async function resolveSystemAccounts(admin: SupabaseClient, orgId: string
     constructionRevenue: require(CONSTRUCTION_REVENUE_CODE, "Construction Revenue"),
     changeOrderRevenue: require(CHANGE_ORDER_REVENUE_CODE, "Change Order Revenue"),
     accountsPayable: require(ACCOUNTS_PAYABLE_CODE, "Accounts Payable"),
+    operatingBank: require(OPERATING_BANK_CODE, "Operating Bank"),
+    creditCard: require(CREDIT_CARD_CODE, "Credit Cards"),
   };
+}
+
+/**
+ * Phase 13.8, Part 27 — payment-method -> asset/liability account mapping.
+ * No accounting_settings default-account columns exist yet (audited: not
+ * needed for this phase, see the Phase 13.8 report) — resolution is by
+ * well-known system-account code instead. `card` maps to the Credit Cards
+ * liability (a company purchase made ON a card is a liability incurred, not
+ * cash leaving a bank account yet); every other allowed method (cash/check/
+ * ach/wire/bank_transfer/other) maps to Operating Bank. This is a Phase
+ * 13.8 DEFAULT mapping, not a configurable multi-bank-account system — a
+ * future phase may let an org choose its own default bank/card accounts,
+ * but nothing here reads such a setting today.
+ *
+ * Phase 13.8B, Part 5 — a missing/blank method is never silently treated as
+ * "not card, so Operating Bank." Every caller of this function is posting a
+ * real journal entry that credits one specific account; a null method would
+ * make that choice arbitrary rather than a real business fact. Both current
+ * callers (expense-create.ts, vendor-bill-record-payment.ts) already reject
+ * a missing method before reaching this point (DB-enforced for expenses via
+ * expenses_posted_requires_payment_method, and vendor_payments.payment_method
+ * is `not null` already) — this throw exists so that guarantee holds even if
+ * a future caller forgets to check first.
+ */
+export function resolvePaymentAccount(accounts: SystemAccountIds, method: string | null | undefined): string {
+  if (!method) throw new Error("resolvePaymentAccount: payment method is required — refusing to guess a default asset/liability account.");
+  return method === "card" ? accounts.creditCard : accounts.operatingBank;
 }
 
 export type PostJournalEntryInput = {
@@ -165,6 +212,114 @@ export async function postInvoicePaymentSucceeded(admin: SupabaseClient, orgId: 
     lines: [
       { accountId: accounts.undepositedFunds, debit: payment.amount, projectId: payment.projectId, contactId: payment.contactId, description: `Payment — Invoice ${payment.invoiceNumber}` },
       { accountId: accounts.accountsReceivable, credit: payment.amount, projectId: payment.projectId, contactId: payment.contactId, description: `A/R paid down — Invoice ${payment.invoiceNumber}` },
+    ],
+  });
+}
+
+// ── Phase 13.8 — Expenses / Vendor Bills / Vendor Payments ─────────────────
+
+export type ExpenseForPosting = {
+  id: string; amount: number; expenseDate: string; description: string;
+  accountId: string; paymentMethod: string | null;
+  projectId: string | null; contactId: string | null;
+};
+
+/**
+ * Part 6/9 — direct/cash-paid expense: Dr the selected expense/COGS account,
+ * Cr the payment-method-resolved asset/liability account (Operating Bank or
+ * Credit Cards — see resolvePaymentAccount). This is a single already-
+ * incurred, already-paid transaction (unlike a vendor bill, there is no
+ * separate "owed" state) — the debit and credit both post at the same
+ * event, same as postInvoiceIssued posts both sides of an invoice at once.
+ */
+export async function postExpenseRecorded(admin: SupabaseClient, orgId: string, expense: ExpenseForPosting, createdBy: string | null): Promise<PostJournalEntryResult> {
+  const accounts = await resolveSystemAccounts(admin, orgId);
+  const paymentAccountId = resolvePaymentAccount(accounts, expense.paymentMethod);
+  return postJournalEntry(admin, {
+    orgId,
+    entryDate: expense.expenseDate,
+    description: `Expense — ${expense.description}`,
+    sourceType: "expense",
+    sourceId: expense.id,
+    postingKey: "recorded",
+    projectId: expense.projectId,
+    contactId: expense.contactId,
+    createdBy,
+    lines: [
+      { accountId: expense.accountId, debit: expense.amount, projectId: expense.projectId, contactId: expense.contactId, description: expense.description },
+      { accountId: paymentAccountId, credit: expense.amount, projectId: expense.projectId, contactId: expense.contactId, description: `Payment — ${expense.description}` },
+    ],
+  });
+}
+
+export type VendorBillLineForPosting = { accountId: string; amount: number; description: string; projectId: string | null };
+export type VendorBillForPosting = {
+  id: string; billNumber: string | null; totalAmount: number; billDate: string;
+  vendorId: string; projectId: string | null; lines: VendorBillLineForPosting[];
+};
+
+/**
+ * Part 9 — accrual recognition: Dr each line's expense/COGS account for its
+ * own amount (preserving per-line project_id so project-cost attribution —
+ * Part 21 — survives into the ledger), Cr Accounts Payable for the bill
+ * total. Only ever called once a DRAFT bill is explicitly posted (never for
+ * a draft) — the caller (vendor-bill-post.ts) enforces that transition.
+ * post_journal_entry requires >=2 lines and a balanced entry; a single-line
+ * bill therefore naturally produces the minimum valid 2-line entry (one
+ * expense line + one A/P line).
+ */
+export async function postVendorBillOpened(admin: SupabaseClient, orgId: string, bill: VendorBillForPosting, createdBy: string | null): Promise<PostJournalEntryResult> {
+  const accounts = await resolveSystemAccounts(admin, orgId);
+  const label = bill.billNumber ? `Bill ${bill.billNumber}` : "Vendor bill";
+  return postJournalEntry(admin, {
+    orgId,
+    entryDate: bill.billDate,
+    description: `${label} posted`,
+    sourceType: "vendor_bill",
+    sourceId: bill.id,
+    postingKey: "opened",
+    projectId: bill.projectId,
+    contactId: null,
+    createdBy,
+    lines: [
+      ...bill.lines.map((l) => ({
+        accountId: l.accountId, debit: l.amount,
+        projectId: l.projectId ?? bill.projectId,
+        description: `${label} — ${l.description}`,
+      })),
+      { accountId: accounts.accountsPayable, credit: bill.totalAmount, projectId: bill.projectId, description: `A/P — ${label}` },
+    ],
+  });
+}
+
+export type VendorPaymentForPosting = {
+  id: string; amount: number; paidAt: string; paymentMethod: string;
+  billNumber: string | null; projectId: string | null;
+};
+
+/**
+ * Part 10 — bill payment: Dr Accounts Payable, Cr the payment-method-
+ * resolved asset/liability account. Never touches an expense/COGS account —
+ * the expense was already recognized when the bill posted (Part 10: "Do NOT
+ * credit expense again").
+ */
+export async function postVendorPaymentSucceeded(admin: SupabaseClient, orgId: string, payment: VendorPaymentForPosting, createdBy: string | null): Promise<PostJournalEntryResult> {
+  const accounts = await resolveSystemAccounts(admin, orgId);
+  const paymentAccountId = resolvePaymentAccount(accounts, payment.paymentMethod);
+  const label = payment.billNumber ? `Bill ${payment.billNumber}` : "vendor bill";
+  return postJournalEntry(admin, {
+    orgId,
+    entryDate: payment.paidAt,
+    description: `Payment sent — ${label}`,
+    sourceType: "vendor_payment",
+    sourceId: payment.id,
+    postingKey: "succeeded",
+    projectId: payment.projectId,
+    contactId: null,
+    createdBy,
+    lines: [
+      { accountId: accounts.accountsPayable, debit: payment.amount, projectId: payment.projectId, description: `A/P paid down — ${label}` },
+      { accountId: paymentAccountId, credit: payment.amount, projectId: payment.projectId, description: `Payment — ${label}` },
     ],
   });
 }
