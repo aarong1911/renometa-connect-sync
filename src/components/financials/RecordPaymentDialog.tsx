@@ -48,6 +48,11 @@ export function RecordPaymentDialog({ open, onClose, invoiceId, invoiceNumber, b
   const [reference, setReference] = useState("");
   const [notes, setNotes] = useState("");
   const [recording, setRecording] = useState(false);
+  // Phase 13.10B, Part 15/29 — one key per submit attempt, reused verbatim
+  // on a failed-submit retry (not regenerated until the dialog reopens for
+  // a genuinely new logical payment) so a double-click or network retry
+  // collapses into the same operational payment instead of creating two.
+  const [idempotencyKey, setIdempotencyKey] = useState(() => crypto.randomUUID());
 
   useEffect(() => {
     if (!open) return;
@@ -56,12 +61,20 @@ export function RecordPaymentDialog({ open, onClose, invoiceId, invoiceNumber, b
     setDate(todayDateOnlyValue());
     setReference("");
     setNotes("");
+    setIdempotencyKey(crypto.randomUUID());
   }, [open, balance]);
 
   const handleSubmit = async () => {
     if (recording) return;
     const amt = parseFloat(amount);
     if (!Number.isFinite(amt) || amt <= 0) { toast.error("Enter a valid payment amount"); return; }
+    // Phase 13.10C, Part 15/42 — `date` is stable form state (set once when
+    // the dialog opens/resets, only changed by deliberate user edit — never
+    // regenerated from wall-clock time), so re-reading it here on every
+    // submit/retry is already deterministic: a failed-submit retry with no
+    // user edit in between sends the exact same paidAt both times, closing
+    // the loop with the DB's now-mandatory, non-defaulted p_paid_at.
+    if (!date) { toast.error("A payment date is required"); return; }
     setRecording(true);
     try {
       const { data: { session } } = await supabase.auth.getSession();
@@ -71,7 +84,7 @@ export function RecordPaymentDialog({ open, onClose, invoiceId, invoiceNumber, b
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
         body: JSON.stringify({
           invoiceId, amount: amt, method, paidAt: date,
-          reference: reference || undefined, notes: notes || undefined,
+          reference: reference || undefined, notes: notes || undefined, idempotencyKey,
         }),
       });
       const body = await res.json();

@@ -13,11 +13,16 @@
 //   Invoiced      = sum(total_amount) over Issued invoices.
 //   Collected     = sum(amount_paid) over Issued invoices (drafts never
 //                   carry a payment).
-//   Outstanding   = sum(total_amount - amount_paid) over Issued invoices
-//                   with a balance > 0. Never includes drafts.
-//   Overdue       = the subset of Outstanding whose due_date has passed
-//                   and which isn't already "paid". A draft is never
-//                   overdue, regardless of its due_date.
+//   Outstanding   = sum(total_amount - amount_paid - creditsTotal) over
+//                   Issued invoices with a balance > 0 (Phase 13.10A — a
+//                   posted customer credit memo reduces this exactly like a
+//                   payment does; ignoring credits would OVERSTATE A/R).
+//                   Never includes drafts.
+//   Overdue       = the subset of Outstanding whose due_date has passed,
+//                   isn't already "paid", and still has a positive
+//                   effective balance (a fully-credited invoice is never
+//                   overdue even if its raw status hasn't caught up). A
+//                   draft is never overdue, regardless of its due_date.
 //   Open/Current  = Outstanding minus Overdue (mutually exclusive with it).
 //
 // Contracted Revenue reuses the exact Project → Financials contract
@@ -31,6 +36,7 @@
 import { supabase } from "@/lib/supabase";
 import { fetchApprovedChangeOrderTotalsByProject } from "@/lib/project-change-orders";
 import { isIssuedInvoice, isInvoiceOverdue as isInvoiceOverdueStatus, getInvoiceBalance } from "@/lib/invoice-status";
+import { fetchPostedCustomerCreditTotals } from "@/lib/customer-credits";
 import { dateOnlyToLocalDate } from "@/lib/format";
 
 // issue_date and a ledger payment's paid_at are DATE-ONLY business values
@@ -63,6 +69,8 @@ export type FinancialInvoice = {
   dueDate: string | null;
   totalAmount: number;
   amountPaid: number;
+  /** Sum of posted customer credit memos against this invoice — Phase 13.10A. Never folded into amountPaid (credits are not payments). */
+  creditsTotal: number;
   createdAt: string;
   updatedAt: string;
   clientId: string | null;
@@ -73,11 +81,14 @@ export type FinancialInvoice = {
 };
 
 export async function fetchFinancialInvoices(orgId: string): Promise<FinancialInvoice[]> {
-  const { data, error } = await supabase
-    .from("invoices")
-    .select("id, invoice_number, status, issue_date, due_date, total_amount, amount_paid, created_at, updated_at, client_id, project_id, contacts!client_id(full_name,avatar_key), projects!project_id(name)")
-    .eq("org_id", orgId)
-    .order("created_at", { ascending: false });
+  const [{ data, error }, creditTotals] = await Promise.all([
+    supabase
+      .from("invoices")
+      .select("id, invoice_number, status, issue_date, due_date, total_amount, amount_paid, created_at, updated_at, client_id, project_id, contacts!client_id(full_name,avatar_key), projects!project_id(name)")
+      .eq("org_id", orgId)
+      .order("created_at", { ascending: false }),
+    fetchPostedCustomerCreditTotals(orgId),
+  ]);
   if (error) { console.error("[financials]", error); return []; }
   return (data ?? []).map((r: any) => ({
     id: r.id,
@@ -87,6 +98,7 @@ export async function fetchFinancialInvoices(orgId: string): Promise<FinancialIn
     dueDate: r.due_date,
     totalAmount: Number(r.total_amount ?? 0),
     amountPaid: Number(r.amount_paid ?? 0),
+    creditsTotal: creditTotals.get(r.id) ?? 0,
     createdAt: r.created_at,
     updatedAt: r.updated_at ?? r.created_at,
     clientId: r.client_id,
@@ -106,13 +118,18 @@ export function isIssued(inv: Pick<FinancialInvoice, "status">): boolean {
   return isIssuedInvoice(inv.status);
 }
 
-/** Never true for a draft/paid, regardless of due_date. */
-export function isInvoiceOverdue(inv: Pick<FinancialInvoice, "status" | "dueDate">, now: Date = new Date()): boolean {
-  return isInvoiceOverdueStatus(inv.status, inv.dueDate, now);
+/**
+ * Never true for a draft/paid, regardless of due_date — and never true once
+ * the effective balance (total - paid - posted credits) hits zero, even if
+ * the raw stored status hasn't caught up (Phase 13.10A, Part 19).
+ */
+export function isInvoiceOverdue(inv: Pick<FinancialInvoice, "status" | "dueDate" | "totalAmount" | "amountPaid" | "creditsTotal">, now: Date = new Date()): boolean {
+  return isInvoiceOverdueStatus(inv.status, inv.dueDate, now, invoiceBalance(inv));
 }
 
-export function invoiceBalance(inv: Pick<FinancialInvoice, "totalAmount" | "amountPaid">): number {
-  return getInvoiceBalance(inv.totalAmount, inv.amountPaid);
+/** Canonical effective balance: total - paid - posted credits, floored at 0. */
+export function invoiceBalance(inv: Pick<FinancialInvoice, "totalAmount" | "amountPaid" | "creditsTotal">): number {
+  return getInvoiceBalance(inv.totalAmount, inv.amountPaid, inv.creditsTotal ?? 0);
 }
 
 // ── Payment ledger (optional — falls back gracefully) ───────────────────
@@ -131,13 +148,20 @@ export type InvoicePaymentRecord = {
   amount: number;
   status: "pending" | "succeeded" | "failed" | "refunded" | "voided";
   paidAt: string;
+  /** 'reversal' for an append-only reversal row (status stays 'succeeded' — see accounting-integrity skill). Never treat a reversal row as an ordinary positive receipt; see isReversalPayment(). */
+  source: string;
 };
+
+/** True for an append-only reversal row (source='reversal') — always nets NEGATIVE against any Collected/Received total, regardless of its own status='succeeded'. */
+export function isReversalPayment(p: Pick<InvoicePaymentRecord, "source">): boolean {
+  return p.source === "reversal";
+}
 
 /** Returns null (not []) when the ledger table doesn't exist yet, so callers can distinguish "no payments" from "no ledger." */
 export async function fetchInvoicePayments(orgId: string): Promise<InvoicePaymentRecord[] | null> {
   const { data, error } = await supabase
     .from("invoice_payments")
-    .select("id, invoice_id, amount, status, paid_at")
+    .select("id, invoice_id, amount, status, paid_at, source")
     .eq("org_id", orgId)
     .order("paid_at", { ascending: false });
   if (error) {
@@ -145,7 +169,7 @@ export async function fetchInvoicePayments(orgId: string): Promise<InvoicePaymen
     return null;
   }
   return (data ?? []).map((r: any) => ({
-    id: r.id, invoiceId: r.invoice_id, amount: Number(r.amount ?? 0), status: r.status, paidAt: r.paid_at,
+    id: r.id, invoiceId: r.invoice_id, amount: Number(r.amount ?? 0), status: r.status, paidAt: r.paid_at, source: r.source ?? "manual",
   }));
 }
 
@@ -158,8 +182,10 @@ export type InvoiceMetrics = {
   /** Non-overdue outstanding balance — mutually exclusive with overdueAmount. */
   openAmount: number;
   openCount: number;
-  /** Cash actually collected (amount_paid) across all issued invoices, all-time. */
+  /** Cash actually collected (amount_paid) across all issued invoices, all-time. Never includes credits — credits are not payments. */
   paidAmount: number;
+  /** Sum of posted customer credit memos across all issued invoices, all-time — informational only, already netted out of outstandingAmount/overdueAmount/openAmount. */
+  creditsIssuedAmount: number;
   collectedThisMonth: number;
   collectedThisMonthCount: number;
   invoicedYTD: number;
@@ -180,6 +206,7 @@ export function computeInvoiceMetrics(invoices: FinancialInvoice[], now: Date = 
   const overdueAmount = round2(overdue.reduce((s, i) => s + invoiceBalance(i), 0));
   const openAmount = round2(open.reduce((s, i) => s + invoiceBalance(i), 0));
   const paidAmount = round2(issued.reduce((s, i) => s + i.amountPaid, 0));
+  const creditsIssuedAmount = round2(issued.reduce((s, i) => s + (i.creditsTotal ?? 0), 0));
   const totalIssuedInvoiced = round2(issued.reduce((s, i) => s + i.totalAmount, 0));
 
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -188,9 +215,14 @@ export function computeInvoiceMetrics(invoices: FinancialInvoice[], now: Date = 
   if (payments) {
     // Payment ledger deployed — real paid_at dates, no approximation.
     // paid_at is a DATE-ONLY business date here (see businessDateOrTimestamp).
-    const succeeded = payments.filter((p) => p.status === "succeeded" && (dateOnlyToLocalDate(p.paidAt) ?? new Date(p.paidAt)) >= monthStart);
+    // A reversal row also has status='succeeded' (append-only model — see
+    // accounting-integrity skill), so it must be excluded from `succeeded`
+    // and netted separately, or a reversed payment would double-count as a
+    // positive receipt instead of netting to zero.
+    const succeeded = payments.filter((p) => p.status === "succeeded" && !isReversalPayment(p) && (dateOnlyToLocalDate(p.paidAt) ?? new Date(p.paidAt)) >= monthStart);
+    const reversals = payments.filter((p) => p.status === "succeeded" && isReversalPayment(p) && (dateOnlyToLocalDate(p.paidAt) ?? new Date(p.paidAt)) >= monthStart);
     const refunded = payments.filter((p) => p.status === "refunded" && (dateOnlyToLocalDate(p.paidAt) ?? new Date(p.paidAt)) >= monthStart);
-    collectedThisMonth = round2(succeeded.reduce((s, p) => s + p.amount, 0) - refunded.reduce((s, p) => s + p.amount, 0));
+    collectedThisMonth = round2(succeeded.reduce((s, p) => s + p.amount, 0) - reversals.reduce((s, p) => s + p.amount, 0) - refunded.reduce((s, p) => s + p.amount, 0));
     collectedThisMonthCount = succeeded.length;
   } else {
     // No ledger yet — amount_paid is a running balance, so "collected this
@@ -217,6 +249,7 @@ export function computeInvoiceMetrics(invoices: FinancialInvoice[], now: Date = 
     openAmount,
     openCount: open.length,
     paidAmount,
+    creditsIssuedAmount,
     collectedThisMonth,
     collectedThisMonthCount,
     invoicedYTD,
@@ -259,7 +292,10 @@ export function computeInvoicedVsCollectedTrend(invoices: FinancialInvoice[], ra
       if (p.status !== "succeeded" && p.status !== "refunded") continue;
       const paidAt = dateOnlyToLocalDate(p.paidAt) ?? new Date(p.paidAt);
       const bucket = buckets.find((b) => paidAt >= b.start && paidAt < b.end);
-      if (bucket) bucket.collected += p.status === "refunded" ? -p.amount : p.amount;
+      // A reversal row is status='succeeded' too (append-only model) — it
+      // must net negative here, same as a 'refunded' row, or a reversed
+      // payment double-counts as a positive "Collected" data point.
+      if (bucket) bucket.collected += (p.status === "refunded" || isReversalPayment(p)) ? -p.amount : p.amount;
     }
   } else {
     for (const inv of issued) {

@@ -9,14 +9,16 @@ const STATUS_ICON: Record<InvoiceStatus, ComponentType<{ className?: string }>> 
   paid: CheckCircle2, overdue: AlertCircle, void: Ban, cancelled: Ban,
 };
 
-export function InvoiceStatusBadge({ status, dueDate, className, showIcon = true }: {
+export function InvoiceStatusBadge({ status, dueDate, effectiveBalance, className, showIcon = true }: {
   status: string | null | undefined;
   dueDate?: string | null;
+  /** Phase 13.10A, Part 19 — total - paid - posted credits. When provided, a $0 balance is never shown as Overdue even if the raw due_date has passed. */
+  effectiveBalance?: number;
   className?: string;
   showIcon?: boolean;
 }) {
-  const display = getInvoiceDisplayStatus(status, dueDate ?? null);
-  const style = getInvoiceStatusStyle(status, dueDate ?? null);
+  const display = getInvoiceDisplayStatus(status, dueDate ?? null, new Date(), effectiveBalance);
+  const style = getInvoiceStatusStyle(status, dueDate ?? null, new Date(), effectiveBalance);
   const Icon = STATUS_ICON[display];
   return (
     <span className={cn("inline-flex w-fit items-center gap-1 rounded-md px-2 py-0.5 text-[10.5px] font-semibold ring-1", style.badge, className)}>

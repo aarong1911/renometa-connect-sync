@@ -12,7 +12,7 @@ import { cn } from "@/lib/utils";
 import { formatMoney, formatCompactMoney } from "@/lib/format";
 import {
   fetchFinancialsOrgId, fetchFinancialInvoices, computeInvoiceMetrics, computeInvoicedVsCollectedTrend,
-  fetchContractedRevenue, fetchInvoicePayments, isIssued,
+  fetchContractedRevenue, fetchInvoicePayments, isIssued, invoiceBalance,
   type FinancialInvoice, type InvoicePaymentRecord, type TrendRange,
 } from "@/lib/financials";
 import { dateOnlyToLocalDate } from "@/lib/format";
@@ -93,8 +93,8 @@ const AGING_BUCKETS = [
 function computeAging(invoices: FinancialInvoice[], now: Date) {
   const buckets: Record<string, number> = { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90_plus: 0 };
   for (const inv of invoices.filter(isIssued)) {
-    const balance = Math.max(0, inv.totalAmount - inv.amountPaid);
-    if (balance <= 0) continue; // fully paid invoices never appear in aging
+    const balance = invoiceBalance(inv);
+    if (balance <= 0) continue; // fully paid/credited invoices never appear in aging
     const due = dateOnlyToLocalDate(inv.dueDate);
     const daysOverdue = due ? Math.floor((now.getTime() - due.getTime()) / 86_400_000) : -1;
     if (daysOverdue <= 0) buckets.current += balance;

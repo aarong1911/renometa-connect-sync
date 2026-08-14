@@ -12,6 +12,7 @@
 // financials.reports.tsx.
 import type { Payment } from "@/lib/mock-data";
 import { fetchPaymentTransactions } from "@/lib/payment-transactions";
+import { fetchPostedCustomerCreditTotals } from "@/lib/customer-credits";
 import { supabase } from "@/lib/supabase";
 
 async function getOrgId(): Promise<string | null> {
@@ -21,6 +22,25 @@ async function getOrgId(): Promise<string | null> {
   if (p?.organization_id) return p.organization_id;
   const { data: m } = await supabase.from("org_memberships").select("org_id").eq("member_id", user.id).maybeSingle();
   return m?.org_id ?? null;
+}
+
+/**
+ * Signed contribution of a received-payments row to any Received/Collected
+ * total or method-total. The append-only reversal model (see
+ * accounting-integrity skill) inserts a reversal as its OWN row —
+ * status='succeeded', source='reversal', reverses_payment_id -> the
+ * original — never mutates the original. Summing raw `.amount` therefore
+ * double-counts a reversed payment (original +$50, reversal ALSO +$50 —
+ * inflating totals instead of netting to $0). A reversal row must always
+ * contribute -amount here so the pair nets correctly; every other row
+ * (manual, stripe_webhook, legacy_import) contributes +amount unchanged.
+ * Never sum `p.amount` directly for an aggregate/total — always go through
+ * this helper. Individual row display (the Payments table, detail drawer)
+ * intentionally keeps showing each row's own real amount — this only
+ * governs aggregation.
+ */
+export function paymentNetAmount(p: Pick<Payment, "amount" | "source">): number {
+  return p.source === "reversal" ? -p.amount : p.amount;
 }
 
 export async function fetchReceivedPayments(): Promise<Payment[]> {
@@ -53,25 +73,39 @@ export type OutstandingInvoice = {
   invoice_number: string;
   total_amount: number;
   amount_paid: number;
+  /** Posted customer credit memos against this invoice — Phase 13.10A. */
+  credits_total: number;
   due_date: string | null;
   status: string;
 };
 
-/** Invoices that are sent/viewed/overdue/partial with a balance still owed. */
+/**
+ * Invoices that are sent/viewed/overdue/partial with a balance still owed.
+ *
+ * Phase 13.10A, Part 15/16 — a fully-credited invoice can still carry a
+ * non-"paid" status (the canonical status column is deliberately left
+ * alone), so this still selects it; callers must derive "still actually
+ * outstanding" from the credit-aware effective balance (total_amount -
+ * amount_paid - credits_total), not from status alone.
+ */
 export async function fetchOutstandingInvoices(): Promise<OutstandingInvoice[]> {
   const orgId = await getOrgId();
   if (!orgId) return [];
-  const { data, error } = await supabase
-    .from("invoices")
-    .select("id, invoice_number, total_amount, amount_paid, due_date, status")
-    .eq("org_id", orgId)
-    .not("status", "in", "(draft,paid)");
+  const [{ data, error }, creditTotals] = await Promise.all([
+    supabase
+      .from("invoices")
+      .select("id, invoice_number, total_amount, amount_paid, due_date, status")
+      .eq("org_id", orgId)
+      .not("status", "in", "(draft,paid)"),
+    fetchPostedCustomerCreditTotals(orgId),
+  ]);
   if (error) { console.error("[received-payments]", error); return []; }
   return (data ?? []).map((r: any) => ({
     id: r.id,
     invoice_number: r.invoice_number ?? "—",
     total_amount: Number(r.total_amount ?? 0),
     amount_paid: Number(r.amount_paid ?? 0),
+    credits_total: creditTotals.get(r.id) ?? 0,
     due_date: r.due_date,
     status: r.status ?? "sent",
   }));

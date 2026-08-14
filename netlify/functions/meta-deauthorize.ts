@@ -1,6 +1,7 @@
-// netlify/functions/meta-deauthorize.js
+// netlify/functions/meta-deauthorize.ts
 
-exports.handler = async (event) => {
+import type { HandlerEvent } from "@netlify/functions";
+export const handler = async (event: HandlerEvent) => {
   try {
     if (event.httpMethod !== "POST") {
       return {

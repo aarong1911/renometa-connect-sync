@@ -13,7 +13,7 @@ import { formatDate, formatMoney, daysFromNow } from "@/lib/format";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { PaymentDetailDrawer } from "@/components/financials/payment-detail-drawer";
 import { toast } from "sonner";
-import { fetchReceivedPayments } from "@/lib/received-payments";
+import { fetchReceivedPayments, paymentNetAmount } from "@/lib/received-payments";
 import { formatPaymentMethod, PAYMENT_METHOD_FILTERS } from "@/lib/payment-method";
 
 export const Route = createFileRoute("/financials/payments")({
@@ -62,7 +62,9 @@ function PaymentsPage() {
     const received = allPayments.filter((p) => (p.status ?? "Received") === "Received");
     const sched = allPayments.filter((p) => p.status === "Scheduled");
     const pastDue = sched.filter(isPastDue);
-    const total = received.reduce((s, p) => s + p.amount, 0);
+    // Reversal rows (source==='reversal') net negative here so a reversed
+    // payment doesn't inflate the Received total — see paymentNetAmount().
+    const total = received.reduce((s, p) => s + paymentNetAmount(p), 0);
     const upcoming = sched.reduce((s, p) => s + p.amount, 0);
     const pastDueAmount = pastDue.reduce((s, p) => s + p.amount, 0);
     // Part 12 — grouped strictly by each row's own stored payment_method
@@ -70,7 +72,7 @@ function PaymentsPage() {
     const byMethod: Record<string, number> = {};
     received.forEach((p) => {
       const key = (p.method ?? "other").toLowerCase();
-      byMethod[key] = (byMethod[key] ?? 0) + p.amount;
+      byMethod[key] = (byMethod[key] ?? 0) + paymentNetAmount(p);
     });
     const top = Object.entries(byMethod).sort((a, b) => b[1] - a[1])[0];
     return {
@@ -182,6 +184,12 @@ function PaymentsPage() {
           <tbody>
             {rows.map((p) => {
               const isScheduled = p.status === "Scheduled";
+              // A reversal row (source==='reversal', append-only model — see
+              // paymentNetAmount()) is a real, distinct invoice_payments row
+              // and must stay visible in history, but it is not itself a
+              // positive receipt — it must never render as a normal
+              // "Received +$amount" row.
+              const isReversal = p.source === "reversal";
               const overdue = isPastDue(p);
               const lastReminder = overdue ? lastReminderByPayment.get(p.id) : undefined;
               const dateLabel = isScheduled
@@ -205,9 +213,13 @@ function PaymentsPage() {
                   </td>
                   <td className="px-4">
                     <div className="flex items-center gap-1.5">
-                      <StatusBadge tone={PAYMENT_STATUS_TONE[overdue ? "Past due" : (p.status ?? "Received")]}>
-                        {overdue ? "Past due" : (p.status ?? "Received")}
-                      </StatusBadge>
+                      {isReversal ? (
+                        <StatusBadge tone="warning">Reversal</StatusBadge>
+                      ) : (
+                        <StatusBadge tone={PAYMENT_STATUS_TONE[overdue ? "Past due" : (p.status ?? "Received")]}>
+                          {overdue ? "Past due" : (p.status ?? "Received")}
+                        </StatusBadge>
+                      )}
                       {lastReminder && (
                         <span
                           className="inline-flex items-center gap-1 rounded bg-secondary px-1.5 py-0.5 text-[10px] text-muted-foreground"
@@ -225,10 +237,10 @@ function PaymentsPage() {
                   <td
                     className={
                       "px-4 text-right font-semibold tabular-nums " +
-                      (isScheduled ? "text-primary" : "text-success")
+                      (isReversal ? "text-destructive" : isScheduled ? "text-primary" : "text-success")
                     }
                   >
-                    {isScheduled ? "" : "+"}
+                    {isScheduled ? "" : isReversal ? "-" : "+"}
                     {formatMoney(p.amount)}
                   </td>
                   <td className="px-4 text-xs text-muted-foreground">{dateLabel}</td>

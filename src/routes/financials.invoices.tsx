@@ -94,7 +94,7 @@ function FinancialsInvoicesPage() {
                       {inv.projectName !== "—" && <p className="truncate text-[11px] leading-tight text-muted-foreground">{inv.projectName}</p>}
                     </div>
                   </div>
-                  <InvoiceStatusBadge status={inv.status} dueDate={inv.dueDate} />
+                  <InvoiceStatusBadge status={inv.status} dueDate={inv.dueDate} effectiveBalance={balance} />
                   <div className="text-right text-[13.5px] font-semibold tabular-nums">{formatMoney(inv.totalAmount)}</div>
                   <div className={cn("text-right text-[12.5px] tabular-nums", balance > 0 ? "font-medium text-foreground" : "text-muted-foreground")}>
                     {inv.status === "draft" ? "—" : formatMoney(balance)}

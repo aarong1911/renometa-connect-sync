@@ -96,6 +96,20 @@ export const handler: Handler = async (event) => {
         : { data: [] },
     ]);
 
+  // Phase 13.10A, Part 15 — posted customer credit memos must reduce what
+  // the portal shows as "due" the same way they do everywhere else (public-
+  // invoice.ts, InvoiceDetailsSheet.tsx); otherwise the client dashboard
+  // overstates its own outstanding balance.
+  const invoiceIds = (invoices ?? []).map((i: any) => i.id);
+  const { data: creditRows } = invoiceIds.length
+    ? await supabaseAdmin.from("customer_credit_memos").select("invoice_id, total_amount").in("invoice_id", invoiceIds).eq("status", "posted")
+    : { data: [] as any[] };
+  const creditsByInvoice = new Map<string, number>();
+  for (const r of creditRows ?? []) {
+    creditsByInvoice.set(r.invoice_id, Math.round(((creditsByInvoice.get(r.invoice_id) ?? 0) + Number(r.total_amount ?? 0)) * 100) / 100);
+  }
+  const invoicesWithCredits = (invoices ?? []).map((i: any) => ({ ...i, credits_total: creditsByInvoice.get(i.id) ?? 0 }));
+
   return {
     statusCode: 200,
     headers,
@@ -112,7 +126,7 @@ export const handler: Handler = async (event) => {
       },
       projects: projects ?? [],
       estimates: estimates ?? [],
-      invoices: invoices ?? [],
+      invoices: invoicesWithCredits,
       notes: notes ?? [],
       files: files ?? [],
     }),

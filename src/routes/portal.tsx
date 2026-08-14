@@ -28,6 +28,8 @@ type Estimate = {
 };
 type Invoice = {
   id: string; invoice_number: string; total_amount: number; amount_paid: number;
+  /** Posted customer credit memos against this invoice — Phase 13.10A, Part 15. Defaults to 0 if the backend didn't send it. */
+  credits_total?: number;
   status: string; due_date: string | null; issue_date: string;
 };
 type Note = {
@@ -45,6 +47,11 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; bg: string; 
   on_hold:     { label: "On Hold",     color: "#D97706", bg: "#FFFBEB", icon: <Clock className="h-3.5 w-3.5" /> },
   completed:   { label: "Completed",   color: "#059669", bg: "#ECFDF5", icon: <CheckCircle2 className="h-3.5 w-3.5" /> },
 };
+
+/** Phase 13.10A, Part 15 — canonical effective balance for this portal, mirroring getInvoiceBalance(). */
+function invoiceBalance(inv: Pick<Invoice, "total_amount" | "amount_paid" | "credits_total">) {
+  return Math.max(0, inv.total_amount - inv.amount_paid - (inv.credits_total ?? 0));
+}
 
 function fmt(date: string | null) {
   if (!date) return "—";
@@ -305,13 +312,13 @@ export function ClientPortal() {
               {/* Overview */}
               {activeTab === "overview" && (
                 <div className="p-5 space-y-4">
-                  {data.invoices.filter(i => i.status !== "paid").length > 0 && (
+                  {data.invoices.filter(i => i.status !== "paid" && invoiceBalance(i) > 0).length > 0 && (
                     <div className="rounded-lg border border-amber-100 bg-amber-50 p-4">
                       <p className="text-sm font-medium text-amber-700 mb-1">Outstanding invoices</p>
-                      {data.invoices.filter(i => i.status !== "paid").map(inv => (
+                      {data.invoices.filter(i => i.status !== "paid" && invoiceBalance(i) > 0).map(inv => (
                         <div key={inv.id} className="flex items-center justify-between">
                           <span className="text-sm text-amber-600">Invoice #{inv.invoice_number}</span>
-                          <span className="text-sm font-semibold text-amber-800">{fmtMoney(inv.total_amount - inv.amount_paid)} due {fmt(inv.due_date)}</span>
+                          <span className="text-sm font-semibold text-amber-800">{fmtMoney(invoiceBalance(inv))} due {fmt(inv.due_date)}</span>
                         </div>
                       ))}
                     </div>
@@ -400,7 +407,7 @@ export function ClientPortal() {
                 <div className="divide-y divide-gray-50">
                   {data.invoices.length === 0 && <p className="text-sm text-gray-400 text-center py-10">No invoices yet.</p>}
                   {data.invoices.map(inv => {
-                    const balance = inv.total_amount - inv.amount_paid;
+                    const balance = invoiceBalance(inv);
                     return (
                       <div key={inv.id} className="p-5 flex items-start justify-between gap-3">
                         <div>
@@ -415,6 +422,9 @@ export function ClientPortal() {
                           <p className="text-xs text-gray-400 mt-1">Issued {fmt(inv.issue_date)}{inv.due_date ? ` · Due ${fmt(inv.due_date)}` : ""}</p>
                           {inv.amount_paid > 0 && (
                             <p className="text-xs text-green-600 mt-0.5">{fmtMoney(inv.amount_paid)} paid</p>
+                          )}
+                          {(inv.credits_total ?? 0) > 0 && (
+                            <p className="text-xs text-green-600 mt-0.5">{fmtMoney(inv.credits_total ?? 0)} credited</p>
                           )}
                         </div>
                         <div className="text-right shrink-0">

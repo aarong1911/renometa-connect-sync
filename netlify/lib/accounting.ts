@@ -109,7 +109,7 @@ export type PostJournalEntryInput = {
   orgId: string;
   entryDate: string; // YYYY-MM-DD
   description: string;
-  sourceType: "invoice" | "invoice_payment" | "expense" | "vendor_bill" | "vendor_payment" | "change_order" | "manual" | "refund" | "credit_memo" | "opening_balance";
+  sourceType: "invoice" | "invoice_payment" | "expense" | "vendor_bill" | "vendor_payment" | "change_order" | "manual" | "refund" | "credit_memo" | "vendor_credit" | "opening_balance";
   sourceId: string | null;
   postingKey: string;
   lines: Array<{ accountId: string; debit?: number; credit?: number; description?: string; projectId?: string | null; contactId?: string | null }>;
@@ -379,6 +379,73 @@ export async function reverseJournalEntry(admin: SupabaseClient, input: {
     reversalEntryId: row.reversal_entry_id, reversalEntryNumber: row.reversal_entry_number,
     originalEntryId: row.original_entry_id, alreadyReversed: row.already_reversed,
   };
+}
+
+// ── Phase 13.10 — Customer credit memos / vendor credits ────────────────────
+
+export type CustomerCreditMemoForPosting = {
+  id: string; creditNumber: string | null; amount: number; creditDate: string;
+  revenueAccountId: string; invoiceId: string; invoiceNumber: string;
+  projectId: string | null; contactId: string | null;
+};
+
+/**
+ * Part 15 — customer credit memo: Dr the invoice's own original revenue
+ * account (derived by the caller from that invoice's posted 'issued' entry
+ * — never hardcoded to Construction Revenue, see the Phase 13.10 report),
+ * Cr Accounts Receivable, for the credited amount. Reduces both revenue
+ * and the receivable without touching the original invoice's own entry.
+ */
+export async function postCustomerCreditMemo(admin: SupabaseClient, orgId: string, credit: CustomerCreditMemoForPosting, createdBy: string | null): Promise<PostJournalEntryResult> {
+  const accounts = await resolveSystemAccounts(admin, orgId);
+  const label = credit.creditNumber ? `Credit ${credit.creditNumber}` : "Customer credit";
+  return postJournalEntry(admin, {
+    orgId,
+    entryDate: credit.creditDate,
+    description: `${label} — Invoice ${credit.invoiceNumber}`,
+    sourceType: "credit_memo",
+    sourceId: credit.id,
+    postingKey: "posted",
+    projectId: credit.projectId,
+    contactId: credit.contactId,
+    createdBy,
+    lines: [
+      { accountId: credit.revenueAccountId, debit: credit.amount, projectId: credit.projectId, contactId: credit.contactId, description: `${label} — Invoice ${credit.invoiceNumber}` },
+      { accountId: accounts.accountsReceivable, credit: credit.amount, projectId: credit.projectId, contactId: credit.contactId, description: `A/R reduced — ${label}` },
+    ],
+  });
+}
+
+export type VendorCreditForPosting = {
+  id: string; creditNumber: string | null; amount: number; creditDate: string;
+  expenseAccountId: string; vendorBillId: string; billNumber: string | null; projectId: string | null;
+};
+
+/**
+ * Part 25 — vendor credit: Dr Accounts Payable, Cr the ORIGINAL bill's own
+ * credited expense/COGS account (chosen by the caller from that bill's own
+ * line accounts, validated server-side — never a default/unrelated
+ * account). Reduces A/P and the recognized project cost.
+ */
+export async function postVendorCredit(admin: SupabaseClient, orgId: string, credit: VendorCreditForPosting, createdBy: string | null): Promise<PostJournalEntryResult> {
+  const accounts = await resolveSystemAccounts(admin, orgId);
+  const label = credit.creditNumber ? `Credit ${credit.creditNumber}` : "Vendor credit";
+  const billLabel = credit.billNumber ? `Bill ${credit.billNumber}` : "vendor bill";
+  return postJournalEntry(admin, {
+    orgId,
+    entryDate: credit.creditDate,
+    description: `${label} — ${billLabel}`,
+    sourceType: "vendor_credit",
+    sourceId: credit.id,
+    postingKey: "posted",
+    projectId: credit.projectId,
+    contactId: null,
+    createdBy,
+    lines: [
+      { accountId: accounts.accountsPayable, debit: credit.amount, projectId: credit.projectId, description: `A/P reduced — ${label}` },
+      { accountId: credit.expenseAccountId, credit: credit.amount, projectId: credit.projectId, description: `${label} — ${billLabel}` },
+    ],
+  });
 }
 
 /**

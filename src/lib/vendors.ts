@@ -269,18 +269,61 @@ export async function fetchVendorPaymentsForBill(billId: string): Promise<Vendor
   }));
 }
 
+export type VendorCredit = {
+  id: string;
+  vendorBillId: string;
+  creditNumber: string | null;
+  creditDate: string;
+  reason: string;
+  totalAmount: number;
+  status: "draft" | "posted" | "reversed";
+  createdAt: string;
+};
+
+export async function fetchVendorCreditsForBill(billId: string): Promise<VendorCredit[]> {
+  const { data, error } = await supabase
+    .from("vendor_credits")
+    .select("id, vendor_bill_id, credit_number, credit_date, reason, total_amount, status, created_at")
+    .eq("vendor_bill_id", billId)
+    .order("credit_date", { ascending: false });
+  if (error) { console.error("[vendors]", error); return []; }
+  return (data ?? []).map((r: any) => ({
+    id: r.id, vendorBillId: r.vendor_bill_id, creditNumber: r.credit_number, creditDate: r.credit_date,
+    reason: r.reason, totalAmount: Number(r.total_amount ?? 0), status: r.status, createdAt: r.created_at,
+  }));
+}
+
+/** Sum of posted vendor credits, per bill, for every bill in orgId — batched (one query), not N+1. */
+export async function fetchPostedVendorCreditTotals(orgId: string): Promise<Map<string, number>> {
+  const { data, error } = await supabase
+    .from("vendor_credits")
+    .select("vendor_bill_id, total_amount")
+    .eq("org_id", orgId)
+    .eq("status", "posted");
+  const totals = new Map<string, number>();
+  if (error) { console.error("[vendors]", error); return totals; }
+  for (const r of data ?? []) {
+    const billId = (r as any).vendor_bill_id as string;
+    totals.set(billId, round2((totals.get(billId) ?? 0) + Number((r as any).total_amount ?? 0)));
+  }
+  return totals;
+}
+
 /**
  * Canonical UI-facing vendor bill balance. A reversed bill's total_amount
  * and amount_paid stay exactly as posted (historical/audit record — never
  * rewritten for presentation), but a reversed bill no longer represents an
  * outstanding payable, so its EFFECTIVE balance is always $0 regardless of
  * what total_amount/amount_paid happen to say. Every other status falls
- * back to the normal total-minus-paid figure, floored at 0 so floating-
- * point noise can never show a negative balance.
+ * back to total minus paid minus posted credits, floored at 0 so floating-
+ * point noise can never show a negative balance. `creditsTotal` defaults
+ * to 0 so every pre-existing call site stays correct unchanged — credits
+ * are never folded into amount_paid itself (Part 27: credits are not
+ * payments).
  */
-export function getVendorBillEffectiveBalance(bill: Pick<VendorBill, "status" | "totalAmount" | "amountPaid">): number {
+export function getVendorBillEffectiveBalance(bill: Pick<VendorBill, "status" | "totalAmount" | "amountPaid">, creditsTotal: number = 0): number {
   if (bill.status === "reversed") return 0;
-  return Math.max(0, round2(bill.totalAmount - bill.amountPaid));
+  return Math.max(0, round2(bill.totalAmount - bill.amountPaid - creditsTotal));
 }
 
 // ── A/P Aging (Part 12) ──────────────────────────────────────────────────
@@ -293,11 +336,11 @@ export function getVendorBillEffectiveBalance(bill: Pick<VendorBill, "status" | 
 
 export type ApAgingBuckets = { current: number; d1_30: number; d31_60: number; d61_90: number; d90_plus: number };
 
-export function computeApAging(bills: VendorBill[], now: Date = new Date()): ApAgingBuckets {
+export function computeApAging(bills: VendorBill[], now: Date = new Date(), creditTotals: Map<string, number> = new Map()): ApAgingBuckets {
   const buckets: ApAgingBuckets = { current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90_plus: 0 };
   for (const bill of bills) {
     if (bill.status !== "open" && bill.status !== "partial" && bill.status !== "overdue") continue;
-    const balance = round2(bill.totalAmount - bill.amountPaid);
+    const balance = getVendorBillEffectiveBalance(bill, creditTotals.get(bill.id) ?? 0);
     if (balance <= 0) continue;
     if (!bill.dueDate) { buckets.current += balance; continue; }
     const daysOverdue = Math.floor((now.getTime() - new Date(bill.dueDate).getTime()) / 86_400_000);
@@ -321,7 +364,7 @@ export type ExpenseKpis = {
   totalPayable: number;
 };
 
-export function computeExpenseKpis(expenses: Expense[], bills: VendorBill[], now: Date = new Date()): ExpenseKpis {
+export function computeExpenseKpis(expenses: Expense[], bills: VendorBill[], now: Date = new Date(), creditTotals: Map<string, number> = new Map()): ExpenseKpis {
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
   const postedThisMonth = expenses.filter((e) => e.status === "posted" && new Date(e.expenseDate) >= monthStart);
   const expensesThisMonth = round2(postedThisMonth.reduce((s, e) => s + e.amount, 0));
@@ -329,8 +372,8 @@ export function computeExpenseKpis(expenses: Expense[], bills: VendorBill[], now
   const operatingExpenses = round2(postedThisMonth.filter((e) => !e.isCogs || !e.projectId).reduce((s, e) => s + e.amount, 0));
 
   const openBills = bills.filter((b) => b.status === "open" || b.status === "partial" || b.status === "overdue");
-  const openBillsAmount = round2(openBills.reduce((s, b) => s + (b.totalAmount - b.amountPaid), 0));
-  const overdueBillsAmount = round2(bills.filter((b) => b.status === "overdue").reduce((s, b) => s + (b.totalAmount - b.amountPaid), 0));
+  const openBillsAmount = round2(openBills.reduce((s, b) => s + getVendorBillEffectiveBalance(b, creditTotals.get(b.id) ?? 0), 0));
+  const overdueBillsAmount = round2(bills.filter((b) => b.status === "overdue").reduce((s, b) => s + getVendorBillEffectiveBalance(b, creditTotals.get(b.id) ?? 0), 0));
 
   return {
     expensesThisMonth, directProjectCosts, operatingExpenses,

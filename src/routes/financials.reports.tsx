@@ -17,7 +17,7 @@ import {
 } from "recharts";
 import { type Payment } from "@/lib/mock-data";
 import { useScheduledPayments } from "@/lib/scheduled-payments";
-import { fetchReceivedPayments, fetchOutstandingInvoices, fetchInvoicedTotal, type OutstandingInvoice } from "@/lib/received-payments";
+import { fetchReceivedPayments, fetchOutstandingInvoices, fetchInvoicedTotal, paymentNetAmount, type OutstandingInvoice } from "@/lib/received-payments";
 import { formatMoney } from "@/lib/format";
 import { formatPaymentMethod } from "@/lib/payment-method";
 import { TrendingUp, TrendingDown, ArrowUpRight, Wallet, CalendarClock } from "lucide-react";
@@ -52,15 +52,17 @@ function ReportsPage() {
     fetchInvoicedTotal().then(setInvoicedTotal);
   }, []);
 
-  const collected = received.reduce((s, p) => s + p.amount, 0);
-  const outstanding = outstandingInvoices.reduce((s, i) => s + (i.total_amount - i.amount_paid), 0);
+  // Reversal rows (source==='reversal') net negative here so a reversed
+  // payment doesn't inflate Received/Revenue — see paymentNetAmount().
+  const collected = received.reduce((s, p) => s + paymentNetAmount(p), 0);
+  const outstanding = outstandingInvoices.reduce((s, i) => s + Math.max(0, i.total_amount - i.amount_paid - i.credits_total), 0);
   const collectionRate = invoicedTotal > 0 ? Math.round((collected / invoicedTotal) * 100) : 0;
 
   // Phase 13.7B — grouped by each row's own canonical payment_method
   // (lowercase, from invoice_payments), humanized only at render time.
   const methodTotals = received.reduce<Record<string, number>>((acc, p) => {
     const key = (p.method ?? "other").toLowerCase();
-    acc[key] = (acc[key] ?? 0) + p.amount;
+    acc[key] = (acc[key] ?? 0) + paymentNetAmount(p);
     return acc;
   }, {});
   const methodData = Object.entries(methodTotals).map(([name, value]) => ({ name: formatPaymentMethod(name), value }));
@@ -70,7 +72,7 @@ function ReportsPage() {
     const buckets = { current: 0, d1_30: 0, d31_60: 0, d60plus: 0 };
     const now = Date.now();
     for (const inv of outstandingInvoices) {
-      const balance = inv.total_amount - inv.amount_paid;
+      const balance = inv.total_amount - inv.amount_paid - inv.credits_total;
       if (balance <= 0) continue;
       const daysOverdue = inv.due_date ? Math.floor((now - new Date(inv.due_date).getTime()) / 86_400_000) : -1;
       if (daysOverdue <= 0) buckets.current += balance;
@@ -436,7 +438,8 @@ function buildCashflow(
   for (const p of received) {
     if ((p.status ?? "Received") !== "Received") continue;
     const idx = indexOf(p.receivedAt);
-    if (idx >= 0) buckets[idx].received += p.amount;
+    // Reversal rows net negative — see paymentNetAmount().
+    if (idx >= 0) buckets[idx].received += paymentNetAmount(p);
   }
   for (const p of scheduled) {
     if (p.status !== "Scheduled") continue;

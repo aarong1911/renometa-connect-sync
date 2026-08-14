@@ -17,7 +17,7 @@ type LineItem = { description: string; quantity: number; unitPrice: number; amou
 type PublicInvoice = {
   invoiceNumber: string; status: string; issueDate: string | null; dueDate: string | null;
   customerName: string | null; projectName: string | null;
-  lineItems: LineItem[]; subtotal: number; taxAmount: number; total: number; amountPaid: number; remainingBalance: number;
+  lineItems: LineItem[]; subtotal: number; taxAmount: number; total: number; amountPaid: number; creditsTotal: number; remainingBalance: number;
   business: { name: string; logoUrl: string | null; phone: string | null; email: string | null; website: string | null };
 };
 
@@ -209,6 +209,9 @@ function PublicInvoicePage() {
               {data.taxAmount > 0 && <div className="flex justify-between text-slate-600"><span>Tax</span><span>{fmtMoney(data.taxAmount)}</span></div>}
               <div className="flex justify-between text-base font-semibold text-slate-900"><span>Total</span><span>{fmtMoney(data.total)}</span></div>
               <div className="flex justify-between text-slate-600"><span>Paid</span><span>{fmtMoney(data.amountPaid)}</span></div>
+              {data.creditsTotal > 0 && (
+                <div className="flex justify-between text-emerald-700"><span>Credits</span><span>−{fmtMoney(data.creditsTotal)}</span></div>
+              )}
               <div className="flex justify-between border-t border-slate-100 pt-1.5 text-base font-semibold text-slate-900">
                 <span>Amount Due</span><span>{fmtMoney(data.remainingBalance)}</span>
               </div>

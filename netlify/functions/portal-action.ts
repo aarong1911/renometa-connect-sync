@@ -143,9 +143,24 @@ export const handler: Handler = async (event) => {
     if (invoice.status === "paid")
       return { statusCode: 400, headers, body: JSON.stringify({ error: "Invoice already paid" }) };
 
-    const balance = Math.round((invoice.total_amount - invoice.amount_paid) * 100);
+    // Phase 13.10A, Part 12 — credit-aware, same fix as invoice-create-
+    // payment.ts's own Stripe Checkout path. This portal action creates a
+    // SEPARATE Checkout Session from that one (different entry point, same
+    // invoices row) — without this, a credit memo would silently be
+    // ignored on this path even though it's already respected elsewhere.
+    //
+    // Phase 13.10C, Part 6 — CRITICAL FIX. Uses the RESERVED available
+    // balance (draft+posted), not posted-only — see invoice-create-
+    // payment.ts's own comment for the full reasoning. A draft credit
+    // whose GL/finalize is still pending must still block Stripe from
+    // charging into its reserved amount.
+    const { data: creditRows } = await supabaseAdmin
+      .from("customer_credit_memos").select("total_amount").eq("invoice_id", invoiceId).in("status", ["draft", "posted"]);
+    const reservedCreditsCents = Math.round((creditRows ?? []).reduce((s: number, r: any) => s + Number(r.total_amount ?? 0), 0) * 100);
+
+    const balance = Math.round((invoice.total_amount - invoice.amount_paid) * 100) - reservedCreditsCents;
     if (balance <= 0)
-      return { statusCode: 400, headers, body: JSON.stringify({ error: "No balance due" }) };
+      return { statusCode: 400, headers, body: JSON.stringify({ error: "Payment is temporarily unavailable while an adjustment is being processed." }) };
 
     const stripeKey = process.env.STRIPE_SECRET_KEY;
     if (!stripeKey) {

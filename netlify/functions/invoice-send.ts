@@ -14,11 +14,27 @@
 // already uses for "collected this month"), and the send is logged as a
 // project_notes row when the invoice has a project — the same activity
 // feed ProjectDetailSheet already reads from.
+//
+// Phase 13.10F — extended to also handle RESEND for any already-issued,
+// non-void/cancelled invoice (Task 2: replaces the standalone "Copy
+// Payment Link" endpoint/button entirely, so there is exactly one place
+// that mints a token + sends the invoice email, never two). A resend:
+//   - mints a brand-new token via the same mintPublicInvoiceToken() helper
+//     the original draft->sent send already used (no duplicated token
+//     logic)
+//   - sends the exact same email template as the original send
+//   - does NOT transition invoice status (stays whatever it already was —
+//     sent/viewed/partial/paid/overdue)
+//   - does NOT re-run postInvoiceIssued() — that posted once, at the
+//     original draft->sent transition, and never needs to post again
+// A draft invoice still goes through the original path unchanged. A void
+// or cancelled invoice is rejected for either path.
 
 import type { Handler, HandlerEvent, HandlerResponse } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import nodemailer from "nodemailer";
 import { formatDateOnly } from "../../src/lib/format";
+import { isIssuedInvoice } from "../../src/lib/invoice-status";
 import { postInvoiceIssued } from "../lib/accounting";
 import { mintPublicInvoiceToken, revokePublicInvoiceTokenByRawToken } from "../lib/invoice-tokens";
 
@@ -200,11 +216,15 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
   if (invoiceError) return json(500, { error: "Could not load the invoice." });
   if (!invoice) return json(404, { error: "Invoice not found." });
 
-  // Only a Draft can be sent from here — no resend semantics exist yet for
-  // invoices (unlike estimates), so an already-sent invoice is a conflict,
-  // not a re-send.
-  if (invoice.status !== "draft") {
-    return json(409, { error: `This invoice has already been sent (status: ${invoice.status}).` });
+  // Phase 13.10F, Task 2 — a draft goes through the original one-time
+  // draft->sent path below unchanged. Any already-issued invoice
+  // (sent/viewed/partial/paid/overdue) is a RESEND: same email, a fresh
+  // token, but no status transition and no re-posting. void/cancelled is
+  // rejected either way — isIssuedInvoice() excludes draft too, so this
+  // check only ever rejects void/cancelled here (draft already branched).
+  const isResend = invoice.status !== "draft";
+  if (isResend && !isIssuedInvoice(invoice.status)) {
+    return json(409, { error: `A ${invoice.status} invoice cannot be resent.` });
   }
 
   if (!invoice.client_id) {
@@ -271,7 +291,23 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
     // link. Best-effort: a revoke failure here must not mask the real SMTP
     // error being reported below.
     await revokePublicInvoiceTokenByRawToken(admin, rawToken);
-    return json(500, { error: "The invoice email could not be delivered. The invoice was not marked as sent." });
+    return json(500, { error: isResend ? "The invoice email could not be delivered." : "The invoice email could not be delivered. The invoice was not marked as sent." });
+  }
+
+  // Phase 13.10F, Task 2 — resend path ends here: no status transition, no
+  // accounting re-post. The invoice's financial status is exactly what it
+  // was before this request.
+  if (isResend) {
+    if (invoice.project_id) {
+      const { error: noteError } = await admin.from("project_notes").insert({
+        project_id: invoice.project_id,
+        body: `Invoice ${invoice.invoice_number} (${money(Number(invoice.total_amount ?? 0))}) resent to ${recipientEmail}.`,
+        author: [profile?.first_name, profile?.last_name].filter(Boolean).join(" ").trim() || organizationName,
+        is_client_message: false,
+      });
+      if (noteError) console.warn("[invoice-send] resend activity note insert failed (non-blocking):", noteError.message);
+    }
+    return json(200, { ok: true, status: invoice.status, resent: true, recipientEmail });
   }
 
   const nowIso = new Date().toISOString();

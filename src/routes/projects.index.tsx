@@ -148,6 +148,8 @@ type Invoice = {
   id: string; invoice_number: string; status: string;
   issue_date: string | null; due_date: string | null;
   total_amount: number; amount_paid: number;
+  /** Posted customer credit memos against this invoice — Phase 13.10B, Part 22/23. Defaults to 0 until fetched. */
+  credits_total?: number;
 };
 
 type Note = { id: string; body: string; created_at: string; author: string };
@@ -517,7 +519,19 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
     const { data } = await supabase.from("invoices")
       .select("id, invoice_number, status, issue_date, due_date, total_amount, amount_paid")
       .eq("project_id", project.id).order("issue_date", { ascending: false });
-    setInvoices((data ?? []) as Invoice[]);
+    const rows = (data ?? []) as Invoice[];
+    // Phase 13.10B, Part 22/23 — a fully-credited invoice must not show as
+    // collectible-Overdue here either; fetch posted credits so the status
+    // badge below can derive effective balance instead of raw due_date.
+    const invoiceIds = rows.map((r) => r.id);
+    const { data: creditRows } = invoiceIds.length
+      ? await supabase.from("customer_credit_memos").select("invoice_id, total_amount").in("invoice_id", invoiceIds).eq("status", "posted")
+      : { data: [] as any[] };
+    const creditsByInvoice = new Map<string, number>();
+    for (const r of creditRows ?? []) {
+      creditsByInvoice.set((r as any).invoice_id, ((creditsByInvoice.get((r as any).invoice_id) ?? 0) + Number((r as any).total_amount ?? 0)));
+    }
+    setInvoices(rows.map((r) => ({ ...r, credits_total: creditsByInvoice.get(r.id) ?? 0 })));
     setInvoicesLoading(false);
   }, [project?.id]);
 
@@ -1813,7 +1827,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
                             </p>
                           </div>
                           <p className="text-sm font-semibold tabular-nums shrink-0">{formatMoneyFull(inv.total_amount)}</p>
-                          <InvoiceStatusBadge status={inv.status} dueDate={inv.due_date} className="shrink-0" />
+                          <InvoiceStatusBadge status={inv.status} dueDate={inv.due_date} effectiveBalance={Math.max(0, inv.total_amount - inv.amount_paid - (inv.credits_total ?? 0))} className="shrink-0" />
                         </div>
                       );
                     })}

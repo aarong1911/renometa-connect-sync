@@ -11,16 +11,18 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Loader2, Send, CreditCard, Undo2 } from "lucide-react";
+import { Loader2, Send, CreditCard, Undo2, Tag } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
 import { formatMoney, formatDateOnlyShort, todayDateOnlyValue } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import {
-  fetchVendorBillLines, fetchVendorPaymentsForBill, getVendorBillEffectiveBalance,
-  type VendorBill, type VendorBillLine, type VendorPayment,
+  fetchVendorBillLines, fetchVendorPaymentsForBill, fetchVendorCreditsForBill, getVendorBillEffectiveBalance,
+  type VendorBill, type VendorBillLine, type VendorPayment, type VendorCredit,
 } from "@/lib/vendors";
 import { ReversalReasonDialog } from "@/components/financials/ReversalReasonDialog";
+
+const CREDIT_REASONS = ["Vendor discount", "Billing correction", "Returned materials", "Other"];
 
 const PAYMENT_METHODS = [
   { value: "cash", label: "Cash" }, { value: "check", label: "Check" }, { value: "card", label: "Card" },
@@ -53,22 +55,31 @@ type Props = {
 export function BillDetailSheet({ bill, open, onClose, onChanged }: Props) {
   const [lines, setLines] = useState<VendorBillLine[]>([]);
   const [payments, setPayments] = useState<VendorPayment[]>([]);
+  const [credits, setCredits] = useState<VendorCredit[]>([]);
   const [loading, setLoading] = useState(false);
   const [posting, setPosting] = useState(false);
   const [payOpen, setPayOpen] = useState(false);
+  const [creditOpen, setCreditOpen] = useState(false);
   const [reverseBillOpen, setReverseBillOpen] = useState(false);
   const [reversingPaymentId, setReversingPaymentId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open || !bill) return;
     setLoading(true);
-    Promise.all([fetchVendorBillLines(bill.id), fetchVendorPaymentsForBill(bill.id)])
-      .then(([l, p]) => { setLines(l); setPayments(p); })
+    Promise.all([fetchVendorBillLines(bill.id), fetchVendorPaymentsForBill(bill.id), fetchVendorCreditsForBill(bill.id)])
+      .then(([l, p, c]) => { setLines(l); setPayments(p); setCredits(c); })
       .finally(() => setLoading(false));
   }, [open, bill?.id]);
 
   if (!bill) return null;
-  const balance = getVendorBillEffectiveBalance(bill);
+  const postedCreditsTotal = credits.filter((c) => c.status === "posted").reduce((s, c) => s + c.totalAmount, 0);
+  const balance = getVendorBillEffectiveBalance(bill, postedCreditsTotal);
+  // Phase 13.10C, Part 33/36 — draft+posted, used ONLY to cap/prefill the
+  // vendor payment dialog (never displayed as a financial number) — a
+  // draft vendor credit already reserves its amount server-side
+  // (record_vendor_payment enforces this regardless of what the UI sends).
+  const reservedCreditsTotal = credits.filter((c) => c.status === "draft" || c.status === "posted").reduce((s, c) => s + c.totalAmount, 0);
+  const availableBalance = getVendorBillEffectiveBalance(bill, reservedCreditsTotal);
 
   const handlePost = async () => {
     if (posting) return;
@@ -170,6 +181,7 @@ export function BillDetailSheet({ bill, open, onClose, onChanged }: Props) {
               {bill.status !== "draft" && (
                 <>
                   <div className="flex justify-between text-success"><span>Paid</span><span className="tabular-nums">{formatMoney(bill.amountPaid)}</span></div>
+                  {postedCreditsTotal > 0 && <div className="flex justify-between text-destructive"><span>Credits</span><span className="tabular-nums">−{formatMoney(postedCreditsTotal)}</span></div>}
                   <div className="flex justify-between font-semibold"><span>Balance</span><span className="tabular-nums">{formatMoney(balance)}</span></div>
                 </>
               )}
@@ -179,6 +191,23 @@ export function BillDetailSheet({ bill, open, onClose, onChanged }: Props) {
           {bill.status === "reversed" && bill.reversalReason && (
             <div className="rounded-md bg-destructive-soft px-3 py-2 text-[12px] text-destructive">
               <span className="font-medium">Reversed:</span> {bill.reversalReason}
+            </div>
+          )}
+
+          {credits.length > 0 && (
+            <div>
+              <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Vendor Credits</p>
+              <ul className="space-y-1.5">
+                {credits.map((c) => (
+                  <li key={c.id} className="rounded-md bg-secondary/40 px-3 py-2 text-[12.5px]">
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground">{c.creditNumber ?? "—"} · {formatDateOnlyShort(c.creditDate)}</span>
+                      <span className="font-medium tabular-nums text-destructive">−{formatMoney(c.totalAmount)}</span>
+                    </div>
+                    <p className="mt-0.5 text-[11px] text-muted-foreground">Reason: {c.reason}</p>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
 
@@ -223,6 +252,9 @@ export function BillDetailSheet({ bill, open, onClose, onChanged }: Props) {
             {(bill.status === "open" || bill.status === "partial" || bill.status === "overdue") && (
               <Button size="sm" onClick={() => setPayOpen(true)}><CreditCard className="mr-1.5 h-3.5 w-3.5" />Record payment</Button>
             )}
+            {(bill.status === "open" || bill.status === "partial" || bill.status === "overdue") && availableBalance > 0 && (
+              <Button size="sm" variant="outline" onClick={() => setCreditOpen(true)}><Tag className="mr-1.5 h-3.5 w-3.5" />Create vendor credit</Button>
+            )}
             {bill.status === "open" && bill.amountPaid === 0 && (
               <Button size="sm" variant="outline" onClick={() => setReverseBillOpen(true)}><Undo2 className="mr-1.5 h-3.5 w-3.5" />Reverse bill</Button>
             )}
@@ -234,7 +266,9 @@ export function BillDetailSheet({ bill, open, onClose, onChanged }: Props) {
         </div>
       </SheetContent>
 
-      <RecordBillPaymentDialog open={payOpen} onClose={() => setPayOpen(false)} bill={bill} balance={balance} onRecorded={() => { setPayOpen(false); onChanged(); }} />
+      <RecordBillPaymentDialog open={payOpen} onClose={() => setPayOpen(false)} bill={bill} balance={availableBalance} onRecorded={() => { setPayOpen(false); onChanged(); }} />
+
+      <CreateVendorCreditDialog open={creditOpen} onClose={() => setCreditOpen(false)} bill={bill} lines={lines} balance={availableBalance} onCreated={() => { setCreditOpen(false); onChanged(); }} />
 
       <ReversalReasonDialog
         open={reverseBillOpen} onClose={() => setReverseBillOpen(false)}
@@ -322,6 +356,103 @@ function RecordBillPaymentDialog({ open, onClose, bill, balance, onRecorded }: {
           <Button variant="outline" size="sm" onClick={onClose} disabled={recording}>Cancel</Button>
           <Button size="sm" onClick={handleSubmit} disabled={recording}>
             {recording ? <><Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />Recording…</> : "Record payment"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// Part 25 — the credited account MUST be one of this bill's own line
+// accounts (deduped from `lines`, never a free choice from the whole
+// chart of accounts) — the server independently re-validates this.
+function CreateVendorCreditDialog({ open, onClose, bill, lines, balance, onCreated }: {
+  open: boolean; onClose: () => void; bill: VendorBill; lines: VendorBillLine[]; balance: number; onCreated: () => void;
+}) {
+  const billAccounts = Array.from(new Map(lines.map((l) => [l.accountId, l.accountName])).entries());
+  const [amount, setAmount] = useState("");
+  const [accountId, setAccountId] = useState("");
+  const [reason, setReason] = useState(CREDIT_REASONS[0]);
+  const [description, setDescription] = useState("");
+  const [date, setDate] = useState(todayDateOnlyValue);
+  const [saving, setSaving] = useState(false);
+  // Phase 13.10A, Part 7/9 — regenerated only when the dialog reopens, so a
+  // retried submit reuses the same key (collapsing into the RPC's
+  // idempotency check) while a fresh dialog open gets a new one.
+  const [idempotencyKey, setIdempotencyKey] = useState(() => crypto.randomUUID());
+
+  useEffect(() => {
+    if (!open) return;
+    setAmount(balance > 0 ? balance.toFixed(2) : "");
+    setAccountId(billAccounts[0]?.[0] ?? "");
+    setReason(CREDIT_REASONS[0]);
+    setDescription("");
+    setDate(todayDateOnlyValue());
+    setIdempotencyKey(crypto.randomUUID());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, balance]);
+
+  const handleSubmit = async () => {
+    if (saving) return;
+    const amt = parseFloat(amount);
+    if (!Number.isFinite(amt) || amt <= 0) { toast.error("Enter a valid credit amount"); return; }
+    if (!accountId) { toast.error("Select a category to credit"); return; }
+    setSaving(true);
+    try {
+      const headers = await authHeader();
+      const res = await fetch("/.netlify/functions/vendor-credit-create", {
+        method: "POST", headers,
+        body: JSON.stringify({ billId: bill.id, amount: amt, accountId, reason, description: description || undefined, creditDate: date, idempotencyKey }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.error || "Could not create this vendor credit");
+      if (body.accountingWarning) toast.warning(body.accountingWarning);
+      else toast.success(`Vendor credit ${body.creditNumber ?? ""} created`.trim());
+      onCreated();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not create this vendor credit");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={(v) => !v && !saving && onClose()}>
+      <DialogContent className="sm:max-w-sm">
+        <DialogHeader><DialogTitle className="text-base font-semibold">Create Vendor Credit</DialogTitle></DialogHeader>
+        <div className="space-y-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Amount</Label>
+            <Input className="h-9" type="number" min="0.01" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} />
+            <p className="text-[11px] text-muted-foreground">Current balance: {formatMoney(balance)}</p>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Category to credit</Label>
+            <Select value={accountId} onValueChange={setAccountId}>
+              <SelectTrigger className="h-9"><SelectValue placeholder="Select a category" /></SelectTrigger>
+              <SelectContent>{billAccounts.map(([id, name]) => <SelectItem key={id} value={id}>{name}</SelectItem>)}</SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Reason</Label>
+            <Select value={reason} onValueChange={setReason}>
+              <SelectTrigger className="h-9"><SelectValue /></SelectTrigger>
+              <SelectContent>{CREDIT_REASONS.map((r) => <SelectItem key={r} value={r}>{r}</SelectItem>)}</SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Date</Label>
+            <Input className="h-9" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Description (optional)</Label>
+            <Input className="h-9" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Defaults to the reason" />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" size="sm" onClick={onClose} disabled={saving}>Cancel</Button>
+          <Button size="sm" onClick={handleSubmit} disabled={saving || billAccounts.length === 0}>
+            {saving ? <><Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />Creating…</> : "Create credit"}
           </Button>
         </DialogFooter>
       </DialogContent>

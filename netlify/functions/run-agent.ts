@@ -11,6 +11,7 @@ import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { execFile } from "node:child_process";
 import { createServerTask } from "../lib/tasks";
+import { isInvoiceOverdue } from "../../src/lib/invoice-status";
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -204,16 +205,67 @@ async function fetchAgentData(
       }
       case "invoices": {
         if (source.filter === "overdue") {
+          // Phase 13.10G -- CRITICAL FIX. invoices.status is NEVER
+          // literally persisted as 'overdue' anywhere in this codebase --
+          // it's a derived, read-time-only value (see src/lib/invoice-
+          // status.ts's isInvoiceOverdue()/getInvoiceDisplayStatus()).
+          // `.eq("status", "overdue")` therefore matched zero rows,
+          // unconditionally, before the reserved-credit guard below ever
+          // ran -- the Collections Agent could never surface a single
+          // invoice regardless of credits. Fixed by fetching every issued/
+          // collectible invoice with a due date (excluding draft/void/
+          // cancelled, same exclusion isIssuedInvoice() uses elsewhere)
+          // and deriving "overdue" via the SAME canonical isInvoiceOverdue()
+          // helper every other surface in this app already uses -- no
+          // second, inconsistent overdue definition.
+          const now = new Date();
           const { data } = await supabase
             .from("invoices")
             .select("id, invoice_number, total_amount, amount_paid, due_date, status, contacts(full_name, phone, email)")
             .eq("org_id", orgId)
-            .eq("status", "overdue")
+            .not("status", "in", "(draft,void,cancelled)")
+            .not("due_date", "is", null)
             .order("due_date");
-          result.invoices = (data ?? []).map((inv: any) => ({
-            ...inv,
-            days_overdue: Math.floor((Date.now() - new Date(inv.due_date).getTime()) / 86400000),
-          }));
+          const invoiceIds = (data ?? []).map((inv: any) => inv.id);
+          // Phase 13.10A, Part 19 — the Collections Agent (a real, opt-in
+          // scheduled automation) must never nag a customer for a balance a
+          // credit memo has already zeroed out. `status='overdue'` is a raw
+          // DB column that credits never touch, so it alone isn't enough --
+          // every candidate invoice's credits are subtracted here, and
+          // anything at $0 available balance is dropped before it ever
+          // reaches the LLM prompt / SMS send.
+          //
+          // Phase 13.10C, Part 31 — CRITICAL FIX. Uses draft+posted
+          // (reserved/available), not posted-only. A draft credit means an
+          // accounting adjustment is actively in progress for this invoice
+          // -- collections must not nag the customer while that's pending,
+          // even though the draft hasn't posted to the ledger yet. This is
+          // the one deliberate exception to "collections/reporting stays
+          // posted-only" -- collection SAFETY uses the same reserved
+          // formula as payment-initiation safety, never the financial-
+          // reporting formula (A/R aging itself remains posted-only,
+          // untouched by this change).
+          const { data: creditRows } = invoiceIds.length
+            ? await supabase.from("customer_credit_memos").select("invoice_id, total_amount").in("invoice_id", invoiceIds).in("status", ["draft", "posted"])
+            : { data: [] as any[] };
+          const creditsByInvoice = new Map<string, number>();
+          for (const r of creditRows ?? []) {
+            creditsByInvoice.set(r.invoice_id, Math.round(((creditsByInvoice.get(r.invoice_id) ?? 0) + Number(r.total_amount ?? 0)) * 100) / 100);
+          }
+          result.invoices = (data ?? [])
+            .map((inv: any) => {
+              const creditsTotal = creditsByInvoice.get(inv.id) ?? 0;
+              const amountDue = Math.max(0, Math.round((Number(inv.total_amount ?? 0) - Number(inv.amount_paid ?? 0) - creditsTotal) * 100) / 100);
+              return { ...inv, credits_total: creditsTotal, amount_due: amountDue, days_overdue: Math.floor((now.getTime() - new Date(inv.due_date).getTime()) / 86400000) };
+            })
+            // Phase 13.10G -- canonical overdue rule: issued/collectible
+            // (not draft/paid/void/cancelled), has a due date in the past,
+            // AND still has positive available balance after the reserved-
+            // credit guard. isInvoiceOverdue()'s own effectiveBalance
+            // parameter (Part 19 of invoice-status.ts) does the amount_due
+            // <= 0 exclusion for us -- this is one check, not two competing
+            // ones.
+            .filter((inv: any) => isInvoiceOverdue(inv.status, inv.due_date, now, inv.amount_due));
         }
         break;
       }

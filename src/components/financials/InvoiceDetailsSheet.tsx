@@ -1,15 +1,17 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { ContactAvatar } from "@/components/ui/contact-avatar";
 import { InvoiceStatusBadge } from "@/components/financials/InvoiceStatusBadge";
 import { RecordPaymentDialog } from "@/components/financials/RecordPaymentDialog";
 import { PaymentHistory } from "@/components/financials/PaymentHistory";
+import { CreateCreditMemoDialog } from "@/components/financials/CreateCreditMemoDialog";
 import { supabase } from "@/lib/supabase";
 import { isIssuedInvoice, getInvoiceBalance } from "@/lib/invoice-status";
+import { fetchCustomerCreditMemosForInvoice, type CustomerCreditMemo } from "@/lib/customer-credits";
 import { formatDateOnly } from "@/lib/format";
 import { ProjectDetailSheet } from "@/routes/projects.index";
 import { ContactDrawer, type CompanyOption } from "@/routes/contacts";
@@ -18,7 +20,7 @@ import { useCompanies } from "@/lib/companies-store";
 import { deleteContact } from "@/lib/contacts-store";
 import type { Contact } from "@/lib/mock-data";
 import { tagColorClasses } from "@/lib/tag-utils";
-import { CalendarDays, ChevronRight, CircleDollarSign, FolderKanban, Loader2, Mail, Phone, Printer, ReceiptText, UserRound } from "lucide-react";
+import { CalendarDays, ChevronRight, CircleDollarSign, FolderKanban, Loader2, Mail, Phone, Printer, ReceiptText, Send, Tag, UserRound } from "lucide-react";
 
 interface Props {
   invoiceId: string | null;
@@ -48,6 +50,9 @@ export function InvoiceDetailsSheet({ invoiceId, open, onClose, onUpdated }: Pro
   const [loading, setLoading] = useState(false);
   const [recordPaymentOpen, setRecordPaymentOpen] = useState(false);
   const [paymentHistoryKey, setPaymentHistoryKey] = useState(0);
+  const [credits, setCredits] = useState<CustomerCreditMemo[]>([]);
+  const [creditModalOpen, setCreditModalOpen] = useState(false);
+  const [sending, setSending] = useState(false);
 
   // Contextual linked-record drawers (Part 13-18) — layered directly over
   // this same Sheet (Sheet-over-Sheet: Radix stacks the newest Portal on
@@ -68,13 +73,27 @@ export function InvoiceDetailsSheet({ invoiceId, open, onClose, onUpdated }: Pro
     Promise.all([
       supabase.from("invoices").select(`id, invoice_number, status, issue_date, due_date, subtotal, tax_amount, total_amount, amount_paid, notes, client_id, project_id, projects!project_id(name,address), contacts!client_id(full_name,email,phone,avatar_key)`).eq("id", invoiceId).maybeSingle(),
       supabase.from("invoice_items").select("id,description,quantity,unit_price,amount").eq("invoice_id", invoiceId).order("id"),
-    ]).then(([invoiceResult, itemsResult]) => {
+      fetchCustomerCreditMemosForInvoice(invoiceId),
+    ]).then(([invoiceResult, itemsResult, creditResult]) => {
       const row: any = invoiceResult.data;
       setInvoice(row ? { ...row, client: row.contacts ?? undefined, project: row.projects ?? undefined } : null);
       setItems((itemsResult.data ?? []) as Item[]);
+      setCredits(creditResult);
       setLoading(false);
     });
   }, [invoiceId, open]);
+
+  /** Re-fetches only the fast-changing fields (status/amount_paid/credits) after a payment reversal or a new credit memo — avoids a full invoice+items refetch. */
+  const reloadBalanceInputs = async () => {
+    if (!invoice) return;
+    const [{ data: row }, creditResult] = await Promise.all([
+      supabase.from("invoices").select("status, amount_paid").eq("id", invoice.id).maybeSingle(),
+      fetchCustomerCreditMemosForInvoice(invoice.id),
+    ]);
+    if (row) setInvoice((prev) => prev ? { ...prev, status: row.status, amount_paid: row.amount_paid } : prev);
+    setCredits(creditResult);
+    onUpdated?.({ id: invoice.id, status: row?.status, amountPaid: row?.amount_paid });
+  };
 
   const openLinkedProject = async () => {
     if (!invoice?.project_id) return;
@@ -134,33 +153,97 @@ export function InvoiceDetailsSheet({ invoiceId, open, onClose, onUpdated }: Pro
     setPaymentHistoryKey((k) => k + 1);
   };
 
-  const balance = invoice ? getInvoiceBalance(invoice.total_amount, invoice.amount_paid) : 0;
-  const canRecordPayment = Boolean(invoice) && isIssuedInvoice(invoice?.status) && invoice?.status !== "paid" && balance > 0;
+  // Phase 13.10F, Task 2 — this sheet has no "Send Invoice" action at all
+  // (drafts aren't opened from here), so Resend Invoice is the only path
+  // here to reach a customer again once an invoice exists. Calls the same
+  // invoice-send.ts endpoint used everywhere else (mints a fresh token via
+  // its existing mintPublicInvoiceToken() call, sends the normal email
+  // template) — no duplicated token/email logic. invoice-send.ts itself
+  // recognizes this as a resend (status already non-draft) and never
+  // changes status or re-posts accounting.
+  const handleResend = async () => {
+    if (!invoice || sending) return;
+    setSending(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) throw new Error("You must be signed in to resend an invoice");
+      const res = await fetch("/.netlify/functions/invoice-send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ invoiceId: invoice.id }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.error || "Could not resend this invoice");
+      const nextStatus = body.status ?? invoice.status;
+      setInvoice((prev) => prev ? { ...prev, status: nextStatus } : prev);
+      onUpdated?.({ id: invoice.id, status: nextStatus });
+      toast.success(`Invoice ${invoice.invoice_number} resent to ${body.recipientEmail ?? "the customer"}`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not resend this invoice");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const postedCreditsTotal = credits.filter((c) => c.status === "posted").reduce((s, c) => s + c.totalAmount, 0);
+  const balance = invoice ? getInvoiceBalance(invoice.total_amount, invoice.amount_paid, postedCreditsTotal) : 0;
+  // Phase 13.10C, Part 30/36 — DISPLAYED balance above stays posted-only.
+  // But a draft credit (GL/finalize pending) already reserves its amount
+  // server-side (record_invoice_payment/record_customer_credit_memo both
+  // enforce this) — gating the CTAs on the same reserved total the backend
+  // actually enforces avoids offering an action the server will just
+  // reject. Never displayed as a number, only used to disable/enable.
+  const reservedCreditsTotal = credits.filter((c) => c.status === "draft" || c.status === "posted").reduce((s, c) => s + c.totalAmount, 0);
+  const availableBalance = invoice ? getInvoiceBalance(invoice.total_amount, invoice.amount_paid, reservedCreditsTotal) : 0;
+  const canRecordPayment = Boolean(invoice) && isIssuedInvoice(invoice?.status) && invoice?.status !== "paid" && availableBalance > 0;
+  const canCreateCredit = Boolean(invoice) && isIssuedInvoice(invoice?.status) && availableBalance > 0;
+  // Any non-draft, non-void/cancelled invoice is still a real receivable
+  // and can be resent — including a fully-paid one (still viewable;
+  // record_invoice_payment()'s own available-balance ceiling is what
+  // actually stops a further payment, not resend availability).
+  const canResend = Boolean(invoice) && invoice?.status !== "draft" && isIssuedInvoice(invoice?.status);
+  const hasClientEmail = Boolean(invoice?.client?.email?.trim());
 
   return (
     <Sheet open={open} onOpenChange={(value) => !value && onClose()}>
       <SheetContent showCloseButton={false} className="w-full overflow-y-auto p-0 sm:max-w-xl">
-        <SheetHeader className="border-b px-6 py-5 text-left">
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <SheetTitle className="flex items-center gap-2 text-lg"><ReceiptText className="h-5 w-5" /> Invoice {invoice?.invoice_number ?? ""}</SheetTitle>
-              <SheetDescription>Invoice, customer, project, and payment details.</SheetDescription>
-            </div>
-            <div className="flex shrink-0 items-center gap-2">
-              {canRecordPayment && (
-                <Button size="sm" onClick={() => setRecordPaymentOpen(true)}>
-                  <CircleDollarSign className="mr-1.5 h-4 w-4" />Record Payment
-                </Button>
-              )}
-              <Button variant="outline" size="sm" onClick={() => window.print()} disabled={!invoice}><Printer className="mr-1.5 h-4 w-4" />Print</Button>
-            </div>
+        <SheetHeader className="border-b px-6 py-4 text-left">
+          <div className="flex items-center justify-end gap-2">
+            {canRecordPayment && (
+              <Button size="sm" onClick={() => setRecordPaymentOpen(true)}>
+                <CircleDollarSign className="mr-1.5 h-4 w-4" />Record Payment
+              </Button>
+            )}
+            {canCreateCredit && (
+              <Button variant="outline" size="sm" onClick={() => setCreditModalOpen(true)}>
+                <Tag className="mr-1.5 h-4 w-4" />Create Credit Memo
+              </Button>
+            )}
+            {canResend && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleResend}
+                disabled={sending || !hasClientEmail}
+                title={!hasClientEmail ? "This customer has no email address on file" : undefined}
+              >
+                {sending ? <><Loader2 className="mr-1.5 h-4 w-4 animate-spin" />Resending…</> : <><Send className="mr-1.5 h-4 w-4" />Resend Invoice</>}
+              </Button>
+            )}
+            <Button variant="outline" size="sm" onClick={() => window.print()} disabled={!invoice}><Printer className="mr-1.5 h-4 w-4" />Print</Button>
           </div>
+          <SheetTitle className="mt-2 flex items-center gap-2 whitespace-nowrap text-lg">
+            <ReceiptText className="h-5 w-5 shrink-0" />{invoice?.invoice_number ?? ""}
+          </SheetTitle>
+          {canResend && !hasClientEmail && (
+            <p className="text-xs text-destructive">This customer has no email address on file — add one before resending.</p>
+          )}
         </SheetHeader>
         {loading ? <div className="flex justify-center py-24"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div> : !invoice ? <div className="py-20 text-center text-sm text-muted-foreground">Invoice not found.</div> : (
           <div className="space-y-6 px-6 py-6">
             <div className="flex items-center justify-between rounded-xl border bg-card p-4">
               <div><p className="text-xs uppercase tracking-wider text-muted-foreground">Total</p><p className="mt-1 text-2xl font-semibold tabular-nums">{money(invoice.total_amount)}</p></div>
-              <InvoiceStatusBadge status={invoice.status} dueDate={invoice.due_date} />
+              <InvoiceStatusBadge status={invoice.status} dueDate={invoice.due_date} effectiveBalance={balance} />
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
               <LinkedRecordCard
@@ -192,12 +275,39 @@ export function InvoiceDetailsSheet({ invoiceId, open, onClose, onUpdated }: Pro
             </div>
             <section className="rounded-xl border p-4"><p className="mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground"><CalendarDays className="h-4 w-4" />Dates</p><div className="grid grid-cols-2 gap-4 text-sm"><div><p className="text-muted-foreground">Issued</p><p className="mt-1 font-medium">{date(invoice.issue_date)}</p></div><div><p className="text-muted-foreground">Due</p><p className="mt-1 font-medium">{date(invoice.due_date)}</p></div></div></section>
             <section><p className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Line items</p><div className="overflow-hidden rounded-xl border"><div className="grid grid-cols-[1fr_52px_100px] bg-secondary/50 px-4 py-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"><span>Description</span><span className="text-center">Qty</span><span className="text-right">Amount</span></div>{items.length ? items.map(item => <div key={item.id} className="grid grid-cols-[1fr_52px_100px] border-t px-4 py-3 text-sm"><span>{item.description}</span><span className="text-center text-muted-foreground">{item.quantity}</span><span className="text-right font-medium tabular-nums">{money(item.amount)}</span></div>) : <div className="border-t px-4 py-6 text-center text-sm text-muted-foreground">No line items.</div>}</div></section>
-            <div className="ml-auto w-full max-w-xs space-y-2 text-sm"><div className="flex justify-between text-muted-foreground"><span>Subtotal</span><span>{money(invoice.subtotal)}</span></div>{invoice.tax_amount > 0 && <div className="flex justify-between text-muted-foreground"><span>Tax</span><span>{money(invoice.tax_amount)}</span></div>}<Separator /><div className="flex justify-between font-semibold"><span>Total</span><span>{money(invoice.total_amount)}</span></div><div className="flex justify-between text-success"><span>Paid</span><span>{money(invoice.amount_paid)}</span></div><div className="flex justify-between text-base font-semibold"><span>Balance due</span><span>{money(balance)}</span></div></div>
-            <PaymentHistory invoiceId={invoice.id} refreshKey={paymentHistoryKey} />
+            <div className="ml-auto w-full max-w-xs space-y-2 text-sm"><div className="flex justify-between text-muted-foreground"><span>Subtotal</span><span>{money(invoice.subtotal)}</span></div>{invoice.tax_amount > 0 && <div className="flex justify-between text-muted-foreground"><span>Tax</span><span>{money(invoice.tax_amount)}</span></div>}<Separator /><div className="flex justify-between font-semibold"><span>Total</span><span>{money(invoice.total_amount)}</span></div><div className="flex justify-between text-success"><span>Paid</span><span>{money(invoice.amount_paid)}</span></div>{postedCreditsTotal > 0 && <div className="flex justify-between text-destructive"><span>Credits</span><span>−{money(postedCreditsTotal)}</span></div>}<div className="flex justify-between text-base font-semibold"><span>Balance due</span><span>{money(balance)}</span></div></div>
+            {credits.length > 0 && (
+              <section>
+                <p className="mb-2 text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">Credit Memos</p>
+                <div className="space-y-1.5">
+                  {credits.map((c) => (
+                    <div key={c.id} className="rounded-lg border border-border bg-background px-3 py-2 text-sm">
+                      <div className="flex items-center justify-between">
+                        <p className="font-medium">{c.creditNumber ?? "—"} · {date(c.creditDate)}</p>
+                        <p className="font-semibold tabular-nums text-destructive">−{money(c.totalAmount)}</p>
+                      </div>
+                      <p className="mt-1 text-[11px] text-muted-foreground">Reason: {c.reason}</p>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+            <PaymentHistory invoiceId={invoice.id} refreshKey={paymentHistoryKey} onReversed={reloadBalanceInputs} />
             {invoice.notes && <section className="rounded-xl bg-secondary/50 p-4"><p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Notes</p><p className="mt-2 whitespace-pre-wrap text-sm">{invoice.notes}</p></section>}
           </div>
         )}
       </SheetContent>
+
+      {invoice && (
+        <CreateCreditMemoDialog
+          open={creditModalOpen}
+          onClose={() => setCreditModalOpen(false)}
+          invoiceId={invoice.id}
+          invoiceNumber={invoice.invoice_number}
+          balance={availableBalance}
+          onCreated={() => { setCreditModalOpen(false); void reloadBalanceInputs(); }}
+        />
+      )}
 
       {invoice && (
         <RecordPaymentDialog
@@ -205,7 +315,7 @@ export function InvoiceDetailsSheet({ invoiceId, open, onClose, onUpdated }: Pro
           onClose={() => setRecordPaymentOpen(false)}
           invoiceId={invoice.id}
           invoiceNumber={invoice.invoice_number}
-          balance={balance}
+          balance={availableBalance}
           onRecorded={handleRecordPaymentResult}
         />
       )}

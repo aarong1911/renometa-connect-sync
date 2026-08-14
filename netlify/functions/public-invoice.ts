@@ -62,9 +62,17 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
     invoice.project_id ? admin.from("projects").select("name").eq("id", invoice.project_id).maybeSingle() : Promise.resolve({ data: null }),
   ]);
 
+  // Phase 13.10A, Part 12/17 — credit-aware, matching invoice-create-
+  // payment.ts's own ceiling: a posted credit memo must reduce what the
+  // customer sees as owed (and, downstream, what Stripe Checkout is
+  // allowed to charge) — never the stale pre-credit total.
+  const { data: creditRows } = await admin
+    .from("customer_credit_memos").select("total_amount").eq("invoice_id", invoice.id).eq("status", "posted");
+  const creditsTotal = round2((creditRows ?? []).reduce((s: number, r: any) => s + Number(r.total_amount ?? 0), 0));
+
   const totalAmount = Number(invoice.total_amount ?? 0);
   const amountPaid = Number(invoice.amount_paid ?? 0);
-  const remainingBalance = round2(Math.max(0, totalAmount - amountPaid));
+  const remainingBalance = round2(Math.max(0, totalAmount - amountPaid - creditsTotal));
 
   return json(200, {
     invoiceNumber: invoice.invoice_number,
@@ -80,6 +88,7 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
     taxAmount: Number(invoice.tax_amount ?? 0),
     total: totalAmount,
     amountPaid: round2(amountPaid),
+    creditsTotal,
     remainingBalance,
     business: {
       name: org?.public_name?.trim() || org?.name?.trim() || "Your contractor",

@@ -17,6 +17,7 @@ import { formatMoney, formatCompactMoney, formatDateOnlyShort } from "@/lib/form
 import {
   fetchVendorsOrgId, fetchVendors, fetchExpenses, fetchVendorBills, fetchExpenseCategoryAccounts,
   computeApAging, computeExpenseKpis, vendorDisplayName, getVendorBillEffectiveBalance,
+  fetchPostedVendorCreditTotals,
   type Vendor, type Expense, type VendorBill, type ExpenseCategoryAccount,
 } from "@/lib/vendors";
 import { NewVendorModal } from "@/components/financials/NewVendorModal";
@@ -57,28 +58,30 @@ function ExpensesPage() {
   const [billModalOpen, setBillModalOpen] = useState(false);
   const [selectedBill, setSelectedBill] = useState<VendorBill | null>(null);
   const [selectedExpense, setSelectedExpense] = useState<Expense | null>(null);
+  const [creditTotals, setCreditTotals] = useState<Map<string, number>>(new Map());
 
   const load = async () => {
     setLoading(true);
     const id = await fetchVendorsOrgId();
     setOrgId(id);
     if (!id) { setLoading(false); return; }
-    const [v, e, b, c] = await Promise.all([
-      fetchVendors(id), fetchExpenses(id), fetchVendorBills(id), fetchExpenseCategoryAccounts(id),
+    const [v, e, b, c, credits] = await Promise.all([
+      fetchVendors(id), fetchExpenses(id), fetchVendorBills(id), fetchExpenseCategoryAccounts(id), fetchPostedVendorCreditTotals(id),
     ]);
     setMigrationMissing(v === null || e === null || b === null);
     setVendors(v ?? []);
     setExpenses(e ?? []);
     setBills(b ?? []);
     setCategories(c);
+    setCreditTotals(credits);
     setLoading(false);
   };
 
   useEffect(() => { void load(); }, []);
 
   const now = useMemo(() => new Date(), []);
-  const kpis = useMemo(() => computeExpenseKpis(expenses, bills, now), [expenses, bills, now]);
-  const aging = useMemo(() => computeApAging(bills, now), [bills, now]);
+  const kpis = useMemo(() => computeExpenseKpis(expenses, bills, now, creditTotals), [expenses, bills, now, creditTotals]);
+  const aging = useMemo(() => computeApAging(bills, now, creditTotals), [bills, now, creditTotals]);
 
   const filteredExpenses = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -103,13 +106,13 @@ function ExpensesPage() {
     for (const b of bills) {
       const entry = m.get(b.vendorId) ?? { open: 0, paid: 0 };
       if (b.status !== "draft" && b.status !== "cancelled") {
-        entry.open += Math.max(0, b.totalAmount - b.amountPaid);
+        entry.open += getVendorBillEffectiveBalance(b, creditTotals.get(b.id) ?? 0);
         entry.paid += b.amountPaid;
       }
       m.set(b.vendorId, entry);
     }
     return m;
-  }, [bills]);
+  }, [bills, creditTotals]);
 
   return (
     <div className="space-y-5">
@@ -181,7 +184,7 @@ function ExpensesPage() {
       ) : tab === "expenses" ? (
         <ExpensesTable expenses={filteredExpenses} empty={expenses.length === 0} onSelect={setSelectedExpense} />
       ) : tab === "bills" ? (
-        <BillsTable bills={filteredBills} empty={bills.length === 0} onSelect={setSelectedBill} />
+        <BillsTable bills={filteredBills} empty={bills.length === 0} onSelect={setSelectedBill} creditTotals={creditTotals} />
       ) : (
         <VendorsTable vendors={filteredVendors} empty={vendors.length === 0} balances={vendorBalances} />
       )}
@@ -244,7 +247,7 @@ function ExpensesTable({ expenses, empty, onSelect }: { expenses: Expense[]; emp
   );
 }
 
-function BillsTable({ bills, empty, onSelect }: { bills: VendorBill[]; empty: boolean; onSelect: (b: VendorBill) => void }) {
+function BillsTable({ bills, empty, onSelect, creditTotals }: { bills: VendorBill[]; empty: boolean; onSelect: (b: VendorBill) => void; creditTotals: Map<string, number> }) {
   return (
     <Card className="overflow-hidden">
       <div className="grid grid-cols-[110px_minmax(160px,1.5fr)_100px_100px_90px_90px_90px] gap-4 border-b border-border bg-secondary/40 px-5 py-2.5 text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground">
@@ -255,7 +258,7 @@ function BillsTable({ bills, empty, onSelect }: { bills: VendorBill[]; empty: bo
       ) : (
         <ul className="divide-y divide-border">
           {bills.map((b) => {
-            const balance = getVendorBillEffectiveBalance(b);
+            const balance = getVendorBillEffectiveBalance(b, creditTotals.get(b.id) ?? 0);
             return (
               <li key={b.id} onClick={() => onSelect(b)} role="button" tabIndex={0}
                 className="grid cursor-pointer grid-cols-[110px_minmax(160px,1.5fr)_100px_100px_90px_90px_90px] items-center gap-4 px-5 py-3 transition-colors hover:bg-secondary/50">

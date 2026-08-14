@@ -78,8 +78,26 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
   if (invoice.status === "paid") return json(409, { error: "This invoice has already been paid." });
   if (["draft", "void", "cancelled"].includes(invoice.status)) return json(409, { error: `A ${invoice.status} invoice cannot be paid.` });
 
-  const balanceCents = Math.round((Number(invoice.total_amount ?? 0) - Number(invoice.amount_paid ?? 0)) * 100);
-  if (balanceCents <= 0) return json(409, { error: "This invoice has no remaining balance." });
+  // Phase 13.10A, Part 12 — credit-aware ceiling. A customer credit memo
+  // must reduce what Stripe Checkout charges the exact same way a payment
+  // does — otherwise this would create a Checkout Session for a stale
+  // balance. No refund logic here (that's Phase 13.11) — this only ever
+  // makes the charge amount smaller/zero, never larger.
+  //
+  // Phase 13.10C, Part 6 — CRITICAL FIX. Payment-INITIATION safety must use
+  // the RESERVED available balance (status IN ('draft','posted')), not
+  // posted-only — a draft credit whose GL posting/finalize is still
+  // pending already reserves its amount (see the migration's ARCHITECTURE
+  // comment), and Stripe must never be allowed to charge into that
+  // reservation. This is a write-safety check only; the public page's
+  // DISPLAYED remaining balance (public-invoice.ts) stays posted-only,
+  // unchanged.
+  const { data: creditRows } = await admin
+    .from("customer_credit_memos").select("total_amount").eq("invoice_id", invoice.id).in("status", ["draft", "posted"]);
+  const reservedCreditsCents = Math.round((creditRows ?? []).reduce((s: number, r: any) => s + Number(r.total_amount ?? 0), 0) * 100);
+
+  const balanceCents = Math.round((Number(invoice.total_amount ?? 0) - Number(invoice.amount_paid ?? 0)) * 100) - reservedCreditsCents;
+  if (balanceCents <= 0) return json(409, { error: "Payment is temporarily unavailable while an adjustment is being processed." });
 
   const stripeKey = process.env.STRIPE_SECRET_KEY;
   if (!stripeKey) return json(501, { error: "Online payment isn't configured yet. Please contact your contractor to pay this invoice." });
@@ -97,7 +115,7 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
   // state (never accepted from the browser): once amount_paid actually
   // changes (a payment lands), the key changes too, so a later legitimate
   // partial-payment request is free to create its own new session.
-  const idempotencyKey = `invoice-pay:${invoice.id}:${Math.round(Number(invoice.total_amount ?? 0) * 100)}:${Math.round(Number(invoice.amount_paid ?? 0) * 100)}`;
+  const idempotencyKey = `invoice-pay:${invoice.id}:${Math.round(Number(invoice.total_amount ?? 0) * 100)}:${Math.round(Number(invoice.amount_paid ?? 0) * 100)}:${reservedCreditsCents}`;
 
   try {
     const session = await stripe.checkout.sessions.create(

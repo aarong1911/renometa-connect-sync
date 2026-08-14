@@ -11,6 +11,7 @@ import { InvoiceStatusBadge } from "@/components/financials/InvoiceStatusBadge";
 import { RecordPaymentDialog } from "@/components/financials/RecordPaymentDialog";
 import { PaymentHistory } from "@/components/financials/PaymentHistory";
 import { isIssuedInvoice, getInvoiceBalance } from "@/lib/invoice-status";
+import { fetchCustomerCreditMemosForInvoice } from "@/lib/customer-credits";
 import { formatDateOnly } from "@/lib/format";
 
 type InvoiceItem = {
@@ -54,6 +55,14 @@ export function InvoiceDetailModal({ invoiceId, open, onClose, onUpdated }: Prop
   const [sending, setSending] = useState(false);
   const [recordPaymentOpen, setRecordPaymentOpen] = useState(false);
   const [paymentHistoryKey, setPaymentHistoryKey] = useState(0);
+  // Phase 13.10A, Part 15 — posted customer credit memos against this
+  // invoice, so the balance/print totals here match InvoiceDetailsSheet
+  // (Financials tab) rather than silently ignoring credits.
+  const [postedCreditsTotal, setPostedCreditsTotal] = useState(0);
+  // Phase 13.10C, Part 30/36 — draft+posted, used ONLY to gate the Record
+  // Payment CTA/prefill (never displayed as a financial number) — a draft
+  // credit already reserves its amount server-side.
+  const [reservedCreditsTotal, setReservedCreditsTotal] = useState(0);
 
   useEffect(() => {
     if (!open || !invoiceId) return;
@@ -66,7 +75,8 @@ export function InvoiceDetailModal({ invoiceId, open, onClose, onUpdated }: Prop
         contacts!client_id(full_name, email, phone)
       `).eq("id", invoiceId).maybeSingle(),
       supabase.from("invoice_items").select("*").eq("invoice_id", invoiceId).order("id"),
-    ]).then(([{ data: inv }, { data: lineItems }]) => {
+      fetchCustomerCreditMemosForInvoice(invoiceId),
+    ]).then(([{ data: inv }, { data: lineItems }, credits]) => {
       if (inv) {
         const d = inv as any;
         setInvoice({
@@ -76,6 +86,8 @@ export function InvoiceDetailModal({ invoiceId, open, onClose, onUpdated }: Prop
         });
       }
       setItems((lineItems ?? []) as InvoiceItem[]);
+      setPostedCreditsTotal(credits.filter((c) => c.status === "posted").reduce((s, c) => s + c.totalAmount, 0));
+      setReservedCreditsTotal(credits.filter((c) => c.status === "draft" || c.status === "posted").reduce((s, c) => s + c.totalAmount, 0));
       setLoading(false);
     });
   }, [invoiceId, open]);
@@ -150,8 +162,10 @@ export function InvoiceDetailModal({ invoiceId, open, onClose, onUpdated }: Prop
     <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;"><span style="color:#6b7280;">Subtotal</span><span>${fmt(invoice.subtotal)}</span></div>
     ${invoice.tax_amount > 0 ? `<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;"><span style="color:#6b7280;">Tax</span><span>${fmt(invoice.tax_amount)}</span></div>` : ""}
     <div style="display:flex;justify-content:space-between;padding:10px 0;font-size:18px;font-weight:700;border-top:2px solid #111;margin-top:4px;"><span>Total</span><span>${fmt(invoice.total_amount)}</span></div>
-    ${invoice.amount_paid > 0 ? `<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;color:#16a34a;"><span>Paid</span><span>${fmt(invoice.amount_paid)}</span></div>
-    <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:15px;font-weight:700;color:#16a34a;"><span>Balance Due</span><span>${fmt(invoice.total_amount - invoice.amount_paid)}</span></div>` : ""}
+    ${invoice.amount_paid > 0 || postedCreditsTotal > 0 ? `
+    ${invoice.amount_paid > 0 ? `<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;color:#16a34a;"><span>Paid</span><span>${fmt(invoice.amount_paid)}</span></div>` : ""}
+    ${postedCreditsTotal > 0 ? `<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:14px;color:#16a34a;"><span>Credits</span><span>-${fmt(postedCreditsTotal)}</span></div>` : ""}
+    <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:15px;font-weight:700;color:#16a34a;"><span>Balance Due</span><span>${fmt(balance)}</span></div>` : ""}
   </div>
 </div>
 ${invoice.notes ? `<div style="margin-top:32px;padding:16px;background:#f9fafb;border-radius:8px;font-size:13px;color:#374151;"><strong>Notes:</strong><br/>${invoice.notes}</div>` : ""}
@@ -161,8 +175,17 @@ ${invoice.notes ? `<div style="margin-top:32px;padding:16px;background:#f9fafb;b
     setTimeout(() => { win.print(); }, 500);
   };
 
+  // Phase 13.10F, Task 2 — invoice-send.ts now handles BOTH the original
+  // draft->sent send AND a resend for any already-issued invoice (mints a
+  // fresh token, sends the same email template, changes nothing else) —
+  // one shared handler for both "Send Invoice" and "Resend Invoice", since
+  // it's the exact same request/response shape either way. The backend
+  // itself decides whether this is a first send or a resend from the
+  // invoice's current status; the resend response's `status` is always the
+  // invoice's unchanged status, so this never mutates status on a resend.
   const handleSend = async () => {
     if (!invoice || sending) return;
+    const wasDraft = invoice.status === "draft";
     setSending(true);
     try {
       const { data: { session } } = await supabase.auth.getSession();
@@ -173,13 +196,15 @@ ${invoice.notes ? `<div style="margin-top:32px;padding:16px;background:#f9fafb;b
         body: JSON.stringify({ invoiceId: invoice.id }),
       });
       const body = await res.json();
-      if (!res.ok) throw new Error(body?.error || "Could not send this invoice");
-      const nextStatus = body.status ?? "sent";
+      if (!res.ok) throw new Error(body?.error || (wasDraft ? "Could not send this invoice" : "Could not resend this invoice"));
+      const nextStatus = body.status ?? invoice.status;
       setInvoice(prev => prev ? { ...prev, status: nextStatus } : prev);
-      toast.success(`Invoice ${invoice.invoice_number} sent to ${body.recipientEmail ?? "the customer"}`);
+      toast.success(wasDraft
+        ? `Invoice ${invoice.invoice_number} sent to ${body.recipientEmail ?? "the customer"}`
+        : `Invoice ${invoice.invoice_number} resent to ${body.recipientEmail ?? "the customer"}`);
       onUpdated?.({ id: invoice.id, status: nextStatus });
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not send this invoice");
+      toast.error(err instanceof Error ? err.message : (wasDraft ? "Could not send this invoice" : "Could not resend this invoice"));
     } finally {
       setSending(false);
     }
@@ -192,9 +217,15 @@ ${invoice.notes ? `<div style="margin-top:32px;padding:16px;background:#f9fafb;b
     setPaymentHistoryKey((k) => k + 1);
   };
 
-  const balance = invoice ? getInvoiceBalance(invoice.total_amount, invoice.amount_paid) : 0;
+  const balance = invoice ? getInvoiceBalance(invoice.total_amount, invoice.amount_paid, postedCreditsTotal) : 0;
+  const availableBalance = invoice ? getInvoiceBalance(invoice.total_amount, invoice.amount_paid, reservedCreditsTotal) : 0;
   const isDraft = invoice?.status === "draft";
-  const canRecordPayment = Boolean(invoice) && isIssuedInvoice(invoice?.status) && invoice?.status !== "paid" && balance > 0;
+  const canRecordPayment = Boolean(invoice) && isIssuedInvoice(invoice?.status) && invoice?.status !== "paid" && availableBalance > 0;
+  // Any non-draft, non-void/cancelled invoice is still a real receivable
+  // and can be resent — including a fully-paid one (still viewable;
+  // record_invoice_payment()'s own available-balance ceiling is what
+  // actually stops a further payment, not resend availability).
+  const canResend = Boolean(invoice) && !isDraft && isIssuedInvoice(invoice?.status);
   const hasClientEmail = Boolean(invoice?.client?.email?.trim());
 
   return (
@@ -220,12 +251,24 @@ ${invoice.notes ? `<div style="margin-top:32px;padding:16px;background:#f9fafb;b
                   <CircleDollarSign className="h-3.5 w-3.5" />Record Payment
                 </Button>
               )}
+              {canResend && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-1.5"
+                  onClick={handleSend}
+                  disabled={loading || !invoice || sending || !hasClientEmail}
+                  title={!hasClientEmail ? "This customer has no email address on file" : undefined}
+                >
+                  {sending ? <><Loader2 className="h-3.5 w-3.5 animate-spin" />Resending…</> : <><Send className="h-3.5 w-3.5" />Resend Invoice</>}
+                </Button>
+              )}
               <Button variant="outline" size="sm" className="h-8 gap-1.5" onClick={handlePrint} disabled={loading || !invoice}>
                 <Printer className="h-3.5 w-3.5" />Download / Print
               </Button>
             </div>
           </div>
-          {isDraft && !hasClientEmail && !loading && invoice && (
+          {(isDraft || canResend) && !hasClientEmail && !loading && invoice && (
             <p className="pt-2 text-xs text-destructive">This customer has no email address on file — add one before sending.</p>
           )}
         </DialogHeader>
@@ -255,7 +298,7 @@ ${invoice.notes ? `<div style="margin-top:32px;padding:16px;background:#f9fafb;b
               <div className="text-right">
                 <p className="text-3xl font-black tracking-tight text-foreground">INVOICE</p>
                 <p className="text-sm text-muted-foreground mt-0.5">#{invoice.invoice_number}</p>
-                <InvoiceStatusBadge status={invoice.status} dueDate={invoice.due_date} className="mt-2" />
+                <InvoiceStatusBadge status={invoice.status} dueDate={invoice.due_date} effectiveBalance={balance} className="mt-2" />
               </div>
             </div>
 
@@ -325,12 +368,20 @@ ${invoice.notes ? `<div style="margin-top:32px;padding:16px;background:#f9fafb;b
                   <span className="font-bold text-base">Total</span>
                   <span className="font-bold text-base tabular-nums">{fmt(invoice.total_amount)}</span>
                 </div>
-                {invoice.amount_paid > 0 && (
+                {(invoice.amount_paid > 0 || postedCreditsTotal > 0) && (
                   <>
-                    <div className="flex justify-between text-green-600 text-sm">
-                      <span>Paid</span>
-                      <span className="tabular-nums">{fmt(invoice.amount_paid)}</span>
-                    </div>
+                    {invoice.amount_paid > 0 && (
+                      <div className="flex justify-between text-green-600 text-sm">
+                        <span>Paid</span>
+                        <span className="tabular-nums">{fmt(invoice.amount_paid)}</span>
+                      </div>
+                    )}
+                    {postedCreditsTotal > 0 && (
+                      <div className="flex justify-between text-sm text-emerald-700">
+                        <span>Credits</span>
+                        <span className="tabular-nums">−{fmt(postedCreditsTotal)}</span>
+                      </div>
+                    )}
                     <div className="flex justify-between border-t border-border pt-1.5">
                       <span className={`font-semibold ${balance > 0 ? "text-amber-600" : "text-green-600"}`}>Balance Due</span>
                       <span className={`font-semibold tabular-nums ${balance > 0 ? "text-amber-600" : "text-green-600"}`}>{fmt(balance)}</span>
@@ -365,7 +416,7 @@ ${invoice.notes ? `<div style="margin-top:32px;padding:16px;background:#f9fafb;b
           onClose={() => setRecordPaymentOpen(false)}
           invoiceId={invoice.id}
           invoiceNumber={invoice.invoice_number}
-          balance={balance}
+          balance={availableBalance}
           onRecorded={handlePaymentRecorded}
         />
       )}
