@@ -220,6 +220,11 @@ function PaymentsPage() {
                           {overdue ? "Past due" : (p.status ?? "Received")}
                         </StatusBadge>
                       )}
+                      {!isReversal && !isScheduled && (p.refundedAmount ?? 0) > 0 && (
+                        <StatusBadge tone="warning">
+                          {p.refundedAmount! >= p.amount - 0.005 ? "Refunded" : "Partial refund"}
+                        </StatusBadge>
+                      )}
                       {lastReminder && (
                         <span
                           className="inline-flex items-center gap-1 rounded bg-secondary px-1.5 py-0.5 text-[10px] text-muted-foreground"

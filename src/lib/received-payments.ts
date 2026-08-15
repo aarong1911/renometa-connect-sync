@@ -34,13 +34,23 @@ async function getOrgId(): Promise<string | null> {
  * inflating totals instead of netting to $0). A reversal row must always
  * contribute -amount here so the pair nets correctly; every other row
  * (manual, stripe_webhook, legacy_import) contributes +amount unchanged.
+ *
+ * Phase 13.11 — a Stripe refund does NOT get its own row in this list (it
+ * lives in the separate invoice_payment_refunds table — see the Phase
+ * 13.11 migration's data-model rationale); instead the ORIGINAL payment
+ * row's own `refundedAmount` (sum of its SUCCEEDED refunds) is subtracted
+ * here, so a fully-refunded Stripe payment nets to $0 and a partially
+ * refunded one nets to the remainder, without ever mutating the row's own
+ * displayed `amount`.
+ *
  * Never sum `p.amount` directly for an aggregate/total — always go through
  * this helper. Individual row display (the Payments table, detail drawer)
- * intentionally keeps showing each row's own real amount — this only
- * governs aggregation.
+ * intentionally keeps showing each row's own real original amount — this
+ * only governs aggregation.
  */
-export function paymentNetAmount(p: Pick<Payment, "amount" | "source">): number {
-  return p.source === "reversal" ? -p.amount : p.amount;
+export function paymentNetAmount(p: Pick<Payment, "amount" | "source" | "refundedAmount">): number {
+  if (p.source === "reversal") return -p.amount;
+  return p.amount - (p.refundedAmount ?? 0);
 }
 
 export async function fetchReceivedPayments(): Promise<Payment[]> {
@@ -65,6 +75,7 @@ export async function fetchReceivedPayments(): Promise<Payment[]> {
       currency: t.currency,
       reference: t.reference,
       notes: t.notes,
+      refundedAmount: t.refundedAmount,
     }));
 }
 

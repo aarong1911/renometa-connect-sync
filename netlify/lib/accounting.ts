@@ -353,6 +353,16 @@ export async function findJournalEntry(admin: SupabaseClient, orgId: string, sou
 
 export type ReverseJournalEntryResult = { reversalEntryId: string; reversalEntryNumber: string; originalEntryId: string; alreadyReversed: boolean };
 
+/** Reads the posted lines of a journal entry — used by refund posting to find the ORIGINAL payment entry's own clearing/cash account rather than assuming one. */
+export async function fetchJournalEntryLines(admin: SupabaseClient, entryId: string): Promise<Array<{ accountId: string; debit: number; credit: number }>> {
+  const { data, error } = await admin
+    .from("accounting_journal_entry_lines")
+    .select("account_id, debit, credit")
+    .eq("journal_entry_id", entryId);
+  if (error) throw new Error(`Could not load journal entry lines: ${error.message}`);
+  return (data ?? []).map((l: any) => ({ accountId: l.account_id, debit: Number(l.debit ?? 0), credit: Number(l.credit ?? 0) }));
+}
+
 /**
  * Thin wrapper over reverse_journal_entry() — the RPC itself is the
  * transactional boundary (locks the original, swaps every line, posts via
@@ -444,6 +454,62 @@ export async function postVendorCredit(admin: SupabaseClient, orgId: string, cre
     lines: [
       { accountId: accounts.accountsPayable, debit: credit.amount, projectId: credit.projectId, description: `A/P reduced — ${label}` },
       { accountId: credit.expenseAccountId, credit: credit.amount, projectId: credit.projectId, description: `${label} — ${billLabel}` },
+    ],
+  });
+}
+
+// ── Phase 13.11 — Stripe refunds ────────────────────────────────────────────
+
+export type InvoicePaymentRefundForPosting = {
+  id: string; invoicePaymentId: string; amount: number; processedAt: string;
+  invoiceNumber: string; projectId: string | null; contactId: string | null;
+};
+
+/**
+ * Dr Accounts Receivable / Cr the SAME clearing/cash account the ORIGINAL
+ * payment posted to — never hardcoded to Undeposited Funds. Reads the
+ * original payment's own posted journal entry (source_type='invoice_payment',
+ * source_id=invoicePaymentId, posting_key='succeeded') and reuses whichever
+ * account it debited, so this stays correct even if a future phase makes
+ * postInvoicePaymentSucceeded vary its clearing account by payment method.
+ * Throws (never guesses a fallback account) if the original entry can't be
+ * found — this happens only when accounting wasn't initialized for this org
+ * at the time the original payment was recorded, in which case refund
+ * accounting is correctly skipped too (same non-blocking, logged pattern
+ * every other caller of this module already uses).
+ *
+ * For a partial refund, only the refunded amount is reversed — this never
+ * touches or re-posts the original entry itself (accounting-integrity:
+ * "reverse only the refunded amount, do NOT reverse the whole original JE").
+ * Idempotent via post_journal_entry's own (org, source_type, source_id,
+ * posting_key) uniqueness, keyed on THIS refund's own id — a webhook replay
+ * or a retry from the synchronous handler can never double-post.
+ */
+export async function postInvoicePaymentRefundSucceeded(admin: SupabaseClient, orgId: string, refund: InvoicePaymentRefundForPosting, createdBy: string | null): Promise<PostJournalEntryResult> {
+  const originalEntry = await findJournalEntry(admin, orgId, "invoice_payment", refund.invoicePaymentId, "succeeded");
+  if (!originalEntry) {
+    throw new Error(`Cannot post refund accounting: no posted journal entry found for original payment ${refund.invoicePaymentId} (accounting likely was not initialized when that payment was recorded)`);
+  }
+  const lines = await fetchJournalEntryLines(admin, originalEntry.id);
+  const clearingLine = lines.find((l) => l.debit > 0);
+  if (!clearingLine) {
+    throw new Error(`Cannot post refund accounting: original entry ${originalEntry.entryNumber} has no debit (clearing/cash) line`);
+  }
+
+  const accounts = await resolveSystemAccounts(admin, orgId);
+  return postJournalEntry(admin, {
+    orgId,
+    entryDate: refund.processedAt,
+    description: `Refund — Invoice ${refund.invoiceNumber}`,
+    sourceType: "refund",
+    sourceId: refund.id,
+    postingKey: "succeeded",
+    projectId: refund.projectId,
+    contactId: refund.contactId,
+    createdBy,
+    lines: [
+      { accountId: accounts.accountsReceivable, debit: refund.amount, projectId: refund.projectId, contactId: refund.contactId, description: `A/R restored — Refund, Invoice ${refund.invoiceNumber}` },
+      { accountId: clearingLine.accountId, credit: refund.amount, projectId: refund.projectId, contactId: refund.contactId, description: `Refund — Invoice ${refund.invoiceNumber}` },
     ],
   });
 }

@@ -37,7 +37,7 @@
 import type { Handler, HandlerEvent, HandlerResponse } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import Stripe from "stripe";
-import { postInvoicePaymentSucceeded } from "../lib/accounting";
+import { postInvoicePaymentSucceeded, postInvoicePaymentRefundSucceeded } from "../lib/accounting";
 import { mintPublicInvoiceToken, revokePublicInvoiceTokenByRawToken } from "../lib/invoice-tokens";
 import { sendPaymentReceipt } from "../lib/payment-receipt";
 
@@ -96,8 +96,18 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
     return json(400, { error: "Invalid signature" });
   }
 
+  // Phase 13.11 — refund lifecycle. Handled via the refund-level events
+  // (Stripe's own recommendation), never charge.refunded — refund.created/
+  // refund.updated/refund.failed carry the refund's own id/status directly,
+  // where charge.refunded only summarizes the parent charge's aggregate
+  // refunded amount.
+  if (stripeEvent.type === "refund.created" || stripeEvent.type === "refund.updated" || stripeEvent.type === "refund.failed") {
+    return handleRefundEvent(stripeEvent);
+  }
+
   // Every other event type is acknowledged (200) so Stripe stops retrying
-  // it, but only payment_intent.succeeded is ever acted on.
+  // it, but only payment_intent.succeeded and the refund events above are
+  // ever acted on.
   if (stripeEvent.type !== "payment_intent.succeeded") {
     return json(200, { received: true, ignored: stripeEvent.type });
   }
@@ -299,3 +309,81 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
 
   return json(200, { received: true, paymentId: payment.id });
 };
+
+/** Maps Stripe's Refund.status to invoice_payment_refunds.status — see the identical helper in invoice-payment-refund.ts (kept local rather than shared, matching this file's existing style of standalone webhook logic). */
+function mapRefundStatus(s: string | null | undefined): string {
+  if (s === "succeeded" || s === "failed" || s === "canceled" || s === "requires_action") return s;
+  return "pending";
+}
+
+// Phase 13.11 — refund.created / refund.updated / refund.failed. This is
+// the CANONICAL confirmation path for a Stripe refund (Part "Stripe
+// webhook is the canonical external confirmation" in the lifecycle
+// diagram) — the synchronous invoice-payment-refund.ts handler already
+// calls the exact same apply_invoice_payment_refund_result() RPC right
+// after stripe.refunds.create() returns, so this handler's job is to
+// converge state for: (a) the case that synchronous update failed after
+// Stripe already confirmed success, (b) any later lifecycle change
+// (pending/requires_action -> succeeded/failed) that happens asynchronously
+// after the initial API response, and (c) event replays/out-of-order
+// delivery, both made safe by apply_invoice_payment_refund_result()'s own
+// idempotent, terminal-state-frozen design.
+async function handleRefundEvent(stripeEvent: Stripe.Event): Promise<HandlerResponse> {
+  const refund = stripeEvent.data.object as Stripe.Refund;
+  const orgId = refund.metadata?.org_id;
+  const localRefundId = refund.metadata?.local_refund_id || null;
+
+  if (!orgId) {
+    // Not one of our refunds (or a pre-Phase-13.11 refund created outside
+    // this flow) — nothing we can safely act on. Ack so Stripe stops
+    // retrying; log for manual follow-up.
+    console.warn("[stripe-webhook] refund event missing org_id metadata — ignoring", { refundId: refund.id, type: stripeEvent.type });
+    return json(200, { received: true, ignored: "missing org_id metadata" });
+  }
+
+  const mappedStatus = mapRefundStatus(refund.status);
+  const { data: rows, error } = await admin.rpc("apply_invoice_payment_refund_result", {
+    p_org_id: orgId,
+    p_local_refund_id: localRefundId,
+    p_stripe_refund_id: refund.id,
+    p_status: mappedStatus,
+    p_failure_reason: refund.failure_reason ?? null,
+  });
+  if (error) {
+    console.error("[stripe-webhook] apply_invoice_payment_refund_result failed", { refundId: refund.id, orgId, error: error.message });
+    // 500 -> Stripe will retry; this may be a transient DB error.
+    return json(500, { error: "Could not process refund event" });
+  }
+  const result = Array.isArray(rows) ? rows[0] : rows;
+  if (!result?.refund_id) {
+    console.error("[stripe-webhook] refund event resolved no local row", { refundId: refund.id, orgId });
+    return json(200, { received: true, error: "refund row not found" });
+  }
+
+  // Post accounting exactly once — only when THIS call is what actually
+  // transitioned the row into 'succeeded' (result.changed=true). A replay
+  // of an already-succeeded refund returns changed=false and skips this
+  // entirely, so post_journal_entry's own idempotency is a backstop, not
+  // the only guard.
+  if (result.changed && result.status === "succeeded") {
+    try {
+      const { data: accountingSettings } = await admin
+        .from("accounting_settings").select("status").eq("org_id", orgId).maybeSingle();
+      if (accountingSettings?.status === "initialized") {
+        const { data: invoiceForPosting } = await admin
+          .from("invoices").select("invoice_number").eq("id", result.invoice_id).maybeSingle();
+        await postInvoicePaymentRefundSucceeded(admin, orgId, {
+          id: result.refund_id, invoicePaymentId: result.invoice_payment_id, amount: Number(result.amount),
+          processedAt: new Date().toISOString().slice(0, 10),
+          invoiceNumber: invoiceForPosting?.invoice_number ?? "", projectId: result.project_id ?? null, contactId: result.contact_id ?? null,
+        }, null);
+      }
+    } catch (accountingError) {
+      console.error("[stripe-webhook] refund accounting posting failed (non-blocking)", {
+        refundId: result.refund_id, orgId, error: accountingError instanceof Error ? accountingError.message : String(accountingError),
+      });
+    }
+  }
+
+  return json(200, { received: true, refundId: result.refund_id, status: result.status });
+}

@@ -6,6 +6,7 @@ import { Undo2 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { formatDateOnly } from "@/lib/format";
 import { ReversalReasonDialog } from "@/components/financials/ReversalReasonDialog";
+import { RefundDialog } from "@/components/financials/RefundDialog";
 
 type PaymentRow = {
   id: string;
@@ -19,6 +20,24 @@ type PaymentRow = {
   reversesPaymentId: string | null;
   reversalReason: string | null;
   isReversed: boolean;
+  refunds: RefundRow[];
+};
+
+type RefundRow = {
+  id: string;
+  amount: number;
+  status: string;
+  reason: string | null;
+  requestedAt: string;
+  stripeFailureReason: string | null;
+};
+
+const REFUND_STATUS_LABEL: Record<string, string> = {
+  pending: "Refund pending",
+  requires_action: "Refund pending",
+  succeeded: "Refunded",
+  failed: "Refund failed",
+  canceled: "Refund canceled",
 };
 
 const METHOD_LABEL: Record<string, string> = {
@@ -49,23 +68,41 @@ async function authHeader(): Promise<Record<string, string>> {
 export function PaymentHistory({ invoiceId, refreshKey, onReversed }: { invoiceId: string; refreshKey?: number; onReversed?: () => void }) {
   const [payments, setPayments] = useState<PaymentRow[] | null>(null);
   const [reversingId, setReversingId] = useState<string | null>(null);
+  const [refundingId, setRefundingId] = useState<string | null>(null);
 
   const load = () => {
-    supabase
-      .from("invoice_payments")
-      .select("id, amount, payment_method, status, provider, paid_at, reference, source, reverses_payment_id, reversal_reason")
-      .eq("invoice_id", invoiceId)
-      .order("paid_at", { ascending: false })
-      .then(({ data, error }) => {
-        if (error) { setPayments([]); return; }
-        const reversedIds = new Set((data ?? []).map((r: any) => r.reverses_payment_id).filter(Boolean));
-        setPayments((data ?? []).map((r: any) => ({
-          id: r.id, amount: Number(r.amount ?? 0), paymentMethod: r.payment_method,
-          status: r.status, provider: r.provider, paidAt: r.paid_at, reference: r.reference, source: r.source,
-          reversesPaymentId: r.reverses_payment_id ?? null, reversalReason: r.reversal_reason ?? null,
-          isReversed: reversedIds.has(r.id),
-        })));
-      });
+    Promise.all([
+      supabase
+        .from("invoice_payments")
+        .select("id, amount, payment_method, status, provider, paid_at, reference, source, reverses_payment_id, reversal_reason")
+        .eq("invoice_id", invoiceId)
+        .order("paid_at", { ascending: false }),
+      supabase
+        .from("invoice_payment_refunds")
+        .select("id, invoice_payment_id, amount, status, reason, requested_at, stripe_failure_reason")
+        .eq("invoice_id", invoiceId)
+        .order("requested_at", { ascending: false }),
+    ]).then(([paymentsRes, refundsRes]) => {
+      if (paymentsRes.error) { setPayments([]); return; }
+      const data = paymentsRes.data ?? [];
+      const refundsByPayment = new Map<string, RefundRow[]>();
+      for (const r of (refundsRes.data ?? []) as any[]) {
+        const list = refundsByPayment.get(r.invoice_payment_id) ?? [];
+        list.push({
+          id: r.id, amount: Number(r.amount ?? 0), status: r.status, reason: r.reason ?? null,
+          requestedAt: r.requested_at, stripeFailureReason: r.stripe_failure_reason ?? null,
+        });
+        refundsByPayment.set(r.invoice_payment_id, list);
+      }
+      const reversedIds = new Set(data.map((r: any) => r.reverses_payment_id).filter(Boolean));
+      setPayments(data.map((r: any) => ({
+        id: r.id, amount: Number(r.amount ?? 0), paymentMethod: r.payment_method,
+        status: r.status, provider: r.provider, paidAt: r.paid_at, reference: r.reference, source: r.source,
+        reversesPaymentId: r.reverses_payment_id ?? null, reversalReason: r.reversal_reason ?? null,
+        isReversed: reversedIds.has(r.id),
+        refunds: refundsByPayment.get(r.id) ?? [],
+      })));
+    });
   };
 
   useEffect(() => { load(); }, [invoiceId, refreshKey]);
@@ -88,8 +125,35 @@ export function PaymentHistory({ invoiceId, refreshKey, onReversed }: { invoiceI
     }
   };
 
+  const handleRefund = async (paymentId: string, amount: number, reason: string) => {
+    try {
+      const headers = await authHeader();
+      const idempotencyKey = crypto.randomUUID();
+      const res = await fetch("/.netlify/functions/invoice-payment-refund", {
+        method: "POST", headers, body: JSON.stringify({ paymentId, amount, reason: reason || undefined, idempotencyKey }),
+      });
+      const resBody = await res.json();
+      if (!res.ok) throw new Error(resBody?.error || "Could not refund this payment");
+      if (resBody.accountingWarning) toast.warning(resBody.accountingWarning);
+      else if (resBody.warning) toast.warning(resBody.warning);
+      else if (resBody.status === "succeeded") toast.success("Refund complete");
+      else toast.success("Refund submitted — status will update shortly");
+      setRefundingId(null);
+      load();
+      onReversed?.();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not refund this payment");
+    }
+  };
+
   if (!payments || payments.length === 0) return null;
   const reversingPayment = payments.find((p) => p.id === reversingId) ?? null;
+  const refundingPayment = payments.find((p) => p.id === refundingId) ?? null;
+  const refundingRefundable = refundingPayment
+    ? refundingPayment.amount - refundingPayment.refunds
+        .filter((r) => ["pending", "requires_action", "succeeded"].includes(r.status))
+        .reduce((s, r) => s + r.amount, 0)
+    : 0;
 
   return (
     <div>
@@ -98,6 +162,11 @@ export function PaymentHistory({ invoiceId, refreshKey, onReversed }: { invoiceI
         {payments.map((p) => {
           const isReversal = Boolean(p.reversesPaymentId);
           const canReverse = p.status === "succeeded" && p.provider === "manual" && !isReversal && !p.isReversed;
+          const reservedRefunds = p.refunds
+            .filter((r) => ["pending", "requires_action", "succeeded"].includes(r.status))
+            .reduce((s, r) => s + r.amount, 0);
+          const refundable = Math.max(0, p.amount - reservedRefunds);
+          const canRefund = p.status === "succeeded" && p.provider === "stripe" && !isReversal && refundable > 0.005;
           return (
             <div key={p.id} className="rounded-lg border border-border bg-background px-3 py-2 text-sm">
               <div className="flex items-center justify-between">
@@ -111,7 +180,6 @@ export function PaymentHistory({ invoiceId, refreshKey, onReversed }: { invoiceI
                     {METHOD_LABEL[p.paymentMethod] ?? p.paymentMethod}
                     {p.provider === "stripe" ? " · Stripe" : ""}
                     {p.reference ? ` · ${p.reference}` : ""}
-                    {p.status === "refunded" ? " · Refunded" : ""}
                     {p.source === "legacy_import" ? " · Imported" : ""}
                   </p>
                 </div>
@@ -124,13 +192,44 @@ export function PaymentHistory({ invoiceId, refreshKey, onReversed }: { invoiceI
                       <Undo2 className="h-3.5 w-3.5" />
                     </button>
                   )}
+                  {canRefund && (
+                    <button title="Refund this payment" onClick={() => setRefundingId(p.id)} className="rounded p-1 text-muted-foreground hover:bg-secondary hover:text-destructive">
+                      <Undo2 className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                 </div>
               </div>
               {p.reversalReason && <p className="mt-1 text-[11px] text-muted-foreground">Reason: {p.reversalReason}</p>}
+              {p.refunds.length > 0 && (
+                <div className="mt-1.5 space-y-1 border-t border-border pt-1.5">
+                  {p.refunds.map((r) => (
+                    <div key={r.id} className="flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-1.5 text-muted-foreground">
+                        <Badge variant="outline" className={`text-[10px] ${r.status === "succeeded" ? "border-destructive/40 text-destructive" : r.status === "failed" ? "border-warning-soft-foreground/40" : ""}`}>
+                          {REFUND_STATUS_LABEL[r.status] ?? r.status}
+                        </Badge>
+                        <span>{fmtDate(r.requestedAt)}</span>
+                        {r.reason && <span>· {r.reason}</span>}
+                        {r.status === "failed" && r.stripeFailureReason && <span>· {r.stripeFailureReason}</span>}
+                      </div>
+                      <span className={`font-medium tabular-nums ${r.status === "succeeded" ? "text-destructive" : "text-muted-foreground"}`}>
+                        −{money(r.amount)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           );
         })}
       </div>
+
+      <RefundDialog
+        open={Boolean(refundingPayment)} onClose={() => setRefundingId(null)}
+        originalAmount={refundingPayment?.amount ?? 0}
+        refundableAmount={refundingRefundable}
+        onConfirm={(amount, reason) => refundingPayment ? handleRefund(refundingPayment.id, amount, reason) : Promise.resolve()}
+      />
 
       <ReversalReasonDialog
         open={Boolean(reversingPayment)} onClose={() => setReversingId(null)}

@@ -420,6 +420,8 @@ export type Payment = {
   currency?: string;
   reference?: string | null;
   notes?: string | null;
+  /** Phase 13.11 — sum of SUCCEEDED Stripe refunds against this payment. See paymentNetAmount() in @/lib/received-payments. */
+  refundedAmount?: number;
 };
 
 const owners = ["Alex Romero", "Priya Shah", "Jamal Burke", "Mei Lin", "Sara Holt"];

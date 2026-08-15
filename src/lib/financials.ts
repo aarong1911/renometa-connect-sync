@@ -148,29 +148,69 @@ export type InvoicePaymentRecord = {
   amount: number;
   status: "pending" | "succeeded" | "failed" | "refunded" | "voided";
   paidAt: string;
-  /** 'reversal' for an append-only reversal row (status stays 'succeeded' — see accounting-integrity skill). Never treat a reversal row as an ordinary positive receipt; see isReversalPayment(). */
+  /**
+   * 'reversal' for an append-only manual-payment reversal row (status stays
+   * 'succeeded' — see accounting-integrity skill), or 'refund' for a
+   * synthetic event representing a SUCCEEDED Stripe refund (Phase 13.11 —
+   * not a real invoice_payments row at all; see fetchInvoicePayments()).
+   * Never treat either as an ordinary positive receipt — see
+   * isNegativeLedgerEvent().
+   */
   source: string;
 };
 
-/** True for an append-only reversal row (source='reversal') — always nets NEGATIVE against any Collected/Received total, regardless of its own status='succeeded'. */
-export function isReversalPayment(p: Pick<InvoicePaymentRecord, "source">): boolean {
-  return p.source === "reversal";
+/** True for an append-only reversal row (source='reversal') or a succeeded Stripe refund (source='refund') — both always net NEGATIVE against any Collected/Received total, regardless of status='succeeded'. */
+export function isNegativeLedgerEvent(p: Pick<InvoicePaymentRecord, "source">): boolean {
+  return p.source === "reversal" || p.source === "refund";
 }
 
-/** Returns null (not []) when the ledger table doesn't exist yet, so callers can distinguish "no payments" from "no ledger." */
+/**
+ * Returns null (not []) when the ledger table doesn't exist yet, so callers
+ * can distinguish "no payments" from "no ledger."
+ *
+ * Phase 13.11 — also merges in one synthetic InvoicePaymentRecord per
+ * SUCCEEDED row in invoice_payment_refunds (source='refund', status=
+ * 'succeeded', amount = the refunded amount, paidAt = when the refund
+ * actually succeeded). These are not real invoice_payments rows — a Stripe
+ * refund lives in its own table (see the Phase 13.11 migration's data-model
+ * rationale) — but every caller in this file already knows how to net a
+ * negative-source ledger event into Collected/Received totals via
+ * isNegativeLedgerEvent(), so folding refunds in here (rather than
+ * threading a second parameter through every metrics function) keeps that
+ * logic in exactly one place.
+ */
 export async function fetchInvoicePayments(orgId: string): Promise<InvoicePaymentRecord[] | null> {
-  const { data, error } = await supabase
-    .from("invoice_payments")
-    .select("id, invoice_id, amount, status, paid_at, source")
-    .eq("org_id", orgId)
-    .order("paid_at", { ascending: false });
-  if (error) {
-    if (error.code !== "42P01") console.error("[financials]", error);
+  const [paymentsRes, refundsRes] = await Promise.all([
+    supabase
+      .from("invoice_payments")
+      .select("id, invoice_id, amount, status, paid_at, source")
+      .eq("org_id", orgId)
+      .order("paid_at", { ascending: false }),
+    supabase
+      .from("invoice_payment_refunds")
+      .select("id, invoice_id, amount, status, succeeded_at, requested_at")
+      .eq("org_id", orgId)
+      .eq("status", "succeeded"),
+  ]);
+  if (paymentsRes.error) {
+    if (paymentsRes.error.code !== "42P01") console.error("[financials]", paymentsRes.error);
     return null;
   }
-  return (data ?? []).map((r: any) => ({
+  const records: InvoicePaymentRecord[] = (paymentsRes.data ?? []).map((r: any) => ({
     id: r.id, invoiceId: r.invoice_id, amount: Number(r.amount ?? 0), status: r.status, paidAt: r.paid_at, source: r.source ?? "manual",
   }));
+  // 42P01 here just means invoice_payment_refunds isn't deployed yet in
+  // this environment — degrade to "no refunds," same fallback posture as
+  // the payments query above, never a hard failure.
+  if (!refundsRes.error) {
+    for (const r of (refundsRes.data ?? []) as any[]) {
+      records.push({
+        id: r.id, invoiceId: r.invoice_id, amount: Number(r.amount ?? 0), status: "succeeded",
+        paidAt: r.succeeded_at ?? r.requested_at, source: "refund",
+      });
+    }
+  }
+  return records;
 }
 
 export type InvoiceMetrics = {
@@ -219,10 +259,10 @@ export function computeInvoiceMetrics(invoices: FinancialInvoice[], now: Date = 
     // accounting-integrity skill), so it must be excluded from `succeeded`
     // and netted separately, or a reversed payment would double-count as a
     // positive receipt instead of netting to zero.
-    const succeeded = payments.filter((p) => p.status === "succeeded" && !isReversalPayment(p) && (dateOnlyToLocalDate(p.paidAt) ?? new Date(p.paidAt)) >= monthStart);
-    const reversals = payments.filter((p) => p.status === "succeeded" && isReversalPayment(p) && (dateOnlyToLocalDate(p.paidAt) ?? new Date(p.paidAt)) >= monthStart);
+    const succeeded = payments.filter((p) => p.status === "succeeded" && !isNegativeLedgerEvent(p) && (dateOnlyToLocalDate(p.paidAt) ?? new Date(p.paidAt)) >= monthStart);
+    const negatives = payments.filter((p) => p.status === "succeeded" && isNegativeLedgerEvent(p) && (dateOnlyToLocalDate(p.paidAt) ?? new Date(p.paidAt)) >= monthStart);
     const refunded = payments.filter((p) => p.status === "refunded" && (dateOnlyToLocalDate(p.paidAt) ?? new Date(p.paidAt)) >= monthStart);
-    collectedThisMonth = round2(succeeded.reduce((s, p) => s + p.amount, 0) - reversals.reduce((s, p) => s + p.amount, 0) - refunded.reduce((s, p) => s + p.amount, 0));
+    collectedThisMonth = round2(succeeded.reduce((s, p) => s + p.amount, 0) - negatives.reduce((s, p) => s + p.amount, 0) - refunded.reduce((s, p) => s + p.amount, 0));
     collectedThisMonthCount = succeeded.length;
   } else {
     // No ledger yet — amount_paid is a running balance, so "collected this
@@ -292,10 +332,12 @@ export function computeInvoicedVsCollectedTrend(invoices: FinancialInvoice[], ra
       if (p.status !== "succeeded" && p.status !== "refunded") continue;
       const paidAt = dateOnlyToLocalDate(p.paidAt) ?? new Date(p.paidAt);
       const bucket = buckets.find((b) => paidAt >= b.start && paidAt < b.end);
-      // A reversal row is status='succeeded' too (append-only model) — it
-      // must net negative here, same as a 'refunded' row, or a reversed
-      // payment double-counts as a positive "Collected" data point.
-      if (bucket) bucket.collected += (p.status === "refunded" || isReversalPayment(p)) ? -p.amount : p.amount;
+      // A reversal row is status='succeeded' too (append-only model), and a
+      // succeeded refund is folded in as a synthetic status='succeeded'
+      // source='refund' event (see fetchInvoicePayments()) — both must net
+      // negative here, same as a 'refunded' row, or double-count as a
+      // positive "Collected" data point.
+      if (bucket) bucket.collected += (p.status === "refunded" || isNegativeLedgerEvent(p)) ? -p.amount : p.amount;
     }
   } else {
     for (const inv of issued) {

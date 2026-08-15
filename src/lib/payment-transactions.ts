@@ -46,6 +46,8 @@ export type PaymentTransaction = {
   paidAt: string;
   reference: string | null;
   notes: string | null;
+  /** Phase 13.11 — sum of SUCCEEDED Stripe refunds against this payment. Always 0 for a manual payment (refunds only ever target provider='stripe' rows). Never subtracted from `amount` itself (each row still shows its own real original amount) — only used by paymentNetAmount() for aggregate Collected/Received totals. */
+  refundedAmount: number;
 };
 
 /** Returns [] (not an error) when the ledger table doesn't exist yet in this environment, or the caller has no org — callers should treat that identically to "no payments yet." */
@@ -53,24 +55,40 @@ export async function fetchPaymentTransactions(): Promise<PaymentTransaction[]> 
   const orgId = await getOrgId();
   if (!orgId) return [];
 
-  const { data, error } = await supabase
-    .from("invoice_payments")
-    .select(`
-      id, invoice_id, project_id, contact_id, amount, currency, status,
-      payment_method, provider, provider_payment_id, source, paid_at, reference, notes,
-      invoices!invoice_id(invoice_number),
-      contacts!contact_id(full_name),
-      projects!project_id(name)
-    `)
-    .eq("org_id", orgId)
-    .order("paid_at", { ascending: false });
+  const [paymentsRes, refundsRes] = await Promise.all([
+    supabase
+      .from("invoice_payments")
+      .select(`
+        id, invoice_id, project_id, contact_id, amount, currency, status,
+        payment_method, provider, provider_payment_id, source, paid_at, reference, notes,
+        invoices!invoice_id(invoice_number),
+        contacts!contact_id(full_name),
+        projects!project_id(name)
+      `)
+      .eq("org_id", orgId)
+      .order("paid_at", { ascending: false }),
+    supabase
+      .from("invoice_payment_refunds")
+      .select("invoice_payment_id, amount")
+      .eq("org_id", orgId)
+      .eq("status", "succeeded"),
+  ]);
 
-  if (error) {
-    if (error.code !== "42P01") console.error("[payment-transactions]", error);
+  if (paymentsRes.error) {
+    if (paymentsRes.error.code !== "42P01") console.error("[payment-transactions]", paymentsRes.error);
     return [];
   }
 
-  return (data ?? []).map((r: any) => ({
+  // 42P01 here just means invoice_payment_refunds isn't deployed yet —
+  // degrade to "no refunds" rather than failing the whole page.
+  const refundedByPayment = new Map<string, number>();
+  if (!refundsRes.error) {
+    for (const r of (refundsRes.data ?? []) as any[]) {
+      refundedByPayment.set(r.invoice_payment_id, (refundedByPayment.get(r.invoice_payment_id) ?? 0) + Number(r.amount ?? 0));
+    }
+  }
+
+  return (paymentsRes.data ?? []).map((r: any) => ({
     id: r.id,
     invoiceId: r.invoice_id,
     invoiceNumber: r.invoices?.invoice_number ?? "—",
@@ -88,5 +106,6 @@ export async function fetchPaymentTransactions(): Promise<PaymentTransaction[]> 
     paidAt: r.paid_at,
     reference: r.reference ?? null,
     notes: r.notes ?? null,
+    refundedAmount: refundedByPayment.get(r.id) ?? 0,
   }));
 }
