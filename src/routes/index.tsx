@@ -28,7 +28,7 @@ import { cn } from "@/lib/utils";
 import { NewContactDialog } from "@/components/contacts/new-contact-dialog";
 import { NewDealDialog } from "@/components/sales/new-deal-dialog";
 import { normalizePipelineStage } from "@/lib/pipeline-phases";
-import { useBroadcasts } from "@/lib/broadcasts-store";
+import { useMarketingCampaigns } from "@/lib/marketing-campaigns-store";
 import { computeEffectiveEstimateTotals } from "@/lib/estimate-totals";
 import {
   APPOINTMENT_STATUS_LABELS, APPOINTMENT_STATUS_TINT,
@@ -469,7 +469,7 @@ function DashboardPage() {
   const { conversations } = useSmsMetaConversations();
   const { conversations: gmailConversations } = useGmailConversations();
   const { workflows: allWorkflows, runs: workflowRuns } = useWorkflows();
-  const allBroadcasts = useBroadcasts();
+  const allCampaigns = useMarketingCampaigns();
   const navigate = useNavigate();
 
   const [userName, setUserName] = useState("there");
@@ -1186,17 +1186,15 @@ function DashboardPage() {
     return { activeCount: activeWorkflows.length, totalCount: allWorkflows.length, running, recentSuccesses, recentFailures, needingAttention };
   }, [allWorkflows, workflowRuns]);
 
-  // ─── Marketing Activity — real broadcasts (useBroadcasts, currently
-  // localStorage-backed — no dedicated Supabase table exists yet, see
-  // broadcasts-store.ts) + real leads.source breakdown. Deliberately does
-  // NOT show open/click/reply rate — every broadcast's engagement counters
-  // are always initialized to 0 (no send/delivery-tracking pipeline exists
-  // yet), so a rate computed from them would just always read "0%", which
-  // would look like real data but isn't meaningfully measured yet. ────────
+  // ─── Marketing Activity — real Campaigns (the live `campaigns` table,
+  // reconciled — not duplicated — as of Phase 14.1) + real leads.source
+  // breakdown. Sent count reflects campaigns whose backend processing has actually
+  // completed (marketing-campaign-process-queue.ts), not merely a status
+  // flag the user set.
   const marketingStats = useMemo(() => {
-    const sent = allBroadcasts.filter(b => b.status === "sent").length;
-    const scheduled = allBroadcasts.filter(b => b.status === "scheduled").length;
-    const drafts = allBroadcasts.filter(b => b.status === "draft").length;
+    const sent = allCampaigns.filter(c => c.status === "completed").length;
+    const scheduled = allCampaigns.filter(c => c.status === "scheduled" || c.status === "queued" || c.status === "sending").length;
+    const drafts = allCampaigns.filter(c => c.status === "draft").length;
 
     const bySource = new Map<string, number>();
     for (const s of leadSources) {
@@ -1209,7 +1207,7 @@ function DashboardPage() {
     const maxSourceCount = Math.max(1, ...topSources.map(s => s.count));
 
     return { sent, scheduled, drafts, topSources, maxSourceCount, totalLeadsWithSource: leadSources.length };
-  }, [allBroadcasts, leadSources]);
+  }, [allCampaigns, leadSources]);
 
   // ─── Pipeline Pulse — real deal_activities events only ────────────────────
   const pipelinePulse = useMemo(() => {
@@ -1616,19 +1614,14 @@ function DashboardPage() {
         </div>
 
         <div className="col-span-1 lg:col-span-6 xl:col-span-4 2xl:col-span-3 h-full">
-          <SectionCard title="Marketing Activity" icon={Megaphone} tint="indigo" action={<CardAction to="/marketing">View all</CardAction>} className="h-full 2xl:min-h-[170px]">
+          <SectionCard title="Campaigns" icon={Megaphone} tint="indigo" action={<CardAction to="/marketing">View all</CardAction>} className="h-full 2xl:min-h-[170px]">
             {marketingStats.sent + marketingStats.scheduled + marketingStats.drafts === 0 && marketingStats.totalLeadsWithSource === 0 ? (
-              <p className="py-5 text-center text-sm text-muted-foreground">No marketing activity yet.</p>
+              <p className="py-5 text-center text-sm text-muted-foreground">No campaigns yet.</p>
             ) : (
               <>
                 <div className="grid grid-cols-3 gap-1.5">
                   <div className="rounded-lg bg-secondary/60 ring-1 ring-border/60 p-1.5">
-                    {/* "Marked Sent," not "Sent" — this reflects a status
-                        flag the user set, not a confirmed delivery event.
-                        See broadcasts-store.ts: no real send/delivery
-                        pipeline is wired up yet, so "Sent" alone would
-                        overstate what actually happened. */}
-                    <div className="text-[9px] text-muted-foreground uppercase tracking-wider">Marked Sent</div>
+                    <div className="text-[9px] text-muted-foreground uppercase tracking-wider">Sent</div>
                     <div className="text-base font-semibold mt-0.5 tabular-nums text-success">{marketingStats.sent}</div>
                   </div>
                   <div className="rounded-lg bg-secondary/60 ring-1 ring-border/60 p-1.5">
@@ -1655,9 +1648,6 @@ function DashboardPage() {
                       ))}
                     </ul>
                   </div>
-                )}
-                {marketingStats.sent > 0 && (
-                  <p className="text-[9px] text-muted-foreground mt-1.5">Delivery and engagement tracking are not connected yet.</p>
                 )}
               </>
             )}

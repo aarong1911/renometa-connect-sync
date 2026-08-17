@@ -32,7 +32,7 @@ export const PERMISSION_SECTIONS: PermissionSection[] = [
   { label: "Inbox", features: [
     { id: "conversations", label: "Conversations",  description: "Client & team messages" },
     { id: "templates",     label: "Templates",      description: "Message templates" },
-    { id: "broadcasts",    label: "Broadcasts",     description: "Bulk messaging" },
+    { id: "campaigns",     label: "Campaigns",      description: "Bulk email & SMS campaigns" },
   ]},
   { label: "Automation", features: [
     { id: "workflows",     label: "Workflows",      description: "Automated sequences" },
@@ -60,9 +60,9 @@ export const PERMISSION_SECTIONS: PermissionSection[] = [
 export const ROLE_FEATURE_ACCESS: Record<Role, string[]> = {
   owner:          ["*"],
   admin:          ["*"],
-  office_manager: ["contacts","companies","leads","pipeline","projects","tasks","calendar","files","change_orders","conversations","templates","broadcasts","estimates","invoices","payments"],
+  office_manager: ["contacts","companies","leads","pipeline","projects","tasks","calendar","files","change_orders","conversations","templates","campaigns","estimates","invoices","payments"],
   estimator:      ["contacts","companies","leads","pipeline","conversations","templates","estimates"],
-  sales:          ["contacts","companies","leads","pipeline","conversations","templates","broadcasts","estimates"],
+  sales:          ["contacts","companies","leads","pipeline","conversations","templates","campaigns","estimates"],
   project_manager:["contacts","companies","projects","tasks","calendar","files","change_orders","conversations","templates","estimates"],
   field_worker:   [],
   accountant:     ["contacts","companies","estimates","invoices","payments","analytics","change_orders"],

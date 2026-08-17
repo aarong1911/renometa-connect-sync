@@ -49,6 +49,7 @@ import {
 import { NewContactDialog } from "@/components/contacts/new-contact-dialog";
 import { ContactRelatedTab } from "@/components/contacts/contact-related-tab";
 import { CommunicationTab } from "@/components/contacts/communication-tab";
+import { CommunicationPreferencesSection } from "@/components/contacts/communication-preferences-section";
 import { useContactNotes, type ContactNote } from "@/lib/contact-notes";
 import {
   normalizeTags, buildCanonicalTagOptions, contactHasCanonicalTag,
@@ -1837,6 +1838,8 @@ export function ContactDrawer({
                         />
                       </div>
                     </div>
+                    <Separator />
+                    <CommunicationPreferencesSection contactId={contact.id} />
                     <Separator />
                     <div className="rounded-md border border-border bg-secondary/40 p-3 text-xs text-muted-foreground">
                       Created {formatDistanceToNow(new Date(contact.createdAt), { addSuffix: true })} · Last activity {formatDistanceToNow(new Date(contact.lastActivity), { addSuffix: true })}.
