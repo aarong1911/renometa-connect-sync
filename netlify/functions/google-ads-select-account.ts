@@ -154,6 +154,20 @@ export const handler: Handler = async (event) => {
       accessible_customer_ids: Array.from(new Set(mergedIds)),
       last_synced_at: nowIso,
       last_error_code: null,
+      // Real-Account Isolation Verification phase — lead_last_synced_at/
+      // lead_last_error_code are written by google-ads-lead-sync.ts every
+      // time a lead sync runs, always against whichever customer was
+      // selected AT THAT TIME (see that file's operational-bookkeeping
+      // update) — they describe "the selected advertiser's last sync",
+      // not the OAuth connection globally. Left stale across an account
+      // switch, they'd show a real timestamp/status from the PREVIOUS
+      // advertiser under the newly selected one, before it has ever been
+      // synced itself. Reset to null here so a freshly selected advertiser
+      // starts from an honest "never synced" state rather than borrowing
+      // the old advertiser's sync history. This never touches historical
+      // submissions/events/mappings — only this per-connection metadata.
+      lead_last_synced_at: null,
+      lead_last_error_code: null,
       updated_at: nowIso,
     })
     .eq("id", connection.id)

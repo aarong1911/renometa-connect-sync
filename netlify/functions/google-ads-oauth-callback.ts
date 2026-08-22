@@ -161,7 +161,7 @@ export const handler: Handler = async (event) => {
     warn("state_verification", { reason: e?.message });
     return integrationsRedirect("error", "invalid_state");
   }
-  const { userId, orgId, nonce } = statePayload;
+  const { userId, orgId, nonce, intent } = statePayload;
 
   // ── 3. Re-confirm, server-side, that the user still exists and still
   // belongs to this org — the signed state could be up to 10 minutes old,
@@ -282,6 +282,21 @@ export const handler: Handler = async (event) => {
   // empty string can never slip through as if it were a usable value.
   const newlyEncryptedRefreshToken: string | null = refreshToken ? encryptToBytea(refreshToken) : null;
   const existingEncryptedRefreshToken: string | null = existing?.encrypted_refresh_token || null;
+
+  // Reconnect + Disconnect phase, Step 8 — an EXPLICIT reconnect must never
+  // silently keep operating against the OLD Google identity/hierarchy just
+  // because Google happened not to return a fresh refresh_token this run.
+  // Falling back to `existingEncryptedRefreshToken` here would make the UI
+  // report "reconnected" while every subsequent API call is still using the
+  // previous authorization — exactly the failure mode this phase exists to
+  // prevent. Nothing is written to the connection row on this path; the
+  // organization's existing (old) connection is left completely untouched,
+  // so it keeps working normally until the user successfully reconnects.
+  if (intent === "reconnect" && !newlyEncryptedRefreshToken) {
+    warn("token_exchange", { reason: "reconnect_missing_new_refresh_token" });
+    return integrationsRedirect("error", "reconnect_requires_consent");
+  }
+
   const effectiveEncryptedRefreshToken: string | null =
     newlyEncryptedRefreshToken || existingEncryptedRefreshToken;
 

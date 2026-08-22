@@ -23,6 +23,7 @@ import { resolveOrgFromBearerToken } from "./lib/resolve-org";
 import {
   signGoogleAdsOAuthState,
   type GoogleAdsOAuthStatePayload,
+  type GoogleAdsOAuthIntent,
 } from "./lib/google-ads-oauth-state";
 
 const supabaseAdmin = createClient(
@@ -64,6 +65,20 @@ export const handler: Handler = async (event) => {
   }
   const { userId, orgId } = resolved;
 
+  // Reconnect + Disconnect phase — the ONLY value ever accepted here is a
+  // strict-whitelisted `intent`; everything else that matters (userId,
+  // orgId) still comes exclusively from the resolved session above, never
+  // the request body.
+  let reqBody: { intent?: unknown } = {};
+  try {
+    reqBody = event.body ? JSON.parse(event.body) : {};
+  } catch {
+    // Malformed body just falls back to the default "connect" intent below
+    // rather than failing the whole request — intent is the only thing
+    // ever read from it.
+  }
+  const intent: GoogleAdsOAuthIntent = reqBody.intent === "reconnect" ? "reconnect" : "connect";
+
   const clientId = process.env.GOOGLE_ADS_CLIENT_ID;
   const redirectUri = process.env.GOOGLE_ADS_REDIRECT_URI;
   const stateSecret = process.env.GOOGLE_ADS_OAUTH_STATE_SECRET;
@@ -80,8 +95,21 @@ export const handler: Handler = async (event) => {
     nonce,
     iat: issuedAt,
     exp: issuedAt + STATE_TTL_MS,
+    intent,
   };
   const state = signGoogleAdsOAuthState(statePayload, stateSecret);
+
+  // Normal connect keeps the existing behavior unchanged: `prompt=consent`
+  // alone (Google already returns a fresh refresh_token on every such
+  // authorization, since re-consent is forced regardless of any existing
+  // session). An explicit RECONNECT additionally adds `select_account` —
+  // Google's own documented, supported space-delimited `prompt` value list
+  // (https://developers.google.com/identity/protocols/oauth2/web-server#creatingclient)
+  // — so a user whose browser is still signed into the OLD Google identity
+  // is shown an account chooser instead of silently re-consenting as the
+  // same account, making it possible to actually authorize a different
+  // Google identity/manager hierarchy.
+  const prompt = intent === "reconnect" ? "consent select_account" : "consent";
 
   const authUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
   const params = new URLSearchParams({
@@ -90,7 +118,7 @@ export const handler: Handler = async (event) => {
     response_type: "code",
     scope: "https://www.googleapis.com/auth/adwords openid email profile",
     access_type: "offline",
-    prompt: "consent",
+    prompt,
     include_granted_scopes: "true",
     state,
   });

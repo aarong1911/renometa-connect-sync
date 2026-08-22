@@ -16,7 +16,7 @@ import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { resolveOrgFromBearerToken } from "./lib/resolve-org";
 import { googleAdsCorsHeaders } from "./lib/google-ads-cors";
-import { GOOGLE_ADS_SAFE_ERROR_CODES } from "./lib/google-ads-api";
+import { GOOGLE_ADS_SAFE_ERROR_CODES, normalizeGoogleAdsCustomerId } from "./lib/google-ads-api";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -28,6 +28,7 @@ const LAST_30_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
 interface ConnectionRow {
   status: string;
+  selected_customer_id: string | null;
   lead_last_synced_at: string | null;
   lead_last_error_code: string | null;
 }
@@ -55,7 +56,7 @@ export const handler: Handler = async (event) => {
 
   const { data: connection, error: connErr } = (await supabaseAdmin
     .from("google_ads_connections")
-    .select("status, lead_last_synced_at, lead_last_error_code")
+    .select("status, selected_customer_id, lead_last_synced_at, lead_last_error_code")
     .eq("organization_id", orgId)
     .maybeSingle()) as unknown as { data: ConnectionRow | null; error: any };
 
@@ -67,11 +68,27 @@ export const handler: Handler = async (event) => {
     return disconnectedResponse(headers);
   }
 
+  // Real-Account Isolation Verification phase — BUG FIX: this count
+  // previously filtered ONLY by organization_id, with no
+  // google_ads_customer_id filter at all. Since one organization can have
+  // submissions from more than one Google Ads advertiser over time (e.g.
+  // an old test advertiser's fixture rows plus a newly connected real
+  // advertiser's rows), that made this card's "Last 30 days" count a
+  // cross-account leak — it silently included every previously-connected
+  // advertiser's submissions, not just the CURRENTLY selected one. Fixed
+  // by requiring selected_customer_id and filtering the count by it,
+  // exactly like every other Google Ads reporting endpoint already does.
+  const selectedCustomerId = normalizeGoogleAdsCustomerId(connection.selected_customer_id);
+  if (!selectedCustomerId) {
+    return disconnectedResponse(headers);
+  }
+
   const since = new Date(Date.now() - LAST_30_DAYS_MS).toISOString();
   const { count, error: countErr } = await supabaseAdmin
     .from("google_ads_lead_submissions")
     .select("id", { count: "exact", head: true })
     .eq("organization_id", orgId)
+    .eq("google_ads_customer_id", selectedCustomerId)
     .gte("submission_date_time", since);
 
   if (countErr) {

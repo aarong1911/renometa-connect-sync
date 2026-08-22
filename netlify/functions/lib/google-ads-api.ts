@@ -267,11 +267,18 @@ export interface GoogleAdsConnectionRowForStatus {
   last_error_code: string | null;
 }
 
+// Reconnect + Disconnect phase fix — "disconnected" was missing from this
+// allowlist despite being a real value in GoogleAdsSafeConnectionStatus and
+// the DB's own status CHECK constraint. Before this fix, a disconnected
+// connection row would silently fall through to the "error" bucket below,
+// making the Integrations card show "Connection error" instead of a proper
+// disconnected state after a user-initiated disconnect.
 const SAFE_CONNECTION_STATUSES = new Set<GoogleAdsSafeConnectionStatus>([
   "connected",
   "needs_account_selection",
   "needs_account_sync",
   "error",
+  "disconnected",
 ]);
 
 export function buildGoogleAdsStatusPayload(row: GoogleAdsConnectionRowForStatus | null): GoogleAdsConnectionStatusPayload {
@@ -497,8 +504,17 @@ export function preflightGoogleAdsConnection(row: GoogleAdsConnectionRowForSumma
 
   if (row.status !== "connected") {
     if (row.status === "needs_account_selection") return { ok: false, errorCode: "account_selection_required" };
-    // needs_account_sync, error, disconnected, or any unrecognized value —
-    // all need a sync/retry before a read can be attempted.
+    // Reconnect + Disconnect phase — a user-initiated disconnect is
+    // reported with the SAME code as "no connection row at all"
+    // (google_ads_not_connected), since that's exactly what it means from
+    // every Google Ads endpoint's perspective: this org currently has no
+    // usable Google Ads access, full stop. This is what makes disconnect a
+    // real, centrally-enforced block rather than a cosmetic status label —
+    // every endpoint below already calls this same function first, so
+    // nothing needs to be patched per-endpoint.
+    if (row.status === "disconnected") return { ok: false, errorCode: "google_ads_not_connected" };
+    // needs_account_sync, error, or any unrecognized value — all need a
+    // sync/retry before a read can be attempted.
     return { ok: false, errorCode: "account_sync_required" };
   }
 

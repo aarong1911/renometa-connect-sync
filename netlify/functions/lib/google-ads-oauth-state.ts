@@ -14,12 +14,26 @@
 
 import crypto from "node:crypto";
 
+// Reconnect + Disconnect phase — `intent` distinguishes a normal first-time/
+// routine connect from an EXPLICIT reconnect request (the user clicking
+// "Reconnect" specifically to authorize a possibly-different Google
+// identity/hierarchy). Signed into the state alongside the existing
+// userId/orgId/nonce fields — never trusted as a bare `?reconnect=true`
+// query param, which the callback could not distinguish from a forged one.
+// Always present (oauth-start.ts sets it explicitly on every state it
+// signs); defaults to "connect" only as a defensive fallback for
+// verifyGoogleAdsOAuthState() reading a payload that somehow predates this
+// field (never actually reachable given the 10-minute state TTL, but safer
+// than a hard type assumption).
+export type GoogleAdsOAuthIntent = "connect" | "reconnect";
+
 export interface GoogleAdsOAuthStatePayload {
   userId: string;
   orgId: string;
   nonce: string;
   iat: number;
   exp: number;
+  intent: GoogleAdsOAuthIntent;
 }
 
 const MAX_LIFETIME_MS = 10 * 60 * 1000; // 10 minutes
@@ -102,6 +116,14 @@ export function verifyGoogleAdsOAuthState(
   ) {
     throw new Error("Invalid OAuth state");
   }
+  // `intent` is validated against a strict whitelist rather than trusted as
+  // any string — an unrecognized/tampered value (which the signature check
+  // above would already have caught, but defense-in-depth costs nothing
+  // here) falls back to the safe default "connect" rather than being
+  // rejected outright, since a missing field is expected for the payload
+  // shape's defensive-fallback case described above.
+  const rawIntent = candidate.intent;
+  const intent: GoogleAdsOAuthIntent = rawIntent === "reconnect" ? "reconnect" : "connect";
 
   const { userId, orgId, nonce, iat, exp } = candidate as unknown as GoogleAdsOAuthStatePayload;
   const now = Date.now();
@@ -119,5 +141,5 @@ export function verifyGoogleAdsOAuthState(
     throw new Error("Expired OAuth state");
   }
 
-  return { userId, orgId, nonce, iat, exp };
+  return { userId, orgId, nonce, iat, exp, intent };
 }

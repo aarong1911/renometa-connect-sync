@@ -62,6 +62,12 @@ function IntegrationsSettings() {
   const [googleAdsStatusLoading, setGoogleAdsStatusLoading] = useState(true);
   const [googleAdsForceSelection, setGoogleAdsForceSelection] = useState(false);
   const googleAdsReturnProcessed = useRef(false);
+  // Reconnect + Disconnect phase — mirrors the Gmail card's own
+  // reconnect/disconnect state shape above, kept independent so a Google
+  // Ads action in flight never disables/blocks the Gmail card or vice versa.
+  const [googleAdsReconnecting, setGoogleAdsReconnecting] = useState(false);
+  const [googleAdsDisconnecting, setGoogleAdsDisconnecting] = useState(false);
+  const [googleAdsDisconnectConfirmOpen, setGoogleAdsDisconnectConfirmOpen] = useState(false);
 
   // ── Gmail "SEND EMAIL" state (SMTP App Password) ───────────────────────
   // Real — organizations.integration_settings.gmail is read directly by
@@ -480,6 +486,12 @@ function IntegrationsSettings() {
         provider_error: "Google could not complete the connection — please try again",
         token_exchange: "Could not finish connecting to Google Ads — please try again",
         server_configuration: "Google Ads connection is not available right now — please try again later",
+        // Reconnect + Disconnect phase — Google didn't grant a fresh
+        // authorization this time (e.g. the consent screen was skipped),
+        // so the existing connection was deliberately left untouched
+        // rather than silently keeping the old one. See the "critical
+        // refresh token" handling in google-ads-oauth-callback.ts.
+        reconnect_requires_consent: "Google didn't grant new access — please try Reconnect again and approve access when prompted",
       };
       toast.error((reason && safeMessages[reason]) || "Could not connect Google Ads — please try again");
     }
@@ -490,6 +502,67 @@ function IntegrationsSettings() {
     const next = params.toString();
     window.history.replaceState({}, "", next ? `${window.location.pathname}?${next}` : window.location.pathname);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetchGoogleAdsStatus]);
+
+  // Reconnect + Disconnect phase — mirrors handleGoogleAdsConnect's shape
+  // (see integration-config-drawer.tsx) but passes intent: "reconnect" so
+  // the server signs that into the OAuth state and requests Google's
+  // account-chooser prompt, letting the user authorize a different Google
+  // identity/manager hierarchy without first disconnecting. Never deletes
+  // or replaces the existing connection client-side — the callback decides
+  // what to persist once the user completes (or cancels) the flow.
+  const handleGoogleAdsReconnect = useCallback(async () => {
+    if (googleAdsReconnecting) return; // guard against duplicate clicks
+    setGoogleAdsReconnecting(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) { toast.error("You must be signed in"); return; }
+      const res = await fetch("/.netlify/functions/google-ads-oauth-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ intent: "reconnect" }),
+      });
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok || !result.authorizationUrl) {
+        toast.error(result.error ?? "Could not start Google Ads reconnect");
+        setGoogleAdsReconnecting(false);
+        return;
+      }
+      window.location.assign(result.authorizationUrl);
+    } catch {
+      toast.error("Network error — could not start Google Ads reconnect");
+      setGoogleAdsReconnecting(false);
+    }
+  }, [googleAdsReconnecting]);
+
+  // Disconnect only ever calls the dedicated server endpoint — never
+  // touches google_ads_connections (or anything else) directly, and never
+  // deletes historical lead submissions/conversion events/mappings, which
+  // live in separate tables scoped by their own organization_id/
+  // google_ads_customer_id columns.
+  const handleGoogleAdsDisconnect = useCallback(async () => {
+    setGoogleAdsDisconnecting(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) { toast.error("You must be signed in to disconnect Google Ads"); return; }
+      const res = await fetch("/.netlify/functions/google-ads-disconnect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({}),
+      });
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast.error(result.error ?? "Could not disconnect Google Ads");
+        return;
+      }
+      toast.success("Google Ads disconnected");
+      setGoogleAdsDisconnectConfirmOpen(false);
+      await fetchGoogleAdsStatus();
+    } catch {
+      toast.error("Network error — could not disconnect Google Ads");
+    } finally {
+      setGoogleAdsDisconnecting(false);
+    }
   }, [fetchGoogleAdsStatus]);
 
   const actionLabel = (i: Integration) => {
@@ -768,9 +841,17 @@ function IntegrationsSettings() {
                           <span className="font-semibold">Account:</span> {formatGoogleAdsCustomerId(googleAdsStatus.selectedCustomerId)}
                         </p>
                       )}
-                      <div className="flex gap-2">
+                      {/* Reconnect + Disconnect phase — connected state gets
+                          all three lifecycle actions (Manage/Reconnect
+                          neutral per the RenoMeta warm-neutral control
+                          system, Disconnect destructive); every other
+                          status keeps the single existing action button
+                          unchanged. flex-wrap keeps this from overflowing
+                          the card at narrow widths. */}
+                      <div className="flex flex-wrap items-center gap-2">
                         <Button
                           size="sm"
+                          variant={googleAdsStatus?.status === "connected" ? "neutral" : "default"}
                           className="h-7 text-xs"
                           disabled={googleAdsStatusLoading}
                           onClick={() => {
@@ -791,6 +872,28 @@ function IntegrationsSettings() {
                             ? "Retry"
                             : "Connect"}
                         </Button>
+                        {googleAdsStatus?.status === "connected" && (
+                          <>
+                            <Button
+                              size="sm"
+                              variant="neutral"
+                              className="h-7 text-xs"
+                              disabled={googleAdsReconnecting}
+                              onClick={handleGoogleAdsReconnect}
+                            >
+                              {googleAdsReconnecting ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : null}
+                              {googleAdsReconnecting ? "Redirecting…" : "Reconnect"}
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="destructive"
+                              className="h-7 text-xs"
+                              onClick={() => setGoogleAdsDisconnectConfirmOpen(true)}
+                            >
+                              Disconnect
+                            </Button>
+                          </>
+                        )}
                       </div>
                     </div>
                   ) : (
@@ -898,6 +1001,34 @@ function IntegrationsSettings() {
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
               {gmailDisconnecting ? "Disconnecting…" : "Disconnect"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Reconnect + Disconnect phase — disconnect is destructive to the
+          LIVE connection only; copy is explicit that historical CRM data
+          (leads, attribution, conversion history, test fixtures) is never
+          deleted, and that reconnecting later needs no manual cleanup. */}
+      <AlertDialog open={googleAdsDisconnectConfirmOpen} onOpenChange={(open) => !open && !googleAdsDisconnecting && setGoogleAdsDisconnectConfirmOpen(false)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 text-destructive" />
+              Disconnect Google Ads?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              RenoMeta will stop syncing leads and reporting from Google Ads. Historical leads, CRM attribution, and conversion history are kept — nothing is deleted. Your Google Ads campaigns are not affected in any way. You can reconnect at any time.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={googleAdsDisconnecting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleGoogleAdsDisconnect}
+              disabled={googleAdsDisconnecting}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {googleAdsDisconnecting ? "Disconnecting…" : "Disconnect"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
