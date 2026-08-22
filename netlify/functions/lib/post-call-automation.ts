@@ -139,6 +139,7 @@ async function upsertContact(params: {
 async function upsertLead(params: {
   tenantId: string;
   contactId: string;
+  name: string;
   service: string;
   budget: string;
   timeline: string;
@@ -147,7 +148,7 @@ async function upsertLead(params: {
   calledFrom: string | null;
   status: 'new' | 'qualified';
 }): Promise<string | null> {
-  const { tenantId, contactId, service, budget, timeline, notes, calledFrom, status } = params;
+  const { tenantId, contactId, name, service, budget, timeline, notes, calledFrom, status } = params;
 
   const noteParts = [
     service && `Service: ${service}`,
@@ -171,6 +172,11 @@ async function upsertLead(params: {
     await supabase
       .from('leads')
       .update({
+        // Phase 3, CRM Schema Improvement — kept in sync with whatever
+        // name upsertContact() just wrote for this same call, so an
+        // existing lead's snapshot doesn't go stale relative to its
+        // linked contact.
+        name: name || undefined,
         status,
         notes: noteParts.join(' | ') || null,
         estimated_value: estimatedValue || undefined,
@@ -186,7 +192,12 @@ async function upsertLead(params: {
     .insert({
       org_id: tenantId,
       contact_id: contactId,
-      source: 'Voice AI',
+      name: name || null,
+      // Lead-source normalization pass — canonical machine value, not the
+      // display string "Voice AI" (that literal is still correct for
+      // appointments.source elsewhere, a separate column/enum with its own
+      // grandfathered "Voice AI" literal — this change is leads.source only).
+      source: 'voice_ai',
       status,
       estimated_value: estimatedValue,
       notes: noteParts.join(' | ') || null,
@@ -451,6 +462,7 @@ export async function runPostCallAutomation(params: {
     const leadId = await upsertLead({
       tenantId,
       contactId,
+      name,
       service: extracted.service,
       budget: extracted.budget,
       timeline: extracted.timeline,

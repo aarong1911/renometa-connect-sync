@@ -1117,12 +1117,30 @@ export function getCompanyBySlug(slug: string): Company | undefined {
 }
 
 // ============= LEADS =============
-export type LeadSource = "Website" | "Referral" | "Angi" | "Thumbtack" | "Google Ads" | "Walk-in" | "Social Media" | "Gmail";
+// Widened to `string` (lead-source normalization pass) — leads.source has
+// no DB CHECK constraint (confirmed live: advertising/cold_call/referral/
+// google_ads/voice_ai/website rows already coexist) and several write
+// paths (Google Ads ingestion, Vapi/Voice AI, CSV import, manual edit)
+// already assign values this union never covered. The union was always an
+// approximation of the manual Add Lead form's own option list, not a real
+// constraint on what could be stored or edited — see
+// src/lib/lead-source.ts's CanonicalLeadSource for the actual small set of
+// canonical machine values RenoMeta's own integrations write, and
+// normalizeLeadSource()/leadSourceLabel() for normalizing/displaying
+// whatever ends up in this field.
+export type LeadSource = string;
 export type LeadStatus = "new" | "contacted" | "qualified" | "converted" | "lost";
 export type LeadScore = "hot" | "warm" | "cold";
 
 export type Lead = {
   id: string;
+  // Phase 3, CRM Schema Improvement — backed by the real, nullable
+  // leads.name column (supabase/migrations/20260903_leads_add_name.sql).
+  // Always a non-null string at the app-Lead-type level: leads-store.ts's
+  // mapRow() coalesces `row.name` with the linked contact's full_name,
+  // then the legacy custom_fields.name, then "Unknown" as a display-only
+  // fallback for any row none of those can resolve. Never write "Unknown"
+  // (or any other placeholder) back into leads.name itself.
   name: string;
   email: string;
   phone: string;

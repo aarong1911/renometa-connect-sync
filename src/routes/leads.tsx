@@ -28,7 +28,7 @@ import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
-  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue, SelectSeparator,
 } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -40,7 +40,7 @@ import {
 import { Download, Upload, Trash2, Pencil as PencilIcon, Loader2 } from "lucide-react";
 import { AlertTriangle, CheckCircle2 } from "lucide-react";
 import { StickyNote, Pencil, Check, X as XIcon } from "lucide-react";
-import { type Lead, type LeadSource, type LeadStatus, type LeadScore } from "@/lib/mock-data";
+import { type Lead, type LeadStatus, type LeadScore } from "@/lib/mock-data";
 import { formatMoney, formatDateShort, formatPhone } from "@/lib/format";
 import { formatDistanceToNow } from "date-fns";
 import { toast } from "sonner";
@@ -68,7 +68,8 @@ import {
   LEAD_FIELDS, type ColumnMapping, type LeadFieldKey, type TemplateType,
 } from "@/lib/leads-csv";
 import { LEAD_STATUSES, LEAD_STATUS_LABELS, leadStatusLabel, leadStatusBadgeVariant } from "@/lib/lead-status";
-import { leadSourceLabel } from "@/lib/lead-source";
+import { leadSourceLabel, normalizeLeadSource, CANONICAL_LEAD_SOURCE_OPTIONS } from "@/lib/lead-source";
+import { fetchGoogleAdsCampaignLeadIds, fetchGoogleAdsAdGroupLeadIds } from "@/lib/google-ads-client";
 import { normalizeEmail, findDuplicateContactCandidates } from "@/lib/identity-normalization";
 import { getOrgId as getContactsOrgId } from "@/lib/contacts-store";
 import { CSV_MAX_SYNC_IMPORT_ROWS, CSV_WARN_ROW_THRESHOLD } from "@/lib/csv-utils";
@@ -76,12 +77,99 @@ import { createImportJob, logImportRows, completeImportJob, prefetchContactIdent
 import { ImportHistoryDialog } from "@/components/crm/import-history-dialog";
 import { History } from "lucide-react";
 
-type LeadsSearch = { leadId?: string };
+// Google Ads Campaign -> CRM Leads Deep Link phase — `source` is always a
+// CANONICAL machine value (e.g. "google_ads"), never a display label like
+// "Google Ads" (Step 2). `campaignId`/`campaignName` carry campaign
+// context only when arriving from the Campaign Detail Sheet's "View CRM
+// Leads" button — campaignId is canonical/preferred, campaignName is a
+// fallback only consulted server-side when a submission row has no
+// campaign_id, mirroring the exact attribution rule already implemented
+// in google-ads-campaign-crm-outcomes.ts/google-ads-campaign-leads.ts.
+// Ad Group -> CRM Leads Deep Link phase — adGroupId is the canonical
+// selector (digit-only, same validation policy as campaignId); adGroupName
+// is DISPLAY ONLY (Step 27) — it is never sent to the server for
+// attribution, never used to filter, purely for the chip label.
+type LeadsSearch = {
+  leadId?: string; source?: string;
+  campaignId?: string; campaignName?: string;
+  adGroupId?: string; adGroupName?: string;
+};
+
+// Defensive backward-compatibility normalization only (Google Ads Campaign
+// Deep Link Quoting + Fallback fix) — the producer (marketing.tsx's "View
+// CRM Leads" Link) never wraps its own values in quotes, and TanStack
+// Router's own default search serializer already round-trips a plain
+// numeric-looking string cleanly back through validateSearch (it
+// JSON-quote-wraps such values only in the visible address bar, to keep
+// them typed as strings rather than silently coercing to numbers on
+// decode — see stringifySearchWith/parseSearchWith in
+// @tanstack/router-core/searchParams.js). This helper exists purely to
+// tolerate a STALE or manually-pasted URL that genuinely contains a
+// literal, single matching pair of wrapping quote characters (e.g.
+// "24152601041") — never a general character-stripping routine.
+function stripOneMatchingQuotePair(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+// campaignId is always a Google Ads numeric campaign identifier — after
+// normalization, anything containing non-digit content is treated as
+// invalid and omitted entirely rather than sent to the server as a
+// malformed selector (Step 4). Kept as a string throughout (never
+// Number(...)) so no precision risk exists for large IDs.
+function normalizeDeepLinkCampaignId(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const normalized = stripOneMatchingQuotePair(raw);
+  return /^\d+$/.test(normalized) ? normalized : undefined;
+}
+
+// campaignName has no digit-only constraint — just quote/whitespace
+// normalization.
+function normalizeDeepLinkCampaignName(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const normalized = stripOneMatchingQuotePair(raw);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+// adGroupId — identical policy to campaignId (digit-only, quote-stripped,
+// kept as a string, invalid -> undefined rather than thrown).
+function normalizeDeepLinkAdGroupId(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const normalized = stripOneMatchingQuotePair(raw);
+  return /^\d+$/.test(normalized) ? normalized : undefined;
+}
+
+// adGroupName — DISPLAY ONLY (Step 27). Identical normalization to
+// campaignName, but never consulted for server-side filtering anywhere in
+// this file — only ever read for the Ad Group chip's label.
+function normalizeDeepLinkAdGroupName(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const normalized = stripOneMatchingQuotePair(raw);
+  return normalized.length > 0 ? normalized : undefined;
+}
 
 export const Route = createFileRoute("/leads")({
-  validateSearch: (raw: Record<string, unknown>): LeadsSearch => ({
-    leadId: typeof raw.leadId === "string" ? raw.leadId : undefined,
-  }),
+  validateSearch: (raw: Record<string, unknown>): LeadsSearch => {
+    // An invalid/unknown source value safely falls back to "no source
+    // filter" (All Sources) rather than throwing or silently corrupting
+    // the filter state (Step 2) — validated against the same canonical
+    // catalog the Source filter dropdown itself renders.
+    const rawSource = typeof raw.source === "string" ? raw.source : undefined;
+    const validSource = rawSource && CANONICAL_LEAD_SOURCE_OPTIONS.some((o) => o.value === rawSource)
+      ? rawSource
+      : undefined;
+    return {
+      leadId: typeof raw.leadId === "string" ? raw.leadId : undefined,
+      source: validSource,
+      campaignId: normalizeDeepLinkCampaignId(raw.campaignId),
+      campaignName: normalizeDeepLinkCampaignName(raw.campaignName),
+      adGroupId: normalizeDeepLinkAdGroupId(raw.adGroupId),
+      adGroupName: normalizeDeepLinkAdGroupName(raw.adGroupName),
+    };
+  },
   component: LeadsPage,
 });
 
@@ -90,7 +178,23 @@ export const Route = createFileRoute("/leads")({
 // sourced from src/lib/lead-status.ts, the single shared definition.
 const STATUS_FILTERS = ["All statuses", ...LEAD_STATUSES] as const;
 const SCORE_FILTERS = ["All scores", "hot", "warm", "cold"] as const;
-const ALL_SOURCES: LeadSource[] = ["Website", "Referral", "Angi", "Thumbtack", "Google Ads", "Walk-in", "Social Media"];
+// Lead-source normalization pass — the Add Lead form's own option list.
+// `value` is always the canonical machine value persisted to
+// leads.source; `label` is what the user sees. Never use a display
+// string as the option value (that was the original bug: leads.source
+// ending up with literal "Google Ads"/"Website" text instead of a
+// canonical value, which is exactly what produced duplicate-looking
+// entries in the source filter dropdown once a second casing variant
+// existed alongside it).
+//
+// Lead Source Filter Enhancement — reuses the single canonical ordered
+// export from lib/lead-source.ts (Paid, then Owned channels) rather than
+// keeping a parallel array; the Leads source filter below reuses the same
+// export directly. Legacy values (advertising, cold_call, referral, angi,
+// thumbtack, walk_in, social_media, etc.) are intentionally excluded —
+// they remain valid, readable, filterable historical data
+// (src/lib/lead-source.ts), just no longer offered as new choices.
+const ADD_LEAD_SOURCE_OPTIONS = CANONICAL_LEAD_SOURCE_OPTIONS;
 const ALL_STATUSES: LeadStatus[] = LEAD_STATUSES;
 const ALL_SCORES: LeadScore[] = ["hot", "warm", "cold"];
 const PROJECT_TYPES = ["Kitchen Remodel", "Bath Remodel", "Whole Home Renovation", "Basement Finish", "Addition", "Outdoor Living", "Primary Suite"];
@@ -135,7 +239,11 @@ function isDeleteBlockedConverted(lead: Pick<Lead, "status" | "convertedDealId">
 }
 
 function LeadsPage() {
-  const { leadId } = useSearch({ from: "/leads" });
+  const {
+    leadId, source: sourceParam,
+    campaignId: campaignIdParam, campaignName: campaignNameParam,
+    adGroupId: adGroupIdParam, adGroupName: adGroupNameParam,
+  } = useSearch({ from: "/leads" });
   const navigate = useNavigate({ from: "/leads" });
   const teamMembers = useTeam();
   const pipelineStages = usePipelineStages();
@@ -143,7 +251,36 @@ function LeadsPage() {
   const leads = useLeads();
   const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
-  const [sourceFilter, setSourceFilter] = useState<string>("All sources");
+  // Lazy-initialized from the URL so a direct navigation / browser refresh
+  // shows the right filter immediately, without waiting for an effect to
+  // run after first paint (Step 3). Back/forward and other in-app search
+  // changes are handled by the sync effect below.
+  const [sourceFilter, setSourceFilter] = useState<string>(() => sourceParam ?? "All sources");
+  // Campaign context (Step 4) — only ever set from the URL (arriving via
+  // the Campaign Detail Sheet's "View CRM Leads" button) or cleared by the
+  // user (chip's X, Clear filters, or manually changing Source away from
+  // Google Ads). Never derived from anything else.
+  const [campaignContext, setCampaignContext] = useState<{ campaignId?: string; campaignName?: string } | null>(
+    () => (campaignIdParam || campaignNameParam) ? { campaignId: campaignIdParam, campaignName: campaignNameParam } : null,
+  );
+  const [campaignLeadIds, setCampaignLeadIds] = useState<Set<string> | null>(null);
+  const [campaignLeadIdsLoading, setCampaignLeadIdsLoading] = useState(false);
+  // Ad Group context (Ad Group -> CRM Leads Deep Link phase) — nested
+  // under campaign context, exactly like the product hierarchy it mirrors
+  // (Campaign -> Ad Group). Same "only ever set from the URL or cleared by
+  // the user" rule as campaignContext.
+  const [adGroupContext, setAdGroupContext] = useState<{ adGroupId?: string; adGroupName?: string } | null>(
+    () => (adGroupIdParam || adGroupNameParam) ? { adGroupId: adGroupIdParam, adGroupName: adGroupNameParam } : null,
+  );
+  const [adGroupLeadIds, setAdGroupLeadIds] = useState<Set<string> | null>(null);
+  const [adGroupLeadIdsLoading, setAdGroupLeadIdsLoading] = useState(false);
+  // Unlike campaignLeadIds (which fails OPEN on a fetch error — see the
+  // effect below), Ad Group attribution fails CLOSED (Step 22): a load
+  // failure must never risk silently showing the broader, unfiltered
+  // Google Ads lead set as if Ad Group filtering had succeeded. This error
+  // string drives both a compact retry banner and forces the visible rows
+  // to 0 while it's set.
+  const [adGroupLeadIdsError, setAdGroupLeadIdsError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string>("All statuses");
   const [scoreFilter, setScoreFilter] = useState<string>("All scores");
   // "More filters" (Priority 7) — kept as separate controlled state rather
@@ -216,15 +353,153 @@ function LeadsPage() {
     }
   }, [leadId, leads]);
 
-  // Source filter options derived from the leads actually loaded (Priority
-  // 9) — not a fixed/fabricated category list. Distinct raw values,
-  // labeled for display via leadSourceLabel(); the raw value is what's
-  // actually compared when filtering.
-  const sourceFilterOptions = useMemo(() => {
-    const raw = [...new Set(leads.map((l) => l.source).filter(Boolean))];
-    raw.sort((a, b) => leadSourceLabel(a).localeCompare(leadSourceLabel(b)));
-    return raw;
-  }, [leads]);
+  // Google Ads Campaign -> CRM Leads Deep Link (Step 3/4) — re-syncs
+  // sourceFilter/campaignContext whenever the URL's own source/campaignId/
+  // campaignName actually change (direct navigation, browser refresh,
+  // back/forward). A manual in-page filter change never triggers this —
+  // it only sets local state, so it never fights with a stale URL value
+  // (Step 11). validateSearch() has already rejected an unrecognized
+  // source value down to undefined, so no re-validation is needed here.
+  useEffect(() => {
+    setSourceFilter(sourceParam ?? "All sources");
+    setCampaignContext((campaignIdParam || campaignNameParam) ? { campaignId: campaignIdParam, campaignName: campaignNameParam } : null);
+    setAdGroupContext((adGroupIdParam || adGroupNameParam) ? { adGroupId: adGroupIdParam, adGroupName: adGroupNameParam } : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sourceParam, campaignIdParam, campaignNameParam, adGroupIdParam, adGroupNameParam]);
+
+  // Resolves the campaign-attributed lead_id set for the active campaign
+  // context (Step 5) — reuses the exact same server-side attribution rule
+  // as the Campaign Detail Sheet's CRM outcomes via
+  // google-ads-campaign-leads.ts, never a client-side re-implementation.
+  useEffect(() => {
+    if (!campaignContext || (!campaignContext.campaignId && !campaignContext.campaignName)) {
+      setCampaignLeadIds(null);
+      setCampaignLeadIdsLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setCampaignLeadIdsLoading(true);
+    fetchGoogleAdsCampaignLeadIds({
+      campaignId: campaignContext.campaignId ?? null,
+      campaignName: campaignContext.campaignName ?? null,
+    }).then((result) => {
+      if (cancelled) return;
+      if (result.ok) {
+        setCampaignLeadIds(new Set(result.data.leadIds));
+      } else {
+        // Fails open (no campaign restriction) rather than showing a
+        // broken/empty Leads page over a transient network or connection
+        // issue — the campaign chip stays visible so the user can still
+        // see context was requested, but the extra filter simply doesn't
+        // apply until it resolves successfully.
+        console.error("[leads] campaign_lead_ids_fetch_failed", result.kind);
+        setCampaignLeadIds(null);
+      }
+      setCampaignLeadIdsLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [campaignContext?.campaignId, campaignContext?.campaignName]);
+
+  // Resolves the Ad Group-attributed lead_id set (Step 5/12) — reuses the
+  // exact same server-side ad_group_id attribution rule as the Ad Group
+  // Detail view's CRM outcomes via google-ads-ad-group-leads.ts. Per Step
+  // 7, this set is authoritative on its own once an Ad Group context is
+  // active — it is never intersected against a separately fetched campaign
+  // lead-ID set. Unlike the campaign fetch above, a failure here fails
+  // CLOSED (Step 22): adGroupLeadIdsError is set and `filtered` below
+  // forces zero visible rows rather than silently falling back to the
+  // broader campaign/source result.
+  useEffect(() => {
+    if (!adGroupContext?.adGroupId || !campaignContext?.campaignId) {
+      setAdGroupLeadIds(null);
+      setAdGroupLeadIdsLoading(false);
+      setAdGroupLeadIdsError(null);
+      return;
+    }
+    let cancelled = false;
+    setAdGroupLeadIdsLoading(true);
+    setAdGroupLeadIdsError(null);
+    fetchGoogleAdsAdGroupLeadIds({
+      campaignId: campaignContext.campaignId,
+      adGroupId: adGroupContext.adGroupId,
+    }).then((result) => {
+      if (cancelled) return;
+      if (result.ok) {
+        setAdGroupLeadIds(new Set(result.data.leadIds));
+      } else {
+        console.error("[leads] ad_group_lead_ids_fetch_failed", result.kind);
+        setAdGroupLeadIds(null);
+        setAdGroupLeadIdsError("Unable to load Ad Group leads right now.");
+      }
+      setAdGroupLeadIdsLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [adGroupContext?.adGroupId, campaignContext?.campaignId]);
+
+  const retryAdGroupLeadIds = useCallback(() => {
+    if (!adGroupContext?.adGroupId || !campaignContext?.campaignId) return;
+    setAdGroupLeadIdsLoading(true);
+    setAdGroupLeadIdsError(null);
+    fetchGoogleAdsAdGroupLeadIds({
+      campaignId: campaignContext.campaignId,
+      adGroupId: adGroupContext.adGroupId,
+    }).then((result) => {
+      if (result.ok) {
+        setAdGroupLeadIds(new Set(result.data.leadIds));
+      } else {
+        setAdGroupLeadIds(null);
+        setAdGroupLeadIdsError("Unable to load Ad Group leads right now.");
+      }
+      setAdGroupLeadIdsLoading(false);
+    });
+  }, [adGroupContext?.adGroupId, campaignContext?.campaignId]);
+
+  // Ad Group is nested under Campaign (Step 17) — clears both. Never
+  // leaves an orphaned Ad Group chip pointing at a campaign context that
+  // no longer exists.
+  const clearCampaignContext = useCallback(() => {
+    setCampaignContext(null);
+    setCampaignLeadIds(null);
+    setAdGroupContext(null);
+    setAdGroupLeadIds(null);
+    setAdGroupLeadIdsError(null);
+    navigate({ search: (prev) => ({ ...prev, campaignId: undefined, campaignName: undefined, adGroupId: undefined, adGroupName: undefined }), replace: true });
+  }, [navigate]);
+
+  // Clearing just the Ad Group chip (Step 16) keeps campaign context/source
+  // intact — falls back to the campaign-filtered view.
+  const clearAdGroupContext = useCallback(() => {
+    setAdGroupContext(null);
+    setAdGroupLeadIds(null);
+    setAdGroupLeadIdsError(null);
+    navigate({ search: (prev) => ({ ...prev, adGroupId: undefined, adGroupName: undefined }), replace: true });
+  }, [navigate]);
+
+  // Manual Source filter change (Step 11/19) — campaign AND ad group
+  // context only ever make sense paired with the Google Ads source, so
+  // switching away from it clears both rather than leaving a confusing,
+  // invisible restriction in place. Switching source while staying on
+  // Google Ads (or arriving at Google Ads by other means) leaves existing
+  // context untouched.
+  const handleSourceFilterChange = useCallback((value: string) => {
+    setSourceFilter(value);
+    if (value !== "google_ads" && (campaignContext || adGroupContext)) {
+      setCampaignContext(null);
+      setCampaignLeadIds(null);
+      setAdGroupContext(null);
+      setAdGroupLeadIds(null);
+      setAdGroupLeadIdsError(null);
+      navigate({
+        search: (prev) => ({
+          ...prev,
+          source: value === "All sources" ? undefined : value,
+          campaignId: undefined, campaignName: undefined,
+          adGroupId: undefined, adGroupName: undefined,
+        }),
+        replace: true,
+      });
+    }
+  }, [campaignContext, adGroupContext, navigate]);
 
   const ownerFilterOptions = useMemo(() => {
     const names = new Set<string>();
@@ -232,7 +507,14 @@ function LeadsPage() {
     return [...names].sort((a, b) => a.localeCompare(b));
   }, [leads, teamMembers]);
 
-  const filtered = useMemo(() => {
+  // Lead Source Filter Enhancement — every filter EXCEPT source, computed
+  // once and shared by both `filtered` (adds the source filter on top)
+  // and `sourceCounts` below (Step 5's faceted-count decision: counts
+  // reflect all OTHER active filters, but never the source filter itself
+  // — so picking "Google Ads" doesn't zero out every other source's
+  // count). A single pass here also avoids re-deriving the same 9 other
+  // filter predicates twice (Step 14).
+  const nonSourceFiltered = useMemo(() => {
     let list = leads;
     if (search) {
       // Normalized so a formatted or unformatted phone/email still matches
@@ -258,7 +540,6 @@ function LeadsPage() {
         );
       });
     }
-    if (sourceFilter !== "All sources") list = list.filter((l) => l.source === sourceFilter);
     if (statusFilter !== "All statuses") list = list.filter((l) => l.status === statusFilter);
     if (scoreFilter !== "All scores") list = list.filter((l) => l.score === scoreFilter);
     if (ownerFilter !== "All owners") list = list.filter((l) => resolveOwnerName(l, teamMembers) === ownerFilter);
@@ -282,7 +563,61 @@ function LeadsPage() {
       if (Number.isFinite(max)) list = list.filter((l) => l.estimatedBudget <= max);
     }
     return list;
-  }, [leads, search, sourceFilter, statusFilter, scoreFilter, ownerFilter, convertedFilter, dateFrom, dateTo, budgetMin, budgetMax, teamMembers]);
+  }, [leads, search, statusFilter, scoreFilter, ownerFilter, convertedFilter, dateFrom, dateTo, budgetMin, budgetMax, teamMembers]);
+
+  // Live per-source counts (Step 4) — always the full 9-canonical-source
+  // catalog (initialized to 0 so a zero-lead source still gets an entry),
+  // computed from normalized source values in a single pass over
+  // nonSourceFiltered rather than filtering the array once per source
+  // (Step 14). A legacy value (advertising/cold_call/referral/etc.)
+  // normalizes to something outside the 9 canonical keys and is simply not
+  // counted into any of them — it's still included in totalSourceCount
+  // below (Step 6).
+  const sourceCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const o of CANONICAL_LEAD_SOURCE_OPTIONS) counts[o.value] = 0;
+    for (const l of nonSourceFiltered) {
+      const canonical = normalizeLeadSource(l.source);
+      if (canonical in counts) counts[canonical]++;
+    }
+    return counts;
+  }, [nonSourceFiltered]);
+
+  // "All Sources" count (Step 5/6) — the complete nonSourceFiltered total,
+  // which includes historical legacy-source leads even though they don't
+  // contribute to any of the 9 canonical buckets above.
+  const totalSourceCount = nonSourceFiltered.length;
+
+  const filtered = useMemo(() => {
+    let list = nonSourceFiltered;
+    // Filter value semantics (Step 10/11): sourceFilter now holds the
+    // CANONICAL machine value ("google_ads", not "Google Ads"). l.source
+    // is already normalized at read time (leads-store.ts's mapRow), so a
+    // stale raw alias like "Google Ads" still compares equal here — but
+    // normalizeLeadSource() is applied defensively rather than assumed.
+    if (sourceFilter !== "All sources") {
+      list = list.filter((l) => normalizeLeadSource(l.source) === sourceFilter);
+    }
+    // Ad Group context, when present, is the AUTHORITATIVE narrowest
+    // restriction (Step 7) — never intersected with a separately fetched
+    // campaign lead-ID set, even though campaign context/chip may still be
+    // visible for display. Fails CLOSED (Step 22): while the fetch is
+    // still loading, or if it failed, this forces zero visible rows
+    // instead of silently falling back to the broader campaign/source
+    // result — the compact banner near the Ad Group chip explains why.
+    // Campaign context filter (Step 5) only applies when there is NO Ad
+    // Group context — campaignLeadIds is the exact lead_id set resolved
+    // server-side for this campaign (never a client-side re-derivation of
+    // attribution); while it's still loading or absent, the campaign
+    // restriction simply doesn't apply yet (fails OPEN, unchanged from the
+    // Campaign deep-link phase).
+    if (adGroupContext) {
+      list = adGroupLeadIds ? list.filter((l) => adGroupLeadIds.has(l.id)) : [];
+    } else if (campaignContext && campaignLeadIds) {
+      list = list.filter((l) => campaignLeadIds.has(l.id));
+    }
+    return list;
+  }, [nonSourceFiltered, sourceFilter, campaignContext, campaignLeadIds, adGroupContext, adGroupLeadIds]);
 
   // Stats
   const stats = useMemo(() => {
@@ -295,7 +630,12 @@ function LeadsPage() {
 
   const openLead = (lead: Lead) => {
     setSelected(lead);
-    navigate({ search: { leadId: lead.id }, replace: true });
+    // Merges onto the existing search object (Google Ads Lead Navigation
+    // Consistency pass) rather than replacing it outright — a literal
+    // `search: { leadId }` object would silently wipe out an active
+    // source/campaignId/campaignName context every time any lead row is
+    // opened, which is exactly the bug this pass fixes.
+    navigate({ search: (prev) => ({ ...prev, leadId: lead.id }), replace: true });
   };
 
   const handleStatusChange = async (id: string, newStatus: LeadStatus) => {
@@ -338,7 +678,11 @@ function LeadsPage() {
         email: normalizeEmail(editForm.email),
         phone: editForm.phone.trim(),
         address: editForm.address.trim(),
-        source: editForm.source.trim() || "Website",
+        // storeUpdateLead() normalizes this to the canonical machine value —
+        // editForm.source is already canonical if the user picked one of
+        // the 9 built-ins, or the lead's own preserved legacy value if
+        // they left the source selector untouched.
+        source: editForm.source.trim() || "website_form",
         projectType: editForm.projectType.trim(),
         estimatedBudget: Number(editForm.estimatedBudget) || 0,
         notes: editForm.notes.trim(),
@@ -371,7 +715,7 @@ function LeadsPage() {
     if (result.ok) {
       toast.success(`${deleteTarget.name} deleted`);
       setDeleteTarget(null);
-      if (selected?.id === deleteTarget.id) navigate({ search: { leadId: undefined }, replace: true });
+      if (selected?.id === deleteTarget.id) navigate({ search: (prev) => ({ ...prev, leadId: undefined }), replace: true });
     } else {
       toast.error(result.error);
     }
@@ -509,7 +853,10 @@ function LeadsPage() {
       email: newLead.email.trim(),
       phone: newLead.phone.trim(),
       address: newLead.address.trim(),
-      source: (newLead.source || "Website") as LeadSource,
+      // storeAddLead() (leads-store.ts's addLead()) normalizes this to the
+      // canonical machine value before writing — newLead.source is already
+      // canonical here since it comes from ADD_LEAD_SOURCE_OPTIONS' values.
+      source: newLead.source || "website",
       status: "new",
       score: (newLead.score || "warm") as LeadScore,
       projectType: newLead.projectType || "Kitchen Remodel",
@@ -715,7 +1062,7 @@ function LeadsPage() {
     !!budgetMax.trim(),
   ].filter(Boolean).length;
 
-  const hasActiveFilters = search !== "" || sourceFilter !== "All sources" || statusFilter !== "All statuses" || scoreFilter !== "All scores" || moreFiltersActiveCount > 0;
+  const hasActiveFilters = search !== "" || sourceFilter !== "All sources" || statusFilter !== "All statuses" || scoreFilter !== "All scores" || moreFiltersActiveCount > 0 || !!campaignContext || !!adGroupContext;
   const allVisibleSelected = filtered.length > 0 && filtered.every((lead) => selectedIds.has(lead.id));
 
   const toggleLeadSelection = (id: string) => {
@@ -747,6 +1094,24 @@ function LeadsPage() {
     setDateTo("");
     setBudgetMin("");
     setBudgetMax("");
+    // Step 10/18 — Clear filters also removes any route-applied source/
+    // campaign/Ad Group context, both locally and from the URL, so no
+    // hidden Google Ads attribution filtering silently remains active
+    // after the UI appears cleared.
+    setCampaignContext(null);
+    setCampaignLeadIds(null);
+    setAdGroupContext(null);
+    setAdGroupLeadIds(null);
+    setAdGroupLeadIdsError(null);
+    navigate({
+      search: (prev) => ({
+        ...prev,
+        source: undefined,
+        campaignId: undefined, campaignName: undefined,
+        adGroupId: undefined, adGroupName: undefined,
+      }),
+      replace: true,
+    });
   };
 
   const exportSelected = () => {
@@ -861,14 +1226,63 @@ function LeadsPage() {
               className="h-9 pl-9 text-sm"
             />
           </div>
-          <FilterSelect
+          <SourceFilterSelect
             value={sourceFilter}
-            onChange={setSourceFilter}
-            options={["All sources", ...sourceFilterOptions]}
-            labelFor={(o) => (o === "All sources" ? o : leadSourceLabel(o))}
+            onChange={handleSourceFilterChange}
+            counts={sourceCounts}
+            totalCount={totalSourceCount}
           />
           <FilterSelect value={statusFilter} onChange={setStatusFilter} options={STATUS_FILTERS as unknown as string[]} />
           <FilterSelect value={scoreFilter} onChange={setScoreFilter} options={SCORE_FILTERS as unknown as string[]} />
+          {campaignContext && (
+            // Step 12 — a subtle active-filter indicator, so a user landing
+            // here from a Campaign Detail Sheet understands why only a
+            // subset of Google Ads leads are visible, rather than assuming
+            // the Google Ads source count itself is wrong.
+            <span className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2.5 text-xs font-medium text-foreground">
+              Campaign: {campaignContext.campaignName || campaignContext.campaignId}
+              <button
+                type="button"
+                onClick={clearCampaignContext}
+                aria-label="Clear campaign filter"
+                className="rounded-sm text-muted-foreground hover:text-foreground"
+              >
+                <XIcon className="h-3.5 w-3.5" />
+              </button>
+            </span>
+          )}
+          {adGroupContext && (
+            // Step 15 — compact Ad Group chip, same treatment as the
+            // Campaign chip, rendered immediately after it. Prefers the
+            // human-readable adGroupName (display only, Step 27/8) and
+            // falls back to the raw ID only when no name is known.
+            <span className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2.5 text-xs font-medium text-foreground">
+              Ad Group: {adGroupContext.adGroupName || adGroupContext.adGroupId}
+              <button
+                type="button"
+                onClick={clearAdGroupContext}
+                aria-label="Clear ad group filter"
+                className="rounded-sm text-muted-foreground hover:text-foreground"
+              >
+                <XIcon className="h-3.5 w-3.5" />
+              </button>
+            </span>
+          )}
+          {adGroupLeadIdsError && (
+            // Step 22 — compact, non-destructive load error. The table
+            // itself already shows 0 rows (fail-closed, see `filtered`)
+            // rather than silently falling back to unfiltered results.
+            <span className="inline-flex h-9 items-center gap-1.5 rounded-md border border-destructive/30 bg-destructive/5 px-2.5 text-xs text-destructive">
+              {adGroupLeadIdsError}
+              <button
+                type="button"
+                onClick={retryAdGroupLeadIds}
+                className="font-medium underline-offset-2 hover:underline"
+              >
+                Retry
+              </button>
+            </span>
+          )}
           {hasActiveFilters && (
             <Button size="sm" variant="ghost" className="h-9 text-xs" onClick={clearFilters}>Clear filters</Button>
           )}
@@ -1071,7 +1485,7 @@ function LeadsPage() {
       {/* Detail drawer */}
       <LeadDetailDrawer
         lead={selected ? leads.find((l) => l.id === selected.id) ?? selected : null}
-        onOpenChange={(o) => { if (!o) navigate({ search: { leadId: undefined }, replace: true }); }}
+        onOpenChange={(o) => { if (!o) navigate({ search: (prev) => ({ ...prev, leadId: undefined }), replace: true }); }}
         onStatusChange={handleStatusChange}
         onConvert={handleConvertToDeal}
         onOpenConvertedDeal={(dealId) => setDealDrawerId(dealId)}
@@ -1145,7 +1559,22 @@ function LeadsPage() {
             </div>
             <div className="space-y-1.5">
               <Label>Source</Label>
-              <Input value={editForm.source} onChange={(e) => setEditForm((f) => ({ ...f, source: e.target.value }))} placeholder="Website" />
+              {/* Same 9-value built-in catalog as Add Lead (Step 8 — no
+                  separate catalog per form). If this lead's current source
+                  is a historical/legacy value outside the 9 (e.g.
+                  "advertising", "cold_call"), it's shown as an extra
+                  selectable item labeled with its real display text rather
+                  than being silently dropped or overwritten — leaving the
+                  selector untouched and saving preserves it exactly. */}
+              <Select value={editForm.source} onValueChange={(v) => setEditForm((f) => ({ ...f, source: v }))}>
+                <SelectTrigger><SelectValue placeholder="Select source" /></SelectTrigger>
+                <SelectContent>
+                  {ADD_LEAD_SOURCE_OPTIONS.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
+                  {editForm.source && !ADD_LEAD_SOURCE_OPTIONS.some((o) => o.value === editForm.source) && (
+                    <SelectItem value={editForm.source}>{leadSourceLabel(editForm.source)} (legacy)</SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
             </div>
             <div className="space-y-1.5">
               <Label>Status</Label>
@@ -1315,7 +1744,7 @@ function LeadsPage() {
               <Label>Source</Label>
               <Select value={newLead.source} onValueChange={(v) => setNewLead((p) => ({ ...p, source: v }))}>
                 <SelectTrigger><SelectValue placeholder="Select source" /></SelectTrigger>
-                <SelectContent>{ALL_SOURCES.map((s) => <SelectItem key={s} value={s}>{s}</SelectItem>)}</SelectContent>
+                <SelectContent>{ADD_LEAD_SOURCE_OPTIONS.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}</SelectContent>
               </Select>
             </div>
             <div className="space-y-1.5">
@@ -1600,6 +2029,73 @@ function FilterSelect({ value, onChange, options, labelFor }: { value: string; o
       <SelectContent>
         {options.map((o) => (
           <SelectItem key={o} value={o} className="capitalize text-xs">{getLabel(o)}</SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
+// Lead Source Filter Enhancement — the source filter's own Select (not the
+// generic FilterSelect above) because every row needs a right-aligned
+// live count alongside its label, which FilterSelect's plain string
+// options don't support. Always renders the complete 9-canonical-source
+// catalog (CANONICAL_LEAD_SOURCE_OPTIONS, Paid then Owned — Step 3), never
+// derived from which leads currently exist, so a source with 0 leads
+// (e.g. Meta Ads before the first Meta lead) still appears and remains
+// selectable (Step 9). SelectItem already reserves a pr-8 gutter for its
+// built-in checkmark indicator (see components/ui/select.tsx), so the
+// label+count flex row here never collides with it (Step 8).
+//
+// Count alignment fix: Radix's SelectItem renders its content inside
+// ItemText — a plain, unstyled <span> with no className of its own (see
+// @radix-ui/react-select's SelectItemText, which forwards nothing but the
+// raw <Primitive.span>). Left alone, that span shrink-wraps to its own
+// content, so a `w-full` on OUR row (nested one level inside it) only
+// ever resolves against that shrink-wrapped width — the count ends up
+// sitting right next to the label instead of at the dropdown's far
+// right edge. `[&>span:last-child]:flex-1` targets ItemText specifically
+// (it is always the LAST direct <span> child of SelectItem's own flex
+// row — the checkmark indicator span is first, and is itself
+// `position:absolute` so it never competes for flex space anyway) and
+// makes it a real flex-1 item, so it actually stretches to fill the
+// remaining row width after the pr-8 indicator gutter. Only then does
+// `flex-1`/`shrink-0` inside our own row correctly push the count to
+// that now-real far edge.
+const SOURCE_FILTER_ITEM_CLASSNAME = "text-xs [&>span:last-child]:flex-1 [&>span:last-child]:min-w-0";
+
+function SourceFilterOptionRow({ label, count }: { label: string; count: number }) {
+  return (
+    <span className="flex w-full items-center gap-3">
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      <span className="shrink-0 text-right text-xs tabular-nums text-muted-foreground">{count}</span>
+    </span>
+  );
+}
+
+function SourceFilterSelect({ value, onChange, counts, totalCount }: {
+  value: string; onChange: (v: string) => void; counts: Record<string, number>; totalCount: number;
+}) {
+  const currentLabel = value === "All sources" ? "All Sources" : leadSourceLabel(value);
+  return (
+    <Select value={value} onValueChange={onChange}>
+      <SelectTrigger className="h-9 w-auto min-w-[140px] text-xs">
+        <SelectValue>{currentLabel}</SelectValue>
+      </SelectTrigger>
+      {/* Wide enough that "Google Local Services Ads" (the longest label)
+          and its count never collide (Step 7) — no horizontal scrolling. */}
+      <SelectContent className="min-w-[300px]">
+        <SelectItem value="All sources" className={SOURCE_FILTER_ITEM_CLASSNAME}>
+          <SourceFilterOptionRow label="All Sources" count={totalCount} />
+        </SelectItem>
+        {CANONICAL_LEAD_SOURCE_OPTIONS.map((o, i) => (
+          <React.Fragment key={o.value}>
+            {/* Subtle Paid / Owned channels separator (Step 13, optional) —
+                a non-interactive Radix separator, safe for keyboard nav. */}
+            {i === 3 && <SelectSeparator />}
+            <SelectItem value={o.value} className={SOURCE_FILTER_ITEM_CLASSNAME}>
+              <SourceFilterOptionRow label={o.label} count={counts[o.value] ?? 0} />
+            </SelectItem>
+          </React.Fragment>
         ))}
       </SelectContent>
     </Select>

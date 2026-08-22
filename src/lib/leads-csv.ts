@@ -1,7 +1,7 @@
 import type { Lead, LeadSource, LeadStatus, LeadScore } from "@/lib/mock-data";
 import { escapeCSV, parseCSVLine, splitCSVLines, downloadCSV, parseCSVPreview as sharedParseCSVPreview } from "@/lib/csv-utils";
 import { leadStatusLabel } from "@/lib/lead-status";
-import { leadSourceLabel } from "@/lib/lead-source";
+import { leadSourceLabel, normalizeLeadSource } from "@/lib/lead-source";
 
 export { downloadCSV };
 
@@ -10,7 +10,19 @@ const CSV_HEADERS = [
   "projectType", "estimatedBudget", "notes", "owner",
 ] as const;
 
-const VALID_SOURCES: LeadSource[] = ["Website", "Referral", "Angi", "Thumbtack", "Google Ads", "Walk-in", "Social Media"];
+// Lead Source Catalog Refinement — canonical machine values, matching
+// ADD_LEAD_SOURCE_OPTIONS in routes/leads.tsx exactly (the same 9
+// built-in sources the manual Add/Edit Lead form offers). A CSV source
+// value is checked against this list AFTER normalizeLeadSource() so any
+// case/spacing/legacy variant of a recognized source (e.g. "GOOGLE ADS",
+// "google ads", "Website", "website form") is correctly recognized
+// instead of being defaulted to "website_form" just because its casing
+// didn't exactly match — see applyMappingToLeads() below. This does not
+// change the product behavior for genuinely unrecognized values (e.g.
+// legacy "Angi"/"Referral"/"Advertising" rows imported fresh), which
+// still default to "website_form" exactly as before this pass (the
+// importer does not currently accept arbitrary custom source text).
+const VALID_SOURCES: LeadSource[] = ["google_ads", "meta_ads", "google_lsa", "website_form", "chatbot", "voice_ai", "phone_call", "sms", "email"];
 const VALID_STATUSES: LeadStatus[] = ["new", "contacted", "qualified", "converted", "lost"];
 const VALID_SCORES: LeadScore[] = ["hot", "warm", "cold"];
 
@@ -149,8 +161,9 @@ export function applyMappingToLeads(csv: string, mapping: ColumnMapping): { lead
     if (!name) { errors.push(`Row ${rowNum}: name — missing, skipped.`); continue; }
 
     const rawSource = get("source");
-    const source = (VALID_SOURCES.includes(rawSource as LeadSource) ? rawSource : "Website") as LeadSource;
-    if (rawSource && source !== rawSource) errors.push(`Row ${rowNum}: source — "${rawSource}" not recognized, defaulted to "Website".`);
+    const normalizedSource = normalizeLeadSource(rawSource);
+    const source = (VALID_SOURCES.includes(normalizedSource as LeadSource) ? normalizedSource : "website_form") as LeadSource;
+    if (rawSource && source !== normalizedSource) errors.push(`Row ${rowNum}: source — "${rawSource}" not recognized, defaulted to "Website Form".`);
 
     const rawStatus = get("status");
     const status = (VALID_STATUSES.includes(rawStatus as LeadStatus) ? rawStatus : "new") as LeadStatus;

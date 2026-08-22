@@ -206,7 +206,16 @@ export async function createLeadFromGmailSender(input: CreateLeadFromGmailInput)
   const { error: insertError } = await supabase.from("leads").insert({
     org_id: orgId,
     contact_id: contact.id,
-    source: "Gmail",
+    // Phase 3, CRM Schema Improvement — the linked contact's own stored
+    // name (not input.name directly), so a matched-by-email existing
+    // contact's actual on-file name is what gets snapshotted, not
+    // whatever the inbound Gmail message happened to display.
+    name: contact.name || null,
+    // Lead Source Catalog Refinement — this is an inbound email lead flow
+    // (an unmatched Gmail sender converted to a lead), so it now uses the
+    // canonical "email" source rather than the channel-specific "Gmail"
+    // label that predated the 9-source catalog.
+    source: "email",
     status: "new",
     estimated_value: 0,
     notes,

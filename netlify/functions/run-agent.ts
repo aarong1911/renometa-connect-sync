@@ -551,7 +551,11 @@ async function executeActions(
         await supabase.from("leads").insert({
           org_id: orgId,
           phone: callerPhone,
-          source: "missed_call",
+          // Lead Source Catalog Refinement — this is an inbound phone-call
+          // lead flow (a missed/unrecognized caller), so it now uses the
+          // canonical "phone_call" source rather than the ad hoc
+          // "missed_call" label that predated the 9-source catalog.
+          source: "phone_call",
           job_type: parsed.lead_job_type ?? "Unknown",
           status: "new",
           name: "Unknown Caller",

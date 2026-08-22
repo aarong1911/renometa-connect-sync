@@ -5,7 +5,7 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "@/lib/utils";
 
 const buttonVariants = cva(
-  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
   {
     variants: {
       variant: {
@@ -16,6 +16,15 @@ const buttonVariants = cva(
         secondary: "bg-secondary text-secondary-foreground shadow-sm hover:bg-secondary/80",
         ghost: "hover:bg-accent hover:text-accent-foreground",
         link: "text-primary underline-offset-4 hover:underline",
+        // RenoMeta Global UI Interaction System — the canonical warm-
+        // neutral secondary/navigation control (buttons like "View CRM
+        // Leads", "Sync leads", tab-adjacent action CTAs). Distinct from
+        // `outline` (still white/background-colored) and `secondary`
+        // (cool slate) — use this specifically where the product wants
+        // the #FAF3E4 warm-neutral treatment called for by the design
+        // system, not as a blanket replacement for every outline button.
+        neutral:
+          "border border-control-neutral-border bg-control-neutral text-control-neutral-foreground shadow-sm hover:bg-control-neutral-hover",
       },
       size: {
         default: "h-9 px-4 py-2",

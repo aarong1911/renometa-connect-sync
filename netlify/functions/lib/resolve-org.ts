@@ -45,3 +45,33 @@ export async function resolveOrgFromBearerToken(
   if (!orgId) return null;
   return { userId: user.id, orgId };
 }
+
+// Re-confirms a user still belongs to a SPECIFIC org, server-side — for
+// callbacks that received userId/orgId from a verified-but-earlier-issued
+// source (e.g. a signed OAuth state minted up to 10 minutes ago), where
+// org membership could have been revoked in between. Same precedence as
+// resolveOrgFromBearerToken (profiles.organization_id first,
+// org_memberships fallback), but checks equality against a given orgId
+// instead of deriving one. Does not verify the user still exists —
+// callers that need that should check separately via
+// supabaseAdmin.auth.admin.getUserById first.
+export async function userBelongsToOrg(
+  supabaseAdmin: SupabaseClient,
+  userId: string,
+  orgId: string,
+): Promise<boolean> {
+  const { data: profile } = await supabaseAdmin
+    .from("profiles")
+    .select("organization_id")
+    .eq("id", userId)
+    .maybeSingle();
+  if (profile?.organization_id === orgId) return true;
+
+  const { data: membership } = await supabaseAdmin
+    .from("org_memberships")
+    .select("org_id")
+    .eq("member_id", userId)
+    .eq("org_id", orgId)
+    .maybeSingle();
+  return !!membership;
+}

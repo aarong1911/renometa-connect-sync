@@ -11,8 +11,8 @@
 //
 // User-facing term is "Campaigns" everywhere, never "Broadcasts".
 
-import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { createFileRoute, Link } from "@tanstack/react-router";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PageHeader } from "@/components/layout/app-shell";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -31,12 +31,14 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
+import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
 import {
   Megaphone, Mail, MessageSquare, Send, Calendar as CalendarIcon, Users, Eye,
   MoreHorizontal, Copy, Trash2, X, Clock, CheckCircle2, FileEdit, Plus,
   Sparkles, ChevronRight, ChevronLeft, AlertTriangle, LayoutGrid, Archive,
-  Pause, Play, Loader2,
+  Pause, Play, Loader2, BarChart3, MousePointerClick, CircleDollarSign,
+  Target, Plug, RefreshCw, AlertCircle, ArrowRight,
 } from "lucide-react";
 import {
   useMarketingCampaigns, useMarketingTemplates, useMarketingSegments,
@@ -58,6 +60,32 @@ import { useContacts } from "@/lib/contacts-store";
 import { useOrganization } from "@/lib/organization";
 import { supabase } from "@/lib/supabase";
 import { cn } from "@/lib/utils";
+import {
+  fetchGoogleAdsCampaignPerformance, type GoogleAdsCampaignPerformanceResult,
+  fetchGoogleAdsLeadSyncStatus, triggerGoogleAdsLeadSync,
+  injectGoogleAdsTestLead,
+  fetchGoogleAdsConversionStatus, createGoogleAdsConversionEventTest,
+  fetchGoogleAdsConversionActions, fetchGoogleAdsConversionMappings, saveGoogleAdsConversionMapping,
+  fetchGoogleAdsConversionEvents, exportGoogleAdsConversionEvent,
+  fetchGoogleAdsCampaignCrmOutcomes,
+  fetchGoogleAdsCampaignAdGroups, fetchGoogleAdsAdGroupKeywords, fetchGoogleAdsAdGroupSearchTerms,
+  fetchGoogleAdsAdGroupCrmOutcomes,
+} from "@/lib/google-ads-client";
+import {
+  formatGoogleAdsCustomerId, formatGoogleAdsCount, formatGoogleAdsSpend, formatGoogleAdsCurrency, formatGoogleAdsCtr,
+  formatPlainMoneyValue,
+  type GoogleAdsCampaignPerformanceResponse, type GoogleAdsCampaignPerformanceRow,
+  type GoogleAdsLeadSyncStatusResponse, type GoogleAdsLeadSyncResultResponse,
+  type GoogleAdsTestLeadInjectResponse,
+  type GoogleAdsConversionStatusResponse, type GoogleAdsConversionEventType,
+  type GoogleAdsConversionAction, deriveSuggestedGoogleAdsConversionMapping,
+  EXPECTED_GOOGLE_ADS_CONVERSION_ACTION_NAMES,
+  type GoogleAdsConversionEventListRow,
+  type GoogleAdsCampaignCrmOutcomesResponse,
+  type GoogleAdsAdGroupPerformanceRow, type GoogleAdsKeywordPerformanceRow, type GoogleAdsSearchTermPerformanceRow,
+  type GoogleAdsAdGroupCrmOutcomesResponse,
+  humanizeGoogleAdsKeywordMatchType,
+} from "@/lib/google-ads-format";
 
 type MarketingSearch = { tab: string; createCampaign: boolean; campaignId: string; editCampaignId: string };
 
@@ -128,6 +156,21 @@ function MessagePreview({ channel, subject, body }: { channel: CampaignChannel; 
   );
 }
 
+// CRM Campaigns (Phase 14.1 — Email/SMS/Audiences/Templates) and Paid Ads
+// (Google Ads, Meta Ads later) are different product concepts with
+// different data sources, lifecycles, and metrics — kept as two top-level
+// sections rather than one flat tab row so adding Meta Ads later doesn't
+// further crowd a single TabsList. `section` is deliberately DERIVED from
+// `tab` rather than tracked as its own search param: every existing
+// bookmark/link (?tab=campaigns, ?tab=audiences, ?tab=templates,
+// ?tab=google-ads) still lands in the correct section with zero migration.
+const CRM_CAMPAIGN_TABS = new Set(["campaigns", "audiences", "templates"]);
+type MarketingSection = "crm" | "ads";
+
+function sectionForTab(tab: string): MarketingSection {
+  return CRM_CAMPAIGN_TABS.has(tab) ? "crm" : "ads";
+}
+
 function MarketingPage() {
   const { tab, createCampaign: composerOpen, campaignId, editCampaignId } = Route.useSearch();
   const navigate = Route.useNavigate();
@@ -135,6 +178,8 @@ function MarketingPage() {
   const templates = useMarketingTemplates();
   const segments = useMarketingSegments();
   const contacts = useContacts();
+
+  const section = sectionForTab(tab);
 
   const kpis = useMemo(() => ({
     sent: campaigns.filter((c) => c.status === "completed").length,
@@ -145,6 +190,13 @@ function MarketingPage() {
 
   const selectedCampaign = campaigns.find((c) => c.id === campaignId);
 
+  function handleSectionChange(next: MarketingSection) {
+    if (next === section) return;
+    // Land on each section's natural default tab — never leaves `tab` set
+    // to a value from the OTHER section after switching.
+    navigate({ search: (p) => ({ ...p, tab: next === "crm" ? "campaigns" : "google-ads" }) });
+  }
+
   return (
     <>
       <PageHeader
@@ -154,44 +206,85 @@ function MarketingPage() {
         title="Marketing"
         subtitle="Create campaigns, reach customers, and track engagement from one place."
         actions={
-          <Button onClick={() => navigate({ search: (p) => ({ ...p, createCampaign: true }) })}>
-            <Plus className="mr-1.5 h-4 w-4" /> Create Campaign
-          </Button>
+          // "Create Campaign" is a CRM Campaigns action (Email/SMS) — it
+          // has no meaning in Paid Ads, where campaigns are only ever
+          // created/managed in Google Ads/Meta Ads itself (Step A3).
+          section === "crm" ? (
+            <Button onClick={() => navigate({ search: (p) => ({ ...p, createCampaign: true }) })}>
+              <Plus className="mr-1.5 h-4 w-4" /> Create Campaign
+            </Button>
+          ) : undefined
         }
       />
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 mb-6">
-        <MetricTile icon={Send} iconBg="bg-success-soft" iconColor="text-success" label="Campaigns sent" value={String(kpis.sent)} sub="Completed sends" />
-        <MetricTile icon={Clock} iconBg="bg-info-soft" iconColor="text-info" label="Scheduled campaigns" value={String(kpis.scheduled)} sub="Queued or scheduled" />
-        <MetricTile icon={Users} iconBg="bg-cyan-soft" iconColor="text-cyan-soft-foreground" label="CRM contacts" value={kpis.contacts.toLocaleString()} sub="Total eligible audience" />
-        <MetricTile icon={FileEdit} iconBg="bg-gold-soft" iconColor="text-gold-hover" label="Draft campaigns" value={String(kpis.drafts)} sub="Not yet sent" />
-      </div>
-
-      <Tabs value={tab} onValueChange={(v) => navigate({ search: (p) => ({ ...p, tab: v }) })} className="space-y-4">
+      <Tabs value={section} onValueChange={(v) => handleSectionChange(v as MarketingSection)} className="mb-4">
         <TabsList>
-          <TabsTrigger value="campaigns">Campaigns</TabsTrigger>
-          <TabsTrigger value="audiences">Audiences</TabsTrigger>
-          <TabsTrigger value="templates">Templates</TabsTrigger>
+          <TabsTrigger value="crm">CRM Campaigns</TabsTrigger>
+          <TabsTrigger value="ads">Paid Ads</TabsTrigger>
         </TabsList>
-
-        <TabsContent value="campaigns">
-          <CampaignsTable
-            campaigns={campaigns}
-            segments={segments}
-            onOpen={(id) => navigate({ search: (p) => ({ ...p, campaignId: id }) })}
-            onEdit={(id) => navigate({ search: (p) => ({ ...p, editCampaignId: id }) })}
-            onCompose={() => navigate({ search: (p) => ({ ...p, createCampaign: true }) })}
-          />
-        </TabsContent>
-
-        <TabsContent value="audiences">
-          <AudiencesTab segments={segments} />
-        </TabsContent>
-
-        <TabsContent value="templates">
-          <TemplatesTab templates={templates} />
-        </TabsContent>
       </Tabs>
+
+      {section === "crm" && (
+        <>
+          {/* CRM Campaign metrics — never shown above Paid Ads reporting,
+              where they'd misleadingly read as describing Google Ads
+              (Step A4). Google Ads has its own metric cards inside
+              GoogleAdsPerformanceTab. */}
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 mb-6">
+            <MetricTile icon={Send} iconBg="bg-success-soft" iconColor="text-success" label="Campaigns sent" value={String(kpis.sent)} sub="Completed sends" />
+            <MetricTile icon={Clock} iconBg="bg-info-soft" iconColor="text-info" label="Scheduled campaigns" value={String(kpis.scheduled)} sub="Queued or scheduled" />
+            <MetricTile icon={Users} iconBg="bg-cyan-soft" iconColor="text-cyan-soft-foreground" label="CRM contacts" value={kpis.contacts.toLocaleString()} sub="Total eligible audience" />
+            <MetricTile icon={FileEdit} iconBg="bg-gold-soft" iconColor="text-gold-hover" label="Draft campaigns" value={String(kpis.drafts)} sub="Not yet sent" />
+          </div>
+
+          <Tabs value={tab} onValueChange={(v) => navigate({ search: (p) => ({ ...p, tab: v }) })} className="space-y-4">
+            <TabsList>
+              <TabsTrigger value="campaigns">Campaigns</TabsTrigger>
+              <TabsTrigger value="audiences">Audiences</TabsTrigger>
+              <TabsTrigger value="templates">Templates</TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="campaigns">
+              <CampaignsTable
+                campaigns={campaigns}
+                segments={segments}
+                onOpen={(id) => navigate({ search: (p) => ({ ...p, campaignId: id }) })}
+                onEdit={(id) => navigate({ search: (p) => ({ ...p, editCampaignId: id }) })}
+                onCompose={() => navigate({ search: (p) => ({ ...p, createCampaign: true }) })}
+              />
+            </TabsContent>
+
+            <TabsContent value="audiences">
+              <AudiencesTab segments={segments} />
+            </TabsContent>
+
+            <TabsContent value="templates">
+              <TemplatesTab templates={templates} />
+            </TabsContent>
+          </Tabs>
+        </>
+      )}
+
+      {section === "ads" && (
+        // Inner tab value is hardcoded to "google-ads" — Meta Ads has no
+        // real surface yet, so its trigger is disabled and there is no
+        // TabsContent for it at all (never render a fake reporting page,
+        // per Step A1). If a bookmark ever carries ?tab=meta-ads, it still
+        // safely lands here showing the real Google Ads tab.
+        <Tabs value="google-ads" className="space-y-4">
+          <TabsList>
+            <TabsTrigger value="google-ads">Google Ads</TabsTrigger>
+            <TabsTrigger value="meta-ads" disabled className="gap-1.5">
+              Meta Ads
+              <Badge variant="secondary" className="h-4 rounded-full px-1.5 text-[9px] font-normal">Coming soon</Badge>
+            </TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="google-ads">
+            <GoogleAdsPerformanceTab />
+          </TabsContent>
+        </Tabs>
+      )}
 
       <CreateCampaignSheet
         open={composerOpen || !!editCampaignId}
@@ -980,6 +1073,1993 @@ function TemplateEditorSheet({ template, open, onClose }: { template: MarketingT
         </SheetFooter>
       </SheetContent>
     </Sheet>
+  );
+}
+
+// ---------- Google Ads tab (Phase 3, Step 5) ----------
+//
+// Read-only paid-media reporting from the live Google Ads API — entirely
+// separate from CRM Email/SMS Campaigns above (Phase 14.1): different data
+// source (Google Ads API vs. campaigns/campaign_recipients), different
+// lifecycle (no pause/resume/duplicate/delete — Google Ads campaigns are
+// only ever managed in Google Ads itself), and deliberately not merged
+// into CampaignsTable's rows or actions. Uses the real
+// google-ads-campaign-performance endpoint only — no fake/sample rows or
+// metrics anywhere in this section.
+
+function useGoogleAdsCampaignPerformance() {
+  const [loading, setLoading] = useState(true);
+  const [result, setResult] = useState<GoogleAdsCampaignPerformanceResult | null>(null);
+  const [retryTick, setRetryTick] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Clear any previously-loaded result immediately so a retry (or a
+    // revisit of this tab) never shows the PREVIOUS fetch's connected
+    // state/metrics underneath the loading skeleton (Step 9: never flash
+    // fake zeros, fake connected state, or a previous account's metrics).
+    setResult(null);
+    setLoading(true);
+    fetchGoogleAdsCampaignPerformance()
+      .then((r) => { if (!cancelled) setResult(r); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [retryTick]);
+
+  return { loading, result, retry: () => setRetryTick((t) => t + 1) };
+}
+
+function GoogleAdsEmptyStateCard({ icon: Icon, title, description, action }: {
+  icon: React.ComponentType<{ className?: string }>; title: string; description: string; action?: React.ReactNode;
+}) {
+  return (
+    <Card>
+      <CardContent className="flex flex-col items-center gap-3 py-16 text-center">
+        <div className="grid h-12 w-12 place-items-center rounded-full bg-secondary">
+          <Icon className="h-5 w-5 text-muted-foreground" />
+        </div>
+        <div>
+          <div className="text-sm font-medium">{title}</div>
+          <p className="mx-auto mt-1 max-w-sm text-sm text-muted-foreground">{description}</p>
+        </div>
+        {action}
+      </CardContent>
+    </Card>
+  );
+}
+
+function GoogleAdsIntegrationsLinkButton({ children }: { children: React.ReactNode }) {
+  return (
+    <Button asChild size="sm" className="mt-2">
+      <Link to="/settings/integrations">
+        <Plug className="mr-1.5 h-3.5 w-3.5" /> {children}
+      </Link>
+    </Button>
+  );
+}
+
+function GoogleAdsPerformanceSkeleton() {
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardContent className="flex items-center gap-3 p-4">
+          <Skeleton className="h-9 w-9 rounded-lg" />
+          <div className="space-y-1.5">
+            <Skeleton className="h-4 w-32" />
+            <Skeleton className="h-3 w-48" />
+          </div>
+        </CardContent>
+      </Card>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+        {Array.from({ length: 5 }).map((_, i) => (
+          <Card key={i}>
+            <CardContent className="p-4 space-y-2">
+              <Skeleton className="h-3 w-20" />
+              <Skeleton className="h-6 w-16" />
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+      <Card>
+        <CardContent className="p-4">
+          <Skeleton className="h-32 w-full" />
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function GoogleAdsAccountHeader({ data }: { data: GoogleAdsCampaignPerformanceResponse }) {
+  return (
+    <Card>
+      <CardContent className="flex flex-wrap items-center gap-3 p-4">
+        <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-secondary ring-1 ring-black/5">
+          <BarChart3 className="h-4 w-4 text-muted-foreground" />
+        </div>
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-semibold text-foreground">Google Ads</span>
+            <StatusBadge tone="success" icon={CheckCircle2}>Connected</StatusBadge>
+          </div>
+          <p className="mt-0.5 truncate text-xs text-muted-foreground">
+            Account {formatGoogleAdsCustomerId(data.customerId) || data.customerId} · Last 30 days
+            {data.timeZone && <span className="text-muted-foreground/70"> · {data.timeZone}</span>}
+          </p>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// Shared section header for every Google Ads section below this point
+// (Campaigns, Google Ads Leads, Conversion Feedback, Conversion Events,
+// Offline Conversion Mapping) — one consistent title/subtitle treatment
+// instead of each section carrying its own slightly different CardHeader
+// className. Symmetric `py-4` (rather than the previous ad hoc `pb-2`,
+// which left 24px of top padding against only 8px of bottom padding) is
+// what makes the title/subtitle group read as centered inside the header
+// band instead of pushed toward its bottom border. Pairs with each
+// section's `<CardContent className="pt-4 ...">` so the header→content
+// gap is even too. The same two-piece pattern (this header + a `pt-4`
+// CardContent) is what a future Meta Ads tab would reuse — kept as a
+// small local helper rather than a bigger shared abstraction, since this
+// is the only piece that was genuinely duplicated five times.
+function GoogleAdsSectionHeader({ title, description }: { title: string; description: string }) {
+  return (
+    <CardHeader className="py-4">
+      <CardTitle className="text-sm font-semibold leading-none">{title}</CardTitle>
+      <CardDescription className="text-xs">{description}</CardDescription>
+    </CardHeader>
+  );
+}
+
+function GoogleAdsMetricCards({ summary, currencyCode }: {
+  summary: GoogleAdsCampaignPerformanceResponse["summary"]; currencyCode: string | null;
+}) {
+  return (
+    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+      <MetricTile icon={Eye} iconBg="bg-info-soft" iconColor="text-info" label="Impressions" value={formatGoogleAdsCount(summary.impressions)} sub="Last 30 days" />
+      <MetricTile icon={MousePointerClick} iconBg="bg-cyan-soft" iconColor="text-cyan-soft-foreground" label="Clicks" value={formatGoogleAdsCount(summary.clicks)} sub="Last 30 days" />
+      <MetricTile icon={CircleDollarSign} iconBg="bg-gold-soft" iconColor="text-gold-hover" label="Spend" value={formatGoogleAdsSpend(summary.costMicros, currencyCode)} sub="Last 30 days" />
+      <MetricTile icon={Target} iconBg="bg-success-soft" iconColor="text-success" label="Conversions" value={summary.conversions.toLocaleString(undefined, { maximumFractionDigits: 2 })} sub="Last 30 days" />
+      <MetricTile icon={Sparkles} iconBg="bg-violet-soft" iconColor="text-violet" label="Conversion value" value={formatGoogleAdsCurrency(summary.conversionValue, currencyCode)} sub="Last 30 days" />
+    </div>
+  );
+}
+
+// ── Campaign health (Step 17, product-facing) — deterministic, derived
+// ONLY from metrics already returned by google-ads-campaign-performance.ts
+// (impressions/clicks/conversions). No judgment calls like "wasting
+// money" — just a factual read of whether a campaign is serving, getting
+// clicks, or converting. `impressions`/`clicks` are base-10 digit strings
+// (never coerced through Number() for equality — comparing against the
+// literal "0" avoids any large-value precision concern, matching the same
+// policy already used elsewhere for these fields).
+type GoogleAdsCampaignHealth = "no_activity" | "traffic_no_conversions" | "converting";
+
+function deriveGoogleAdsCampaignHealth(campaign: GoogleAdsCampaignPerformanceRow): GoogleAdsCampaignHealth {
+  if (campaign.impressions === "0") return "no_activity";
+  if (campaign.conversions > 0) return "converting";
+  return "traffic_no_conversions";
+}
+
+const CAMPAIGN_HEALTH_META: Record<GoogleAdsCampaignHealth, { label: string; tone: BadgeTone }> = {
+  no_activity: { label: "No activity", tone: "muted" },
+  traffic_no_conversions: { label: "Traffic, no conversions", tone: "warning" },
+  converting: { label: "Converting", tone: "success" },
+};
+
+// Google Ads campaign.status enum (ENABLED/PAUSED/REMOVED) — a plain,
+// factual tone mapping, not a health judgment (that's CAMPAIGN_HEALTH_META
+// above, a separate concept: a REMOVED campaign and a PAUSED campaign are
+// both just... not enabled, regardless of any activity they once had).
+const CAMPAIGN_STATUS_TONE: Record<string, BadgeTone> = {
+  ENABLED: "success",
+  PAUSED: "warning",
+  REMOVED: "muted",
+};
+
+function GoogleAdsCampaignStatusBadge({ status }: { status: string | null }) {
+  const tone = (status && CAMPAIGN_STATUS_TONE[status]) || "muted";
+  return <StatusBadge tone={tone}>{status ?? "—"}</StatusBadge>;
+}
+
+function GoogleAdsCampaignTable({ campaigns, currencyCode, customerId, dateRange }: {
+  campaigns: GoogleAdsCampaignPerformanceRow[]; currencyCode: string | null; customerId: string; dateRange: string;
+}) {
+  // Campaign row interaction (Step 2) — clicking a row (or its name
+  // button/link, for keyboard access) opens the read-only detail Sheet for
+  // that exact campaign. Never refetches campaign performance — the
+  // selected row's data is already fully loaded from the table above.
+  const [selectedCampaign, setSelectedCampaign] = useState<GoogleAdsCampaignPerformanceRow | null>(null);
+
+  return (
+    <Card>
+      <GoogleAdsSectionHeader title="Campaigns" description="Performance for campaigns in the selected Google Ads account." />
+      {campaigns.length === 0 ? (
+        <CardContent className="flex flex-col items-center gap-2 pt-4 py-16 text-center">
+          <BarChart3 className="h-10 w-10 text-muted-foreground" />
+          <div>
+            <h3 className="text-sm font-semibold">No campaigns found for this Google Ads account</h3>
+            <p className="text-xs text-muted-foreground">Performance will appear here when this account has campaign activity.</p>
+          </div>
+        </CardContent>
+      ) : (
+        <CardContent className="pt-4">
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-[26%]">Campaign</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead>Activity</TableHead>
+                  <TableHead className="text-right">Impressions</TableHead>
+                  <TableHead className="text-right">Clicks</TableHead>
+                  <TableHead className="text-right">Spend</TableHead>
+                  <TableHead className="text-right">Conversions</TableHead>
+                  <TableHead className="text-right">Conversion value</TableHead>
+                  <TableHead className="w-[32px]" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {campaigns.map((c) => {
+                  const health = CAMPAIGN_HEALTH_META[deriveGoogleAdsCampaignHealth(c)];
+                  return (
+                    <TableRow
+                      key={c.campaignId}
+                      className="cursor-pointer"
+                      onClick={() => setSelectedCampaign(c)}
+                    >
+                      <TableCell className="max-w-[220px] text-sm" title={c.name}>
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); setSelectedCampaign(c); }}
+                          className="truncate text-left font-medium hover:underline focus:underline focus:outline-none"
+                        >
+                          {c.name}
+                        </button>
+                      </TableCell>
+                      <TableCell><GoogleAdsCampaignStatusBadge status={c.status} /></TableCell>
+                      <TableCell><StatusBadge tone={health.tone}>{health.label}</StatusBadge></TableCell>
+                      <TableCell className="text-right tabular-nums text-sm">{formatGoogleAdsCount(c.impressions)}</TableCell>
+                      <TableCell className="text-right tabular-nums text-sm">{formatGoogleAdsCount(c.clicks)}</TableCell>
+                      <TableCell className="text-right tabular-nums text-sm">{formatGoogleAdsSpend(c.costMicros, currencyCode)}</TableCell>
+                      <TableCell className="text-right tabular-nums text-sm">{c.conversions.toLocaleString(undefined, { maximumFractionDigits: 2 })}</TableCell>
+                      <TableCell className="text-right tabular-nums text-sm">{formatGoogleAdsCurrency(c.conversionValue, currencyCode)}</TableCell>
+                      <TableCell className="text-right">
+                        <ChevronRight className="ml-auto h-4 w-4 text-muted-foreground" />
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </div>
+        </CardContent>
+      )}
+
+      <GoogleAdsCampaignDetailSheet
+        campaign={selectedCampaign}
+        customerId={customerId}
+        dateRange={dateRange}
+        currencyCode={currencyCode}
+        open={selectedCampaign !== null}
+        onClose={() => setSelectedCampaign(null)}
+      />
+    </Card>
+  );
+}
+
+// ── Campaign Detail Sheet (Google Ads product phase) ────────────────────
+// Read-only. No editor, no Save button, no mutation control of any kind —
+// this is strictly a combined view of live Google Ads campaign performance
+// (already loaded, never refetched here) plus a small async fetch of
+// RenoMeta CRM outcomes attributed to this exact campaign.
+
+function useGoogleAdsCampaignCrmOutcomes(campaign: GoogleAdsCampaignPerformanceRow | null) {
+  const [loading, setLoading] = useState(false);
+  const [data, setData] = useState<GoogleAdsCampaignCrmOutcomesResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [retryTick, setRetryTick] = useState(0);
+
+  useEffect(() => {
+    if (!campaign) { setData(null); setError(null); setLoading(false); return; }
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    fetchGoogleAdsCampaignCrmOutcomes({ campaignId: campaign.campaignId, campaignName: campaign.name }).then((result) => {
+      if (cancelled) return;
+      if (result.ok) {
+        setData(result.data);
+      } else {
+        setData(null);
+        setError("Unable to load CRM outcomes right now.");
+      }
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [campaign?.campaignId, campaign?.name, retryTick]);
+
+  return { loading, data, error, retry: () => setRetryTick((t) => t + 1) };
+}
+
+function GoogleAdsSheetMetric({ label, value, caption }: { label: string; value: string; caption?: string }) {
+  return (
+    <div className="rounded-md border border-border p-3">
+      <p className="text-[11px] text-muted-foreground">{label}</p>
+      <p className="mt-1 text-sm font-semibold tabular-nums text-foreground">{value}</p>
+      {caption && <p className="mt-0.5 text-[10px] text-muted-foreground">{caption}</p>}
+    </div>
+  );
+}
+
+// Ad Group / Keyword / Search Term drill-down (Campaign Detail Sheet phase)
+// — internal Sheet state only, never a route/second Sheet/second drawer
+// (see the task's "why not a second drawer" rationale). Deliberately kept
+// as one flat useState-per-field set inside the Sheet component itself
+// rather than a reducer/store — the whole tree resets together every time
+// the Sheet opens or the selected campaign changes (Step 28), and nothing
+// here needs to survive the Sheet closing.
+type GoogleAdsCampaignDetailTab = "overview" | "ad-groups";
+type GoogleAdsAdGroupSubTab = "keywords" | "search-terms";
+
+function GoogleAdsCampaignDetailSheet({ campaign, customerId, dateRange, currencyCode, open, onClose }: {
+  campaign: GoogleAdsCampaignPerformanceRow | null;
+  customerId: string;
+  dateRange: string;
+  currencyCode: string | null;
+  open: boolean;
+  onClose: () => void;
+}) {
+  // Only fetches while a campaign is actually selected+open — closing the
+  // Sheet (campaign becomes null via onClose) tears the fetch state down,
+  // so reopening on a DIFFERENT campaign never briefly shows the previous
+  // campaign's stale outcomes (Step 15/Step 24E).
+  const { loading, data, error, retry } = useGoogleAdsCampaignCrmOutcomes(open ? campaign : null);
+
+  const [activeTab, setActiveTab] = useState<GoogleAdsCampaignDetailTab>("overview");
+
+  const [adGroups, setAdGroups] = useState<GoogleAdsAdGroupPerformanceRow[] | null>(null);
+  const [adGroupsLoading, setAdGroupsLoading] = useState(false);
+  const [adGroupsError, setAdGroupsError] = useState<string | null>(null);
+
+  const [selectedAdGroup, setSelectedAdGroup] = useState<GoogleAdsAdGroupPerformanceRow | null>(null);
+  const [adGroupSubTab, setAdGroupSubTab] = useState<GoogleAdsAdGroupSubTab>("keywords");
+
+  const [keywords, setKeywords] = useState<GoogleAdsKeywordPerformanceRow[] | null>(null);
+  const [keywordsLoading, setKeywordsLoading] = useState(false);
+  const [keywordsError, setKeywordsError] = useState<string | null>(null);
+
+  const [searchTerms, setSearchTerms] = useState<GoogleAdsSearchTermPerformanceRow[] | null>(null);
+  const [searchTermsLoading, setSearchTermsLoading] = useState(false);
+  const [searchTermsError, setSearchTermsError] = useState<string | null>(null);
+
+  // Ad Group-Level CRM Outcomes phase — separate loading/error/data state
+  // from Keywords/Search Terms, exactly like Overview's own CRM outcomes
+  // are separate from its Google Ads performance grid (Step 22: only this
+  // section shows a loading skeleton, never Ad Group performance/Keywords/
+  // Search Terms). A small in-session cache (keyed by adGroupId, cleared
+  // by the same reset effect as everything else below) avoids refetching
+  // when the user backs out of an ad group and reopens the SAME one
+  // (Step 24) — not a global cache framework, just a plain Map scoped to
+  // this Sheet instance's lifetime.
+  const [adGroupCrmOutcomes, setAdGroupCrmOutcomes] = useState<GoogleAdsAdGroupCrmOutcomesResponse | null>(null);
+  const [adGroupCrmOutcomesLoading, setAdGroupCrmOutcomesLoading] = useState(false);
+  const [adGroupCrmOutcomesError, setAdGroupCrmOutcomesError] = useState<string | null>(null);
+  const adGroupCrmOutcomesCacheRef = useRef<Map<string, GoogleAdsAdGroupCrmOutcomesResponse>>(new Map());
+
+  // Campaign-switch / reopen reset (Step 28, Test H) — fires on every fresh
+  // open (including reopening the SAME campaign) and on switching to a
+  // DIFFERENT campaign while already open, so no Ad Group/Keyword/Search
+  // Term state from a previous campaign (or a previous look at the same
+  // one) ever bleeds into the next view. Overview's own CRM-outcomes fetch
+  // is handled separately by useGoogleAdsCampaignCrmOutcomes above and is
+  // NOT refetched by this reset (Step 17 — Overview must not be
+  // rerequested just because the Ad Groups tab was touched).
+  useEffect(() => {
+    if (!open) return;
+    setActiveTab("overview");
+    setAdGroups(null); setAdGroupsLoading(false); setAdGroupsError(null);
+    setSelectedAdGroup(null); setAdGroupSubTab("keywords");
+    setKeywords(null); setKeywordsLoading(false); setKeywordsError(null);
+    setSearchTerms(null); setSearchTermsLoading(false); setSearchTermsError(null);
+    setAdGroupCrmOutcomes(null); setAdGroupCrmOutcomesLoading(false); setAdGroupCrmOutcomesError(null);
+    adGroupCrmOutcomesCacheRef.current.clear();
+  }, [campaign?.campaignId, open]);
+
+  const loadAdGroups = useCallback(() => {
+    if (!campaign) return;
+    setAdGroupsLoading(true);
+    setAdGroupsError(null);
+    fetchGoogleAdsCampaignAdGroups({ campaignId: campaign.campaignId }).then((result) => {
+      if (result.ok) {
+        setAdGroups(result.data.adGroups);
+      } else {
+        setAdGroups(null);
+        setAdGroupsError("Unable to load ad groups right now.");
+      }
+      setAdGroupsLoading(false);
+    });
+  }, [campaign?.campaignId]);
+
+  const loadKeywords = useCallback((adGroup: GoogleAdsAdGroupPerformanceRow) => {
+    if (!campaign) return;
+    setKeywordsLoading(true);
+    setKeywordsError(null);
+    fetchGoogleAdsAdGroupKeywords({ campaignId: campaign.campaignId, adGroupId: adGroup.adGroupId }).then((result) => {
+      if (result.ok) {
+        setKeywords(result.data.keywords);
+      } else {
+        setKeywords(null);
+        setKeywordsError("Unable to load keywords right now.");
+      }
+      setKeywordsLoading(false);
+    });
+  }, [campaign?.campaignId]);
+
+  const loadSearchTerms = useCallback((adGroup: GoogleAdsAdGroupPerformanceRow) => {
+    if (!campaign) return;
+    setSearchTermsLoading(true);
+    setSearchTermsError(null);
+    fetchGoogleAdsAdGroupSearchTerms({ campaignId: campaign.campaignId, adGroupId: adGroup.adGroupId }).then((result) => {
+      if (result.ok) {
+        setSearchTerms(result.data.searchTerms);
+      } else {
+        setSearchTerms(null);
+        setSearchTermsError("Unable to load search terms right now.");
+      }
+      setSearchTermsLoading(false);
+    });
+  }, [campaign?.campaignId]);
+
+  // Ad Group-Level CRM Outcomes fetch — checks the in-session cache first
+  // (Step 24); `force` bypasses it (used by the section's own Retry
+  // button so a real retry never just re-serves a stale cached failure —
+  // though a failure is never cached in the first place, see below).
+  const loadAdGroupCrmOutcomes = useCallback((adGroup: GoogleAdsAdGroupPerformanceRow, opts?: { force?: boolean }) => {
+    if (!campaign) return;
+    const cached = !opts?.force ? adGroupCrmOutcomesCacheRef.current.get(adGroup.adGroupId) : undefined;
+    if (cached) {
+      setAdGroupCrmOutcomes(cached);
+      setAdGroupCrmOutcomesError(null);
+      setAdGroupCrmOutcomesLoading(false);
+      return;
+    }
+    setAdGroupCrmOutcomesLoading(true);
+    setAdGroupCrmOutcomesError(null);
+    fetchGoogleAdsAdGroupCrmOutcomes({ campaignId: campaign.campaignId, adGroupId: adGroup.adGroupId }).then((result) => {
+      if (result.ok) {
+        adGroupCrmOutcomesCacheRef.current.set(adGroup.adGroupId, result.data);
+        setAdGroupCrmOutcomes(result.data);
+      } else {
+        // A failure is deliberately never cached — so a Retry (or simply
+        // reopening this ad group later) gets a genuine fresh attempt
+        // instead of permanently re-serving the same error for the rest
+        // of the Sheet session.
+        setAdGroupCrmOutcomes(null);
+        setAdGroupCrmOutcomesError("Unable to load CRM outcomes right now.");
+      }
+      setAdGroupCrmOutcomesLoading(false);
+    });
+  }, [campaign?.campaignId]);
+
+  // Lazy loading (Step 27) — Ad Groups is only ever fetched the first time
+  // the tab is actually clicked, never on Sheet open.
+  const handleTabChange = (value: string) => {
+    const tab = value as GoogleAdsCampaignDetailTab;
+    setActiveTab(tab);
+    if (tab === "ad-groups" && adGroups === null && !adGroupsLoading) {
+      loadAdGroups();
+    }
+  };
+
+  // Clicking an Ad Group row switches the SAME Sheet into an internal
+  // detail view (Step 19) — no second Sheet/drawer, no navigation away.
+  // Keywords and CRM outcomes both load immediately (Keywords is the
+  // default sub-tab; CRM outcomes is its own always-visible section);
+  // Search Terms stays lazy until that sub-tab is actually opened.
+  const openAdGroup = (adGroup: GoogleAdsAdGroupPerformanceRow) => {
+    setSelectedAdGroup(adGroup);
+    setAdGroupSubTab("keywords");
+    setKeywords(null); setKeywordsError(null);
+    setSearchTerms(null); setSearchTermsError(null);
+    setAdGroupCrmOutcomes(null); setAdGroupCrmOutcomesError(null);
+    loadKeywords(adGroup);
+    loadAdGroupCrmOutcomes(adGroup);
+  };
+
+  const handleAdGroupSubTabChange = (value: string) => {
+    const tab = value as GoogleAdsAdGroupSubTab;
+    setAdGroupSubTab(tab);
+    if (tab === "search-terms" && searchTerms === null && !searchTermsLoading && selectedAdGroup) {
+      loadSearchTerms(selectedAdGroup);
+    }
+  };
+
+  if (!campaign) return null;
+  const health = CAMPAIGN_HEALTH_META[deriveGoogleAdsCampaignHealth(campaign)];
+  const dateRangeLabel = dateRange === "LAST_30_DAYS" ? "Last 30 days" : dateRange;
+
+  return (
+    <Sheet open={open} onOpenChange={(o) => !o && onClose()}>
+      {/* Widened for the Ad Group Detail phase (Keywords/Search Terms
+          tables need real room — the previous sm:max-w-lg (~512px) forced
+          horizontal scrolling on the standard 8-column Keyword table at
+          normal desktop widths). sm:max-w-2xl (672px) covers small/medium
+          desktop; lg:max-w-[800px] is the actual target width on full
+          desktop — still a drawer, never 100vw, so the page stays visible
+          behind it. Below `sm`, w-full is unchanged (full-width, fully
+          responsive on mobile). */}
+      <SheetContent className="w-full overflow-y-auto sm:max-w-2xl lg:max-w-[800px]">
+        {selectedAdGroup ? (
+          <GoogleAdsAdGroupDetailView
+            campaignId={campaign.campaignId}
+            campaignName={campaign.name}
+            adGroup={selectedAdGroup}
+            currencyCode={currencyCode}
+            dateRangeLabel={dateRangeLabel}
+            subTab={adGroupSubTab}
+            onSubTabChange={handleAdGroupSubTabChange}
+            keywords={keywords}
+            keywordsLoading={keywordsLoading}
+            keywordsError={keywordsError}
+            onRetryKeywords={() => loadKeywords(selectedAdGroup)}
+            searchTerms={searchTerms}
+            searchTermsLoading={searchTermsLoading}
+            searchTermsError={searchTermsError}
+            onRetrySearchTerms={() => loadSearchTerms(selectedAdGroup)}
+            crmOutcomes={adGroupCrmOutcomes}
+            crmOutcomesLoading={adGroupCrmOutcomesLoading}
+            crmOutcomesError={adGroupCrmOutcomesError}
+            onRetryCrmOutcomes={() => loadAdGroupCrmOutcomes(selectedAdGroup, { force: true })}
+            onBack={() => setSelectedAdGroup(null)}
+          />
+        ) : (
+          <>
+            <SheetHeader>
+              <SheetTitle className="pr-6">
+                <span className="block truncate text-base">{campaign.name}</span>
+              </SheetTitle>
+              <div className="flex flex-wrap items-center gap-2">
+                <GoogleAdsCampaignStatusBadge status={campaign.status} />
+                <StatusBadge tone={health.tone}>{health.label}</StatusBadge>
+              </div>
+              <SheetDescription className="text-xs">
+                Google Ads · Account {formatGoogleAdsCustomerId(customerId) || customerId} · {dateRangeLabel}
+              </SheetDescription>
+            </SheetHeader>
+
+            <Tabs value={activeTab} onValueChange={handleTabChange} className="pt-3">
+              <TabsList>
+                <TabsTrigger value="overview">Overview</TabsTrigger>
+                <TabsTrigger value="ad-groups">Ad Groups</TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="overview" className="space-y-5 pt-4">
+                <div>
+                  <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Google Ads performance</h4>
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                    <GoogleAdsSheetMetric label="Impressions" value={formatGoogleAdsCount(campaign.impressions)} />
+                    <GoogleAdsSheetMetric label="Clicks" value={formatGoogleAdsCount(campaign.clicks)} />
+                    <GoogleAdsSheetMetric label="CTR" value={formatGoogleAdsCtr(campaign.clicks, campaign.impressions)} />
+                    <GoogleAdsSheetMetric label="Spend" value={formatGoogleAdsSpend(campaign.costMicros, currencyCode)} />
+                    <GoogleAdsSheetMetric label="Conversions" value={campaign.conversions.toLocaleString(undefined, { maximumFractionDigits: 2 })} />
+                    <GoogleAdsSheetMetric label="Conversion value" value={formatGoogleAdsCurrency(campaign.conversionValue, currencyCode)} />
+                  </div>
+                </div>
+
+                <div>
+                  <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">RenoMeta CRM outcomes</h4>
+                  {loading ? (
+                    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                      {Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-14 w-full" />)}
+                    </div>
+                  ) : error ? (
+                    <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-xs text-destructive">
+                      <span>{error}</span>
+                      <Button size="sm" variant="outline" className="h-7 shrink-0" onClick={retry}>Retry</Button>
+                    </div>
+                  ) : data ? (
+                    <>
+                      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                        <GoogleAdsSheetMetric label="Leads" value={String(data.outcomes.leads)} />
+                        <GoogleAdsSheetMetric label="Qualified" value={String(data.outcomes.qualifiedLeads)} />
+                        <GoogleAdsSheetMetric label="Appointments" value={String(data.outcomes.appointments)} />
+                        <GoogleAdsSheetMetric label="Won deals" value={String(data.outcomes.wonDeals)} />
+                        {/* "Won value", never "Revenue" — no confirmed
+                            organization-wide canonical currency field exists yet
+                            (see google-ads-campaign-crm-outcomes.ts). This
+                            Google Ads account itself reports currencyCode "ILS"
+                            — deliberately NEVER used to label a CRM deal value,
+                            since it's an advertiser setting, not proof of what
+                            currency deals.value is actually recorded in.
+                            formatPlainMoneyValue() never prints a currency
+                            symbol/code at all (unlike formatMoney(), which
+                            hardcodes "$"/USD) — see lib/google-ads-format.ts. */}
+                        <GoogleAdsSheetMetric
+                          label="Won value"
+                          value={data.outcomes.wonDeals > 0 ? formatPlainMoneyValue(data.outcomes.wonValue) : "—"}
+                          caption={data.outcomes.wonDeals > 0 ? "Currency not configured" : undefined}
+                        />
+                      </div>
+                      {data.outcomes.leads > 0 && (
+                        // Deep-links into the Leads page with the Google Ads
+                        // source preselected, plus this exact campaign's context
+                        // (Google Ads Campaign -> CRM Leads Deep Link phase).
+                        // Sends BOTH campaignId and campaignName whenever both
+                        // are known — NOT campaignName-only-when-campaignId-
+                        // absent. This does not make campaignName authoritative;
+                        // campaign_id exact match still wins server-side (see
+                        // google-ads-campaign-lead-ids.ts). It exists purely so
+                        // local/legacy submission rows with campaign_id IS NULL
+                        // (e.g. the Phase3 dev-fixture rows, which only ever
+                        // recorded a campaign_name) can still be matched via the
+                        // documented name-fallback path once the real campaign
+                        // now has a live campaignId — omitting campaignName here
+                        // would silently exclude those rows even though the
+                        // existing fallback rule was designed to catch them.
+                        // Never renders a nested lead list inside this Sheet —
+                        // the Leads page remains the single canonical CRM lead
+                        // workspace.
+                        // RenoMeta Global UI Interaction System — "View CRM
+                        // Leads" is a warm-neutral navigation CTA, not a
+                        // plain outline button (see .claude/skills/
+                        // ui-design-system/SKILL.md).
+                        <Button asChild variant="neutral" size="sm" className="mt-4">
+                          <Link
+                            to="/leads"
+                            search={{
+                              source: "google_ads",
+                              campaignId: campaign.campaignId || undefined,
+                              campaignName: campaign.name || undefined,
+                            }}
+                          >
+                            View CRM Leads
+                            <ArrowRight className="ml-1.5 h-3.5 w-3.5" />
+                          </Link>
+                        </Button>
+                      )}
+                      {data.attributionMode === "campaign_name_fallback" && (
+                        <p className="mt-2 text-[11px] text-muted-foreground">
+                          Attributed by campaign name — these provider records have no campaign ID (expected for local dev/test fixtures only).
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">No CRM outcomes yet.</p>
+                  )}
+                </div>
+              </TabsContent>
+
+              <TabsContent value="ad-groups" className="pt-4">
+                <GoogleAdsAdGroupsTabContent
+                  adGroups={adGroups}
+                  loading={adGroupsLoading}
+                  error={adGroupsError}
+                  currencyCode={currencyCode}
+                  onRetry={loadAdGroups}
+                  onSelect={openAdGroup}
+                />
+              </TabsContent>
+            </Tabs>
+          </>
+        )}
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+// Compact status badge reused for Ad Group / Keyword criterion status —
+// ENABLED/PAUSED/REMOVED share the exact same tone mapping already
+// established for campaigns (CAMPAIGN_STATUS_TONE above).
+function GoogleAdsEntityStatusBadge({ status }: { status: string | null }) {
+  const tone = (status && CAMPAIGN_STATUS_TONE[status]) || "muted";
+  return <StatusBadge tone={tone}>{status ?? "—"}</StatusBadge>;
+}
+
+function GoogleAdsAdGroupsTabContent({ adGroups, loading, error, currencyCode, onRetry, onSelect }: {
+  adGroups: GoogleAdsAdGroupPerformanceRow[] | null;
+  loading: boolean;
+  error: string | null;
+  currencyCode: string | null;
+  onRetry: () => void;
+  onSelect: (adGroup: GoogleAdsAdGroupPerformanceRow) => void;
+}) {
+  if (loading) {
+    return (
+      <div className="space-y-2">
+        {Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-10 w-full" />)}
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-xs text-destructive">
+        <span>{error}</span>
+        <Button size="sm" variant="outline" className="h-7 shrink-0" onClick={onRetry}>Retry</Button>
+      </div>
+    );
+  }
+  if (!adGroups || adGroups.length === 0) {
+    return <p className="text-xs text-muted-foreground">No ad groups found for this campaign.</p>;
+  }
+  return (
+    <div className="overflow-x-auto">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="text-xs">Ad Group</TableHead>
+            <TableHead className="text-xs">Status</TableHead>
+            <TableHead className="text-right text-xs">Impressions</TableHead>
+            <TableHead className="text-right text-xs">Clicks</TableHead>
+            <TableHead className="text-right text-xs">CTR</TableHead>
+            <TableHead className="text-right text-xs">Spend</TableHead>
+            <TableHead className="text-right text-xs">Conversions</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {adGroups.map((ag) => (
+            <TableRow key={ag.adGroupId}>
+              <TableCell className="text-xs font-medium">
+                {/* Button, not a bare onClick row (Step 33) — real keyboard
+                    focus + hover/focus-visible underline affordance. */}
+                <button
+                  type="button"
+                  onClick={() => onSelect(ag)}
+                  className="rounded-sm text-left text-foreground underline-offset-2 hover:text-primary hover:underline focus-visible:text-primary focus-visible:underline focus-visible:outline-none"
+                >
+                  {ag.name}
+                </button>
+              </TableCell>
+              <TableCell><GoogleAdsEntityStatusBadge status={ag.status} /></TableCell>
+              <TableCell className="text-right tabular-nums text-xs">{formatGoogleAdsCount(ag.impressions)}</TableCell>
+              <TableCell className="text-right tabular-nums text-xs">{formatGoogleAdsCount(ag.clicks)}</TableCell>
+              <TableCell className="text-right tabular-nums text-xs">{formatGoogleAdsCtr(ag.clicks, ag.impressions)}</TableCell>
+              <TableCell className="text-right tabular-nums text-xs">{formatGoogleAdsSpend(ag.costMicros, currencyCode)}</TableCell>
+              <TableCell className="text-right tabular-nums text-xs">{ag.conversions.toLocaleString(undefined, { maximumFractionDigits: 2 })}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}
+
+function GoogleAdsAdGroupDetailView({
+  campaignId, campaignName, adGroup, currencyCode, dateRangeLabel, subTab, onSubTabChange,
+  keywords, keywordsLoading, keywordsError, onRetryKeywords,
+  searchTerms, searchTermsLoading, searchTermsError, onRetrySearchTerms,
+  crmOutcomes, crmOutcomesLoading, crmOutcomesError, onRetryCrmOutcomes,
+  onBack,
+}: {
+  campaignId: string;
+  campaignName: string;
+  adGroup: GoogleAdsAdGroupPerformanceRow;
+  currencyCode: string | null;
+  dateRangeLabel: string;
+  subTab: GoogleAdsAdGroupSubTab;
+  onSubTabChange: (value: string) => void;
+  keywords: GoogleAdsKeywordPerformanceRow[] | null;
+  keywordsLoading: boolean;
+  keywordsError: string | null;
+  onRetryKeywords: () => void;
+  searchTerms: GoogleAdsSearchTermPerformanceRow[] | null;
+  searchTermsLoading: boolean;
+  searchTermsError: string | null;
+  onRetrySearchTerms: () => void;
+  crmOutcomes: GoogleAdsAdGroupCrmOutcomesResponse | null;
+  crmOutcomesLoading: boolean;
+  crmOutcomesError: string | null;
+  onRetryCrmOutcomes: () => void;
+  onBack: () => void;
+}) {
+  return (
+    <>
+      <SheetHeader>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="mb-1 h-7 w-fit px-2 text-xs text-muted-foreground hover:text-foreground"
+          onClick={onBack}
+        >
+          <ChevronLeft className="mr-1 h-3.5 w-3.5" /> Back to Ad Groups
+        </Button>
+        <SheetTitle className="pr-6">
+          <span className="block truncate text-base">{adGroup.name}</span>
+        </SheetTitle>
+        <div className="flex flex-wrap items-center gap-2">
+          <GoogleAdsEntityStatusBadge status={adGroup.status} />
+        </div>
+        <SheetDescription className="text-xs">
+          Campaign: {campaignName} · {dateRangeLabel}
+        </SheetDescription>
+      </SheetHeader>
+
+      <div className="space-y-5 py-4">
+        <div>
+          <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Google Ads performance</h4>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <GoogleAdsSheetMetric label="Impressions" value={formatGoogleAdsCount(adGroup.impressions)} />
+            <GoogleAdsSheetMetric label="Clicks" value={formatGoogleAdsCount(adGroup.clicks)} />
+            <GoogleAdsSheetMetric label="CTR" value={formatGoogleAdsCtr(adGroup.clicks, adGroup.impressions)} />
+            <GoogleAdsSheetMetric label="Spend" value={formatGoogleAdsSpend(adGroup.costMicros, currencyCode)} />
+            <GoogleAdsSheetMetric label="Conversions" value={adGroup.conversions.toLocaleString(undefined, { maximumFractionDigits: 2 })} />
+            <GoogleAdsSheetMetric label="Conversion value" value={formatGoogleAdsCurrency(adGroup.conversionValue, currencyCode)} />
+          </div>
+        </div>
+
+        <div>
+          <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">RenoMeta CRM outcomes</h4>
+          {crmOutcomesLoading ? (
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              {Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-14 w-full" />)}
+            </div>
+          ) : crmOutcomesError ? (
+            <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-xs text-destructive">
+              <span>{crmOutcomesError}</span>
+              <Button size="sm" variant="outline" className="h-7 shrink-0" onClick={onRetryCrmOutcomes}>Retry</Button>
+            </div>
+          ) : crmOutcomes ? (
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              <GoogleAdsSheetMetric label="Leads" value={String(crmOutcomes.outcomes.leads)} />
+              <GoogleAdsSheetMetric label="Qualified" value={String(crmOutcomes.outcomes.qualifiedLeads)} />
+              <GoogleAdsSheetMetric label="Appointments" value={String(crmOutcomes.outcomes.appointments)} />
+              <GoogleAdsSheetMetric label="Won deals" value={String(crmOutcomes.outcomes.wonDeals)} />
+              {/* Same currency-silent policy as Campaign Overview's Won
+                  value — no canonical organization-wide CRM currency exists
+                  yet, so this never prints a fabricated symbol/code. */}
+              <GoogleAdsSheetMetric
+                label="Won value"
+                value={crmOutcomes.outcomes.wonDeals > 0 ? formatPlainMoneyValue(crmOutcomes.outcomes.wonValue) : "—"}
+                caption={crmOutcomes.outcomes.wonDeals > 0 ? "Currency not configured" : undefined}
+              />
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">No CRM outcomes yet.</p>
+          )}
+          {crmOutcomes && (
+            // Ad Group -> CRM Leads Deep Link phase — visible whenever CRM
+            // outcomes have successfully loaded, REGARDLESS of lead count
+            // (Zero-Lead Ad Group CTA fix). A zero-lead Ad Group is still a
+            // valid CRM filter context — the current Phase3 fixture has
+            // ad_group_id = null, so an honest 0-lead result is exactly
+            // what this deep link should surface, not something to hide.
+            // Only gated on `crmOutcomes` being non-null (i.e. loading
+            // finished without error) — never on `outcomes.leads > 0`.
+            // adGroupName is display-only on the Leads page (Step 27
+            // there) — this Link never sends anything that would be used
+            // for server-side attribution beyond adGroupId itself.
+            <Button asChild variant="neutral" size="sm" className="mt-4">
+              <Link
+                to="/leads"
+                search={{
+                  source: "google_ads",
+                  campaignId: campaignId || undefined,
+                  campaignName: campaignName || undefined,
+                  adGroupId: adGroup.adGroupId || undefined,
+                  adGroupName: adGroup.name || undefined,
+                }}
+              >
+                View CRM Leads
+                <ArrowRight className="ml-1.5 h-3.5 w-3.5" />
+              </Link>
+            </Button>
+          )}
+        </div>
+
+        <Tabs value={subTab} onValueChange={onSubTabChange}>
+          <TabsList>
+            <TabsTrigger value="keywords">Keywords</TabsTrigger>
+            <TabsTrigger value="search-terms">Search Terms</TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="keywords" className="pt-3">
+            <GoogleAdsKeywordsTabContent
+              keywords={keywords}
+              loading={keywordsLoading}
+              error={keywordsError}
+              currencyCode={currencyCode}
+              onRetry={onRetryKeywords}
+            />
+          </TabsContent>
+
+          <TabsContent value="search-terms" className="pt-3">
+            <p className="mb-2 text-[11px] text-muted-foreground">
+              Actual searches that triggered ads during the selected date range.
+            </p>
+            <GoogleAdsSearchTermsTabContent
+              searchTerms={searchTerms}
+              loading={searchTermsLoading}
+              error={searchTermsError}
+              currencyCode={currencyCode}
+              onRetry={onRetrySearchTerms}
+            />
+          </TabsContent>
+        </Tabs>
+      </div>
+    </>
+  );
+}
+
+function GoogleAdsKeywordsTabContent({ keywords, loading, error, currencyCode, onRetry }: {
+  keywords: GoogleAdsKeywordPerformanceRow[] | null;
+  loading: boolean;
+  error: string | null;
+  currencyCode: string | null;
+  onRetry: () => void;
+}) {
+  if (loading) {
+    return (
+      <div className="space-y-2">
+        {Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-10 w-full" />)}
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-xs text-destructive">
+        <span>{error}</span>
+        <Button size="sm" variant="outline" className="h-7 shrink-0" onClick={onRetry}>Retry</Button>
+      </div>
+    );
+  }
+  if (!keywords || keywords.length === 0) {
+    return <p className="text-xs text-muted-foreground">No keywords found for this ad group.</p>;
+  }
+  return (
+    // overflow-x-auto stays as a safety fallback for genuinely narrow
+    // widths (Step 6) — at the Sheet's new width, the 8 columns below fit
+    // without triggering it on a normal desktop viewport.
+    <div className="overflow-x-auto">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="text-xs">Keyword</TableHead>
+            <TableHead className="whitespace-nowrap text-xs">Match type</TableHead>
+            <TableHead className="whitespace-nowrap text-xs">Status</TableHead>
+            <TableHead className="whitespace-nowrap text-right text-xs">Impressions</TableHead>
+            <TableHead className="whitespace-nowrap text-right text-xs">Clicks</TableHead>
+            <TableHead className="whitespace-nowrap text-right text-xs">CTR</TableHead>
+            <TableHead className="whitespace-nowrap text-right text-xs">Spend</TableHead>
+            <TableHead className="whitespace-nowrap text-right text-xs">Conversions</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {keywords.map((kw) => (
+            <TableRow key={kw.criterionId}>
+              {/* Keyword text is the one flexible column — allowed to wrap
+                  onto 2 lines for a long phrase rather than forcing the
+                  whole table wider (Step 5). */}
+              <TableCell className="max-w-[240px] whitespace-normal break-words text-xs font-medium">{kw.text}</TableCell>
+              <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{humanizeGoogleAdsKeywordMatchType(kw.matchType)}</TableCell>
+              <TableCell className="whitespace-nowrap"><GoogleAdsEntityStatusBadge status={kw.status} /></TableCell>
+              <TableCell className="whitespace-nowrap text-right tabular-nums text-xs">{formatGoogleAdsCount(kw.impressions)}</TableCell>
+              <TableCell className="whitespace-nowrap text-right tabular-nums text-xs">{formatGoogleAdsCount(kw.clicks)}</TableCell>
+              <TableCell className="whitespace-nowrap text-right tabular-nums text-xs">{formatGoogleAdsCtr(kw.clicks, kw.impressions)}</TableCell>
+              <TableCell className="whitespace-nowrap text-right tabular-nums text-xs">{formatGoogleAdsSpend(kw.costMicros, currencyCode)}</TableCell>
+              <TableCell className="whitespace-nowrap text-right tabular-nums text-xs">{kw.conversions.toLocaleString(undefined, { maximumFractionDigits: 2 })}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}
+
+function GoogleAdsSearchTermsTabContent({ searchTerms, loading, error, currencyCode, onRetry }: {
+  searchTerms: GoogleAdsSearchTermPerformanceRow[] | null;
+  loading: boolean;
+  error: string | null;
+  currencyCode: string | null;
+  onRetry: () => void;
+}) {
+  if (loading) {
+    return (
+      <div className="space-y-2">
+        {Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-10 w-full" />)}
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-xs text-destructive">
+        <span>{error}</span>
+        <Button size="sm" variant="outline" className="h-7 shrink-0" onClick={onRetry}>Retry</Button>
+      </div>
+    );
+  }
+  if (!searchTerms || searchTerms.length === 0) {
+    // Legitimately empty for a low/zero-serving campaign (Step 24) — never
+    // treated as an error.
+    return <p className="text-xs text-muted-foreground">No search terms available for this date range.</p>;
+  }
+  return (
+    // Same responsive-table strategy as Keywords — overflow-x-auto remains
+    // a safety fallback for narrow widths only (Step 7).
+    <div className="overflow-x-auto">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="text-xs">Search term</TableHead>
+            <TableHead className="whitespace-nowrap text-right text-xs">Impressions</TableHead>
+            <TableHead className="whitespace-nowrap text-right text-xs">Clicks</TableHead>
+            <TableHead className="whitespace-nowrap text-right text-xs">CTR</TableHead>
+            <TableHead className="whitespace-nowrap text-right text-xs">Spend</TableHead>
+            <TableHead className="whitespace-nowrap text-right text-xs">Conversions</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {searchTerms.map((st) => (
+            <TableRow key={st.searchTerm}>
+              <TableCell className="max-w-[280px] whitespace-normal break-words text-xs font-medium">{st.searchTerm}</TableCell>
+              <TableCell className="whitespace-nowrap text-right tabular-nums text-xs">{formatGoogleAdsCount(st.impressions)}</TableCell>
+              <TableCell className="whitespace-nowrap text-right tabular-nums text-xs">{formatGoogleAdsCount(st.clicks)}</TableCell>
+              <TableCell className="whitespace-nowrap text-right tabular-nums text-xs">{formatGoogleAdsCtr(st.clicks, st.impressions)}</TableCell>
+              <TableCell className="whitespace-nowrap text-right tabular-nums text-xs">{formatGoogleAdsSpend(st.costMicros, currencyCode)}</TableCell>
+              <TableCell className="whitespace-nowrap text-right tabular-nums text-xs">{st.conversions.toLocaleString(undefined, { maximumFractionDigits: 2 })}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}
+
+function GoogleAdsPerformanceTab() {
+  const { loading, result, retry } = useGoogleAdsCampaignPerformance();
+
+  if (loading || !result) {
+    return <GoogleAdsPerformanceSkeleton />;
+  }
+
+  if (!result.ok) {
+    switch (result.kind) {
+      case "not_connected":
+        return (
+          <GoogleAdsEmptyStateCard
+            icon={BarChart3}
+            title="Google Ads is not connected"
+            description="Connect your Google Ads account to see campaign performance here."
+            action={<GoogleAdsIntegrationsLinkButton>Connect Google Ads</GoogleAdsIntegrationsLinkButton>}
+          />
+        );
+      case "account_selection_required":
+        return (
+          <GoogleAdsEmptyStateCard
+            icon={BarChart3}
+            title="Select a Google Ads account"
+            description="Google Ads is authorized, but an advertiser account still needs to be selected before performance can be shown."
+            action={<GoogleAdsIntegrationsLinkButton>Select account</GoogleAdsIntegrationsLinkButton>}
+          />
+        );
+      case "account_sync_required":
+      case "reconnect_required":
+        return (
+          <GoogleAdsEmptyStateCard
+            icon={AlertTriangle}
+            title="Google Ads needs attention"
+            description={
+              result.kind === "reconnect_required"
+                ? "Your Google Ads authorization has expired. Reconnect to keep seeing performance data."
+                : "Google couldn't sync your account details. Retry the connection from Integrations."
+            }
+            action={<GoogleAdsIntegrationsLinkButton>{result.kind === "reconnect_required" ? "Reconnect Google Ads" : "Go to Integrations"}</GoogleAdsIntegrationsLinkButton>}
+          />
+        );
+      case "unauthorized":
+        // A frontend session/auth error — never treated as "Google Ads is
+        // disconnected" (Step 11: don't auto-disconnect the integration
+        // over a frontend auth error). Retrying re-reads the current
+        // Supabase session, which resolves itself once the user is
+        // properly signed in again.
+        return (
+          <GoogleAdsEmptyStateCard
+            icon={AlertCircle}
+            title="Session error"
+            description="We couldn't verify your session. Please try again."
+            action={<Button size="sm" className="mt-2" onClick={retry}><RefreshCw className="mr-1.5 h-3.5 w-3.5" /> Retry</Button>}
+          />
+        );
+      case "provider_error":
+      case "network_error":
+      default:
+        // Distinguished deliberately from the zero-metrics loaded state —
+        // this is a FAILED fetch, never rendered as if it were real zero
+        // data (Step 12).
+        return (
+          <GoogleAdsEmptyStateCard
+            icon={AlertCircle}
+            title="Unable to load Google Ads performance"
+            description="Something went wrong reaching Google Ads. This is usually temporary."
+            action={<Button size="sm" className="mt-2" onClick={retry}><RefreshCw className="mr-1.5 h-3.5 w-3.5" /> Retry</Button>}
+          />
+        );
+    }
+  }
+
+  const { data } = result;
+  return (
+    <div className="space-y-5">
+      <GoogleAdsAccountHeader data={data} />
+      <GoogleAdsMetricCards summary={data.summary} currencyCode={data.currencyCode} />
+      <GoogleAdsCampaignTable campaigns={data.campaigns} currencyCode={data.currencyCode} customerId={data.customerId} dateRange={data.dateRange} />
+      <GoogleAdsLeadsCard />
+      <GoogleAdsConversionFeedbackCard />
+      <GoogleAdsConversionEventsTableCard />
+      <GoogleAdsOfflineConversionMappingCard />
+    </div>
+  );
+}
+
+// ---------- Google Ads Leads (Phase 3, Step 6, Part B) ─────────────────
+//
+// Compact lead-form-ingestion subsection inside Google Ads reporting —
+// deliberately NOT a full lead-management page (Step B14): a status
+// summary + a manual "Sync leads" action, with a link out to the real CRM
+// Leads page for anything beyond that. Imported leads themselves live in
+// the normal `leads`/`contacts` tables — this card never duplicates that
+// table here.
+
+function useGoogleAdsLeadSyncStatus() {
+  const [loading, setLoading] = useState(true);
+  const [status, setStatus] = useState<GoogleAdsLeadSyncStatusResponse | null>(null);
+  const [refreshTick, setRefreshTick] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    fetchGoogleAdsLeadSyncStatus().then((r) => {
+      if (cancelled) return;
+      setStatus(r.ok ? r.data : null);
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [refreshTick]);
+
+  return { loading, status, refresh: () => setRefreshTick((t) => t + 1) };
+}
+
+const GOOGLE_ADS_LEAD_SYNC_ERROR_MESSAGES: Record<string, string> = {
+  not_connected: "Google Ads is not connected.",
+  account_selection_required: "Select a Google Ads advertiser account first.",
+  account_sync_required: "Google Ads needs attention — retry the connection from Integrations.",
+  reconnect_required: "Google Ads authorization expired — reconnect to sync leads.",
+  unauthorized: "Session error — please try again.",
+};
+
+// Dev-only synthetic-lead injection dialog (Phase 3, Step 6C.1) — feeds a
+// controlled test submission through the EXACT SAME production ingestion
+// pipeline (google-ads-lead-test-inject.ts calls the same
+// insertGoogleAdsLeadSubmissions/ingestGoogleAdsSubmission helpers
+// google-ads-lead-sync.ts does). This component is only ever mounted when
+// import.meta.env.DEV is true (see GoogleAdsLeadsCard below) — but the
+// REAL protection is the endpoint's own backend production guard, not
+// this frontend gate (Step 11: never rely on one without the other).
+function GoogleAdsTestLeadInjectSheet({ open, onClose, onIngested }: { open: boolean; onClose: () => void; onIngested: () => void }) {
+  const [firstName, setFirstName] = useState("Phase3");
+  const [lastName, setLastName] = useState("NewPerson");
+  const [email, setEmail] = useState("phase3-newperson@example.com");
+  const [phone, setPhone] = useState("3055550101");
+  const [submissionId, setSubmissionId] = useState("phase3-browser-001");
+  const [campaignName, setCampaignName] = useState("Leads-Search-1");
+  const [gclid, setGclid] = useState("phase3-gclid-001");
+  const [submitting, setSubmitting] = useState(false);
+  const [lastResult, setLastResult] = useState<GoogleAdsTestLeadInjectResponse | null>(null);
+
+  useEffect(() => {
+    if (open) setLastResult(null);
+  }, [open]);
+
+  async function handleSubmit() {
+    if (submitting) return; // guard against duplicate submission
+    if (!submissionId.trim()) { toast.error("Submission ID is required"); return; }
+    setSubmitting(true);
+    try {
+      const result = await injectGoogleAdsTestLead({ firstName, lastName, email, phone, submissionId, campaignName, gclid });
+      if (!result.ok) {
+        const message =
+          result.kind === "not_available" ? "Test harness is not available in this environment" :
+          result.kind === "unauthorized" ? "Session error — please try again" :
+          result.kind === "provider_error" ? (result.message ?? "Failed to inject test lead") :
+          "Network error — could not inject test lead";
+        toast.error(message);
+        return;
+      }
+      setLastResult(result.data);
+      if (result.data.duplicate) {
+        // Step 8: idempotent replay is a normal, expected outcome — never
+        // shown as a failure.
+        toast("Test submission already exists — no duplicate records created");
+      } else if (result.data.ingestionStatus === "failed") {
+        toast.error("Test Google lead failed to ingest");
+      } else {
+        toast.success(
+          `Test Google lead ingested — ${result.data.contactCreated ? "Contact created" : "Contact matched"}, Lead created`,
+        );
+        // Refreshes the real lead-sync STATUS card (last-30-days count,
+        // sync status) — never fabricates the real sync's "New leads
+        // imported" counter, which specifically represents actual
+        // google-ads-lead-sync.ts output (Step 10).
+        onIngested();
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Sheet open={open} onOpenChange={(o) => !o && onClose()}>
+      <SheetContent side="right" className="w-full sm:max-w-md overflow-y-auto">
+        <SheetHeader>
+          <SheetTitle>Inject Test Lead</SheetTitle>
+          <SheetDescription>
+            Dev-only. Feeds a synthetic submission through the real ingestion pipeline — never touches Google Ads.
+          </SheetDescription>
+        </SheetHeader>
+        <div className="mt-4 space-y-3">
+          <div className="grid grid-cols-2 gap-3">
+            <div className="grid gap-1.5">
+              <Label className="text-xs">First name</Label>
+              <Input value={firstName} onChange={(e) => setFirstName(e.target.value)} />
+            </div>
+            <div className="grid gap-1.5">
+              <Label className="text-xs">Last name</Label>
+              <Input value={lastName} onChange={(e) => setLastName(e.target.value)} />
+            </div>
+          </div>
+          <div className="grid gap-1.5">
+            <Label className="text-xs">Email</Label>
+            <Input value={email} onChange={(e) => setEmail(e.target.value)} />
+          </div>
+          <div className="grid gap-1.5">
+            <Label className="text-xs">Phone</Label>
+            <Input value={phone} onChange={(e) => setPhone(e.target.value)} />
+          </div>
+          <div className="grid gap-1.5">
+            <Label className="text-xs">Submission ID</Label>
+            <Input value={submissionId} onChange={(e) => setSubmissionId(e.target.value)} />
+          </div>
+          <div className="grid gap-1.5">
+            <Label className="text-xs">Campaign name</Label>
+            <Input value={campaignName} onChange={(e) => setCampaignName(e.target.value)} />
+          </div>
+          <div className="grid gap-1.5">
+            <Label className="text-xs">GCLID</Label>
+            <Input value={gclid} onChange={(e) => setGclid(e.target.value)} />
+          </div>
+
+          {lastResult && (
+            <div className="rounded-md border bg-muted/40 p-2.5 text-xs space-y-0.5">
+              <p><span className="font-medium">Result:</span> {lastResult.duplicate ? "Duplicate (idempotent — no new records)" : lastResult.ingestionStatus}</p>
+              {!lastResult.duplicate && (
+                <>
+                  <p>Contact: {lastResult.contactCreated ? "created" : lastResult.contactMatched ? "matched" : "—"}</p>
+                  <p>Lead: {lastResult.leadCreated ? "created" : "—"}</p>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+        <SheetFooter className="mt-6 flex !justify-between border-t pt-4">
+          <Button variant="ghost" onClick={onClose}>Close</Button>
+          <Button onClick={handleSubmit} disabled={submitting}>
+            {submitting ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+            {submitting ? "Injecting…" : "Inject Test Lead"}
+          </Button>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+function GoogleAdsLeadsCard() {
+  const { loading, status, refresh } = useGoogleAdsLeadSyncStatus();
+  const [syncing, setSyncing] = useState(false);
+  const [lastResult, setLastResult] = useState<GoogleAdsLeadSyncResultResponse | null>(null);
+  const [testInjectOpen, setTestInjectOpen] = useState(false);
+
+  async function handleSync() {
+    if (syncing) return; // guard against duplicate submission
+    setSyncing(true);
+    try {
+      const result = await triggerGoogleAdsLeadSync();
+      if (result.ok) {
+        setLastResult(result.data);
+        toast.success(
+          result.data.newSubmissions > 0
+            ? `Google Ads leads synced — ${result.data.newSubmissions} new`
+            : "Google Ads leads synced — no new submissions",
+        );
+        refresh();
+      } else {
+        toast.error(GOOGLE_ADS_LEAD_SYNC_ERROR_MESSAGES[result.kind] ?? "Unable to sync Google Ads leads right now.");
+      }
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  const last30 = status?.last30DaysCount ?? 0;
+
+  return (
+    <Card>
+      <GoogleAdsSectionHeader title="Google Ads Leads" description="Lead-form submissions imported from Google Ads." />
+      <CardContent className="pt-4 space-y-3">
+        {loading ? (
+          <Skeleton className="h-14 w-full" />
+        ) : (
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <div>
+              <p className="text-[11px] text-muted-foreground">Last sync</p>
+              <p className="text-sm font-medium text-foreground">{status?.lastSyncedAt ? new Date(status.lastSyncedAt).toLocaleString() : "Never"}</p>
+            </div>
+            <div>
+              <p className="text-[11px] text-muted-foreground">New leads imported</p>
+              <p className="text-sm font-medium text-foreground">{lastResult ? lastResult.newSubmissions : "—"}</p>
+            </div>
+            <div>
+              <p className="text-[11px] text-muted-foreground">Last 30 days</p>
+              <p className="text-sm font-medium text-foreground">{last30.toLocaleString()} lead{last30 === 1 ? "" : "s"}</p>
+            </div>
+            <div>
+              <p className="mb-0.5 text-[11px] text-muted-foreground">Sync status</p>
+              {status?.lastErrorCode ? (
+                <StatusBadge tone="warning" icon={AlertTriangle}>Needs attention</StatusBadge>
+              ) : (
+                <StatusBadge tone="success" icon={CheckCircle2}>OK</StatusBadge>
+              )}
+            </div>
+          </div>
+        )}
+
+        {!loading && last30 === 0 && (
+          <p className="text-xs text-muted-foreground">No Google Ads lead-form submissions found</p>
+        )}
+
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="neutral" onClick={handleSync} disabled={syncing}>
+            {syncing ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 h-3.5 w-3.5" />}
+            {syncing ? "Syncing…" : "Sync leads"}
+          </Button>
+          {last30 > 0 && (
+            // RenoMeta Global UI Interaction System — same warm-neutral
+            // navigation-CTA treatment as the Campaign/Ad Group Detail
+            // Sheet's "View CRM Leads" buttons, deep-linking with the
+            // Google Ads source preselected. Deliberately no campaign
+            // context here — this card is the generic "all Google Ads
+            // leads" entry point, not a specific campaign's.
+            <Button asChild variant="neutral" size="sm">
+              <Link to="/leads" search={{ source: "google_ads" }}>
+                View in CRM Leads
+                <ArrowRight className="ml-1.5 h-3.5 w-3.5" />
+              </Link>
+            </Button>
+          )}
+          {/* Dev-only (Step 5/11) — the Vite dev-mode check is a UI
+              convenience; the real protection is the endpoint's own
+              backend production guard (see google-ads-lead-test-inject.ts).
+              Never shown in a production build. */}
+          {import.meta.env.DEV && (
+            <Button size="sm" variant="ghost" className="text-muted-foreground" onClick={() => setTestInjectOpen(true)}>
+              Inject Test Lead
+            </Button>
+          )}
+        </div>
+      </CardContent>
+
+      {import.meta.env.DEV && (
+        <GoogleAdsTestLeadInjectSheet
+          open={testInjectOpen}
+          onClose={() => setTestInjectOpen(false)}
+          onIngested={refresh}
+        />
+      )}
+    </Card>
+  );
+}
+
+// ---------- Google Ads Conversion Feedback (Phase 3, Step 7A) ──────────
+//
+// Local-only foundation for future offline-conversion upload — shows how
+// many CRM outcomes (qualified lead / appointment booked / deal won) are
+// queued, and their export eligibility. Makes NO Google Ads API call —
+// this only reads google_ads_conversion_events row counts via
+// google-ads-conversion-status.ts. No Upload button exists yet (Step 7B).
+// Deliberately compact — no per-event table, no gclid display (Part 14);
+// "View conversion events" / "Refresh" are the only actions besides the
+// dev-only controlled-test trigger below.
+
+function useGoogleAdsConversionStatus() {
+  const [loading, setLoading] = useState(true);
+  const [data, setData] = useState<GoogleAdsConversionStatusResponse | null>(null);
+  const [refreshTick, setRefreshTick] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    fetchGoogleAdsConversionStatus().then((r) => {
+      if (cancelled) return;
+      setData(r.ok ? r.data : null);
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [refreshTick]);
+
+  return { loading, data, refresh: () => setRefreshTick((t) => t + 1) };
+}
+
+const CONVERSION_EVENT_TYPE_OPTIONS: { value: GoogleAdsConversionEventType; label: string }[] = [
+  { value: "qualified_lead", label: "Qualified Lead" },
+  { value: "appointment_booked", label: "Appointment Booked" },
+  { value: "deal_won", label: "Deal Won" },
+];
+
+// Dev-only controlled-verification trigger (Part 12) — creates a LOCAL
+// conversion event for a real leadId via the trusted endpoint. Never
+// exposed in production; mirrors the import.meta.env.DEV gating pattern
+// already used by GoogleAdsTestLeadInjectSheet above. The gclid shown in
+// the result here is intentionally the ONLY place in this UI it ever
+// appears — used to manually confirm exact per-lead attribution resolved
+// correctly (Parts 15/16), never rendered in the card itself.
+function GoogleAdsConversionTestCreateSheet({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: () => void }) {
+  const [leadId, setLeadId] = useState("");
+  const [eventType, setEventType] = useState<GoogleAdsConversionEventType>("qualified_lead");
+  const [submitting, setSubmitting] = useState(false);
+  const [lastResult, setLastResult] = useState<{ ok: boolean; message: string; gclid?: string | null; exportStatus?: string } | null>(null);
+
+  useEffect(() => {
+    if (open) setLastResult(null);
+  }, [open]);
+
+  async function handleSubmit() {
+    if (submitting || !leadId.trim()) return;
+    setSubmitting(true);
+    try {
+      const result = await createGoogleAdsConversionEventTest({
+        leadId: leadId.trim(),
+        eventType,
+        eventAt: new Date().toISOString(),
+      });
+      if (result.ok) {
+        setLastResult({
+          ok: true,
+          message: result.data.created ? "Event created" : "Event already existed (idempotent)",
+          gclid: result.data.gclid,
+          exportStatus: result.data.exportStatus,
+        });
+        onCreated();
+      } else if (result.kind === "not_available") {
+        setLastResult({ ok: false, message: "Dev test endpoint is not available in this environment." });
+      } else if (result.kind === "no_provider_attribution") {
+        setLastResult({ ok: false, message: "No Google Ads provider submission found for this leadId." });
+      } else {
+        setLastResult({ ok: false, message: result.kind === "provider_error" ? (result.message ?? "Request failed.") : "Request failed." });
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Sheet open={open} onOpenChange={(o) => !o && onClose()}>
+      <SheetContent>
+        <SheetHeader>
+          <SheetTitle>Create Test Conversion Event</SheetTitle>
+          <SheetDescription>Dev-only bypass endpoint — skips CRM milestone validation (qualified/appointment/deal state) so synthetic fixtures without real CRM state can still be tested. Creates a LOCAL conversion event only; no Google Ads API call is ever made. The production endpoint requires real CRM milestone proof.</SheetDescription>
+        </SheetHeader>
+        <div className="space-y-4 py-4">
+          <div className="space-y-1.5">
+            <Label>Lead ID</Label>
+            <Input value={leadId} onChange={(e) => setLeadId(e.target.value)} placeholder="e.g. db3ca060-19b1-405d-aaa4-244f780c978d" />
+          </div>
+          <div className="space-y-1.5">
+            <Label>Event type</Label>
+            <Select value={eventType} onValueChange={(v) => setEventType(v as GoogleAdsConversionEventType)}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {CONVERSION_EVENT_TYPE_OPTIONS.map((o) => (
+                  <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          {lastResult && (
+            <div className={cn("rounded-md border p-3 text-xs", lastResult.ok ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-destructive/30 bg-destructive/5 text-destructive")}>
+              <p className="font-medium">{lastResult.message}</p>
+              {lastResult.ok && (
+                <div className="mt-1 space-y-0.5 text-muted-foreground">
+                  <p>Export status: {lastResult.exportStatus}</p>
+                  <p>Resolved gclid: {lastResult.gclid ?? "(none)"}</p>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        <SheetFooter>
+          <Button variant="outline" onClick={onClose}>Close</Button>
+          <Button onClick={handleSubmit} disabled={submitting || !leadId.trim()}>
+            {submitting ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+            {submitting ? "Creating…" : "Create event"}
+          </Button>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+function GoogleAdsConversionFeedbackCard() {
+  const { loading, data, refresh } = useGoogleAdsConversionStatus();
+  const [testCreateOpen, setTestCreateOpen] = useState(false);
+
+  const counts = data?.counts;
+
+  return (
+    <Card>
+      <GoogleAdsSectionHeader title="Conversion Feedback" description="CRM outcomes queued for a future Google Ads offline-conversion export. No data has been uploaded to Google." />
+      <CardContent className="pt-4 space-y-3">
+        {loading ? (
+          <Skeleton className="h-14 w-full" />
+        ) : (
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+            <div>
+              <p className="text-[11px] text-muted-foreground">Pending</p>
+              <p className="text-sm font-medium text-foreground">{counts?.pending ?? 0}</p>
+            </div>
+            <div>
+              <p className="text-[11px] text-muted-foreground">Ready</p>
+              <p className="text-sm font-medium text-foreground">{counts?.ready ?? 0}</p>
+            </div>
+            <div>
+              <p className="text-[11px] text-muted-foreground">Exported</p>
+              <p className="text-sm font-medium text-foreground">{counts?.exported ?? 0}</p>
+            </div>
+            <div>
+              <p className="text-[11px] text-muted-foreground">Failed</p>
+              <p className="text-sm font-medium text-foreground">{counts?.failed ?? 0}</p>
+            </div>
+            <div>
+              <p className="text-[11px] text-muted-foreground">Ineligible</p>
+              <p className="text-sm font-medium text-foreground">{counts?.ineligible ?? 0}</p>
+            </div>
+          </div>
+        )}
+
+        {!loading && (data?.total ?? 0) === 0 && (
+          <p className="text-xs text-muted-foreground">No conversion events recorded yet</p>
+        )}
+
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="neutral" onClick={refresh}>
+            <RefreshCw className="mr-1.5 h-3.5 w-3.5" /> Refresh
+          </Button>
+          {/* Dev-only (Part 12) — the Vite dev-mode check is a UI
+              convenience; the real protection would be a backend guard if
+              this endpoint were ever restricted. Not shown in production. */}
+          {import.meta.env.DEV && (
+            <Button size="sm" variant="ghost" className="text-muted-foreground" onClick={() => setTestCreateOpen(true)}>
+              Create Test Event
+            </Button>
+          )}
+        </div>
+      </CardContent>
+
+      {import.meta.env.DEV && (
+        <GoogleAdsConversionTestCreateSheet
+          open={testCreateOpen}
+          onClose={() => setTestCreateOpen(false)}
+          onCreated={refresh}
+        />
+      )}
+    </Card>
+  );
+}
+
+// ---------- Google Ads Offline Conversion Mapping (Phase 3, Step 7B.1) ──
+//
+// Discovery + mapping ONLY — no Upload button exists here, and nothing in
+// this section calls a Google Ads conversion-upload endpoint. Lets the org
+// see its live Google Ads conversion actions, get a non-persisted SUGGESTED
+// default mapping by exact name match, and explicitly save a mapping into
+// google_ads_conversion_mappings via the trusted save endpoint (which
+// independently re-verifies the action against Google before writing —
+// this UI's "suggestion" is a convenience, never the source of trust).
+
+const CONVERSION_MAPPING_ROWS: { eventType: GoogleAdsConversionEventType; label: string }[] = [
+  { eventType: "qualified_lead", label: "Qualified Lead" },
+  { eventType: "appointment_booked", label: "Appointment Booked" },
+  { eventType: "deal_won", label: "Deal Won" },
+];
+
+function conversionActionSelectLabel(action: GoogleAdsConversionAction): string {
+  return `${action.name} — ID: ${action.id}`;
+}
+
+// ---------- Google Ads Conversion Events table (Phase 3, Step 7B.2) ────
+//
+// Per-event Upload/Retry — the first and only place in this UI that can
+// trigger a real Google Ads conversion upload. Never constructs the
+// upload payload itself; only tells google-ads-conversion-export.ts which
+// eventId to export. A synthetic fixture row (phase3-browser-001/002 and
+// any future __renometa_test_fixture-marked event) never shows an
+// Upload/Retry action — the "Test fixture — never uploaded" label is
+// shown instead, regardless of its export_status.
+
+const EVENT_TYPE_LABELS: Record<GoogleAdsConversionEventType, string> = {
+  qualified_lead: "Qualified Lead",
+  appointment_booked: "Appointment Booked",
+  deal_won: "Deal Won",
+};
+
+function conversionEventStatusBadge(row: GoogleAdsConversionEventListRow) {
+  switch (row.exportStatus) {
+    case "exported":
+      return <StatusBadge tone="success" icon={CheckCircle2}>Exported</StatusBadge>;
+    case "ready":
+      return <StatusBadge tone="success" icon={CheckCircle2}>Ready</StatusBadge>;
+    case "failed":
+      return <StatusBadge tone="danger" icon={AlertCircle}>Failed</StatusBadge>;
+    case "ineligible":
+      return <StatusBadge tone="warning" icon={AlertTriangle}>Ineligible</StatusBadge>;
+    case "pending":
+    default:
+      return <StatusBadge tone="muted" icon={Clock}>Pending</StatusBadge>;
+  }
+}
+
+const EXPORT_REJECTION_MESSAGES: Record<string, string> = {
+  event_not_found: "Event not found.",
+  already_exported: "Already exported.",
+  synthetic_fixture_ineligible: "Test fixtures are never uploaded to Google.",
+  event_not_ready: "This event isn't ready yet.",
+  missing_gclid: "No GCLID is attached to this event.",
+  mapping_not_found: "No conversion action is mapped for this event type yet.",
+  mapping_disabled: "The mapping for this event type is disabled.",
+  conversion_action_not_found: "That conversion action was not found for this advertiser.",
+  conversion_action_not_upload_clicks: "That conversion action's type doesn't support offline click uploads.",
+  event_customer_mismatch: "The selected Google Ads advertiser has changed since this event was created.",
+  google_ads_attribution_not_found: "Could not resolve this event's Google Ads attribution.",
+  google_ads_partial_failure: "Google rejected this conversion (partial failure).",
+  google_ads_upload_failed: "The upload to Google Ads failed.",
+};
+
+function GoogleAdsConversionEventsTableCard() {
+  const [loading, setLoading] = useState(true);
+  const [events, setEvents] = useState<GoogleAdsConversionEventListRow[] | null>(null);
+  const [listError, setListError] = useState<string | null>(null);
+  const [exportingId, setExportingId] = useState<string | null>(null);
+
+  async function loadEvents() {
+    setLoading(true);
+    setListError(null);
+    const result = await fetchGoogleAdsConversionEvents();
+    if (result.ok) {
+      setEvents(result.data.events);
+    } else {
+      setEvents(null);
+      setListError(
+        result.kind === "reconnect_required" ? "Google Ads authorization expired — reconnect from Integrations."
+        : result.kind === "account_sync_required" ? "Google Ads needs attention — retry the connection from Integrations."
+        : "Unable to load conversion events right now.",
+      );
+    }
+    setLoading(false);
+  }
+
+  useEffect(() => {
+    loadEvents();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function handleExport(row: GoogleAdsConversionEventListRow) {
+    if (exportingId) return;
+    setExportingId(row.id);
+    try {
+      const result = await exportGoogleAdsConversionEvent(row.id);
+      if (result.ok) {
+        toast.success(`${EVENT_TYPE_LABELS[row.eventType]} exported to Google Ads`);
+        await loadEvents();
+      } else if (result.kind === "rejected") {
+        toast.error(EXPORT_REJECTION_MESSAGES[result.reason] ?? "Export failed.");
+        await loadEvents();
+      } else if (result.kind === "reconnect_required") {
+        toast.error("Google Ads authorization expired — reconnect from Integrations.");
+      } else {
+        toast.error("Export failed — please try again.");
+      }
+    } finally {
+      setExportingId(null);
+    }
+  }
+
+  return (
+    <Card>
+      <GoogleAdsSectionHeader
+        title="Conversion Events"
+        description="Local conversion events for the selected advertiser. Uploading sends exactly this one event to Google — never a bulk upload."
+      />
+      <CardContent className="pt-4 space-y-3">
+        {listError && <p className="text-xs text-destructive">{listError}</p>}
+
+        {loading ? (
+          <Skeleton className="h-24 w-full" />
+        ) : !events || events.length === 0 ? (
+          <p className="text-xs text-muted-foreground">No conversion events recorded yet</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="text-xs">Event</TableHead>
+                  <TableHead className="text-xs">Lead</TableHead>
+                  <TableHead className="text-xs">Event time</TableHead>
+                  <TableHead className="text-xs">GCLID</TableHead>
+                  <TableHead className="text-xs">Status</TableHead>
+                  <TableHead className="text-xs">Action</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {events.map((row) => (
+                  <TableRow key={row.id}>
+                    <TableCell className="text-xs font-medium">{EVENT_TYPE_LABELS[row.eventType]}</TableCell>
+                    <TableCell className="text-xs">
+                      {row.leadId ? (
+                        // Google Ads Lead Navigation Consistency pass — deep-
+                        // links straight into the existing Leads workspace
+                        // (source preselected + this exact lead's drawer
+                        // auto-opened) rather than building a second lead-
+                        // detail view inside Marketing. Short ID kept as-is —
+                        // this endpoint doesn't return lead names, and
+                        // fabricating one is out of scope here.
+                        <Link
+                          to="/leads"
+                          search={{ source: "google_ads", leadId: row.leadId }}
+                          className="rounded-sm font-medium text-primary underline-offset-2 hover:underline focus-visible:underline focus-visible:outline-none"
+                        >
+                          {row.leadId.slice(0, 8)}…
+                        </Link>
+                      ) : (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{new Date(row.eventAt).toLocaleString()}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{row.gclid ?? "—"}</TableCell>
+                    <TableCell>{conversionEventStatusBadge(row)}</TableCell>
+                    <TableCell className="text-xs">
+                      {row.syntheticFixture ? (
+                        <span className="text-muted-foreground">Test fixture — never uploaded</span>
+                      ) : row.exportStatus === "exported" ? (
+                        <span className="text-muted-foreground">{row.exportedAt ? new Date(row.exportedAt).toLocaleString() : "—"}</span>
+                      ) : row.exportStatus === "ready" ? (
+                        <Button size="sm" variant="outline" disabled={exportingId === row.id} onClick={() => handleExport(row)}>
+                          {exportingId === row.id ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+                          Upload
+                        </Button>
+                      ) : row.exportStatus === "failed" ? (
+                        <Button size="sm" variant="outline" disabled={exportingId === row.id} onClick={() => handleExport(row)}>
+                          {exportingId === row.id ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+                          Retry
+                        </Button>
+                      ) : (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+
+        <Button size="sm" variant="neutral" onClick={loadEvents} disabled={loading}>
+          <RefreshCw className="mr-1.5 h-3.5 w-3.5" /> Refresh
+        </Button>
+      </CardContent>
+    </Card>
+  );
+}
+
+function GoogleAdsOfflineConversionMappingCard() {
+  const [actionsLoading, setActionsLoading] = useState(false);
+  const [actions, setActions] = useState<GoogleAdsConversionAction[] | null>(null);
+  const [actionsError, setActionsError] = useState<string | null>(null);
+
+  const [mappingsLoading, setMappingsLoading] = useState(true);
+  // Saved mapping per event type, as last read from google_ads_conversion_mappings.
+  const [savedMappings, setSavedMappings] = useState<Partial<Record<GoogleAdsConversionEventType, { conversionActionId: string; enabled: boolean }>>>({});
+  // The user's current in-progress SELECTOR value per row — never written to
+  // the DB until "Save Mappings" is clicked. Seeded from the saved mapping
+  // (if any) once both actions and mappings have loaded, falling back to a
+  // suggested exact-name match, falling back to empty (no selection).
+  const [selection, setSelection] = useState<Partial<Record<GoogleAdsConversionEventType, string>>>({});
+  const [seeded, setSeeded] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  async function loadActions() {
+    setActionsLoading(true);
+    setActionsError(null);
+    const result = await fetchGoogleAdsConversionActions();
+    if (result.ok) {
+      setActions(result.data.actions);
+    } else {
+      setActions(null);
+      setActionsError(
+        result.kind === "reconnect_required" ? "Google Ads authorization expired — reconnect from Integrations."
+        : result.kind === "account_sync_required" ? "Google Ads needs attention — retry the connection from Integrations."
+        : "Unable to load Google Ads conversion actions right now.",
+      );
+    }
+    setActionsLoading(false);
+  }
+
+  async function loadMappings() {
+    setMappingsLoading(true);
+    const result = await fetchGoogleAdsConversionMappings();
+    if (result.ok) {
+      const next: Partial<Record<GoogleAdsConversionEventType, { conversionActionId: string; enabled: boolean }>> = {};
+      for (const m of result.data.mappings) {
+        next[m.eventType] = { conversionActionId: m.conversionActionId, enabled: m.enabled };
+      }
+      setSavedMappings(next);
+    }
+    setMappingsLoading(false);
+  }
+
+  useEffect(() => {
+    loadActions();
+    loadMappings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Seed the selector values exactly once, after both actions and mappings
+  // have loaded — never re-seeds on a later refresh (that would silently
+  // discard an in-progress unsaved selection the user just picked).
+  useEffect(() => {
+    if (seeded || actionsLoading || mappingsLoading || !actions) return;
+    const next: Partial<Record<GoogleAdsConversionEventType, string>> = {};
+    for (const row of CONVERSION_MAPPING_ROWS) {
+      const saved = savedMappings[row.eventType];
+      if (saved) {
+        next[row.eventType] = saved.conversionActionId;
+        continue;
+      }
+      const suggestion = deriveSuggestedGoogleAdsConversionMapping(row.eventType, actions);
+      if (suggestion.status === "suggested") {
+        next[row.eventType] = suggestion.action.id;
+      }
+    }
+    setSelection(next);
+    setSeeded(true);
+  }, [seeded, actionsLoading, mappingsLoading, actions, savedMappings]);
+
+  async function handleSaveMappings() {
+    if (saving) return;
+    setSaving(true);
+    try {
+      let successCount = 0;
+      let failureCount = 0;
+      for (const row of CONVERSION_MAPPING_ROWS) {
+        const conversionActionId = selection[row.eventType];
+        if (!conversionActionId) continue; // nothing selected for this row — skip, don't save an empty mapping
+        const result = await saveGoogleAdsConversionMapping({ eventType: row.eventType, conversionActionId, enabled: true });
+        if (result.ok) {
+          successCount++;
+          if (result.data.typeCompatibilityWarning) {
+            toast.warning(`${row.label}: mapped, but "${result.data.googleType ?? "this action's type"}" may not support offline click uploads.`);
+          }
+        } else {
+          failureCount++;
+          toast.error(
+            result.kind === "conversion_action_not_found" ? `${row.label}: that conversion action wasn't found for this advertiser.`
+            : `${row.label}: failed to save mapping.`,
+          );
+        }
+      }
+      if (successCount > 0) {
+        toast.success(`Saved ${successCount} mapping${successCount === 1 ? "" : "s"}`);
+        await loadMappings();
+      }
+      if (successCount === 0 && failureCount === 0) {
+        toast.error("Select at least one conversion action before saving.");
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card>
+      <GoogleAdsSectionHeader
+        title="Offline Conversion Mapping"
+        description="Map each RenoMeta milestone to a Google Ads conversion action. Discovery + mapping only — no conversions are uploaded to Google yet."
+      />
+      <CardContent className="pt-4 space-y-4">
+        {actionsError && (
+          <p className="text-xs text-destructive">{actionsError}</p>
+        )}
+
+        <div className="space-y-3">
+          {CONVERSION_MAPPING_ROWS.map((row) => {
+            const suggestion = actions ? deriveSuggestedGoogleAdsConversionMapping(row.eventType, actions) : null;
+            const saved = savedMappings[row.eventType];
+            const selected = selection[row.eventType] ?? "";
+
+            return (
+              <div key={row.eventType} className="grid grid-cols-1 gap-2 rounded-md border border-border p-3 sm:grid-cols-[140px_1fr_120px] sm:items-center sm:gap-3">
+                <div className="text-sm font-medium text-foreground">{row.label}</div>
+
+                <div className="min-w-0">
+                  {actionsLoading || mappingsLoading ? (
+                    <Skeleton className="h-9 w-full" />
+                  ) : (
+                    <Select
+                      // Always a string ("" when unselected, never
+                      // undefined/null) — `selected` above is already
+                      // normalized via `selection[row.eventType] ?? ""`.
+                      // Passing `undefined` here (even only for the
+                      // unselected case) would flip this Select from
+                      // controlled to uncontrolled on first mount, then
+                      // back to controlled once a real action id lands in
+                      // `selection` (from a suggestion, a saved mapping,
+                      // or a manual pick) — exactly the React warning this
+                      // fixes. No SelectItem below is ever given value=""
+                      // — "" is only ever the Select's own unselected
+                      // controlled value, matched against no item, so
+                      // SelectValue's placeholder renders instead.
+                      value={selected}
+                      onValueChange={(v) => setSelection((prev) => ({ ...prev, [row.eventType]: v }))}
+                    >
+                      <SelectTrigger className="h-9 text-xs">
+                        <SelectValue placeholder={`Expected: ${EXPECTED_GOOGLE_ADS_CONVERSION_ACTION_NAMES[row.eventType]}`} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {(actions ?? []).map((a) => (
+                          <SelectItem key={a.id} value={a.id} className="text-xs">
+                            {conversionActionSelectLabel(a)}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )}
+                  {!actionsLoading && !mappingsLoading && suggestion?.status === "ambiguous" && (
+                    <p className="mt-1 text-[11px] text-amber-600">
+                      {suggestion.actions.length} conversion actions named "{EXPECTED_GOOGLE_ADS_CONVERSION_ACTION_NAMES[row.eventType]}" — pick the correct one.
+                    </p>
+                  )}
+                  {!actionsLoading && !mappingsLoading && !saved && suggestion?.status === "missing" && (
+                    <p className="mt-1 text-[11px] text-muted-foreground">No matching conversion action found in Google Ads yet.</p>
+                  )}
+                </div>
+
+                <div className="flex items-center justify-start sm:justify-end">
+                  {mappingsLoading ? (
+                    <Skeleton className="h-5 w-16" />
+                  ) : saved ? (
+                    <StatusBadge tone="success" icon={CheckCircle2}>Mapped</StatusBadge>
+                  ) : suggestion?.status === "missing" ? (
+                    <StatusBadge tone="warning" icon={AlertTriangle}>Missing</StatusBadge>
+                  ) : (
+                    <span className="text-[11px] text-muted-foreground">Not saved</span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="neutral" onClick={loadActions} disabled={actionsLoading}>
+            {actionsLoading ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 h-3.5 w-3.5" />}
+            {actionsLoading ? "Refreshing…" : "Refresh Actions"}
+          </Button>
+          <Button size="sm" onClick={handleSaveMappings} disabled={saving || actionsLoading || !actions}>
+            {saving ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+            {saving ? "Saving…" : "Save Mappings"}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 

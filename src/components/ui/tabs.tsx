@@ -12,7 +12,13 @@ const TabsList = React.forwardRef<
   <TabsPrimitive.List
     ref={ref}
     className={cn(
-      "inline-flex h-9 items-center justify-center rounded-lg bg-muted p-1 text-muted-foreground",
+      // RenoMeta Global UI Interaction System — gap-1.5 is the one shared
+      // segmented-control spacing value for every Tabs usage in the app
+      // (CRM Campaigns/Paid Ads, Google Ads/Meta Ads, Overview/Ad Groups,
+      // Keywords/Search Terms, etc.). RenoMeta tabs are NOT a connected
+      // segmented-control design — adjacent triggers must never visually
+      // touch. Fixed here, once, rather than per-page margins.
+      "inline-flex h-9 items-center justify-center gap-1.5 rounded-lg bg-muted p-1 text-muted-foreground",
       className,
     )}
     {...props}
@@ -27,7 +33,12 @@ const TabsTrigger = React.forwardRef<
   <TabsPrimitive.Trigger
     ref={ref}
     className={cn(
-      "inline-flex items-center justify-center whitespace-nowrap rounded-md px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow",
+      // RenoMeta Global UI Interaction System — the active tab uses the
+      // same warm-neutral control-neutral tokens as the `neutral` Button
+      // variant, so Overview/Ad Groups, Keywords/Search Terms, CRM
+      // Campaigns/Paid Ads etc. all read as one shared tab family instead
+      // of each page inventing its own active-state color.
+      "inline-flex cursor-pointer items-center justify-center whitespace-nowrap rounded-md px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50 data-[state=active]:bg-control-neutral data-[state=active]:text-control-neutral-foreground data-[state=active]:shadow-sm data-[state=active]:border data-[state=active]:border-control-neutral-border",
       className,
     )}
     {...props}

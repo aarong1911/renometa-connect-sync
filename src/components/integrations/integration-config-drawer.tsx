@@ -7,11 +7,16 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
-import { Link2, Copy, ExternalLink, Loader2, CheckCircle2 } from "lucide-react";
+import { Link2, Copy, ExternalLink, Loader2, CheckCircle2, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import { useState, useCallback, useEffect } from "react";
 import type { Integration } from "@/lib/integrations-data";
 import { supabase } from "@/lib/supabase";
+import {
+  formatGoogleAdsCustomerId,
+  type GoogleAdsConnectionStatusResponse,
+  type GoogleAdsSafeAccount,
+} from "@/lib/google-ads-format";
 
 interface Props {
   integration: Integration | null;
@@ -19,6 +24,18 @@ interface Props {
   onOpenChange: (open: boolean) => void;
   onConnect?: (integration: Integration) => void;
   onDisconnect?: (integration: Integration) => void;
+  // Real, server-fetched connection status for the Google Ads card — owned
+  // by settings.integrations.tsx (fetchGoogleAdsStatus), passed down so
+  // this drawer never needs its own duplicate polling logic.
+  googleAdsStatus?: GoogleAdsConnectionStatusResponse | null;
+  // One-shot: true when the drawer should open directly into
+  // account-selection mode (OAuth "select_account" return, or a
+  // "needs_account_sync" card click). Consumed once via
+  // onGoogleAdsForceSelectionConsumed so re-opening the drawer later
+  // doesn't re-trigger it.
+  googleAdsForceSelection?: boolean;
+  onGoogleAdsForceSelectionConsumed?: () => void;
+  onGoogleAdsStatusRefresh?: () => void;
 }
 
 // Map integration id → key inside integration_settings JSON
@@ -39,6 +56,8 @@ function metaProductKey(id: string): string | null {
 }
 
 const META_IDS = new Set(["whatsapp", "fb-messenger", "instagram-direct", "meta-lead-ads", "meta-ads"]);
+
+const GOOGLE_ADS_ID = "google-ads";
 
 interface MetaConnection {
   product: string;
@@ -93,7 +112,10 @@ async function fetchMetaConnection(productKey: string | null): Promise<MetaConne
   return json.connections?.[productKey] ?? null;
 }
 
-export function IntegrationConfigDrawer({ integration, open, onOpenChange, onConnect, onDisconnect }: Props) {
+export function IntegrationConfigDrawer({
+  integration, open, onOpenChange, onConnect, onDisconnect,
+  googleAdsStatus, googleAdsForceSelection, onGoogleAdsForceSelectionConsumed, onGoogleAdsStatusRefresh,
+}: Props) {
   const [fields, setFields] = useState<Record<string, string>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [touched, setTouched] = useState<Record<string, boolean>>({});
@@ -102,6 +124,21 @@ export function IntegrationConfigDrawer({ integration, open, onOpenChange, onCon
   const [reconfiguring, setReconfiguring] = useState(false);
   const [metaConnection, setMetaConnection] = useState<MetaConnection | null>(null);
   const [metaConnecting, setMetaConnecting] = useState(false);
+  const [googleAdsConnecting, setGoogleAdsConnecting] = useState(false);
+
+  // ── Google Ads account-selection UI state ────────────────────────────
+  const [googleAdsSelectionMode, setGoogleAdsSelectionMode] = useState(false);
+  const [googleAdsAccountsLoading, setGoogleAdsAccountsLoading] = useState(false);
+  const [googleAdsAccounts, setGoogleAdsAccounts] = useState<{ advertisers: GoogleAdsSafeAccount[]; managers: GoogleAdsSafeAccount[] } | null>(null);
+  const [googleAdsAccountsResultStatus, setGoogleAdsAccountsResultStatus] = useState<"ok" | "disconnected" | "reconnect_required" | "error" | null>(null);
+  const [googleAdsAccountsError, setGoogleAdsAccountsError] = useState<string | null>(null);
+  const [googleAdsSelectedForSubmit, setGoogleAdsSelectedForSubmit] = useState<string | null>(null);
+  const [googleAdsSubmitting, setGoogleAdsSubmitting] = useState(false);
+  // Immediate confirmation shown right after a successful selection, before
+  // the parent's server-refreshed googleAdsStatus prop has caught up — the
+  // parent's fetch is still authoritative, this is purely a display bridge
+  // so the drawer doesn't flash back to "Connect" for one render cycle.
+  const [googleAdsOptimisticAccount, setGoogleAdsOptimisticAccount] = useState<{ customerId: string; descriptiveName: string | null; loginCustomerId: string | null } | null>(null);
 
   const updateField = useCallback((key: string, value: string) => {
     setFields((f) => ({ ...f, [key]: value }));
@@ -111,6 +148,81 @@ export function IntegrationConfigDrawer({ integration, open, onOpenChange, onCon
   const markTouched = useCallback((key: string) => {
     setTouched((t) => ({ ...t, [key]: true }));
   }, []);
+
+  // Fetches live Google Ads account metadata via google-ads-accounts.ts —
+  // decrypts + refreshes the stored refresh token server-side, rediscovers
+  // accessible accounts, returns safe metadata only. Never selects
+  // anything itself; the user must explicitly choose one advertiser.
+  const fetchGoogleAdsAccounts = useCallback(async () => {
+    setGoogleAdsAccountsLoading(true);
+    setGoogleAdsAccountsError(null);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        setGoogleAdsAccountsError("You must be signed in");
+        return;
+      }
+      const res = await fetch("/.netlify/functions/google-ads-accounts", {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setGoogleAdsAccountsResultStatus("error");
+        setGoogleAdsAccountsError("Could not load your Google Ads accounts — please try again");
+        return;
+      }
+      const status = json.status as "ok" | "disconnected" | "reconnect_required" | "error" | undefined;
+      setGoogleAdsAccountsResultStatus(status ?? "error");
+      if (status === "ok") {
+        setGoogleAdsAccounts({ advertisers: json.advertisers ?? [], managers: json.managers ?? [] });
+      } else if (status === "reconnect_required") {
+        setGoogleAdsAccountsError("Your Google Ads authorization has expired — reconnect to continue.");
+      } else if (status === "disconnected") {
+        setGoogleAdsAccountsError("No Google Ads connection found — connect first.");
+      } else {
+        setGoogleAdsAccountsError("Could not load your Google Ads accounts — please try again");
+      }
+    } catch {
+      setGoogleAdsAccountsResultStatus("error");
+      setGoogleAdsAccountsError("Network error — could not load your Google Ads accounts");
+    } finally {
+      setGoogleAdsAccountsLoading(false);
+    }
+  }, []);
+
+  async function handleGoogleAdsSelectAccount() {
+    if (!googleAdsSelectedForSubmit || googleAdsSubmitting) return; // guard against duplicate submission
+    setGoogleAdsSubmitting(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        toast.error("You must be signed in");
+        return;
+      }
+      const res = await fetch("/.netlify/functions/google-ads-select-account", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ customerId: googleAdsSelectedForSubmit }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json.success) {
+        toast.error(json.error ?? "Could not save your account selection — please try again");
+        return; // keep the selection UI open on failure, per spec
+      }
+      toast.success("Google Ads account connected");
+      setGoogleAdsOptimisticAccount({
+        customerId: json.account?.customerId ?? googleAdsSelectedForSubmit,
+        descriptiveName: json.account?.descriptiveName ?? null,
+        loginCustomerId: json.account?.loginCustomerId ?? null,
+      });
+      setGoogleAdsSelectionMode(false);
+      onGoogleAdsStatusRefresh?.();
+    } catch {
+      toast.error("Network error — could not save your account selection");
+    } finally {
+      setGoogleAdsSubmitting(false);
+    }
+  }
 
   // Load existing connection status when drawer opens
   useEffect(() => {
@@ -122,7 +234,22 @@ export function IntegrationConfigDrawer({ integration, open, onOpenChange, onCon
     setReconfiguring(false);
     setMetaConnection(null);
 
+    if (currentId === GOOGLE_ADS_ID) {
+      setGoogleAdsAccounts(null);
+      setGoogleAdsAccountsError(null);
+      setGoogleAdsAccountsResultStatus(null);
+      setGoogleAdsSelectedForSubmit(null);
+      setGoogleAdsOptimisticAccount(null);
+      const shouldStartInSelection = !!googleAdsForceSelection;
+      setGoogleAdsSelectionMode(shouldStartInSelection);
+      if (shouldStartInSelection) {
+        fetchGoogleAdsAccounts();
+        onGoogleAdsForceSelectionConsumed?.();
+      }
+    }
+
     (async () => {
+      if (currentId === GOOGLE_ADS_ID) return; // handled above — no legacy integration_settings lookup applies
       if (META_IDS.has(currentId)) {
         const productKey = metaProductKey(currentId);
         const conn = await fetchMetaConnection(productKey);
@@ -167,7 +294,8 @@ export function IntegrationConfigDrawer({ integration, open, onOpenChange, onCon
         setFields(safe);
       }
     })();
-  }, [open, integration?.id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, integration?.id, googleAdsForceSelection]);
 
   // Listen for the OAuth popup's postMessage and refresh connection state
   useEffect(() => {
@@ -222,6 +350,33 @@ export function IntegrationConfigDrawer({ integration, open, onOpenChange, onCon
         }
       }, 500);
     })();
+  }
+
+  async function handleGoogleAdsConnect() {
+    if (googleAdsConnecting) return; // guard against duplicate clicks
+    setGoogleAdsConnecting(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        toast.error("You must be signed in to connect Google Ads");
+        return;
+      }
+      const res = await fetch("/.netlify/functions/google-ads-oauth-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({}),
+      });
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok || !result.authorizationUrl) {
+        toast.error(result.error ?? "Could not start Google Ads connection");
+        return;
+      }
+      window.location.assign(result.authorizationUrl);
+    } catch {
+      toast.error("Network error — could not start Google Ads connection");
+    } finally {
+      setGoogleAdsConnecting(false);
+    }
   }
 
   async function handleMetaDisconnect() {
@@ -534,7 +689,160 @@ export function IntegrationConfigDrawer({ integration, open, onOpenChange, onCon
             </div>
           )}
 
-          {integration.connectMethod === "oauth" && !META_IDS.has(int.id) && (
+          {integration.connectMethod === "oauth" && int.id === GOOGLE_ADS_ID && (
+            <div className="space-y-3 rounded-lg border border-border p-4">
+              {googleAdsSelectionMode ? (
+                <div className="space-y-3">
+                  <p className="text-xs text-muted-foreground">
+                    Select the Google Ads advertiser account you want to connect. Manager accounts can't be selected directly.
+                  </p>
+
+                  {googleAdsAccountsLoading ? (
+                    <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading your Google Ads accounts…
+                    </div>
+                  ) : googleAdsAccountsResultStatus === "reconnect_required" ? (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2 rounded-md bg-warning-soft px-3 py-2 text-xs text-warning">
+                        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                        {googleAdsAccountsError ?? "Your Google Ads authorization has expired — reconnect to continue."}
+                      </div>
+                      <Button className="w-full gap-2" onClick={handleGoogleAdsConnect} disabled={googleAdsConnecting}>
+                        {googleAdsConnecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ExternalLink className="h-3.5 w-3.5" />}
+                        {googleAdsConnecting ? "Redirecting to Google…" : "Reconnect with Google"}
+                      </Button>
+                    </div>
+                  ) : googleAdsAccountsError ? (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                        {googleAdsAccountsError}
+                      </div>
+                      <Button variant="outline" size="sm" className="w-full" onClick={fetchGoogleAdsAccounts}>
+                        Retry
+                      </Button>
+                    </div>
+                  ) : (googleAdsAccounts?.advertisers.length ?? 0) === 0 ? (
+                    <div className="space-y-2">
+                      <p className="text-xs text-muted-foreground">
+                        No advertiser accounts were found yet
+                        {(googleAdsAccounts?.managers.length ?? 0) > 0 ? " under the manager account(s) we can see" : ""}. You can retry, or double-check access in Google Ads.
+                      </p>
+                      <Button variant="outline" size="sm" className="w-full" onClick={fetchGoogleAdsAccounts}>
+                        Retry
+                      </Button>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="max-h-64 space-y-1.5 overflow-y-auto">
+                        {googleAdsAccounts!.advertisers.map((a) => {
+                          const isSelected = googleAdsSelectedForSubmit === a.customerId;
+                          const parentManager = a.loginCustomerId
+                            ? googleAdsAccounts!.managers.find((m) => m.customerId === a.loginCustomerId)
+                            : null;
+                          return (
+                            <button
+                              key={a.customerId}
+                              type="button"
+                              onClick={() => setGoogleAdsSelectedForSubmit(a.customerId)}
+                              className={`w-full rounded-md border px-3 py-2 text-left transition-colors ${
+                                isSelected ? "border-primary bg-primary/5" : "border-border hover:bg-muted/50"
+                              }`}
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="truncate text-sm font-medium text-foreground">
+                                  {a.descriptiveName || "Unnamed Google Ads account"}
+                                </span>
+                                {a.testAccount && (
+                                  <Badge variant="secondary" className="h-4 shrink-0 rounded-full px-1.5 text-[9px]">Test account</Badge>
+                                )}
+                              </div>
+                              <p className="mt-0.5 font-mono text-[11px] text-muted-foreground">{formatGoogleAdsCustomerId(a.customerId)}</p>
+                              {a.loginCustomerId && (
+                                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                                  Manager: {parentManager?.descriptiveName || formatGoogleAdsCustomerId(a.loginCustomerId)}
+                                </p>
+                              )}
+                              {(a.currencyCode || a.timeZone) && (
+                                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                                  {[a.currencyCode, a.timeZone].filter(Boolean).join(" · ")}
+                                </p>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <Button
+                        className="w-full"
+                        disabled={!googleAdsSelectedForSubmit || googleAdsSubmitting}
+                        onClick={handleGoogleAdsSelectAccount}
+                      >
+                        {googleAdsSubmitting ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+                        {googleAdsSubmitting ? "Connecting…" : "Connect this account"}
+                      </Button>
+                    </>
+                  )}
+                </div>
+              ) : googleAdsOptimisticAccount || (googleAdsStatus?.connected && googleAdsStatus.selectedCustomerId) ? (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-3 rounded-md bg-success/10 px-3 py-2.5">
+                    <CheckCircle2 className="h-4 w-4 shrink-0 text-success" />
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium leading-tight text-foreground">
+                        {googleAdsOptimisticAccount?.descriptiveName || "Connected"}
+                      </p>
+                      <p className="truncate text-xs text-muted-foreground">
+                        {formatGoogleAdsCustomerId(googleAdsOptimisticAccount?.customerId ?? googleAdsStatus?.selectedCustomerId)}
+                      </p>
+                    </div>
+                  </div>
+                  {(googleAdsOptimisticAccount?.loginCustomerId ?? googleAdsStatus?.loginCustomerId) && (
+                    <p className="text-xs text-muted-foreground">
+                      Manager account: <span className="font-medium text-foreground">
+                        {formatGoogleAdsCustomerId(googleAdsOptimisticAccount?.loginCustomerId ?? googleAdsStatus?.loginCustomerId)}
+                      </span>
+                    </p>
+                  )}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="w-full"
+                    onClick={() => {
+                      setGoogleAdsOptimisticAccount(null);
+                      setGoogleAdsSelectionMode(true);
+                      fetchGoogleAdsAccounts();
+                    }}
+                  >
+                    Select a different account
+                  </Button>
+                </div>
+              ) : googleAdsStatus?.status === "needs_account_sync" || googleAdsStatus?.status === "needs_account_selection" ? (
+                <div className="space-y-2">
+                  <p className="text-xs text-muted-foreground">
+                    Google Ads is authorized, but an advertiser account still needs to be selected.
+                  </p>
+                  <Button
+                    className="w-full"
+                    onClick={() => { setGoogleAdsSelectionMode(true); fetchGoogleAdsAccounts(); }}
+                  >
+                    Select account
+                  </Button>
+                </div>
+              ) : (
+                <>
+                  <p className="text-xs text-muted-foreground">
+                    Click below to securely connect your Google Ads account via OAuth. You'll be redirected to Google to sign in and authorize access.
+                  </p>
+                  <Button className="w-full gap-2" onClick={handleGoogleAdsConnect} disabled={googleAdsConnecting}>
+                    {googleAdsConnecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ExternalLink className="h-3.5 w-3.5" />}
+                    {googleAdsConnecting ? "Redirecting to Google…" : "Connect with Google"}
+                  </Button>
+                </>
+              )}
+            </div>
+          )}
+
+          {integration.connectMethod === "oauth" && !META_IDS.has(int.id) && int.id !== GOOGLE_ADS_ID && (
             <div className="space-y-3 rounded-lg border border-border p-4">
               <p className="text-xs text-muted-foreground">
                 Click below to securely connect your {integration.vendor} account via OAuth.

@@ -3,9 +3,10 @@
 
 import { useState, useEffect, useSyncExternalStore } from "react";
 import { supabase } from "@/lib/supabase";
-import type { Lead, LeadStatus, LeadScore, LeadSource } from "@/lib/mock-data";
+import type { Lead, LeadStatus, LeadScore } from "@/lib/mock-data";
 import { triggerWorkflow } from "@/lib/trigger-workflow";
 import { normalizeLeadStatusForWrite } from "@/lib/lead-status";
+import { normalizeLeadSource } from "@/lib/lead-source";
 
 // ── Org helper ──
 async function getOrgId(): Promise<string | null> {
@@ -47,11 +48,23 @@ function mapRow(row: any, contactMap: Record<string, any>): Lead {
 
   return {
     id: row.id,
-    name: contact?.full_name ?? cf.name ?? "Unknown",
+    // Phase 3, CRM Schema Improvement — leads.name (a real column, the
+    // lead's own stored snapshot) is now the primary source. The prior
+    // read-time derivation (contact.full_name, then the legacy
+    // custom_fields.name) remains as a fallback for any row the
+    // 20260903_leads_add_name.sql backfill couldn't resolve (no linked
+    // contact, and no custom_fields.name either) rather than showing a
+    // blank name for pre-existing data.
+    name: row.name ?? contact?.full_name ?? cf.name ?? "Unknown",
     email: contact?.email ?? cf.email ?? "",
     phone: contact?.phone ?? cf.phone ?? "",
     address: contact?.address ?? cf.address ?? "",
-    source: row.source ?? "Website",
+    // Lead-source normalization pass — normalized at read time so a stale/
+    // legacy raw value ("Google Ads", "google ads") in any environment
+    // still resolves to the same canonical value the rest of the app now
+    // expects (filter equality, comparison keys), without requiring every
+    // environment's data to already be perfectly clean.
+    source: normalizeLeadSource(row.source) || "website_form",
     status,
     rawStatus: row.status ?? "new",
     score: classifyScore(budget, row.status),
@@ -163,7 +176,16 @@ export async function addLead(lead: Omit<Lead, "id">): Promise<Lead> {
       .insert({
         org_id: orgId,
         contact_id: contactId,
-        source: lead.source || "Website",
+        // Phase 3, CRM Schema Improvement — leads.name is now a real
+        // column (was previously only reconstructed at read time from the
+        // linked contact's full_name). Same value written to the contact
+        // above, so this lead's own snapshot starts in sync with it.
+        name: lead.name || null,
+        // Lead-source normalization pass — always writes the canonical
+        // machine value ("google_ads", not "Google Ads"/"google ads"),
+        // regardless of what casing/spacing the caller (manual Add Lead
+        // form, CSV import batch via addLeadsBatch()) passed in.
+        source: normalizeLeadSource(lead.source) || "website_form",
         status: lead.status || "new",
         estimated_value: lead.estimatedBudget || 0,
         notes: lead.notes || null,
@@ -209,7 +231,13 @@ export async function updateLead(
   const current = leads.find((lead) => lead.id === id);
   if (!current) return;
 
-  const next: Lead = { ...current, ...updates, source: (updates.source ?? current.source) as LeadSource, lastActivity: new Date().toISOString() };
+  // Lead-source normalization pass — normalize whatever the caller passed
+  // (or the current in-memory value, if source isn't part of this update)
+  // to the canonical machine value before it becomes part of `next`, the
+  // single source of truth this function both writes to the DB and keeps
+  // as the in-memory representation.
+  const normalizedSource = normalizeLeadSource(updates.source ?? current.source) || "website_form";
+  const next: Lead = { ...current, ...updates, source: normalizedSource, lastActivity: new Date().toISOString() };
   const { data: leadRow, error: readError } = await supabase
     .from("leads")
     .select("contact_id, custom_fields")
@@ -248,7 +276,12 @@ export async function updateLead(
   const { error } = await supabase
     .from("leads")
     .update({
-      source: next.source || "Website",
+      // Phase 3, CRM Schema Improvement — kept in sync with the contact
+      // update above (same next.name value); custom_fields.name is left
+      // in place too for now rather than removed, since other code may
+      // still read it as a legacy fallback.
+      name: next.name || null,
+      source: normalizedSource,
       estimated_value: next.estimatedBudget || 0,
       notes: next.notes || null,
       custom_fields: customFields,

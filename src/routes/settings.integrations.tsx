@@ -1,5 +1,5 @@
 // src/routes/settings.integrations.tsx
-import { useState, useMemo, useCallback, useEffect } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -9,6 +9,7 @@ import { INTEGRATIONS, CATEGORIES, type Integration, type CategoryId } from "@/l
 import { MOCK_MODE } from "@/lib/mock-mode";
 import { IntegrationConfigDrawer } from "@/components/integrations/integration-config-drawer";
 import { cn } from "@/lib/utils";
+import { formatGoogleAdsCustomerId, type GoogleAdsConnectionStatusResponse } from "@/lib/google-ads-format";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -50,6 +51,17 @@ function IntegrationsSettings() {
     syncError: string | null;
   };
   const [gcalStatus, setGcalStatus] = useState<GcalStatus | null>(null);
+
+  // ── Google Ads — server-driven status (real google_ads_connections row,
+  // never the callback's redirect query param alone — see the OAuth-return
+  // effect below). Mirrors the gmail/gcal pattern: a dedicated status
+  // object drives the card's detailed rendering, independent of the
+  // generic `integrations[].connected` heuristic (google-ads is excluded
+  // from that heuristic below, same as google-calendar already is).
+  const [googleAdsStatus, setGoogleAdsStatus] = useState<GoogleAdsConnectionStatusResponse | null>(null);
+  const [googleAdsStatusLoading, setGoogleAdsStatusLoading] = useState(true);
+  const [googleAdsForceSelection, setGoogleAdsForceSelection] = useState(false);
+  const googleAdsReturnProcessed = useRef(false);
 
   // ── Gmail "SEND EMAIL" state (SMTP App Password) ───────────────────────
   // Real — organizations.integration_settings.gmail is read directly by
@@ -331,6 +343,12 @@ function IntegrationsSettings() {
           // integration_settings-object heuristic below (there is no
           // `integration_settings.google_calendar` key to read).
           if (i.id === "google-calendar") return i;
+          // google-ads is driven entirely by googleAdsStatus (real
+          // google_ads_connections row via google-ads-connection-status.ts,
+          // fetched in a dedicated effect below) — there is no
+          // `integration_settings.google_ads` key, and this heuristic would
+          // always read it as disconnected, clobbering the real status.
+          if (i.id === "google-ads") return i;
           if (metaProductMap[i.id]) {
             return { ...i, connected: connectedProducts.includes(metaProductMap[i.id]) };
           }
@@ -389,6 +407,90 @@ function IntegrationsSettings() {
     setSelected(i);
     setDrawerOpen(true);
   };
+
+  // Real, authenticated status check — mirrors fetchGmailStatus. This is
+  // the ONLY source of truth for whether the Google Ads card shows
+  // "Connected"; the OAuth-callback's redirect query param (below) is only
+  // ever used to decide which toast to show and whether to open the
+  // drawer, never to set connected state directly.
+  const fetchGoogleAdsStatus = useCallback(async () => {
+    setGoogleAdsStatusLoading(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) { setGoogleAdsStatusLoading(false); return; }
+      const res = await fetch("/.netlify/functions/google-ads-connection-status", {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      if (!res.ok) { setGoogleAdsStatusLoading(false); return; }
+      const json: GoogleAdsConnectionStatusResponse = await res.json();
+      setGoogleAdsStatus(json);
+      updateConnectionStatus("google-ads", json.connected);
+    } catch {
+      // Best-effort — card keeps whatever state it last had.
+    } finally {
+      setGoogleAdsStatusLoading(false);
+    }
+  }, [updateConnectionStatus]);
+
+  useEffect(() => {
+    if (MOCK_MODE) { setGoogleAdsStatusLoading(false); return; }
+    fetchGoogleAdsStatus();
+  }, [fetchGoogleAdsStatus]);
+
+  // google-ads-oauth-callback.ts redirects back here with a safe, short
+  // result code — ?google_ads=connected|select_account|sync_pending|
+  // cancelled|error (+ ?reason=... for error) — never raw backend/Google
+  // errors. Processed exactly once per navigation via the ref guard below:
+  // React 18 Strict Mode (dev only) re-invokes effect bodies against the
+  // SAME component instance without a real remount, so useRef (which
+  // persists across that double-invoke, unlike re-reading the URL alone)
+  // is what actually makes this idempotent — reading window.location.search
+  // a second time after the params were already stripped would usually
+  // also no-op, but the ref makes that guarantee explicit rather than
+  // incidental. Real connection state always comes from
+  // fetchGoogleAdsStatus() (server-driven), never from this query param.
+  useEffect(() => {
+    if (googleAdsReturnProcessed.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const result = params.get("google_ads");
+    if (!result) return;
+    googleAdsReturnProcessed.current = true;
+    const reason = params.get("reason");
+
+    if (result === "connected") {
+      toast.success("Google Ads connected");
+      fetchGoogleAdsStatus();
+    } else if (result === "select_account") {
+      toast.success("Google Ads authorized. Select the advertiser account you want to connect.");
+      fetchGoogleAdsStatus();
+      setGoogleAdsForceSelection(true);
+      const googleAds = integrations.find((i) => i.id === "google-ads") ?? INTEGRATIONS.find((i) => i.id === "google-ads") ?? null;
+      if (googleAds) openDrawer(googleAds);
+    } else if (result === "sync_pending") {
+      toast.warning("Google authorized, but we couldn't load your ad accounts yet — you can retry from the Google Ads card.");
+      fetchGoogleAdsStatus();
+    } else if (result === "cancelled") {
+      toast("Google Ads connection cancelled");
+    } else if (result === "error") {
+      // Only known, safe reason codes get a specific message — anything
+      // else (or no reason at all) falls back to the generic message.
+      // Never surfaces a raw backend/provider error string.
+      const safeMessages: Record<string, string> = {
+        invalid_state: "Your Google Ads connection request expired or was invalid — please try again",
+        provider_error: "Google could not complete the connection — please try again",
+        token_exchange: "Could not finish connecting to Google Ads — please try again",
+        server_configuration: "Google Ads connection is not available right now — please try again later",
+      };
+      toast.error((reason && safeMessages[reason]) || "Could not connect Google Ads — please try again");
+    }
+
+    // Preserve every other search param — only these two are ever removed.
+    params.delete("google_ads");
+    params.delete("reason");
+    const next = params.toString();
+    window.history.replaceState({}, "", next ? `${window.location.pathname}?${next}` : window.location.pathname);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetchGoogleAdsStatus]);
 
   const actionLabel = (i: Integration) => {
     if (i.connected) return null;
@@ -620,6 +722,77 @@ function IntegrationsSettings() {
                           : "Not connected. Contact RenoMeta support to set up Google Calendar sync."}
                       </p>
                     </div>
+                  ) : i.id === "google-ads" && !MOCK_MODE ? (
+                    /* Server-driven — real google_ads_connections row via
+                       google-ads-connection-status.ts, never the OAuth
+                       callback's redirect query param alone (see the
+                       OAuth-return effect above). Skeleton while loading,
+                       then one of 5 states the click handler below routes
+                       differently for. */
+                    <div className="mt-auto space-y-1.5 pt-3">
+                      <span className={cn(
+                        "inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[10.5px] font-semibold ring-1",
+                        googleAdsStatusLoading
+                          ? "bg-secondary text-muted-foreground ring-border"
+                          : googleAdsStatus?.status === "connected"
+                          ? "bg-success-soft text-success ring-success/20"
+                          : googleAdsStatus?.status === "needs_account_selection" || googleAdsStatus?.status === "needs_account_sync"
+                          ? "bg-warning-soft text-warning ring-warning/20"
+                          : googleAdsStatus?.status === "error"
+                          ? "bg-destructive/10 text-destructive ring-destructive/20"
+                          : "bg-secondary text-muted-foreground ring-border",
+                      )}>
+                        {googleAdsStatusLoading ? (
+                          <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                        ) : googleAdsStatus?.status === "connected" ? (
+                          <CheckCircle2 className="h-3 w-3" />
+                        ) : googleAdsStatus?.status === "needs_account_selection" || googleAdsStatus?.status === "needs_account_sync" || googleAdsStatus?.status === "error" ? (
+                          <AlertTriangle className="h-2.5 w-2.5" />
+                        ) : (
+                          <Circle className="h-2.5 w-2.5" />
+                        )}
+                        {googleAdsStatusLoading
+                          ? "Checking…"
+                          : googleAdsStatus?.status === "connected"
+                          ? "Connected"
+                          : googleAdsStatus?.status === "needs_account_selection"
+                          ? "Select account"
+                          : googleAdsStatus?.status === "needs_account_sync"
+                          ? "Needs attention"
+                          : googleAdsStatus?.status === "error"
+                          ? "Connection error"
+                          : "Not connected"}
+                      </span>
+                      {googleAdsStatus?.status === "connected" && googleAdsStatus.selectedCustomerId && (
+                        <p className="text-[11px] text-foreground">
+                          <span className="font-semibold">Account:</span> {formatGoogleAdsCustomerId(googleAdsStatus.selectedCustomerId)}
+                        </p>
+                      )}
+                      <div className="flex gap-2">
+                        <Button
+                          size="sm"
+                          className="h-7 text-xs"
+                          disabled={googleAdsStatusLoading}
+                          onClick={() => {
+                            const needsSelection =
+                              googleAdsStatus?.status === "needs_account_selection" ||
+                              googleAdsStatus?.status === "needs_account_sync";
+                            setGoogleAdsForceSelection(needsSelection);
+                            openDrawer(i);
+                          }}
+                        >
+                          {googleAdsStatus?.status === "connected"
+                            ? "Manage"
+                            : googleAdsStatus?.status === "needs_account_selection"
+                            ? "Select account"
+                            : googleAdsStatus?.status === "needs_account_sync"
+                            ? "Retry sync"
+                            : googleAdsStatus?.status === "error"
+                            ? "Retry"
+                            : "Connect"}
+                        </Button>
+                      </div>
+                    </div>
                   ) : (
                     <div className="mt-auto flex items-center justify-between gap-2 pt-3">
                       <span className={cn(
@@ -680,6 +853,10 @@ function IntegrationsSettings() {
             });
           }
         }}
+        googleAdsStatus={googleAdsStatus}
+        googleAdsForceSelection={googleAdsForceSelection}
+        onGoogleAdsForceSelectionConsumed={() => setGoogleAdsForceSelection(false)}
+        onGoogleAdsStatusRefresh={fetchGoogleAdsStatus}
       />
 
       <AlertDialog open={!!disconnectTarget} onOpenChange={(open) => !open && setDisconnectTarget(null)}>

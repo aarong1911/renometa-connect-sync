@@ -89,6 +89,14 @@
   --color-emerald: var(--emerald);
   --color-emerald-soft: var(--emerald-soft);
   --color-rose: var(--rose);
+
+  /* RenoMeta Global UI Interaction System — the warm-neutral control
+     family (buttons/tabs/secondary nav CTAs), see .claude/skills/
+     ui-design-system/SKILL.md. */
+  --color-control-neutral: var(--control-neutral);
+  --color-control-neutral-hover: var(--control-neutral-hover);
+  --color-control-neutral-foreground: var(--control-neutral-foreground);
+  --color-control-neutral-border: var(--control-neutral-border);
   --color-chat-surface: var(--chat-surface);
   --color-bubble-in: var(--bubble-in);
   --color-bubble-out: var(--bubble-out);
@@ -138,6 +146,16 @@
   --sidebar-active: oklch(0.96 0.025 256);
   --sidebar-active-foreground: oklch(0.4 0.18 262);
   --sidebar-border: oklch(0.922 0.008 256);
+
+  /* RenoMeta Global UI Interaction System — canonical warm-neutral for
+     secondary/neutral controls (buttons, tabs, secondary nav CTAs). This
+     is the one sanctioned literal-hex definition point for #FAF3E4 — every
+     component references it through the --color-control-neutral-* tokens
+     above, never a hardcoded bg-[#FAF3E4] in a feature file. */
+  --control-neutral: #FAF3E4;
+  --control-neutral-hover: #F3E7D1;
+  --control-neutral-foreground: oklch(0.28 0.03 256);
+  --control-neutral-border: #E8DCC3;
 
   --chart-1: oklch(0.55 0.205 262);
   --chart-2: oklch(0.65 0.16 220);
@@ -217,6 +235,15 @@
   --sidebar-active-foreground: oklch(0.85 0.1 262);
   --sidebar-border: oklch(1 0 0 / 8%);
 
+  /* Dark-mode warm-neutral control family — a muted dark warm tone rather
+     than the light-mode #FAF3E4 literal (which would look chalky/wrong
+     against a dark surface). Same role: secondary/neutral buttons, tabs,
+     secondary nav CTAs. */
+  --control-neutral: oklch(0.3 0.03 80);
+  --control-neutral-hover: oklch(0.35 0.035 80);
+  --control-neutral-foreground: oklch(0.94 0.02 80);
+  --control-neutral-border: oklch(1 0 0 / 12%);
+
   /* Extended status/category tokens (dark) */
   --primary-soft-foreground: #93B4F5;
   --destructive-soft: #3A1E1D;
@@ -281,6 +308,36 @@
 
   ::selection {
     background-color: color-mix(in oklab, var(--primary) 25%, transparent);
+  }
+
+  /* RenoMeta Global UI Interaction System — every genuinely clickable,
+     ENABLED semantic control gets a pointer cursor app-wide, without
+     needing `cursor-pointer` repeated in every feature file. Scoped to
+     semantic interactive selectors only — never a blanket `*` rule, and
+     never applied to static text/labels/decorative elements. Disabled
+     controls are excluded via :not(:disabled)/:not([aria-disabled="true"])
+     so a disabled button/row never shows a misleading pointer. See
+     .claude/skills/ui-design-system/SKILL.md for the full interaction
+     rules this rule exists to enforce. */
+  button:not(:disabled):not([aria-disabled="true"]),
+  a[href],
+  [role="button"]:not([aria-disabled="true"]),
+  [role="tab"]:not([aria-disabled="true"]),
+  [role="menuitem"]:not([data-disabled]),
+  [role="option"]:not([data-disabled]),
+  select:not(:disabled),
+  input[type="checkbox"]:not(:disabled),
+  input[type="radio"]:not(:disabled),
+  [data-radix-collection-item]:not([data-disabled]) {
+    cursor: pointer;
+  }
+
+  button:disabled,
+  [role="button"][aria-disabled="true"],
+  [role="tab"][aria-disabled="true"],
+  select:disabled,
+  input:disabled {
+    cursor: not-allowed;
   }
 }
 
