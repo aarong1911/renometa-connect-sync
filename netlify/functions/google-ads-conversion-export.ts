@@ -352,7 +352,16 @@ export const handler: Handler = async (event) => {
       return { errorCode: uploadResult.errorCode ?? "unknown_partial_failure", errorMessage: uploadResult.errorMessage, safeErrorForClient: "google_ads_partial_failure" };
     }
     if (uploadResult.reason === "http_error") {
-      return { errorCode: `http_${uploadResult.status}`, errorMessage: null, safeErrorForClient: "google_ads_upload_failed" };
+      // Developer Token Eligibility Audit phase — preserve Google's actual
+      // error envelope (status/message) alongside the HTTP status, instead
+      // of collapsing every non-2xx response to a bare "http_404"-style
+      // code. This is what makes a developer-token eligibility rejection
+      // (CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE) distinguishable from
+      // an OAuth/permission error or any other request-level failure in
+      // last_error_code/last_error_message, without changing what counts
+      // as success/failure or touching retry/export semantics at all.
+      const detail = uploadResult.errorCode ? `:${uploadResult.errorCode}` : "";
+      return { errorCode: `http_${uploadResult.status}${detail}`, errorMessage: uploadResult.errorMessage, safeErrorForClient: "google_ads_upload_failed" };
     }
     return { errorCode: "network_error", errorMessage: null, safeErrorForClient: "google_ads_upload_failed" };
   })();

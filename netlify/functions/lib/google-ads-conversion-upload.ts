@@ -85,8 +85,52 @@ export interface GoogleAdsClickConversionUploadResult {
 export type GoogleAdsUploadClickConversionsOutcome =
   | { ok: true; result: GoogleAdsClickConversionUploadResult }
   | { ok: false; reason: "partial_failure"; errorCode: string | null; errorMessage: string | null }
-  | { ok: false; reason: "http_error"; status: number }
+  | { ok: false; reason: "http_error"; status: number; errorCode: string | null; errorMessage: string | null }
   | { ok: false; reason: "network_error" };
+
+// Developer Token Eligibility Audit phase — observability-only addition.
+// A REQUEST-level rejection (as opposed to a per-conversion
+// partialFailureError) — e.g. an OAuth/permission problem, or the exact
+// CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE error Google now returns to a
+// developer token with no qualifying historical offline-conversion upload
+// activity (see https://developers.google.com/google-ads/api/docs/conversions/upload-offline) —
+// arrives as a non-2xx HTTP response whose JSON body follows Google's
+// standard API error envelope: { error: { code, message, status, details } }.
+// Previously this body was never even read on a non-2xx response — only
+// the bare numeric HTTP status was kept, making it impossible to tell a
+// developer-token eligibility block apart from any other 4xx/5xx failure
+// (invalid GCLID, OAuth issue, etc.) in the persisted last_error_code/
+// last_error_message. This is a pure parsing addition — no export
+// semantics, retries, mappings, or eligibility rules changed.
+function parseGoogleAdsErrorEnvelope(json: any): { errorCode: string | null; errorMessage: string | null } {
+  const err = json?.error;
+  if (!err || typeof err !== "object") return { errorCode: null, errorMessage: null };
+
+  // Google's `error.status` (e.g. "PERMISSION_DENIED") is the most useful
+  // short code when present; details[].errors[0].errorCode is the more
+  // specific Google Ads-domain reason (e.g. a
+  // CUSTOMER_NOT_ALLOWLISTED_FOR_THIS_FEATURE-shaped oneof struct) when
+  // Google includes it — both are captured, joined, rather than picking
+  // just one and silently dropping the other.
+  const topStatus = typeof err.status === "string" ? err.status : null;
+  let detailCode: string | null = null;
+  const details = Array.isArray(err.details) ? err.details : [];
+  for (const d of details) {
+    const errors = d?.errors;
+    if (Array.isArray(errors) && errors.length > 0) {
+      const first = errors[0];
+      if (first?.errorCode && typeof first.errorCode === "object") {
+        const key = Object.keys(first.errorCode)[0];
+        detailCode = key ? `${key}:${first.errorCode[key]}` : null;
+      }
+      break;
+    }
+  }
+
+  const errorCode = [topStatus, detailCode].filter(Boolean).join("/") || null;
+  const errorMessage = typeof err.message === "string" ? err.message : null;
+  return { errorCode, errorMessage };
+}
 
 // Step 10: single-event upload — exactly ONE click conversion per call, so
 // index 0 in Google's response always maps 1:1 to the one local event
@@ -124,7 +168,9 @@ export async function uploadSingleGoogleAdsClickConversion(
   }
 
   if (!res.ok) {
-    return { ok: false, reason: "http_error", status: res.status };
+    const errBody: any = await res.json().catch(() => ({}));
+    const { errorCode, errorMessage } = parseGoogleAdsErrorEnvelope(errBody);
+    return { ok: false, reason: "http_error", status: res.status, errorCode, errorMessage };
   }
 
   const json: any = await res.json().catch(() => ({}));
