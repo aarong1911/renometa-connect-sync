@@ -1,6 +1,7 @@
 // netlify/functions/meta-webhook.ts
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
+import { createHmac, timingSafeEqual } from "crypto";
 
 // Writes inbound messages to sms_meta_messages — see
 // supabase/migrations/005_sms_meta_messages.sql for the real schema.
@@ -20,8 +21,40 @@ const supabaseAdmin = createClient(
   { auth: { autoRefreshToken: false, persistSession: false } },
 );
 
+/**
+ * Verifies Meta's `X-Hub-Signature-256` header against the exact raw request
+ * body bytes (never a re-stringified JSON.parse result — Meta signs the
+ * bytes it sent, and re-serializing can reorder/reformat them, breaking the
+ * signature — same discipline as stripe-webhook.ts's rawBody handling).
+ * Fails closed (returns false) on any missing/malformed input; never throws.
+ */
+function verifyMetaWebhookSignature(params: {
+  rawBody: Buffer;
+  signatureHeader: string | undefined;
+  appSecret: string;
+}): boolean {
+  const { rawBody, signatureHeader, appSecret } = params;
+  if (!signatureHeader) return false;
+
+  const prefix = "sha256=";
+  if (!signatureHeader.startsWith(prefix)) return false;
+
+  const providedHex = signatureHeader.slice(prefix.length);
+  if (!/^[0-9a-f]{64}$/i.test(providedHex)) return false; // sha256 hex digest = 64 chars
+
+  const expectedHex = createHmac("sha256", appSecret).update(rawBody).digest("hex");
+
+  const expected = Buffer.from(expectedHex, "hex");
+  const provided = Buffer.from(providedHex, "hex");
+  if (expected.length !== provided.length) return false; // timingSafeEqual throws on length mismatch
+
+  return timingSafeEqual(expected, provided);
+}
+
 export const handler: Handler = async (event) => {
   // ── GET — Meta webhook verification ────────────────────────────────────────
+  // Unchanged: Meta's subscription handshake uses hub.verify_token, not a
+  // request signature — X-Hub-Signature-256 only applies to POST deliveries.
   if (event.httpMethod === "GET") {
     const p = event.queryStringParameters ?? {};
     const mode      = p["hub.mode"];
@@ -42,11 +75,30 @@ export const handler: Handler = async (event) => {
     return { statusCode: 405, headers: CORS, body: JSON.stringify({ error: "Method not allowed" }) };
   }
 
-  // ── POST — incoming WhatsApp message ───────────────────────────────────────
+  // ── POST — incoming WhatsApp/Messenger/Instagram event ─────────────────────
+  const appSecret = process.env.META_APP_SECRET;
+  if (!appSecret) {
+    console.error("[meta-webhook] META_APP_SECRET not configured — refusing to process webhook");
+    return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: "Webhook not configured" }) };
+  }
+
+  const signatureHeader = event.headers["x-hub-signature-256"] ?? event.headers["X-Hub-Signature-256"];
+  // Signature must be checked against the EXACT raw bytes Meta sent, before
+  // any JSON.parse/routing/DB access — decode base64 only if Netlify encoded
+  // the body that way, otherwise take the UTF-8 bytes as-is.
+  const rawBody = event.isBase64Encoded
+    ? Buffer.from(event.body ?? "", "base64")
+    : Buffer.from(event.body ?? "", "utf8");
+
+  if (!verifyMetaWebhookSignature({ rawBody, signatureHeader, appSecret })) {
+    console.warn("[meta-webhook] rejected POST: missing or invalid X-Hub-Signature-256");
+    return { statusCode: 401, headers: CORS, body: JSON.stringify({ error: "Invalid signature" }) };
+  }
+
   // Meta requires a 200 response quickly or it will retry. Process inline —
   // Supabase ops are fast enough that we won't hit the 20-second timeout.
   try {
-    await processPayload(event.body ?? "{}");
+    await processPayload(rawBody.toString("utf8"));
   } catch (err: any) {
     console.error("[meta-webhook] unhandled error:", err.message);
   }
