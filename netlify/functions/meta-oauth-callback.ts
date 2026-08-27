@@ -41,7 +41,7 @@ const supabaseAdmin = createClient(
   { auth: { autoRefreshToken: false, persistSession: false } },
 );
 
-function verifyState(state: string, secret: string): { orgId: string; userId: string; product: string } | null {
+function verifyState(state: string, secret: string): { orgId: string; userId: string; product: string; nonce: string } | null {
   try {
     const [payloadB64, sig] = state.split(".");
     const payload = Buffer.from(payloadB64, "base64url").toString("utf8");
@@ -49,11 +49,56 @@ function verifyState(state: string, secret: string): { orgId: string; userId: st
     if (sig !== expectedSig) return null;
     const parsed = JSON.parse(payload);
     if (Date.now() - parsed.ts > 10 * 60 * 1000) return null;
-    if (!parsed.userId) return null;
-    return { orgId: parsed.orgId, userId: parsed.userId, product: parsed.product };
+    if (!parsed.userId || !parsed.nonce) return null;
+    return { orgId: parsed.orgId, userId: parsed.userId, product: parsed.product, nonce: parsed.nonce };
   } catch {
     return null;
   }
+}
+
+// Race-safe single-use consumption of the nonce reserved by
+// meta-oauth-start.ts (supabase/migrations/20260905_meta_oauth_nonces.sql).
+// A conditional UPDATE, not a SELECT-then-UPDATE: Postgres evaluates the
+// WHERE clause (including `consumed_at IS NULL`) atomically against the
+// row's current state under a row lock, so two concurrent callbacks
+// presenting the SAME nonce can never both succeed — only the first
+// transaction to commit finds a matching row; the second's WHERE clause no
+// longer matches (consumed_at is no longer null) and it gets back zero
+// rows. Also re-verifies org/user/product match the nonce's own reserved
+// context (not just what the signed state claims) and that it hasn't
+// expired. Exactly one returned row = valid, single consumption. Zero
+// rows = missing/invalid/expired/replayed/context-mismatched.
+type NonceConsumeResult = "consumed" | "invalid_or_replayed" | "persistence_error";
+
+async function consumeMetaOAuthNonce(
+  nonce: string,
+  orgId: string,
+  userId: string,
+  product: string,
+): Promise<NonceConsumeResult> {
+  const nonceHash = crypto.createHash("sha256").update(nonce).digest("hex");
+  const nowIso = new Date().toISOString();
+
+  const { data, error } = await supabaseAdmin
+    .from("meta_oauth_nonces")
+    .update({ consumed_at: nowIso })
+    .eq("nonce_hash", nonceHash)
+    .eq("org_id", orgId)
+    .eq("user_id", userId)
+    .eq("product", product)
+    .is("consumed_at", null)
+    .gt("expires_at", nowIso)
+    .select("nonce_hash");
+
+  if (error) {
+    console.error("[meta-oauth-callback] nonce consume query failed:", error.code);
+    return "persistence_error";
+  }
+  if (!data || data.length !== 1) {
+    console.warn("[meta-oauth-callback] nonce invalid, expired, replayed, or context mismatch");
+    return "invalid_or_replayed";
+  }
+  return "consumed";
 }
 
 // Encrypt with AES-256-GCM (key = SHA-256(ENCRYPTION_KEY)), output as a
@@ -109,7 +154,19 @@ export const handler: Handler = async (event) => {
   if (!verified) {
     return popupResponse(false, "Invalid or expired connection request — please try again");
   }
-  const { orgId, userId, product } = verified;
+  const { orgId, userId, product, nonce } = verified;
+
+  // Atomically consume the reserved nonce BEFORE any token exchange or
+  // persistence — a forged/replayed/expired callback can never reach the
+  // Meta API call below. See consumeMetaOAuthNonce() for the race-safety
+  // guarantee.
+  const nonceResult = await consumeMetaOAuthNonce(nonce, orgId, userId, product);
+  if (nonceResult === "invalid_or_replayed") {
+    return popupResponse(false, "This connection request has already been used or has expired — please try again");
+  }
+  if (nonceResult === "persistence_error") {
+    return popupResponse(false, "Could not verify this connection request — please try again");
+  }
 
   const siteUrl = process.env.URL || "https://connect.renometa.com";
   const redirectUri = `${siteUrl}/.netlify/functions/meta-oauth-callback`;
