@@ -2,6 +2,7 @@
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { createHmac, timingSafeEqual } from "crypto";
+import { isMetaLeadgenChange, extractMetaLeadgenEvent, processMetaLeadgenEvent } from "./lib/meta-lead-ads";
 
 // Writes inbound messages to sms_meta_messages — see
 // supabase/migrations/005_sms_meta_messages.sql for the real schema.
@@ -119,12 +120,78 @@ async function processPayload(rawBody: string): Promise<void> {
     return;
   }
   if (payload.object === "page") {
-    await processMessengerOrInstagramPayload(payload, "messenger");
+    await processPagePayload(payload);
     return;
   }
   if (payload.object === "instagram") {
     await processMessengerOrInstagramPayload(payload, "instagram");
     return;
+  }
+}
+
+// Fixes the previous bug where EVERY `object: "page"` webhook delivery was
+// routed straight to Messenger handling regardless of what kind of Page
+// event it actually was — silently swallowing Lead Ads leadgen events
+// (processMessengerOrInstagramPayload only reads entry.messaging[], which
+// is empty/absent on a leadgen-shaped entry, so nothing ever happened, no
+// error either). A single "page" object delivery can contain multiple
+// entries, and Meta's Page subscription fields arrive as two structurally
+// different shapes on the SAME entry object: `changes[]` (used for
+// leadgen, among other non-messaging Page fields) and `messaging[]` (used
+// for Messenger). This dispatches PER ENTRY based on which shape is
+// actually present, so a leadgen event can never fall through to Messenger
+// and vice versa.
+//
+// processMessengerOrInstagramPayload itself is entirely UNTOUCHED — this
+// only changes what gets handed to it (a payload containing only the
+// entries that actually look like Messenger entries), never its own
+// internal logic.
+async function processPagePayload(payload: any): Promise<void> {
+  const messengerEntries: any[] = [];
+
+  for (const entry of payload.entry ?? []) {
+    const pageId: string = entry.id;
+    const changes = Array.isArray(entry.changes) ? entry.changes : [];
+    const hasMessaging = Array.isArray(entry.messaging) && entry.messaging.length > 0;
+
+    if (changes.length > 0) {
+      for (const change of changes) {
+        if (isMetaLeadgenChange(change)) {
+          const event = extractMetaLeadgenEvent(pageId, change);
+          if (!event) {
+            console.warn("[meta-webhook] leadgen change missing required fields (leadgen_id), skipping");
+            continue;
+          }
+          try {
+            const result = await processMetaLeadgenEvent(supabaseAdmin, event);
+            // Safe metadata only — never field_data/name/email/phone.
+            console.log("[meta-webhook] leadgen processed", {
+              metaLeadId: event.metaLeadId,
+              pageId: event.pageId,
+              result: result.ok ? result.status : result.errorCode,
+            });
+          } catch (err: any) {
+            console.error("[meta-webhook] leadgen processing error:", err?.message);
+          }
+        } else if (change?.field) {
+          // Unknown/unhandled Page change field — ignored safely, only the
+          // field name (never any PII-bearing value) is logged.
+          console.log("[meta-webhook] ignoring unhandled page change field:", change.field);
+        }
+      }
+    }
+
+    // Only entries that actually carry messaging content are forwarded to
+    // the existing, unmodified Messenger handler — an entry whose only
+    // content was a leadgen (or other non-messaging) change is never
+    // forwarded, so it can no longer silently no-op there.
+    if (hasMessaging) {
+      messengerEntries.push(entry);
+    }
+  }
+
+  if (messengerEntries.length > 0) {
+    await processMessengerOrInstagramPayload({ ...payload, entry: messengerEntries }, "messenger");
   }
 }
 
