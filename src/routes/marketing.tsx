@@ -29,10 +29,13 @@ import {
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
+import googleAdsIconUrl from "@/assets/google-ads-icon.svg";
+import metaIconUrl from "@/assets/meta-icon.svg";
 import {
   Megaphone, Mail, MessageSquare, Send, Calendar as CalendarIcon, Users, Eye,
   MoreHorizontal, Copy, Trash2, X, Clock, CheckCircle2, FileEdit, Plus,
@@ -86,6 +89,13 @@ import {
   type GoogleAdsAdGroupCrmOutcomesResponse,
   humanizeGoogleAdsKeywordMatchType,
 } from "@/lib/google-ads-format";
+import {
+  getMetaAdsAccountSummary, getMetaAdsCampaigns, getMetaAdsAdSets, getMetaAdsAds,
+  type MetaAdsResult, type MetaAdsDateRangePreset,
+  type MetaAdsAccountSummaryResponse, type MetaAdsCampaignsResponse, type MetaAdsAdSetsResponse, type MetaAdsAdsResponse,
+  type MetaAdsCampaign, type MetaAdsAdSet, type MetaAdsAd,
+} from "@/lib/meta-ads-client";
+import { formatMetaAdsCurrency, formatMetaAdsCount, formatMetaAdsPercent, formatMetaAdsObjective, formatMetaAdsOptimizationGoal } from "@/lib/meta-ads-format";
 
 type MarketingSearch = { tab: string; createCampaign: boolean; campaignId: string; editCampaignId: string };
 
@@ -180,6 +190,10 @@ function MarketingPage() {
   const contacts = useContacts();
 
   const section = sectionForTab(tab);
+  // Paid Ads provider sub-tab — any value other than "meta-ads" (including
+  // a stale/malformed bookmark) falls back to "google-ads" so the inner
+  // Tabs can never end up with no matching TabsContent selected.
+  const paidAdsProviderTab = tab === "meta-ads" ? "meta-ads" : "google-ads";
 
   const kpis = useMemo(() => ({
     sent: campaigns.filter((c) => c.status === "completed").length,
@@ -266,22 +280,31 @@ function MarketingPage() {
       )}
 
       {section === "ads" && (
-        // Inner tab value is hardcoded to "google-ads" — Meta Ads has no
-        // real surface yet, so its trigger is disabled and there is no
-        // TabsContent for it at all (never render a fake reporting page,
-        // per Step A1). If a bookmark ever carries ?tab=meta-ads, it still
-        // safely lands here showing the real Google Ads tab.
-        <Tabs value="google-ads" className="space-y-4">
+        // Provider tab is now URL-driven (?tab=google-ads|meta-ads), same
+        // pattern as the CRM Campaigns/Audiences/Templates tabs above —
+        // Meta Ads has a real reporting surface as of Phase 1A / Step 3, so
+        // it's no longer hardcoded/disabled. Any other `tab` value (or a
+        // stale ?tab=campaigns bookmark that somehow reached this section)
+        // safely falls back to google-ads via the `paidAdsProviderTab` guard
+        // below, so a malformed URL can never render neither tab.
+        <Tabs value={paidAdsProviderTab} onValueChange={(v) => navigate({ search: (p) => ({ ...p, tab: v }) })} className="space-y-4">
           <TabsList>
-            <TabsTrigger value="google-ads">Google Ads</TabsTrigger>
-            <TabsTrigger value="meta-ads" disabled className="gap-1.5">
+            <TabsTrigger value="google-ads" className="gap-2">
+              <img src={googleAdsIconUrl} alt="" aria-hidden="true" className="h-4 w-4 shrink-0" />
+              Google Ads
+            </TabsTrigger>
+            <TabsTrigger value="meta-ads" className="gap-2">
+              <img src={metaIconUrl} alt="" aria-hidden="true" className="h-4 w-4 shrink-0" />
               Meta Ads
-              <Badge variant="secondary" className="h-4 rounded-full px-1.5 text-[9px] font-normal">Coming soon</Badge>
             </TabsTrigger>
           </TabsList>
 
           <TabsContent value="google-ads">
             <GoogleAdsPerformanceTab />
+          </TabsContent>
+
+          <TabsContent value="meta-ads">
+            <MetaAdsPerformanceTab />
           </TabsContent>
         </Tabs>
       )}
@@ -2189,6 +2212,724 @@ function GoogleAdsPerformanceTab() {
       <GoogleAdsConversionFeedbackCard />
       <GoogleAdsConversionEventsTableCard />
       <GoogleAdsOfflineConversionMappingCard />
+    </div>
+  );
+}
+
+// ---------- Meta Ads tab (Phase 1A, Step 3) ─────────────────────────────
+//
+// Read-only paid-media reporting from the live Meta Marketing API, built
+// entirely on the Step 1/2 backend (netlify/functions/meta-ads-*.ts) and
+// the src/lib/meta-ads-client.ts fetch layer — no direct fetch() calls to
+// any /.netlify/functions/meta-* endpoint happen anywhere below. Mirrors
+// the Google Ads tab's architecture (skeleton -> connection-state empty
+// states -> account header + KPI cards + table) but is a fully separate
+// component tree: switching providers unmounts whichever tab was active
+// (Radix Tabs.Content only renders the selected value), so Google/Meta
+// state, loading, and errors can never bleed into each other.
+//
+// Strictly read-only, matching the write-only meta-create-ad-campaign.ts
+// demo endpoint's isolation — no campaign/ad-set/ad create/edit/pause/
+// resume/publish/delete control exists anywhere in this section, and that
+// endpoint is never imported here.
+
+const META_DATE_RANGE_OPTIONS: { value: MetaAdsDateRangePreset; label: string }[] = [
+  { value: "TODAY", label: "Today" },
+  { value: "YESTERDAY", label: "Yesterday" },
+  { value: "LAST_7_DAYS", label: "Last 7 days" },
+  { value: "LAST_14_DAYS", label: "Last 14 days" },
+  { value: "LAST_30_DAYS", label: "Last 30 days" },
+  { value: "THIS_MONTH", label: "This month" },
+  { value: "LAST_MONTH", label: "Last month" },
+];
+
+type MetaAdsInnerTab = "overview" | "campaigns" | "adsets" | "ads";
+
+// One shared fetch-state shape (loading/result/retry) for every Meta Ads
+// list — deliberately not a single generic hook factory: each call site
+// below has a slightly different enable condition (account summary always
+// fetches, campaigns waits on a connected account, ad sets/ads are lazy
+// until their tab is first visited), and spelling each out inline keeps
+// those differences visible rather than hidden behind a config object.
+
+function useMetaAdsAccountSummary(dateRange: MetaAdsDateRangePreset) {
+  const [loading, setLoading] = useState(true);
+  const [result, setResult] = useState<MetaAdsResult<MetaAdsAccountSummaryResponse> | null>(null);
+  const [retryTick, setRetryTick] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Clear the previous result immediately so a date-range change or
+    // retry never shows the PREVIOUS window's account/KPI data underneath
+    // the loading skeleton.
+    setResult(null);
+    setLoading(true);
+    getMetaAdsAccountSummary({ dateRange })
+      .then((r) => { if (!cancelled) setResult(r); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [dateRange, retryTick]);
+
+  return { loading, result, retry: () => setRetryTick((t) => t + 1) };
+}
+
+function useMetaAdsCampaigns(dateRange: MetaAdsDateRangePreset, enabled: boolean) {
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<MetaAdsResult<MetaAdsCampaignsResponse> | null>(null);
+  const [retryTick, setRetryTick] = useState(0);
+
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    setResult(null);
+    setLoading(true);
+    getMetaAdsCampaigns({ dateRange })
+      .then((r) => { if (!cancelled) setResult(r); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [dateRange, enabled, retryTick]);
+
+  return { loading, result, retry: () => setRetryTick((t) => t + 1) };
+}
+
+function useMetaAdsAdSets(dateRange: MetaAdsDateRangePreset, enabled: boolean) {
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<MetaAdsResult<MetaAdsAdSetsResponse> | null>(null);
+  const [retryTick, setRetryTick] = useState(0);
+
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    setResult(null);
+    setLoading(true);
+    getMetaAdsAdSets({ dateRange })
+      .then((r) => { if (!cancelled) setResult(r); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [dateRange, enabled, retryTick]);
+
+  return { loading, result, retry: () => setRetryTick((t) => t + 1) };
+}
+
+function useMetaAdsAds(dateRange: MetaAdsDateRangePreset, enabled: boolean) {
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<MetaAdsResult<MetaAdsAdsResponse> | null>(null);
+  const [retryTick, setRetryTick] = useState(0);
+
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    setResult(null);
+    setLoading(true);
+    getMetaAdsAds({ dateRange })
+      .then((r) => { if (!cancelled) setResult(r); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [dateRange, enabled, retryTick]);
+
+  return { loading, result, retry: () => setRetryTick((t) => t + 1) };
+}
+
+// Every non-"ok" MetaAdsResult kind mapped to a specific, friendly empty
+// state — never collapsed into one generic "Meta connection failed"
+// message (Step 21), and never showing raw Graph API text/fbtrace_id/
+// token errors (Step 24). Reuses GoogleAdsEmptyStateCard as-is — its
+// implementation has no Google-specific content, just a generic
+// icon/title/description/action card.
+function metaAdsAccountManagementLink(label: string) {
+  return (
+    <Button asChild size="sm" className="mt-2">
+      <Link to="/settings/integrations">
+        <Plug className="mr-1.5 h-3.5 w-3.5" /> {label}
+      </Link>
+    </Button>
+  );
+}
+
+function MetaAdsErrorState({ kind, retry }: { kind: Exclude<MetaAdsResult<unknown>, { ok: true }>["kind"]; retry: () => void }) {
+  switch (kind) {
+    case "unauthorized":
+      return (
+        <GoogleAdsEmptyStateCard
+          icon={AlertCircle}
+          title="Session error"
+          description="We couldn't verify your session. Please try again."
+          action={<Button size="sm" className="mt-2" onClick={retry}><RefreshCw className="mr-1.5 h-3.5 w-3.5" /> Retry</Button>}
+        />
+      );
+    case "not_connected":
+      return (
+        <GoogleAdsEmptyStateCard
+          icon={BarChart3}
+          title="Meta Ads is not connected"
+          description="Connect your Meta Ads account to see campaign performance here."
+          action={metaAdsAccountManagementLink("Connect Meta Ads")}
+        />
+      );
+    case "no_ad_account_selected":
+      return (
+        <GoogleAdsEmptyStateCard
+          icon={BarChart3}
+          title="Select a Meta ad account"
+          description="Meta Ads is authorized, but an ad account still needs to be selected before performance can be shown."
+          action={metaAdsAccountManagementLink("Manage connection")}
+        />
+      );
+    case "reconnect_required":
+      return (
+        <GoogleAdsEmptyStateCard
+          icon={AlertTriangle}
+          title="Meta Ads needs attention"
+          description="Your Meta Ads authorization has expired. Reconnect to keep seeing performance data."
+          action={metaAdsAccountManagementLink("Reconnect Meta Ads")}
+        />
+      );
+    case "permission_required":
+      return (
+        <GoogleAdsEmptyStateCard
+          icon={AlertTriangle}
+          title="Meta Ads permissions need attention"
+          description="This connection no longer has permission to read ad account data. Update permissions from Integrations."
+          action={metaAdsAccountManagementLink("Go to Integrations")}
+        />
+      );
+    case "account_unavailable":
+      return (
+        <GoogleAdsEmptyStateCard
+          icon={AlertTriangle}
+          title="Selected ad account unavailable"
+          description="The selected Meta ad account is no longer accessible. Choose a different account to continue."
+          action={metaAdsAccountManagementLink("Manage connection")}
+        />
+      );
+    case "temporarily_unavailable":
+      // Deliberately Retry, never Reconnect — a transient Meta-side issue
+      // is not a token/permission problem (Step 21).
+      return (
+        <GoogleAdsEmptyStateCard
+          icon={AlertCircle}
+          title="Meta is temporarily unavailable"
+          description="This is usually temporary — please try again shortly."
+          action={<Button size="sm" className="mt-2" onClick={retry}><RefreshCw className="mr-1.5 h-3.5 w-3.5" /> Retry</Button>}
+        />
+      );
+    case "provider_error":
+    case "network_error":
+    default:
+      return (
+        <GoogleAdsEmptyStateCard
+          icon={AlertCircle}
+          title="Unable to load Meta Ads performance"
+          description="Something went wrong reaching Meta. This is usually temporary."
+          action={<Button size="sm" className="mt-2" onClick={retry}><RefreshCw className="mr-1.5 h-3.5 w-3.5" /> Retry</Button>}
+        />
+      );
+  }
+}
+
+function MetaAdsAccountHeader({
+  adAccount, dateRange, onDateRangeChange, onRefresh,
+}: {
+  adAccount: MetaAdsAccountSummaryResponse["adAccount"];
+  dateRange: MetaAdsDateRangePreset;
+  onDateRangeChange: (v: MetaAdsDateRangePreset) => void;
+  onRefresh: () => void;
+}) {
+  return (
+    <Card>
+      <CardContent className="flex flex-wrap items-center gap-3 p-4">
+        <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-secondary ring-1 ring-black/5">
+          <img src={metaIconUrl} alt="" aria-hidden="true" className="h-4 w-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-semibold text-foreground">Meta Ads</span>
+            <StatusBadge tone="success" icon={CheckCircle2}>Connected</StatusBadge>
+          </div>
+          <p className="mt-0.5 truncate text-xs text-muted-foreground">
+            {adAccount.name ?? "Ad account"}
+            {adAccount.currency && <span> · {adAccount.currency}</span>}
+            {adAccount.timezoneName && <span className="text-muted-foreground/70"> · {adAccount.timezoneName}</span>}
+            {adAccount.businessName && <span> · Business: {adAccount.businessName}</span>}
+          </p>
+          {/* Numeric ad account ID — secondary detail only, never the
+              primary label (Step 5: no prominent raw IDs). */}
+          <p className="mt-0.5 truncate text-[11px] text-muted-foreground/60">Account ID {adAccount.id}</p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <Select value={dateRange} onValueChange={(v) => onDateRangeChange(v as MetaAdsDateRangePreset)}>
+            <SelectTrigger className="h-8 w-[150px] text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {META_DATE_RANGE_OPTIONS.map((opt) => (
+                <SelectItem key={opt.value} value={opt.value} className="text-xs">{opt.label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={onRefresh} title="Refresh">
+            <RefreshCw className="h-3.5 w-3.5" />
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function MetaAdsMetricCards({ summary, currencyCode }: { summary: MetaAdsAccountSummaryResponse["summary"]; currencyCode: string | null }) {
+  return (
+    <>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <MetricTile icon={CircleDollarSign} iconBg="bg-gold-soft" iconColor="text-gold-hover" label="Spend" value={formatMetaAdsCurrency(summary.spend, currencyCode)} sub="Selected range" />
+        <MetricTile icon={Eye} iconBg="bg-info-soft" iconColor="text-info" label="Impressions" value={formatMetaAdsCount(summary.impressions)} sub="Selected range" />
+        <MetricTile icon={MousePointerClick} iconBg="bg-cyan-soft" iconColor="text-cyan-soft-foreground" label="Clicks" value={formatMetaAdsCount(summary.clicks)} sub="Selected range" />
+        <MetricTile icon={Target} iconBg="bg-success-soft" iconColor="text-success" label="Leads" value={formatMetaAdsCount(summary.leads)} sub="Selected range" />
+      </div>
+      {/* Secondary metrics — a single compact row rather than four more
+          full-weight KPI cards, per Step 8's "do not overcrowd." */}
+      <Card>
+        <CardContent className="flex flex-wrap items-center gap-x-6 gap-y-2 p-3">
+          <MetaAdsInlineStat label="Reach" value={formatMetaAdsCount(summary.reach)} />
+          <MetaAdsInlineStat label="CTR" value={formatMetaAdsPercent(summary.ctr)} />
+          <MetaAdsInlineStat label="CPC" value={formatMetaAdsCurrency(summary.cpc, currencyCode)} />
+          <MetaAdsInlineStat label="Cost per lead" value={formatMetaAdsCurrency(summary.costPerLead, currencyCode)} />
+        </CardContent>
+      </Card>
+    </>
+  );
+}
+
+function MetaAdsInlineStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline gap-1.5">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <span className="text-sm font-semibold tabular-nums text-foreground">{value}</span>
+    </div>
+  );
+}
+
+// Meta's effective_status vocabulary spans campaign/ad-set/ad objects with
+// the same shared values — one tone map for all three, matching the plain
+// factual (not health-judgment) tone convention already used for Google
+// Ads' campaign.status.
+const META_STATUS_TONE: Record<string, BadgeTone> = {
+  ACTIVE: "success",
+  PAUSED: "warning",
+  CAMPAIGN_PAUSED: "warning",
+  ADSET_PAUSED: "warning",
+  IN_PROCESS: "info",
+  PENDING_REVIEW: "info",
+  PENDING_BILLING_INFO: "warning",
+  DISAPPROVED: "danger",
+  WITH_ISSUES: "danger",
+  DELETED: "muted",
+  ARCHIVED: "muted",
+};
+
+// Shows `effectiveStatus` as the primary badge (Step 13) — the actual
+// operational state — with `status` (the configured state) surfaced only
+// as a secondary tooltip detail when the two disagree (e.g. Configured:
+// ACTIVE but Effective: CAMPAIGN_PAUSED because the parent campaign is
+// paused). When they match, this renders identically to a plain status
+// badge with no extra affordance.
+function MetaAdsStatusBadge({ status, effectiveStatus }: { status: string; effectiveStatus: string | null }) {
+  const display = effectiveStatus ?? status;
+  const tone = META_STATUS_TONE[display] ?? "muted";
+  const badge = <StatusBadge tone={tone}>{display}</StatusBadge>;
+
+  if (!effectiveStatus || effectiveStatus === status) {
+    return badge;
+  }
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="cursor-help">{badge}</span>
+      </TooltipTrigger>
+      <TooltipContent className="text-xs">
+        <div>Configured: {status}</div>
+        <div>Effective: {effectiveStatus}</div>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+// Never renders a broken-image icon if thumbnailUrl is absent or fails to
+// load (Step 18) — hides itself entirely on error rather than falling
+// back to a placeholder that implies a creative exists when it doesn't.
+function MetaAdsThumbnail({ src, alt }: { src: string | null; alt: string }) {
+  const [failed, setFailed] = useState(false);
+  if (!src || failed) return null;
+  return <img src={src} alt={alt} className="h-8 w-8 shrink-0 rounded object-cover ring-1 ring-black/5" onError={() => setFailed(true)} />;
+}
+
+function MetaAdsPerformanceSkeleton() {
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardContent className="flex items-center gap-3 p-4">
+          <Skeleton className="h-9 w-9 rounded-lg" />
+          <div className="space-y-1.5">
+            <Skeleton className="h-4 w-32" />
+            <Skeleton className="h-3 w-48" />
+          </div>
+        </CardContent>
+      </Card>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <Card key={i}>
+            <CardContent className="p-4 space-y-2">
+              <Skeleton className="h-3 w-20" />
+              <Skeleton className="h-6 w-16" />
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+      <Card>
+        <CardContent className="p-4">
+          <Skeleton className="h-32 w-full" />
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function MetaAdsTableSkeleton({ rows = 3 }: { rows?: number }) {
+  return (
+    <div className="space-y-2 p-4">
+      {Array.from({ length: rows }).map((_, i) => (
+        <Skeleton key={i} className="h-8 w-full" />
+      ))}
+    </div>
+  );
+}
+
+// ── Campaigns ────────────────────────────────────────────────────────────
+
+function MetaAdsCampaignsTable({ campaigns, currencyCode }: { campaigns: MetaAdsCampaign[]; currencyCode: string | null }) {
+  if (campaigns.length === 0) {
+    return (
+      <CardContent className="flex flex-col items-center gap-2 pt-4 py-16 text-center">
+        <BarChart3 className="h-10 w-10 text-muted-foreground" />
+        <div>
+          <h3 className="text-sm font-semibold">No campaigns found for this Meta Ads account</h3>
+          <p className="text-xs text-muted-foreground">Performance will appear here when this account has campaign activity.</p>
+        </div>
+      </CardContent>
+    );
+  }
+  return (
+    <CardContent className="pt-4">
+      <div className="overflow-x-auto">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Campaign</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>Objective</TableHead>
+              <TableHead className="text-right">Spend</TableHead>
+              <TableHead className="text-right">Impressions</TableHead>
+              <TableHead className="text-right">Clicks</TableHead>
+              <TableHead className="text-right">Leads</TableHead>
+              <TableHead className="text-right">CPL</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {campaigns.map((c) => (
+              <TableRow key={c.id}>
+                <TableCell className="font-medium text-foreground">{c.name}</TableCell>
+                <TableCell><MetaAdsStatusBadge status={c.status} effectiveStatus={c.effectiveStatus} /></TableCell>
+                <TableCell className="text-muted-foreground">{formatMetaAdsObjective(c.objective)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCurrency(c.insights.spend, currencyCode)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCount(c.insights.impressions)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCount(c.insights.clicks)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCount(c.insights.leads)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCurrency(c.insights.costPerLead, currencyCode)}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+    </CardContent>
+  );
+}
+
+// Compact Overview snapshot — name/status/spend/leads only, capped at 5
+// rows with a "View all" affordance into the full Campaigns tab, so
+// Overview and Campaigns read as genuinely different views rather than
+// the same table shown twice.
+function MetaAdsCampaignSnapshot({ campaigns, currencyCode, onViewAll }: { campaigns: MetaAdsCampaign[]; currencyCode: string | null; onViewAll: () => void }) {
+  if (campaigns.length === 0) {
+    return (
+      <CardContent className="flex flex-col items-center gap-2 pt-4 py-16 text-center">
+        <BarChart3 className="h-10 w-10 text-muted-foreground" />
+        <div>
+          <h3 className="text-sm font-semibold">No campaigns found for this Meta Ads account</h3>
+          <p className="text-xs text-muted-foreground">Performance will appear here when this account has campaign activity.</p>
+        </div>
+      </CardContent>
+    );
+  }
+  const shown = campaigns.slice(0, 5);
+  return (
+    <CardContent className="pt-4">
+      <div className="divide-y">
+        {shown.map((c) => (
+          <div key={c.id} className="flex items-center justify-between gap-3 py-2.5">
+            <div className="min-w-0">
+              <div className="truncate text-sm font-medium text-foreground">{c.name}</div>
+              <div className="mt-0.5"><MetaAdsStatusBadge status={c.status} effectiveStatus={c.effectiveStatus} /></div>
+            </div>
+            <div className="flex shrink-0 items-center gap-4 text-right text-sm tabular-nums">
+              <div>
+                <div className="text-foreground">{formatMetaAdsCurrency(c.insights.spend, currencyCode)}</div>
+                <div className="text-[11px] text-muted-foreground">Spend</div>
+              </div>
+              <div>
+                <div className="text-foreground">{formatMetaAdsCount(c.insights.leads)}</div>
+                <div className="text-[11px] text-muted-foreground">Leads</div>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+      {campaigns.length > 5 && (
+        <Button variant="ghost" size="sm" className="mt-2" onClick={onViewAll}>
+          View all {campaigns.length} campaigns <ArrowRight className="ml-1.5 h-3.5 w-3.5" />
+        </Button>
+      )}
+    </CardContent>
+  );
+}
+
+// ── Ad Sets ──────────────────────────────────────────────────────────────
+
+function MetaAdsAdSetsTable({
+  adSets, campaignNameById, currencyCode,
+}: {
+  adSets: MetaAdsAdSet[]; campaignNameById: Map<string, string>; currencyCode: string | null;
+}) {
+  if (adSets.length === 0) {
+    return (
+      <CardContent className="flex flex-col items-center gap-2 pt-4 py-16 text-center">
+        <BarChart3 className="h-10 w-10 text-muted-foreground" />
+        <div>
+          <h3 className="text-sm font-semibold">No ad sets found</h3>
+          <p className="text-xs text-muted-foreground">Ad sets will appear here once this account has campaign activity.</p>
+        </div>
+      </CardContent>
+    );
+  }
+  return (
+    <CardContent className="pt-4">
+      <div className="overflow-x-auto">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Ad Set</TableHead>
+              <TableHead>Campaign</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>Optimization Goal</TableHead>
+              <TableHead className="text-right">Spend</TableHead>
+              <TableHead className="text-right">Impressions</TableHead>
+              <TableHead className="text-right">Clicks</TableHead>
+              <TableHead className="text-right">Leads</TableHead>
+              <TableHead className="text-right">CPL</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {adSets.map((a) => (
+              <TableRow key={a.id}>
+                <TableCell className="font-medium text-foreground">{a.name}</TableCell>
+                <TableCell className="text-muted-foreground">{(a.campaignId && campaignNameById.get(a.campaignId)) ?? "—"}</TableCell>
+                <TableCell><MetaAdsStatusBadge status={a.status} effectiveStatus={a.effectiveStatus} /></TableCell>
+                <TableCell className="text-muted-foreground">{formatMetaAdsOptimizationGoal(a.optimizationGoal)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCurrency(a.insights.spend, currencyCode)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCount(a.insights.impressions)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCount(a.insights.clicks)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCount(a.insights.leads)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCurrency(a.insights.costPerLead, currencyCode)}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+    </CardContent>
+  );
+}
+
+// ── Ads ──────────────────────────────────────────────────────────────────
+
+function MetaAdsAdsTable({
+  ads, campaignNameById, adSetNameById, currencyCode,
+}: {
+  ads: MetaAdsAd[]; campaignNameById: Map<string, string>; adSetNameById: Map<string, string>; currencyCode: string | null;
+}) {
+  if (ads.length === 0) {
+    return (
+      <CardContent className="flex flex-col items-center gap-2 pt-4 py-16 text-center">
+        <BarChart3 className="h-10 w-10 text-muted-foreground" />
+        <div>
+          <h3 className="text-sm font-semibold">No ads found</h3>
+          <p className="text-xs text-muted-foreground">Ads will appear here once this account has campaign activity.</p>
+        </div>
+      </CardContent>
+    );
+  }
+  return (
+    <CardContent className="pt-4">
+      <div className="overflow-x-auto">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Ad</TableHead>
+              <TableHead>Campaign</TableHead>
+              <TableHead>Ad Set</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead className="text-right">Spend</TableHead>
+              <TableHead className="text-right">Impressions</TableHead>
+              <TableHead className="text-right">Clicks</TableHead>
+              <TableHead className="text-right">Leads</TableHead>
+              <TableHead className="text-right">CPL</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {ads.map((a) => (
+              <TableRow key={a.id}>
+                <TableCell>
+                  <div className="flex items-center gap-2">
+                    <MetaAdsThumbnail src={a.thumbnailUrl} alt="" />
+                    <span className="font-medium text-foreground">{a.name}</span>
+                  </div>
+                </TableCell>
+                <TableCell className="text-muted-foreground">{(a.campaignId && campaignNameById.get(a.campaignId)) ?? "—"}</TableCell>
+                <TableCell className="text-muted-foreground">{(a.adSetId && adSetNameById.get(a.adSetId)) ?? "—"}</TableCell>
+                <TableCell><MetaAdsStatusBadge status={a.status} effectiveStatus={a.effectiveStatus} /></TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCurrency(a.insights.spend, currencyCode)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCount(a.insights.impressions)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCount(a.insights.clicks)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCount(a.insights.leads)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatMetaAdsCurrency(a.insights.costPerLead, currencyCode)}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+    </CardContent>
+  );
+}
+
+// ── Container ─────────────────────────────────────────────────────────────
+//
+// No Performance/Insights tab (Step 19) — Overview/Campaigns/Ad Sets/Ads
+// already show spend/leads/etc. per entity at every level via the same
+// merged Insights data; a bare account/campaign/adset/ad level picker
+// would just re-show numbers already visible elsewhere, and Step 2's
+// backend returns aggregate date-range totals only (no daily time series,
+// per Step 20), so no trend chart is built anywhere in this tab either.
+function MetaAdsPerformanceTab() {
+  const [dateRange, setDateRange] = useState<MetaAdsDateRangePreset>("LAST_30_DAYS");
+  const [innerTab, setInnerTab] = useState<MetaAdsInnerTab>("overview");
+  const [visitedAdSets, setVisitedAdSets] = useState(false);
+  const [visitedAds, setVisitedAds] = useState(false);
+
+  useEffect(() => {
+    if (innerTab === "adsets" || innerTab === "ads") setVisitedAdSets(true);
+    if (innerTab === "ads") setVisitedAds(true);
+  }, [innerTab]);
+
+  const account = useMetaAdsAccountSummary(dateRange);
+  const accountConnected = account.result?.ok === true;
+
+  const campaigns = useMetaAdsCampaigns(dateRange, accountConnected);
+  const adSets = useMetaAdsAdSets(dateRange, accountConnected && visitedAdSets);
+  const ads = useMetaAdsAds(dateRange, accountConnected && visitedAds);
+
+  function retryAll() {
+    account.retry();
+  }
+
+  // Overview needs BOTH the account summary and campaigns loaded together
+  // (one combined skeleton) — Ad Sets/Ads get their own lazy skeleton
+  // inside their own tab content once this outer shell is already showing.
+  if (account.loading || !account.result) {
+    return <MetaAdsPerformanceSkeleton />;
+  }
+  if (!account.result.ok) {
+    return <MetaAdsErrorState kind={account.result.kind} retry={retryAll} />;
+  }
+
+  const { adAccount, summary } = account.result.data;
+
+  const campaignList: MetaAdsCampaign[] = campaigns.result?.ok ? campaigns.result.data.campaigns : [];
+  const campaignNameById = new Map(campaignList.map((c) => [c.id, c.name]));
+  const adSetList: MetaAdsAdSet[] = adSets.result?.ok ? adSets.result.data.adSets : [];
+  const adSetNameById = new Map(adSetList.map((a) => [a.id, a.name]));
+
+  return (
+    <div className="space-y-5">
+      <MetaAdsAccountHeader adAccount={adAccount} dateRange={dateRange} onDateRangeChange={setDateRange} onRefresh={retryAll} />
+      <MetaAdsMetricCards summary={summary} currencyCode={adAccount.currency} />
+
+      <Tabs value={innerTab} onValueChange={(v) => setInnerTab(v as MetaAdsInnerTab)} className="space-y-4">
+        <TabsList>
+          <TabsTrigger value="overview">Overview</TabsTrigger>
+          <TabsTrigger value="campaigns">Campaigns</TabsTrigger>
+          <TabsTrigger value="adsets">Ad Sets</TabsTrigger>
+          <TabsTrigger value="ads">Ads</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="overview">
+          <Card>
+            <GoogleAdsSectionHeader title="Campaigns" description="Snapshot of campaigns in the selected Meta ad account." />
+            {campaigns.loading && !campaigns.result ? (
+              <MetaAdsTableSkeleton rows={3} />
+            ) : campaigns.result && !campaigns.result.ok ? (
+              <div className="p-4"><MetaAdsErrorState kind={campaigns.result.kind} retry={campaigns.retry} /></div>
+            ) : (
+              <MetaAdsCampaignSnapshot campaigns={campaignList} currencyCode={adAccount.currency} onViewAll={() => setInnerTab("campaigns")} />
+            )}
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="campaigns">
+          <Card>
+            <GoogleAdsSectionHeader title="Campaigns" description="Performance for campaigns in the selected Meta ad account." />
+            {campaigns.loading && !campaigns.result ? (
+              <MetaAdsTableSkeleton rows={4} />
+            ) : campaigns.result && !campaigns.result.ok ? (
+              <div className="p-4"><MetaAdsErrorState kind={campaigns.result.kind} retry={campaigns.retry} /></div>
+            ) : (
+              <MetaAdsCampaignsTable campaigns={campaignList} currencyCode={adAccount.currency} />
+            )}
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="adsets">
+          <Card>
+            <GoogleAdsSectionHeader title="Ad Sets" description="Performance for ad sets in the selected Meta ad account." />
+            {adSets.loading && !adSets.result ? (
+              <MetaAdsTableSkeleton rows={4} />
+            ) : adSets.result && !adSets.result.ok ? (
+              <div className="p-4"><MetaAdsErrorState kind={adSets.result.kind} retry={adSets.retry} /></div>
+            ) : (
+              <MetaAdsAdSetsTable adSets={adSetList} campaignNameById={campaignNameById} currencyCode={adAccount.currency} />
+            )}
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="ads">
+          <Card>
+            <GoogleAdsSectionHeader title="Ads" description="Performance for ads in the selected Meta ad account." />
+            {ads.loading && !ads.result ? (
+              <MetaAdsTableSkeleton rows={4} />
+            ) : ads.result && !ads.result.ok ? (
+              <div className="p-4"><MetaAdsErrorState kind={ads.result.kind} retry={ads.retry} /></div>
+            ) : (
+              <MetaAdsAdsTable ads={ads.result?.ok ? ads.result.data.ads : []} campaignNameById={campaignNameById} adSetNameById={adSetNameById} currencyCode={adAccount.currency} />
+            )}
+          </Card>
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }
