@@ -2,6 +2,7 @@
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
+import { ensureMetaLeadgenSubscription } from "./lib/meta-lead-ads";
 
 // ─────────────────────────────────────────────────────────────────────────
 // meta-oauth-callback.ts
@@ -168,7 +169,10 @@ export const handler: Handler = async (event) => {
     return popupResponse(false, "Could not verify this connection request — please try again");
   }
 
-  const siteUrl = process.env.URL || "https://connect.renometa.com";
+  const siteUrl =
+  process.env.META_OAUTH_BASE_URL ||
+  process.env.URL ||
+  "https://connect.renometa.com";
   const redirectUri = `${siteUrl}/.netlify/functions/meta-oauth-callback`;
 
   try {
@@ -383,6 +387,27 @@ export const handler: Handler = async (event) => {
         }
       } catch (e) {
         console.warn("[meta-oauth-callback] ad account discovery failed:", e);
+      }
+    }
+
+    // Phase 1B Step 2 — a Page never receives ANY webhook delivery until
+    // the app has explicitly subscribed it via POST /{page_id}/subscribed_apps
+    // (with a PAGE token, not this user token) — granting leads_retrieval/
+    // pages_manage_ads does NOT auto-subscribe it. Best-effort only: a
+    // failure here must never block the connection itself from saving —
+    // same "never let a discovery failure break the whole connect" pattern
+    // as every other try/catch above. See
+    // netlify/functions/lib/meta-lead-ads.ts's ensureMetaLeadgenSubscription
+    // for the full rationale (this repo had ZERO subscribed_apps calls for
+    // any Meta product before this).
+    if (product === "meta-lead-ads" && pageId) {
+      try {
+        const subResult = await ensureMetaLeadgenSubscription(accessToken, pageId);
+        if (!subResult.ok) {
+          console.warn("[meta-oauth-callback] leadgen subscription not established:", subResult.errorCode);
+        }
+      } catch (e) {
+        console.warn("[meta-oauth-callback] leadgen subscription attempt failed:", e);
       }
     }
 

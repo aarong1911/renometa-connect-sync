@@ -34,7 +34,7 @@ const PRODUCT_SCOPES: Record<string, string[]> = {
   whatsapp: ["whatsapp_business_management", "whatsapp_business_messaging", "business_management"],
   "fb-messenger": ["pages_messaging", "pages_show_list", "business_management"],
   "instagram-direct": ["instagram_basic", "instagram_manage_messages", "pages_show_list", "business_management"],
-  "meta-lead-ads": ["pages_show_list", "pages_manage_ads", "pages_read_engagement", "business_management"],
+  "meta-lead-ads": ["pages_show_list", "pages_manage_ads", "pages_manage_metadata", "pages_read_engagement", "business_management", "leads_retrieval"],
   "meta-ads": ["ads_management", "ads_read", "business_management"],
 };
 
@@ -87,7 +87,10 @@ export const handler: Handler = async (event) => {
     return { statusCode: 500, body: "Could not start the Meta connection — please try again" };
   }
 
-  const siteUrl = process.env.URL || "https://connect.renometa.com";
+  const siteUrl =
+  process.env.META_OAUTH_BASE_URL ||
+  process.env.URL ||
+  "https://connect.renometa.com";
   const redirectUri = `${siteUrl}/.netlify/functions/meta-oauth-callback`;
 
   const scopes = (PRODUCT_SCOPES[product] ?? PRODUCT_SCOPES.whatsapp).join(",");

@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
-import { Link2, Copy, ExternalLink, Loader2, CheckCircle2, AlertTriangle } from "lucide-react";
+import { Link2, Copy, ExternalLink, Loader2, CheckCircle2, AlertTriangle, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { useState, useCallback, useEffect } from "react";
 import type { Integration } from "@/lib/integrations-data";
@@ -17,6 +17,7 @@ import {
   type GoogleAdsConnectionStatusResponse,
   type GoogleAdsSafeAccount,
 } from "@/lib/google-ads-format";
+import { getMetaLeadForms, reconcileMetaLeadAds, type MetaLeadForm } from "@/lib/meta-lead-ads-client";
 
 interface Props {
   integration: Integration | null;
@@ -110,6 +111,122 @@ async function fetchMetaConnection(productKey: string | null): Promise<MetaConne
   if (!res.ok) return null;
   const json = await res.json();
   return json.connections?.[productKey] ?? null;
+}
+
+// ── Meta Lead Ads status panel (Phase 1B / Step 2) ──────────────────────
+//
+// Replaces the generic, stale "Message sync for this product is coming
+// soon" copy for meta-lead-ads specifically — that line was written for
+// the messaging products (Messenger/Instagram, still genuinely not built)
+// and never accurately described Lead Ads, which has a real ingestion
+// pipeline as of Phase 1B. Fetches form discovery once when the drawer
+// opens on a connected Lead Ads card; the manual "Sync recent leads"
+// button is a FALLBACK action only — the Meta webhook
+// (netlify/functions/meta-webhook.ts) is the PRIMARY ingestion path and
+// runs automatically without any user action, matching Step 23's
+// "no aggressive polling / not click-to-work" intent. Never renders "fully
+// live" — this repo has not yet completed a live end-to-end test-lead
+// validation (see the Phase 1B / Step 2 report), so copy stays factual
+// about what's technically wired rather than claiming production-proven.
+function MetaLeadAdsStatusPanel() {
+  const [loading, setLoading] = useState(true);
+  const [forms, setForms] = useState<MetaLeadForm[] | null>(null);
+  const [pageName, setPageName] = useState<string | null>(null);
+  const [errorKind, setErrorKind] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncSummary, setSyncSummary] = useState<string | null>(null);
+
+  const loadForms = useCallback(async () => {
+    setLoading(true);
+    setErrorKind(null);
+    const result = await getMetaLeadForms();
+    if (result.ok) {
+      setForms(result.data.forms);
+      setPageName(result.data.page.name);
+    } else {
+      setForms(null);
+      setErrorKind(result.kind);
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    loadForms();
+  }, [loadForms]);
+
+  async function handleSync() {
+    setSyncing(true);
+    setSyncSummary(null);
+    const result = await reconcileMetaLeadAds("24h");
+    setSyncing(false);
+    if (!result.ok) {
+      toast.error(
+        result.kind === "reconnect_required" ? "Your Meta Lead Ads authorization has expired — reconnect to sync leads."
+        : result.kind === "permission_required" ? "Lead Ads permission required — manage the connection to continue."
+        : "Could not sync Meta Lead Ads leads right now.",
+      );
+      return;
+    }
+    // DB idempotency (UNIQUE org_id/meta_lead_id) means running this
+    // repeatedly is always safe — "already imported" reflects genuine
+    // duplicates, never a risk of creating a second CRM lead.
+    const { created, matched, duplicates } = result.data;
+    const summary = `Sync complete — ${created + matched} new lead${created + matched === 1 ? "" : "s"}, ${duplicates} already imported.`;
+    setSyncSummary(summary);
+    toast.success(summary);
+  }
+
+  if (loading) {
+    return <p className="text-xs text-muted-foreground">Checking Lead Ads forms…</p>;
+  }
+
+  if (errorKind === "reconnect_required") {
+    return <p className="text-xs text-destructive">Your Meta Lead Ads authorization has expired. Reconnect to keep capturing leads.</p>;
+  }
+  if (errorKind === "permission_required") {
+    return <p className="text-xs text-destructive">Lead Ads permission required — Meta hasn't granted lead access yet for this connection.</p>;
+  }
+  if (errorKind === "temporarily_unavailable" || errorKind === "provider_error" || errorKind === "network_error") {
+    return (
+      <div className="space-y-1.5">
+        <p className="text-xs text-muted-foreground">Couldn't check Lead Ads forms right now.</p>
+        <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={loadForms}>
+          <RefreshCw className="mr-1.5 h-3 w-3" /> Retry
+        </Button>
+      </div>
+    );
+  }
+
+  const formCount = forms?.length ?? 0;
+
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-muted-foreground">
+        Meta Instant Form leads sync automatically into RenoMeta Connect — campaign/ad set/ad attribution is preserved on every lead.
+      </p>
+      {formCount === 0 ? (
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-xs text-muted-foreground">No Lead Ads forms found on this Page{pageName ? ` (${pageName})` : ""}.</p>
+          <Button variant="ghost" size="sm" className="h-7 shrink-0 px-2 text-xs" onClick={loadForms}>
+            <RefreshCw className="mr-1.5 h-3 w-3" /> Refresh forms
+          </Button>
+        </div>
+      ) : (
+        <p className="text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">{formCount}</span> lead form{formCount === 1 ? "" : "s"} found.
+        </p>
+      )}
+
+      <div className="flex items-center gap-2 pt-1">
+        <Button variant="outline" size="sm" className="h-7 px-2 text-xs" onClick={handleSync} disabled={syncing}>
+          {syncing ? <Loader2 className="mr-1.5 h-3 w-3 animate-spin" /> : <RefreshCw className="mr-1.5 h-3 w-3" />}
+          Sync recent leads
+        </Button>
+        <span className="text-[10px] text-muted-foreground">Optional — new leads import automatically via webhook.</span>
+      </div>
+      {syncSummary && <p className="text-xs text-success">{syncSummary}</p>}
+    </div>
+  );
 }
 
 export function IntegrationConfigDrawer({
@@ -666,6 +783,8 @@ export function IntegrationConfigDrawer({
                     <p className="text-xs text-muted-foreground">
                       Ready to use — try "Create Ad Campaign" in AI Center → AI Tools.
                     </p>
+                  ) : int.id === "meta-lead-ads" ? (
+                    <MetaLeadAdsStatusPanel />
                   ) : int.id !== "whatsapp" && (
                     <p className="text-xs text-muted-foreground">Message sync for this product is coming soon — the connection is active and ready.</p>
                   )}

@@ -176,9 +176,16 @@ async function fetchMetaLeadById(accessToken: string, metaLeadId: string): Promi
 }
 
 // ── Form discovery (Part I) ──────────────────────────────────────────────
-// Reusable for later UI/reconciliation. No consumer endpoint built in this
-// step (not materially needed for Step 1's ingestion foundation) — see the
-// Step 1 report.
+// Reusable for later UI/reconciliation — now consumed by meta-lead-forms.ts
+// and reconcileMetaLeadAds() (Phase 1B / Step 2 Page Token Fix).
+//
+// IMPORTANT — accessToken here must be a PAGE-scoped token (see
+// getMetaPageAccessToken above), not the stored long-lived USER token:
+// /{page_id}/leadgen_forms is a Page-scoped edge and rejects the user
+// token with OAuthException/190, confirmed via live testing. This
+// function's own implementation is unchanged/token-agnostic (it just
+// forwards whatever token it's given to metaGraphPaginate) — the fix is
+// entirely in what callers now pass in.
 
 export interface MetaLeadFormSummary {
   formId: string;
@@ -195,10 +202,10 @@ interface RawMetaLeadForm {
   created_time?: string;
 }
 
-export async function discoverMetaLeadForms(accessToken: string, pageId: string): Promise<MetaLeadFormSummary[]> {
+export async function discoverMetaLeadForms(pageAccessToken: string, pageId: string): Promise<MetaLeadFormSummary[]> {
   const page = await metaGraphPaginate<RawMetaLeadForm>({
     path: `/${pageId}/leadgen_forms`,
-    accessToken,
+    accessToken: pageAccessToken,
     query: { fields: "id,name,status,created_time" },
   });
   return page.items.map((f) => ({
@@ -208,6 +215,137 @@ export async function discoverMetaLeadForms(accessToken: string, pageId: string)
     pageId,
     createdTime: typeof f.created_time === "string" ? f.created_time : null,
   }));
+}
+
+// ── Page webhook subscription (Phase 1B / Step 2, Parts 26-29) ──────────
+//
+// AUDIT FINDING: a Page never receives ANY webhook delivery — Messenger,
+// Instagram, or Lead Ads alike — until the app has explicitly subscribed
+// it via POST /{page_id}/subscribed_apps. Granting OAuth scopes
+// (leads_retrieval, pages_manage_ads, pages_messaging, etc.) does NOT
+// auto-subscribe a Page to anything; this is a separate, mandatory
+// Graph API call. Confirmed by searching this entire repository for
+// "subscribed_apps"/"subscribed_fields" before this file: ZERO matches —
+// no product's connect flow (Messenger, Instagram, WhatsApp, or Lead Ads)
+// has ever performed this call. This is a real, pre-existing gap that
+// also affects Messenger/Instagram; fixing it for those products is out
+// of scope here (Step 2 is Lead Ads only) — flagged in the Step 2 report.
+//
+// The required call needs a PAGE access token, not the long-lived USER
+// token meta_connections already stores (Part 29's exact question). No
+// token-storage redesign is needed to get one: a Page access token can be
+// DERIVED on demand from the existing stored user token via
+// GET /{page_id}?fields=access_token (standard, documented Graph API
+// behavior — works as long as the connecting user has admin access to the
+// Page, which pages_show_list/pages_manage_ads already require). The
+// derived Page token is used only transiently for this one call and is
+// never persisted.
+//
+// Phase 1B / Step 2 follow-up (Page Token Fix): live testing showed
+// meta-lead-forms.ts's form discovery (/{page_id}/leadgen_forms) fails
+// with HTTP 400 / OAuthException / code 190 when called with the stored
+// USER token — the same class of Page-scoped-endpoint rejection this
+// subscription flow already worked around. Every Page-scoped Lead Ads read
+// (leadgen_forms discovery, per-form /leads enumeration) needs the SAME
+// derived Page token this function already used internally — extracted
+// below into a shared helper so meta-lead-forms.ts and
+// reconcileMetaLeadAds() don't each reimplement this derivation.
+
+// Thrown when Meta returns a 2xx response that simply omits access_token
+// (e.g. the connecting user no longer has admin access to this Page) —
+// distinct from MetaGraphApiError (a Graph-level rejection, e.g. code 190
+// for an expired/invalid user token) so callers can classify both the same
+// way they already classify other Graph errors, without conflating "the
+// call itself failed" with "the call succeeded but returned nothing usable".
+export class MetaPageTokenMissingError extends Error {
+  constructor() {
+    super("Meta Page access token missing from Graph response");
+    this.name = "MetaPageTokenMissingError";
+  }
+}
+
+// Derives a transient Page access token from the given long-lived USER
+// token. NEVER persisted — every caller uses the returned value only for
+// the remainder of its own request/run and then discards it (nothing in
+// this file writes it to meta_connections, meta_lead_submissions, or any
+// other table). NEVER logged. Uses the centralized metaGraphRequest — no
+// raw fetch() calls.
+export async function getMetaPageAccessToken(userAccessToken: string, pageId: string): Promise<string> {
+  const resp = await metaGraphRequest<{ access_token?: string }>({
+    path: `/${pageId}`,
+    accessToken: userAccessToken,
+    query: { fields: "access_token" },
+  });
+  if (!resp.access_token || typeof resp.access_token !== "string") {
+    throw new MetaPageTokenMissingError();
+  }
+  return resp.access_token;
+}
+
+export type EnsureLeadgenSubscriptionErrorCode = "permission_required" | "reconnect_required" | "subscription_failed";
+
+export interface EnsureLeadgenSubscriptionResult {
+  ok: boolean;
+  alreadySubscribed: boolean;
+  errorCode?: EnsureLeadgenSubscriptionErrorCode;
+}
+
+interface SubscribedAppsEntry {
+  subscribed_fields?: string[];
+}
+
+// Idempotent (Part 28) by construction: reads the Page's CURRENT
+// subscribed_fields first via GET, and only issues the POST if "leadgen"
+// isn't already present — preserving every other already-subscribed field
+// (Part 27) rather than overwriting the set. Calling this twice in a row
+// is always safe: the second call sees "leadgen" already present and
+// returns alreadySubscribed:true without writing anything.
+export async function ensureMetaLeadgenSubscription(
+  userAccessToken: string,
+  pageId: string,
+): Promise<EnsureLeadgenSubscriptionResult> {
+  let pageAccessToken: string;
+  try {
+    pageAccessToken = await getMetaPageAccessToken(userAccessToken, pageId);
+  } catch (e) {
+    const reconnect = e instanceof MetaGraphApiError && (e.metaType === "OAuthException" || e.metaCode === 190);
+    return { ok: false, alreadySubscribed: false, errorCode: reconnect ? "reconnect_required" : "permission_required" };
+  }
+
+  try {
+    const current = await metaGraphRequest<{ data?: SubscribedAppsEntry[] }>({
+      path: `/${pageId}/subscribed_apps`,
+      accessToken: pageAccessToken,
+    });
+    const existingFields = new Set<string>(current.data?.[0]?.subscribed_fields ?? []);
+    if (existingFields.has("leadgen")) {
+      return { ok: true, alreadySubscribed: true };
+    }
+    existingFields.add("leadgen");
+
+    // subscribed_fields is passed as a query param (not a JSON body) —
+    // Graph API accepts scalar POST params via the querystring, and this
+    // sidesteps whether a given endpoint parses a JSON POST body at all
+    // (most classic Graph API write endpoints expect form/query params).
+    await metaGraphRequest({
+      path: `/${pageId}/subscribed_apps`,
+      accessToken: pageAccessToken,
+      method: "POST",
+      query: { subscribed_fields: [...existingFields].join(",") },
+    });
+    return { ok: true, alreadySubscribed: false };
+  } catch (e) {
+    if (e instanceof MetaGraphApiError) {
+      console.error("[meta-lead-ads] leadgen subscription failed", {
+        httpStatus: e.httpStatus,
+        metaType: e.metaType,
+        metaCode: e.metaCode,
+        metaErrorSubcode: e.metaErrorSubcode,
+        fbTraceId: e.fbTraceId,
+      });
+    }
+    return { ok: false, alreadySubscribed: false, errorCode: "subscription_failed" };
+  }
 }
 
 // ── Contact dedupe (Part K) ──────────────────────────────────────────────
@@ -541,4 +679,229 @@ export async function processMetaLeadgenEvent(
   }
 
   return { ok: true, status: contactStatus, leadId, contactId };
+}
+
+// ── Reconciliation (Phase 1B / Step 2, Parts 6-15) ───────────────────────
+//
+// Enumerates recent leads from every discovered Lead Ads form on the
+// org's connected Page and feeds each one through processMetaLeadgenEvent
+// — the EXACT SAME ingestion path the webhook uses. There is no second
+// CRM-creation implementation anywhere in this file. The webhook remains
+// the PRIMARY ingestion path (near-real-time); this exists purely as a
+// fallback for missed/failed webhook deliveries — callable manually today
+// (meta-lead-reconcile.ts) and from a future scheduled automation with no
+// further CRM-logic changes, since this function's own signature already
+// takes no request-specific state beyond org/window.
+
+export const META_RECONCILE_WINDOWS = ["1h", "6h", "24h", "72h", "7d"] as const;
+export type MetaReconcileWindow = (typeof META_RECONCILE_WINDOWS)[number];
+
+const RECONCILE_WINDOW_TO_MS: Record<MetaReconcileWindow, number> = {
+  "1h": 60 * 60 * 1000,
+  "6h": 6 * 60 * 60 * 1000,
+  "24h": 24 * 60 * 60 * 1000,
+  "72h": 72 * 60 * 60 * 1000,
+  "7d": 7 * 24 * 60 * 60 * 1000,
+};
+
+// Hard safety caps (Part 13) — chosen against the existing bounded
+// paginator architecture (metaGraphPaginate's own pageLimit/maxPages
+// parameters), never an unbounded crawl. Reported exactly in the Step 2
+// report: forms 50, pages/form 5, leads/run 500.
+const MAX_FORMS_SCANNED = 50;
+const MAX_PAGES_PER_FORM = 5;
+const RECONCILE_LEADS_PAGE_LIMIT = 25;
+const MAX_LEADS_PER_RUN = 500;
+
+export type MetaReconcileErrorCode = "not_connected" | "reconnect_required" | "permission_required" | "token_decrypt_failed";
+
+export interface MetaReconcileFailure {
+  metaLeadId: string;
+  errorCode: MetaLeadIngestionErrorCode;
+}
+
+export type MetaReconcileResult =
+  | {
+      ok: true;
+      formsScanned: number;
+      leadsDiscovered: number;
+      created: number;
+      matched: number;
+      duplicates: number;
+      failed: number;
+      failures: MetaReconcileFailure[];
+      truncated: boolean;
+    }
+  | { ok: false; errorCode: MetaReconcileErrorCode };
+
+interface RawMetaLeadListItem {
+  id: string;
+  created_time?: string;
+}
+
+// Account-wide failures (bad/expired token, missing leads_retrieval) stop
+// the ENTIRE reconciliation run early (Part 14) rather than repeating the
+// same failure for every remaining form. A single inaccessible/errored
+// form, by contrast, is recorded and skipped — the run continues with
+// whatever forms remain.
+function classifyReconcileAccountError(e: unknown): "reconnect_required" | "permission_required" | null {
+  if (e instanceof MetaPageTokenMissingError) return "permission_required";
+  if (e instanceof MetaGraphApiError) {
+    if (e.metaType === "OAuthException" || e.metaCode === 190) return "reconnect_required";
+    if (e.metaCode === 200 || e.metaCode === 10) return "permission_required";
+  }
+  return null;
+}
+
+// The single reconciliation entry point — resolves the CALLING org's own
+// Lead Ads connection server-side (never accepts a page/org/form ID from
+// the caller as authorization, matching Step 1's isolation model), then
+// discovers forms, enumerates recent leads per form, and calls
+// processMetaLeadgenEvent() for each one. A future scheduled automation
+// can call this exact function unmodified.
+export async function reconcileMetaLeadAds(
+  supabaseAdmin: SupabaseClient,
+  orgId: string,
+  window: MetaReconcileWindow = "24h",
+): Promise<MetaReconcileResult> {
+  const { data: connection, error: connErr } = await supabaseAdmin
+    .from("meta_connections")
+    .select("id, page_id, access_token")
+    .eq("org_id", orgId)
+    .eq("product", "lead_ads")
+    .maybeSingle();
+
+  if (connErr) {
+    console.error("[meta-lead-ads] reconcile: connection lookup failed:", connErr.message);
+    return { ok: false, errorCode: "not_connected" };
+  }
+  if (!connection || !connection.page_id || !connection.access_token) {
+    return { ok: false, errorCode: "not_connected" };
+  }
+  const pageId: string = connection.page_id;
+
+  let userAccessToken: string;
+  try {
+    userAccessToken = decryptMetaAccessToken(connection.access_token);
+  } catch {
+    return { ok: false, errorCode: "token_decrypt_failed" };
+  }
+
+  // Derived ONCE per reconciliation run (Part 13: "do not derive it once
+  // per form") and reused for every Page-scoped call below — form
+  // discovery AND every form's /leads enumeration. Never re-derived inside
+  // the forms loop, never persisted, never logged, never returned to the
+  // caller. Page-scoped Lead Ads reads (leadgen_forms, /leads) reject the
+  // stored long-lived USER token with OAuthException/190 — the same class
+  // of rejection ensureMetaLeadgenSubscription already worked around.
+  let pageAccessToken: string;
+  try {
+    pageAccessToken = await getMetaPageAccessToken(userAccessToken, pageId);
+  } catch (e) {
+    const code = classifyReconcileAccountError(e);
+    if (code) return { ok: false, errorCode: code };
+    // Deriving the Page token failed for a non-account reason (transient
+    // network/5xx) — nothing to scan this run; same clean-zero fallback
+    // already used below for a form-discovery-level transient failure, so
+    // a transient blip never reads as "reconnect your account".
+    return { ok: true, formsScanned: 0, leadsDiscovered: 0, created: 0, matched: 0, duplicates: 0, failed: 0, failures: [], truncated: false };
+  }
+
+  let forms: MetaLeadFormSummary[];
+  try {
+    const allForms = await discoverMetaLeadForms(pageAccessToken, pageId);
+    forms = allForms.slice(0, MAX_FORMS_SCANNED);
+  } catch (e) {
+    const code = classifyReconcileAccountError(e);
+    if (code) return { ok: false, errorCode: code };
+    // Form discovery itself failing for a non-account reason (transient
+    // network/5xx) — nothing to scan this run; reported as a clean zero
+    // rather than a hard error, so a transient blip never reads as
+    // "reconnect your account".
+    return { ok: true, formsScanned: 0, leadsDiscovered: 0, created: 0, matched: 0, duplicates: 0, failed: 0, failures: [], truncated: false };
+  }
+
+  const windowCutoffMs = Date.now() - RECONCILE_WINDOW_TO_MS[window];
+  const sinceEpochSeconds = Math.floor(windowCutoffMs / 1000);
+
+  let formsScanned = 0;
+  let leadsDiscovered = 0;
+  let created = 0;
+  let matched = 0;
+  let duplicates = 0;
+  let failed = 0;
+  let truncated = false;
+  const failures: MetaReconcileFailure[] = [];
+
+  formLoop: for (const form of forms) {
+    if (leadsDiscovered >= MAX_LEADS_PER_RUN) {
+      truncated = true;
+      break;
+    }
+    formsScanned++;
+
+    let leadItems: RawMetaLeadListItem[];
+    try {
+      // `since` (Unix seconds) is a documented Meta Lead Ads Retrieval
+      // param for this exact edge — not independently re-verified against
+      // a live response this session. Results are ALSO filtered
+      // client-side against the same window below as defense in depth, in
+      // case the param isn't honored exactly as documented.
+      const page = await metaGraphPaginate<RawMetaLeadListItem>({
+        path: `/${form.formId}/leads`,
+        accessToken: pageAccessToken,
+        query: { fields: "id,created_time", since: sinceEpochSeconds },
+        pageLimit: RECONCILE_LEADS_PAGE_LIMIT,
+        maxPages: MAX_PAGES_PER_FORM,
+      });
+      leadItems = page.items;
+    } catch (e) {
+      const code = classifyReconcileAccountError(e);
+      if (code) return { ok: false, errorCode: code };
+      console.warn("[meta-lead-ads] reconcile: form leads fetch failed, continuing with remaining forms", { formId: form.formId });
+      continue;
+    }
+
+    for (const item of leadItems) {
+      if (leadsDiscovered >= MAX_LEADS_PER_RUN) {
+        truncated = true;
+        break formLoop;
+      }
+      if (typeof item.id !== "string" || !item.id) continue;
+
+      const createdTimeMs = item.created_time ? Date.parse(item.created_time) : NaN;
+      if (Number.isFinite(createdTimeMs) && createdTimeMs < windowCutoffMs) continue; // defense-in-depth window filter
+
+      leadsDiscovered++;
+
+      // Same normalized event identity the webhook constructs (Part 9) —
+      // ad_id/adset_id are left null here (the /leads list edge doesn't
+      // return them per-item); processMetaLeadgenEvent's own full
+      // /{lead_id} retrieval fills in real attribution regardless, exactly
+      // as it already does for a webhook delivery with incomplete
+      // attribution. The DB unique key (org_id, meta_lead_id) — never
+      // created_time/email/phone — remains the sole idempotency authority
+      // (Part 9).
+      const event: MetaLeadgenEvent = {
+        metaLeadId: item.id,
+        pageId,
+        formId: form.formId,
+        adId: null,
+        adSetId: null,
+        createdTime: Number.isFinite(createdTimeMs) ? new Date(createdTimeMs).toISOString() : null,
+      };
+
+      const result = await processMetaLeadgenEvent(supabaseAdmin, event);
+      if (!result.ok) {
+        failed++;
+        failures.push({ metaLeadId: item.id, errorCode: result.errorCode });
+        continue;
+      }
+      if (result.status === "created") created++;
+      else if (result.status === "matched") matched++;
+      else duplicates++;
+    }
+  }
+
+  return { ok: true, formsScanned, leadsDiscovered, created, matched, duplicates, failed, failures, truncated };
 }
