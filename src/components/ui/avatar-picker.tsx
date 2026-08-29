@@ -15,12 +15,15 @@ export function AvatarPicker({
   id,
   name,
   avatarKey,
+  avatarUrl,
   size = "lg",
   onSelect,
 }: {
   id?: string | null;
   name: string;
   avatarKey?: string | null;
+  /** Real remote photo (contacts.avatar_url) — forwarded straight to ContactAvatar, which still gives it top priority over avatarKey/generated even inside the picker preview. */
+  avatarUrl?: string | null;
   size?: "xs" | "sm" | "md" | "lg";
   onSelect: (avatarKey: string) => void | Promise<void>;
 }) {
@@ -41,7 +44,7 @@ export function AvatarPicker({
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <button type="button" className="group relative rounded-full" title="Change avatar">
-          <ContactAvatar id={id} name={name} avatarKey={avatarKey} size={size} />
+          <ContactAvatar id={id} name={name} avatarKey={avatarKey} avatarUrl={avatarUrl} size={size} />
           <span className="absolute -bottom-0.5 -right-0.5 grid h-4 w-4 place-items-center rounded-full border border-border bg-background text-muted-foreground opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
             <Pencil className="h-2.5 w-2.5" />
           </span>
