@@ -3,6 +3,7 @@ import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
 import { ensureMetaLeadgenSubscription } from "./lib/meta-lead-ads";
+import { ensureMetaMessengerSubscription, ensureMetaInstagramSubscription } from "./lib/meta-messaging";
 
 // ─────────────────────────────────────────────────────────────────────────
 // meta-oauth-callback.ts
@@ -408,6 +409,32 @@ export const handler: Handler = async (event) => {
         }
       } catch (e) {
         console.warn("[meta-oauth-callback] leadgen subscription attempt failed:", e);
+      }
+    }
+
+    // Meta Messaging Webhook Hardening — same best-effort pattern as Lead
+    // Ads above: a subscription failure must never block the connection
+    // itself from saving. Requires pages_manage_metadata (added to this
+    // product's scopes above) — a connection made before that scope existed
+    // will fail here with permission_required until the user reconnects.
+    if (product === "fb-messenger" && pageId) {
+      try {
+        const subResult = await ensureMetaMessengerSubscription(accessToken, pageId);
+        if (!subResult.ok) {
+          console.warn("[meta-oauth-callback] messenger subscription not established:", subResult.errorCode);
+        }
+      } catch (e) {
+        console.warn("[meta-oauth-callback] messenger subscription attempt failed:", e);
+      }
+    }
+    if (product === "instagram-direct" && pageId) {
+      try {
+        const subResult = await ensureMetaInstagramSubscription(accessToken, pageId);
+        if (!subResult.ok) {
+          console.warn("[meta-oauth-callback] instagram subscription not established:", subResult.errorCode);
+        }
+      } catch (e) {
+        console.warn("[meta-oauth-callback] instagram subscription attempt failed:", e);
       }
     }
 

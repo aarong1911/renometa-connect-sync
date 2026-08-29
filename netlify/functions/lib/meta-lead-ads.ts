@@ -19,6 +19,11 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { metaGraphRequest, metaGraphPaginate, MetaGraphApiError } from "./meta-graph-api";
+import {
+  getMetaPageAccessToken,
+  MetaPageTokenMissingError,
+  ensureMetaPageFieldsSubscribed,
+} from "./meta-page-access";
 import { decryptMetaAccessToken } from "./meta-token-crypto";
 import {
   parseMetaFieldData,
@@ -251,36 +256,12 @@ export async function discoverMetaLeadForms(pageAccessToken: string, pageId: str
 // below into a shared helper so meta-lead-forms.ts and
 // reconcileMetaLeadAds() don't each reimplement this derivation.
 
-// Thrown when Meta returns a 2xx response that simply omits access_token
-// (e.g. the connecting user no longer has admin access to this Page) —
-// distinct from MetaGraphApiError (a Graph-level rejection, e.g. code 190
-// for an expired/invalid user token) so callers can classify both the same
-// way they already classify other Graph errors, without conflating "the
-// call itself failed" with "the call succeeded but returned nothing usable".
-export class MetaPageTokenMissingError extends Error {
-  constructor() {
-    super("Meta Page access token missing from Graph response");
-    this.name = "MetaPageTokenMissingError";
-  }
-}
-
-// Derives a transient Page access token from the given long-lived USER
-// token. NEVER persisted — every caller uses the returned value only for
-// the remainder of its own request/run and then discards it (nothing in
-// this file writes it to meta_connections, meta_lead_submissions, or any
-// other table). NEVER logged. Uses the centralized metaGraphRequest — no
-// raw fetch() calls.
-export async function getMetaPageAccessToken(userAccessToken: string, pageId: string): Promise<string> {
-  const resp = await metaGraphRequest<{ access_token?: string }>({
-    path: `/${pageId}`,
-    accessToken: userAccessToken,
-    query: { fields: "access_token" },
-  });
-  if (!resp.access_token || typeof resp.access_token !== "string") {
-    throw new MetaPageTokenMissingError();
-  }
-  return resp.access_token;
-}
+// getMetaPageAccessToken/MetaPageTokenMissingError now live in the generic
+// lib/meta-page-access.ts (Meta Messaging Webhook Hardening pass), which
+// Messenger/Instagram subscription logic also uses — re-exported here
+// unchanged so existing callers (meta-lead-forms.ts, meta-lead-reconcile.ts)
+// don't need to change their import path.
+export { getMetaPageAccessToken, MetaPageTokenMissingError } from "./meta-page-access";
 
 export type EnsureLeadgenSubscriptionErrorCode = "permission_required" | "reconnect_required" | "subscription_failed";
 
@@ -288,10 +269,6 @@ export interface EnsureLeadgenSubscriptionResult {
   ok: boolean;
   alreadySubscribed: boolean;
   errorCode?: EnsureLeadgenSubscriptionErrorCode;
-}
-
-interface SubscribedAppsEntry {
-  subscribed_fields?: string[];
 }
 
 // Idempotent (Part 28) by construction: reads the Page's CURRENT
@@ -312,40 +289,11 @@ export async function ensureMetaLeadgenSubscription(
     return { ok: false, alreadySubscribed: false, errorCode: reconnect ? "reconnect_required" : "permission_required" };
   }
 
-  try {
-    const current = await metaGraphRequest<{ data?: SubscribedAppsEntry[] }>({
-      path: `/${pageId}/subscribed_apps`,
-      accessToken: pageAccessToken,
-    });
-    const existingFields = new Set<string>(current.data?.[0]?.subscribed_fields ?? []);
-    if (existingFields.has("leadgen")) {
-      return { ok: true, alreadySubscribed: true };
-    }
-    existingFields.add("leadgen");
-
-    // subscribed_fields is passed as a query param (not a JSON body) —
-    // Graph API accepts scalar POST params via the querystring, and this
-    // sidesteps whether a given endpoint parses a JSON POST body at all
-    // (most classic Graph API write endpoints expect form/query params).
-    await metaGraphRequest({
-      path: `/${pageId}/subscribed_apps`,
-      accessToken: pageAccessToken,
-      method: "POST",
-      query: { subscribed_fields: [...existingFields].join(",") },
-    });
-    return { ok: true, alreadySubscribed: false };
-  } catch (e) {
-    if (e instanceof MetaGraphApiError) {
-      console.error("[meta-lead-ads] leadgen subscription failed", {
-        httpStatus: e.httpStatus,
-        metaType: e.metaType,
-        metaCode: e.metaCode,
-        metaErrorSubcode: e.metaErrorSubcode,
-        fbTraceId: e.fbTraceId,
-      });
-    }
-    return { ok: false, alreadySubscribed: false, errorCode: "subscription_failed" };
-  }
+  // Delegates to the generic, product-agnostic field-preserving subscription
+  // helper (lib/meta-page-access.ts) — identical external behavior to the
+  // original inline implementation: preserves every other already-subscribed
+  // field, idempotent, no token persistence, no raw Meta errors surfaced.
+  return ensureMetaPageFieldsSubscribed(pageAccessToken, pageId, ["leadgen"]);
 }
 
 // ── Contact dedupe (Part K) ──────────────────────────────────────────────

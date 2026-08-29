@@ -105,15 +105,21 @@ export function useSmsMetaConversations(): {
 
     const contactIds = [...new Set(data.map((r: any) => r.contact_id).filter(Boolean))] as string[];
 
-    let contactMap: Record<string, { name: string; phone: string; email: string }> = {};
+    let contactMap: Record<string, { name: string; phone: string; email: string; avatarUrl: string | null; avatarKey: string | null }> = {};
     if (contactIds.length > 0) {
       const { data: contacts } = await supabase
         .from("contacts")
-        .select("id, full_name, phone, email")
+        .select("id, full_name, phone, email, avatar_url, avatar_key")
         .in("id", contactIds);
       if (contacts) {
         contactMap = Object.fromEntries(
-          contacts.map((c: any) => [c.id, { name: c.full_name ?? "", phone: c.phone ?? "", email: c.email ?? "" }]),
+          contacts.map((c: any) => [c.id, {
+            name: c.full_name ?? "",
+            phone: c.phone ?? "",
+            email: c.email ?? "",
+            avatarUrl: c.avatar_url ?? null,
+            avatarKey: c.avatar_key ?? null,
+          }]),
         );
       }
     }
@@ -164,6 +170,8 @@ export function useSmsMetaConversations(): {
         unread: hasUnreadInbound,
         lastAt: lastRow?.created_at ?? new Date().toISOString(),
         callerPhone: contactEntry?.phone || undefined,
+        avatarUrl: contactEntry?.avatarUrl ?? null,
+        avatarKey: contactEntry?.avatarKey ?? null,
       });
 
       for (const row of group.rows) {

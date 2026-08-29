@@ -32,8 +32,20 @@ const NONCE_TTL_MS = 10 * 60 * 1000; // must match the state payload's own TTL c
 
 const PRODUCT_SCOPES: Record<string, string[]> = {
   whatsapp: ["whatsapp_business_management", "whatsapp_business_messaging", "business_management"],
-  "fb-messenger": ["pages_messaging", "pages_show_list", "business_management"],
-  "instagram-direct": ["instagram_basic", "instagram_manage_messages", "pages_show_list", "business_management"],
+  // pages_manage_metadata added (Meta Messaging Webhook Hardening) — required
+  // to call POST /{page_id}/subscribed_apps, the same permission Lead Ads
+  // already needed for its own Page subscription. Existing connections made
+  // before this change won't have it granted; they need one reconnect
+  // before subscription can succeed (see ensureMetaMessengerSubscription /
+  // ensureMetaInstagramSubscription call sites in meta-oauth-callback.ts).
+  // pages_messaging was temporarily removed (Messenger OAuth Scope Cleanup)
+  // because Meta rejected it with "Invalid Scopes: pages_messaging" — at
+  // that time the RenoConnect Meta app had no Messenger use case configured.
+  // Restored (Messenger OAuth Scope Restore) now that "Engage with customers
+  // on Messenger from Meta" is enabled and Meta's permissions screen shows
+  // pages_messaging as "Ready for testing".
+  "fb-messenger": ["pages_messaging", "pages_show_list", "pages_manage_metadata", "business_management"],
+  "instagram-direct": ["instagram_basic", "instagram_manage_messages", "pages_show_list", "pages_manage_metadata", "business_management"],
   "meta-lead-ads": ["pages_show_list", "pages_manage_ads", "pages_manage_metadata", "pages_read_engagement", "business_management", "leads_retrieval"],
   "meta-ads": ["ads_management", "ads_read", "business_management"],
 };

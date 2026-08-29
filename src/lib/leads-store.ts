@@ -77,6 +77,9 @@ function mapRow(row: any, contactMap: Record<string, any>): Lead {
     lastActivity: row.updated_at ?? row.created_at ?? new Date().toISOString(),
     convertedDealId: row.converted_to_deal_id ?? undefined,
     assignedTo: row.assigned_to ?? null,
+    contactId: row.contact_id ?? null,
+    contactAvatarUrl: contact?.avatar_url ?? null,
+    contactAvatarKey: contact?.avatar_key ?? null,
   };
 }
 
@@ -111,7 +114,7 @@ async function fetchLeads(): Promise<void> {
     const unique = [...new Set(contactIds)];
     const { data: contacts } = await supabase
       .from("contacts")
-      .select("id, full_name, email, phone, address")
+      .select("id, full_name, email, phone, address, avatar_url, avatar_key")
       .in("id", unique);
 
     if (contacts) {

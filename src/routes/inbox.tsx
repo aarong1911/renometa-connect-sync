@@ -560,9 +560,9 @@ function InboxPage() {
   const resolvedStoreContact = active ? (storeContactMap.get(active.contactId) ?? null) : null;
   const contact = active
     ? (resolvedStoreContact
-        ? { name: resolvedStoreContact.name, email: resolvedStoreContact.email, phone: resolvedStoreContact.phone, tags: resolvedStoreContact.tags, owner: resolvedStoreContact.owner, messenger_psid: resolvedStoreContact.messenger_psid, instagram_igsid: resolvedStoreContact.instagram_igsid }
+        ? { name: resolvedStoreContact.name, email: resolvedStoreContact.email, phone: resolvedStoreContact.phone, tags: resolvedStoreContact.tags, owner: resolvedStoreContact.owner, messenger_psid: resolvedStoreContact.messenger_psid, instagram_igsid: resolvedStoreContact.instagram_igsid, avatar_url: resolvedStoreContact.avatar_url, avatar_key: resolvedStoreContact.avatar_key }
         : mockContacts.find((c) => c.id === active.contactId)
-          ?? { name: active.contactName, email: "", phone: active.callerPhone ?? "", tags: [], owner: "", messenger_psid: undefined, instagram_igsid: undefined })
+          ?? { name: active.contactName, email: "", phone: active.callerPhone ?? "", tags: [], owner: "", messenger_psid: undefined, instagram_igsid: undefined, avatar_url: undefined, avatar_key: undefined })
     : undefined;
   const activeContactTags = active
     ? (contactTagOverrides[active.contactId] ?? contact?.tags ?? [])
@@ -1414,7 +1414,7 @@ function InboxPage() {
                       className="h-10 w-10"
                     />
                   ) : (
-                    <ContactAvatar id={active.contactId} name={active.contactName} size="md" className="h-10 w-10" />
+                    <ContactAvatar id={active.contactId} name={active.contactName} avatarUrl={contact?.avatar_url} avatarKey={contact?.avatar_key} size="md" className="h-10 w-10" />
                   )}
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 text-[15px] font-semibold">
@@ -1904,7 +1904,7 @@ function InboxPage() {
                       className="h-12 w-12"
                     />
                   ) : (
-                    <ContactAvatar id={active.contactId} name={contact.name} size="lg" className="h-12 w-12" />
+                    <ContactAvatar id={active.contactId} name={contact.name} avatarUrl={contact.avatar_url} avatarKey={contact.avatar_key} size="lg" className="h-12 w-12" />
                   )}
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[15px] font-semibold">{contact.name}</div>
@@ -2260,7 +2260,7 @@ function InboxPage() {
         {active && contact && (
           <div className="mt-6 space-y-6">
             <div className="flex items-center gap-3">
-              <ContactAvatar id={active.contactId} name={contact.name} size="lg" className="h-14 w-14" />
+              <ContactAvatar id={active.contactId} name={contact.name} avatarUrl={contact.avatar_url} avatarKey={contact.avatar_key} size="lg" className="h-14 w-14" />
               <div className="min-w-0">
                 <div className="truncate text-lg font-semibold text-foreground">{contact.name}</div>
                 <div className="mt-0.5 text-sm text-muted-foreground">
@@ -2683,7 +2683,7 @@ function ConversationRow({
             className="h-10 w-10"
           />
         ) : (
-          <ContactAvatar id={conv.contactId} name={conv.contactName} size="sm" className="h-10 w-10" />
+          <ContactAvatar id={conv.contactId} name={conv.contactName} avatarUrl={conv.avatarUrl} avatarKey={conv.avatarKey} size="sm" className="h-10 w-10" />
         )}
         <span className="absolute -bottom-0.5 -right-0.5 flex h-4 w-4 items-center justify-center rounded-full border-2 border-background bg-card">
           <ChannelGlyph channel={conv.channel} />
@@ -2822,6 +2822,8 @@ function NewConversationSheet({
     email: string;
     phone: string;
     tags?: string[];
+    avatar_url?: string | null;
+    avatar_key?: string | null;
   }>;
   onClose: () => void;
   onSelect: (c: { id: string; name: string }) => void;
@@ -2903,6 +2905,8 @@ function NewConversationSheet({
                 <ContactAvatar
                   id={contact.id}
                   name={contact.name}
+                  avatarUrl={contact.avatar_url}
+                  avatarKey={contact.avatar_key}
                   size="md"
                   className="h-10 w-10 shrink-0"
                 />

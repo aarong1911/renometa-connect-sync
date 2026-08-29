@@ -3,6 +3,7 @@ import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { createHmac, timingSafeEqual } from "crypto";
 import { isMetaLeadgenChange, extractMetaLeadgenEvent, processMetaLeadgenEvent } from "./lib/meta-lead-ads";
+import { resolveMessengerContactAndLead } from "./lib/meta-messenger-crm";
 
 // Writes inbound messages to sms_meta_messages — see
 // supabase/migrations/005_sms_meta_messages.sql for the real schema.
@@ -320,11 +321,25 @@ async function processMessengerOrInstagramPayload(
         continue;
       }
 
-      // Find the org whose connection matches this Page ID
+      // Find the org whose connection matches this Page ID FOR THIS EXACT
+      // PRODUCT — page_id alone is not unique. The same Page can have up to
+      // four independent meta_connections rows (ads, lead_ads, messenger,
+      // whatsapp — and now instagram), one per product, all sharing the
+      // same page_id (confirmed live: Page 110924278778092 has all four).
+      // A page_id-only .maybeSingle() either throws "multiple (or no) rows
+      // returned" or, if it ever succeeded, could silently resolve the
+      // WRONG product's org. product values below are the exact persisted
+      // productKey strings meta-oauth-callback.ts writes for these two
+      // OAuth products ("fb-messenger" -> "messenger",
+      // "instagram-direct" -> "instagram") — verified by reading that
+      // mapping directly, not assumed.
+      const product = channel === "messenger" ? "messenger" : "instagram";
+
       const { data: connRow, error: connErr } = await supabaseAdmin
         .from("meta_connections")
-        .select("org_id")
+        .select("org_id, access_token")
         .eq("page_id", pageId)
+        .eq("product", product)
         .maybeSingle();
 
       if (connErr) {
@@ -333,44 +348,58 @@ async function processMessengerOrInstagramPayload(
       const orgId = connRow?.org_id;
 
       if (!orgId) {
-        console.warn(`[meta-webhook] no org found for page_id (${channel}):`, pageId);
+        console.warn(`[meta-webhook] no org found for page_id/product (${channel}):`, pageId, product);
         continue;
       }
 
-      // Upsert contact by platform-specific identifier — these are NOT
-      // phone numbers or emails, so they go in messenger_psid/instagram_igsid
-      // (see supabase/migrations/004_contacts_meta_identifiers.sql), not the
-      // phone column. We don't get a display name from this webhook payload
-      // alone — fetching it requires a separate Graph API call
-      // (/{psid}?fields=first_name,last_name), which is left as a future
-      // enhancement; for now the contact is created with a placeholder name
-      // if one doesn't already exist.
-      const idColumn = channel === "messenger" ? "messenger_psid" : "instagram_igsid";
+      let contactId: string | null = null;
 
-      const { data: existingContact } = await supabaseAdmin
-        .from("contacts")
-        .select("id")
-        .eq("org_id", orgId)
-        .eq(idColumn, senderId)
-        .maybeSingle();
+      if (channel === "messenger") {
+        // Messenger Contact Enrichment + First-Conversation Lead Creation —
+        // profile lookup, Contact create/enrich, and active-Lead
+        // resolve-or-create all live in lib/meta-messenger-crm.ts (kept out
+        // of this dispatch-focused file, same separation as
+        // lib/meta-lead-ads.ts). Best-effort by construction — never throws,
+        // so message persistence below always proceeds regardless of
+        // profile/Lead outcome.
+        const resolution = await resolveMessengerContactAndLead(supabaseAdmin, {
+          orgId,
+          pageId,
+          senderId,
+          connectionAccessTokenEncrypted: connRow!.access_token as string,
+        });
+        contactId = resolution.contactId;
+      } else {
+        // Instagram — UNCHANGED from before this task (no profile
+        // enrichment, no Lead creation; out of scope until Instagram's own
+        // live validation pass).
+        const idColumn = "instagram_igsid";
 
-      let contactId: string | null = existingContact?.id ?? null;
-
-      if (!contactId) {
-        const { data: newContact, error: contactErr } = await supabaseAdmin
+        const { data: existingContact } = await supabaseAdmin
           .from("contacts")
-          .insert({
-            org_id: orgId,
-            full_name: channel === "messenger" ? "Messenger Contact" : "Instagram Contact",
-            [idColumn]: senderId,
-          })
           .select("id")
+          .eq("org_id", orgId)
+          .eq(idColumn, senderId)
           .maybeSingle();
 
-        if (contactErr) {
-          console.error(`[meta-webhook] contact insert error (${channel}):`, contactErr.message);
+        contactId = existingContact?.id ?? null;
+
+        if (!contactId) {
+          const { data: newContact, error: contactErr } = await supabaseAdmin
+            .from("contacts")
+            .insert({
+              org_id: orgId,
+              full_name: "Instagram Contact",
+              [idColumn]: senderId,
+            })
+            .select("id")
+            .maybeSingle();
+
+          if (contactErr) {
+            console.error(`[meta-webhook] contact insert error (${channel}):`, contactErr.message);
+          }
+          contactId = newContact?.id ?? null;
         }
-        contactId = newContact?.id ?? null;
       }
 
       const { error: insertErr } = await supabaseAdmin

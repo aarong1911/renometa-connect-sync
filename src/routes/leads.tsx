@@ -1397,7 +1397,7 @@ function LeadsPage() {
                     </td>
                     <td className="cursor-pointer px-3 py-3.5" onClick={() => openLead(lead)}>
                       <div className="flex min-w-[210px] items-center gap-3">
-                        <ContactAvatar id={lead.id} name={lead.name} size="sm" />
+                        <ContactAvatar id={lead.contactId || lead.id} name={lead.name} avatarUrl={lead.contactAvatarUrl} avatarKey={lead.contactAvatarKey} size="sm" />
                         <div className="min-w-0">
                           <div className="truncate font-medium text-foreground">{lead.name || "Unknown"}</div>
                           <div className="truncate text-xs text-muted-foreground">{lead.email || "No email"}</div>

@@ -106,7 +106,8 @@ export type CanonicalLeadSource =
   | "voice_ai"
   | "phone_call"
   | "sms"
-  | "email";
+  | "email"
+  | "messenger";
 
 export const LEAD_SOURCE_LABELS: Record<CanonicalLeadSource, string> = {
   google_ads: "Google Ads",
@@ -118,6 +119,13 @@ export const LEAD_SOURCE_LABELS: Record<CanonicalLeadSource, string> = {
   phone_call: "Phone Call",
   sms: "SMS",
   email: "Email",
+  // Messenger Attribution + Avatar Consistency Cleanup — added as the 10th
+  // built-in source now that Facebook Messenger creates real Leads
+  // (source = "messenger", already the exact stored value — see
+  // lib/meta-messenger-crm.ts). Appended last (after the 9 pre-existing
+  // built-ins) so it renders at the end of the "Owned" channel group in the
+  // Leads source filter without disturbing that group's existing order.
+  messenger: "Messenger",
 };
 
 // Single ordered source-options export (Lead Source Filter Enhancement) —
@@ -172,6 +180,8 @@ const LEAD_SOURCE_CANONICAL_ALIASES: Record<string, string> = {
   sms: "sms",
   // Email
   email: "email",
+  // Messenger
+  messenger: "messenger",
   // Legacy built-ins (pre-refinement) — retained only for historical-data
   // casing consistency, never offered as new choices.
   "cold call": "cold_call",

@@ -785,6 +785,15 @@ export function IntegrationConfigDrawer({
                     </p>
                   ) : int.id === "meta-lead-ads" ? (
                     <MetaLeadAdsStatusPanel />
+                  ) : int.id === "fb-messenger" ? (
+                    // Messenger Contact Enrichment + First-Conversation Lead
+                    // Creation pass: the old "coming soon" line became false
+                    // once live Messenger inbound sync was confirmed working
+                    // (meta-webhook.ts -> Conversations). Kept deliberately
+                    // modest — profile enrichment/Lead creation aren't
+                    // claimed here until THEY pass their own live
+                    // validation; see the task report for what's confirmed.
+                    <p className="text-xs text-muted-foreground">Facebook Messenger conversations sync automatically into RenoMeta Connect.</p>
                   ) : int.id !== "whatsapp" && (
                     <p className="text-xs text-muted-foreground">Message sync for this product is coming soon — the connection is active and ready.</p>
                   )}

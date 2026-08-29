@@ -300,6 +300,10 @@ export type Conversation = {
   senderDisplayName?: string;
   /** The most recent message's actual Gmail Subject header, decoded — used to prefill "Re: <subject>" when replying to an existing thread. Never fabricated. */
   emailSubject?: string;
+  /** Contact.avatar_url passthrough (Messenger Attribution + Avatar Consistency Cleanup) — real remote photo (e.g. Meta profile picture), so the conversation list/header render the same image as Contact Details rather than a different generated one. Null when the contact has none. */
+  avatarUrl?: string | null;
+  /** Contact.avatar_key passthrough — user-picked local avatar, used when there's no avatarUrl. */
+  avatarKey?: string | null;
 };
 
 export type Message = {
@@ -1173,6 +1177,15 @@ export type Lead = {
   // useTeam() list at render time rather than trusting `owner` once this
   // is set.
   assignedTo?: string | null;
+  // Messenger Attribution + Avatar Consistency Cleanup — the linked
+  // Contact's own id/avatar fields, so any surface rendering a Lead's
+  // avatar can use the SAME ContactAvatar seed/image the Contact itself
+  // uses elsewhere (Conversations, Contacts page) instead of seeding off
+  // the Lead's own id, which produces a different generated avatar for the
+  // same person. Null when the Lead has no linked contact.
+  contactId?: string | null;
+  contactAvatarUrl?: string | null;
+  contactAvatarKey?: string | null;
 };
 
 const LEAD_SOURCES: LeadSource[] = ["Website", "Referral", "Angi", "Thumbtack", "Google Ads", "Walk-in", "Social Media", "Gmail"];

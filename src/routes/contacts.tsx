@@ -1023,7 +1023,7 @@ function ContactsPage() {
                   </td>
                   <td className="py-2 pr-4">
                     <div className="flex items-center gap-2.5">
-                      <ContactAvatar id={c.id} name={c.name} avatarKey={c.avatar_key} size="sm" className="h-7 w-7" />
+                      <ContactAvatar id={c.id} name={c.name} avatarUrl={c.avatar_url} avatarKey={c.avatar_key} size="sm" className="h-7 w-7" />
                       <div className="font-medium">{c.name}</div>
                     </div>
                   </td>
