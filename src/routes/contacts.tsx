@@ -282,6 +282,47 @@ function ContactsPage() {
 
   const contacts = useContacts();
 
+  // Lead relationship tag (Contacts/Leads consistency — Issue 4) — derived
+  // from the real leads.contact_id relationship rather than written into
+  // contacts.tags/labels, so it can never go stale if a Lead is deleted,
+  // merged, or its contact_id changes, and applies uniformly regardless of
+  // lead source (Messenger, Meta Ads, Google Ads, manual, etc. all write
+  // leads.contact_id the same way — see leads-store.ts). Only holds contact
+  // ids that have at least one linked Lead; membership alone is all the
+  // display/filter logic below needs.
+  const [contactIdsWithLeads, setContactIdsWithLeads] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const orgId = await getOrgId();
+      if (!orgId || cancelled) return;
+      const { data, error } = await supabase
+        .from("leads")
+        .select("contact_id")
+        .eq("org_id", orgId)
+        .not("contact_id", "is", null);
+      if (error) {
+        console.error("[contacts] leads lookup for Lead tag failed:", error.message);
+        return;
+      }
+      if (!cancelled) {
+        setContactIdsWithLeads(new Set((data ?? []).map((r: any) => r.contact_id as string)));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [contacts]);
+
+  // True display tags for a contact — real stored tags, plus a derived
+  // "Lead" badge appended ONLY when the contact has a linked Lead AND
+  // doesn't already carry a real "Lead"/"lead"/etc. tag (canonical-key
+  // compared, never a duplicate). Used for display/filtering only — never
+  // fed into updateContact()/tag-edit mutations, so it can never get
+  // accidentally persisted back into contacts.labels.
+  const effectiveTags = (c: Contact): string[] =>
+    contactHasCanonicalTag(c.tags, "lead") || !contactIdsWithLeads.has(c.id)
+      ? c.tags
+      : [...c.tags, "Lead"];
+
   // Debounced search (Priority 11) — same 250ms interval used elsewhere in this app.
   useEffect(() => {
     const t = setTimeout(() => setSearch(searchInput), 250);
@@ -407,7 +448,7 @@ function ContactsPage() {
     const qEmail = normalizeEmail(q);
     const qDigits = normalizePhoneForComparison(q);
     return contacts.filter((c) => {
-      if (tagFilter !== "All" && !contactHasCanonicalTag(c.tags, tagFilter)) return false;
+      if (tagFilter !== "All" && !contactHasCanonicalTag(effectiveTags(c), tagFilter)) return false;
       if (companyFilter !== "All accounts" && (c.companyName || c.company) !== companyFilter) return false;
       if (sourceFilter !== "All sources" && contactSourceLabel(c.source) !== sourceFilter) return false;
       if (hasEmailOnly && !c.email) return false;
@@ -434,7 +475,7 @@ function ContactsPage() {
         c.owner.toLowerCase().includes(q)
       );
     });
-  }, [contacts, search, tagFilter, companyFilter, sourceFilter, dateFrom, dateTo, hasEmailOnly, hasPhoneOnly]);
+  }, [contacts, contactIdsWithLeads, search, tagFilter, companyFilter, sourceFilter, dateFrom, dateTo, hasEmailOnly, hasPhoneOnly]);
 
   const clearFilters = () => {
     setSearchInput("");
@@ -1034,16 +1075,19 @@ function ContactsPage() {
                   {visibleColumns.email && <td className="py-2 pr-4 text-muted-foreground">{c.email}</td>}
                   {visibleColumns.phone && <td className="py-2 pr-4 text-muted-foreground tabular-nums">{displayPhone(c.phone)}</td>}
                   {visibleColumns.source && <td className="py-2 pr-4 text-muted-foreground">{contactSourceLabel(c.source)}</td>}
-                  {visibleColumns.tags && (
-                    <td className="py-2 pr-4">
-                      <div className="flex flex-wrap gap-1">
-                        {c.tags.slice(0, 2).map((t) => (
-                          <span key={t} className={`inline-flex h-5 items-center rounded border bg-transparent px-1.5 text-[10px] font-medium ${colorForTag(tagComparisonKey(t)).chip}`}>{t}</span>
-                        ))}
-                        {c.tags.length > 2 && <span className="text-[10px] text-muted-foreground">+{c.tags.length - 2}</span>}
-                      </div>
-                    </td>
-                  )}
+                  {visibleColumns.tags && (() => {
+                    const tags = effectiveTags(c);
+                    return (
+                      <td className="py-2 pr-4">
+                        <div className="flex flex-wrap gap-1">
+                          {tags.slice(0, 2).map((t) => (
+                            <span key={t} className={`inline-flex h-5 items-center rounded border bg-transparent px-1.5 text-[10px] font-medium ${colorForTag(tagComparisonKey(t)).chip}`}>{t}</span>
+                          ))}
+                          {tags.length > 2 && <span className="text-[10px] text-muted-foreground">+{tags.length - 2}</span>}
+                        </div>
+                      </td>
+                    );
+                  })()}
                   {visibleColumns.owner && <td className="py-2 pr-4 text-muted-foreground">{c.owner}</td>}
                   {visibleColumns.created && (
                     <td className="py-2 pr-4 text-muted-foreground">{formatDateShort(c.createdAt)}</td>
@@ -1136,6 +1180,7 @@ function ContactsPage() {
         companies={companies}
         tagOptions={labelFilterOptions}
         colorForTag={colorForTag}
+        hasLinkedLead={!!selected && contactIdsWithLeads.has(selected.id)}
         onOpenChange={(o) => { if (!o) navigate({ search: { contactId: undefined }, replace: true }); }}
         onDelete={(c) => setDeleteTarget(c)}
         onNewDeal={() => navigate({
@@ -1431,6 +1476,7 @@ export function ContactDrawer({
   companies,
   tagOptions,
   colorForTag,
+  hasLinkedLead = false,
   onOpenChange,
   onDelete,
   onNewDeal,
@@ -1440,6 +1486,8 @@ export function ContactDrawer({
   /** Full canonical tag universe across all loaded contacts, for the tag picker's suggestion list. */
   tagOptions: import("@/lib/tag-utils").CanonicalTagOption[];
   colorForTag: (key: string) => TagColorClasses;
+  /** True when this Contact has at least one linked Lead (leads.contact_id) — drives the derived, non-removable "Lead" badge (Issue 4). Not stored on the contact itself. */
+  hasLinkedLead?: boolean;
   onOpenChange: (o: boolean) => void;
   onDelete: (c: Contact) => void;
   onNewDeal: () => void;
@@ -1558,6 +1606,7 @@ export function ContactDrawer({
                   id={contact.id}
                   name={contact.name}
                   avatarKey={contact.avatar_key}
+                  avatarUrl={contact.avatar_url}
                   size="lg"
                   onSelect={(key) => {
                     void updateContact(contact.id, {
@@ -1811,22 +1860,37 @@ export function ContactDrawer({
                         <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Tags</span>
                       </div>
                       <div className="flex flex-wrap gap-1.5">
-                        {contact.tags.length > 0
-                          ? contact.tags.map((t) => (
-                            <span key={t} className={`inline-flex h-6 items-center gap-1 rounded border bg-transparent pl-2 pr-1 text-[11px] font-medium ${colorForTag(tagComparisonKey(t)).chip}`}>
-                              {t}
-                              <button
-                                type="button"
-                                onClick={() => handleRemoveTag(t)}
-                                className="rounded-full p-0.5 hover:bg-black/10"
-                                aria-label={`Remove ${t}`}
-                              >
-                                <X className="h-2.5 w-2.5" />
-                              </button>
-                            </span>
-                          ))
-                          : <span className="text-xs text-muted-foreground">No tags</span>
-                        }
+                        {contact.tags.length === 0 && !hasLinkedLead && (
+                          <span className="text-xs text-muted-foreground">No tags</span>
+                        )}
+                        {contact.tags.map((t) => (
+                          <span key={t} className={`inline-flex h-6 items-center gap-1 rounded border bg-transparent pl-2 pr-1 text-[11px] font-medium ${colorForTag(tagComparisonKey(t)).chip}`}>
+                            {t}
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveTag(t)}
+                              className="rounded-full p-0.5 hover:bg-black/10"
+                              aria-label={`Remove ${t}`}
+                            >
+                              <X className="h-2.5 w-2.5" />
+                            </button>
+                          </span>
+                        ))}
+                        {/* Derived "Lead" badge (Issue 4) — shown only when
+                            the Contact has a linked Lead and doesn't already
+                            carry a real "Lead" tag. Not removable: it isn't
+                            stored data, it's a live reflection of
+                            leads.contact_id, so there's nothing to remove —
+                            it disappears on its own if the Lead relationship
+                            goes away. */}
+                        {!contactHasCanonicalTag(contact.tags, "lead") && hasLinkedLead && (
+                          <span
+                            className={`inline-flex h-6 items-center gap-1 rounded border bg-transparent pl-2 pr-2 text-[11px] font-medium ${colorForTag(tagComparisonKey("Lead")).chip}`}
+                            title="Automatically shown — this Contact has at least one linked Lead"
+                          >
+                            Lead
+                          </span>
+                        )}
                       </div>
                       <div className="mt-2">
                         <TagPicker

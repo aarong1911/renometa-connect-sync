@@ -4,6 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 import { createHmac, timingSafeEqual } from "crypto";
 import { isMetaLeadgenChange, extractMetaLeadgenEvent, processMetaLeadgenEvent } from "./lib/meta-lead-ads";
 import { resolveMessengerContactAndLead } from "./lib/meta-messenger-crm";
+import { resolveInstagramContactAndLead } from "./lib/meta-instagram-crm";
 
 // Writes inbound messages to sms_meta_messages — see
 // supabase/migrations/005_sms_meta_messages.sql for the real schema.
@@ -321,26 +322,38 @@ async function processMessengerOrInstagramPayload(
         continue;
       }
 
-      // Find the org whose connection matches this Page ID FOR THIS EXACT
-      // PRODUCT — page_id alone is not unique. The same Page can have up to
-      // four independent meta_connections rows (ads, lead_ads, messenger,
-      // whatsapp — and now instagram), one per product, all sharing the
-      // same page_id (confirmed live: Page 110924278778092 has all four).
-      // A page_id-only .maybeSingle() either throws "multiple (or no) rows
-      // returned" or, if it ever succeeded, could silently resolve the
-      // WRONG product's org. product values below are the exact persisted
-      // productKey strings meta-oauth-callback.ts writes for these two
-      // OAuth products ("fb-messenger" -> "messenger",
-      // "instagram-direct" -> "instagram") — verified by reading that
-      // mapping directly, not assumed.
+      // Find the org whose connection matches this webhook entry FOR THIS
+      // EXACT PRODUCT — page_id alone is not unique across products (the
+      // same Page can have ads/lead_ads/messenger/whatsapp/instagram rows
+      // all sharing the same page_id, confirmed live), so every lookup
+      // below is also scoped by product. product values are the exact
+      // persisted productKey strings meta-oauth-callback.ts writes
+      // ("fb-messenger" -> "messenger", "instagram-direct" -> "instagram").
+      //
+      // Instagram lookup key fix (Instagram Facebook-Login audit): Meta's
+      // documented behavior for `object: "instagram"` webhook deliveries is
+      // that entry.id is the Instagram-scoped Business Account ID (the same
+      // value meta-oauth-callback.ts persists as meta_connections.ig_actor_id)
+      // — NOT the Facebook Page ID, unlike `object: "page"` (Messenger)
+      // deliveries where entry.id genuinely is the Page ID. Resolving
+      // Instagram by page_id would never match any row, since
+      // meta_connections.page_id holds the Facebook Page's own id, not the
+      // linked IG account's id. Messenger's page_id-based lookup is
+      // unchanged.
       const product = channel === "messenger" ? "messenger" : "instagram";
 
-      const { data: connRow, error: connErr } = await supabaseAdmin
-        .from("meta_connections")
-        .select("org_id, access_token")
-        .eq("page_id", pageId)
-        .eq("product", product)
-        .maybeSingle();
+      // Instagram's row also needs its own page_id column selected here —
+      // deriving a Page access token (getMetaPageAccessToken) always
+      // requires the real Facebook Page id (GET /{page_id}?fields=
+      // access_token is a Page-scoped node lookup), never the IG Business
+      // Account id used above just to RESOLVE the connection. The `pageId`
+      // local variable at this point holds entry.id (= ig_actor_id for
+      // Instagram), which is the wrong id to derive a Page token from.
+      const { data: connRow, error: connErr } = await (
+        channel === "instagram"
+          ? supabaseAdmin.from("meta_connections").select("org_id, access_token, page_id").eq("ig_actor_id", pageId).eq("product", product)
+          : supabaseAdmin.from("meta_connections").select("org_id, access_token").eq("page_id", pageId).eq("product", product)
+      ).maybeSingle();
 
       if (connErr) {
         console.error(`[meta-webhook] meta_connections lookup error (${channel}):`, connErr.message);
@@ -370,36 +383,21 @@ async function processMessengerOrInstagramPayload(
         });
         contactId = resolution.contactId;
       } else {
-        // Instagram — UNCHANGED from before this task (no profile
-        // enrichment, no Lead creation; out of scope until Instagram's own
-        // live validation pass).
-        const idColumn = "instagram_igsid";
-
-        const { data: existingContact } = await supabaseAdmin
-          .from("contacts")
-          .select("id")
-          .eq("org_id", orgId)
-          .eq(idColumn, senderId)
-          .maybeSingle();
-
-        contactId = existingContact?.id ?? null;
-
-        if (!contactId) {
-          const { data: newContact, error: contactErr } = await supabaseAdmin
-            .from("contacts")
-            .insert({
-              org_id: orgId,
-              full_name: "Instagram Contact",
-              [idColumn]: senderId,
-            })
-            .select("id")
-            .maybeSingle();
-
-          if (contactErr) {
-            console.error(`[meta-webhook] contact insert error (${channel}):`, contactErr.message);
-          }
-          contactId = newContact?.id ?? null;
-        }
+        // Instagram Direct Contact Enrichment + First-Conversation Lead
+        // Creation — parity with Messenger, using ONLY fields/endpoints
+        // proven valid for this app's Facebook-Login Instagram architecture
+        // (see lib/meta-instagram-crm.ts). Best-effort by construction —
+        // never throws, so message persistence below always proceeds
+        // regardless of profile/Lead outcome.
+        const resolution = await resolveInstagramContactAndLead(supabaseAdmin, {
+          orgId,
+          // The real Facebook Page id (for Page-token derivation), NOT the
+          // `pageId` local var, which holds entry.id = ig_actor_id here.
+          pageId: (connRow as { page_id?: string | null } | null)?.page_id as string,
+          senderId,
+          connectionAccessTokenEncrypted: connRow!.access_token as string,
+        });
+        contactId = resolution.contactId;
       }
 
       const { error: insertErr } = await supabaseAdmin

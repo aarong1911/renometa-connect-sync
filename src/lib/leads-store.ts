@@ -151,16 +151,26 @@ export async function addLead(lead: Omit<Lead, "id">): Promise<Lead> {
   const tempId = `lead-${Date.now()}`;
 
   if (orgId) {
-    // Create contact first if we have name/phone
+    // Create/match a Contact for this Lead (Lead/Contact creation
+    // architecture audit — Contact/Lead avatar consistency pass). A Lead is
+    // a sales opportunity, never itself "becomes" a Contact — one Contact
+    // can and should own several Leads over time (e.g. Kitchen Remodel,
+    // then later Bathroom Remodel), so this always tries to REUSE an
+    // existing Contact before creating a new one.
     let contactId: string | null = null;
-    if (lead.name || lead.phone) {
+    if (lead.phone) {
+      // Exact match via the real (org_id, phone) unique constraint —
+      // unchanged from prior behavior. ON CONFLICT DO UPDATE (not
+      // ignoreDuplicates:true), so a matching existing Contact's
+      // name/email/address/source/labels get refreshed from this form,
+      // same as before this change.
       const { data: contact } = await supabase
         .from("contacts")
         .upsert(
           {
             org_id: orgId,
             full_name: lead.name || "Unknown",
-            phone: lead.phone || null,
+            phone: lead.phone,
             email: lead.email || null,
             address: lead.address || null,
             source: "manual",
@@ -170,7 +180,62 @@ export async function addLead(lead: Omit<Lead, "id">): Promise<Lead> {
         )
         .select("id")
         .single();
+      contactId = contact?.id ?? null;
+    } else if (lead.email) {
+      // No phone given — upserting on (org_id, phone) with phone: null
+      // would create a NEW Contact on every single call (Postgres never
+      // treats two NULLs as conflicting in a unique constraint), silently
+      // duplicating a Contact who already exists under this exact email
+      // (e.g. someone with a Messenger- or Meta-Lead-Ads-created Contact
+      // that has no phone on file). Falls back to an EXACT,
+      // case-insensitive email match instead — the same phone-then-email
+      // precedence already established for Meta Lead Ads ingestion (see
+      // netlify/functions/lib/meta-lead-ads.ts's findMatchingMetaContact).
+      // Deliberately NOT fuzzy and NEVER matches by name alone.
+      const { data: existingByEmail } = await supabase
+        .from("contacts")
+        .select("id")
+        .eq("org_id", orgId)
+        .ilike("email", lead.email)
+        .limit(1)
+        .maybeSingle();
 
+      if (existingByEmail) {
+        contactId = existingByEmail.id;
+      } else {
+        const { data: contact } = await supabase
+          .from("contacts")
+          .insert({
+            org_id: orgId,
+            full_name: lead.name || "Unknown",
+            phone: null,
+            email: lead.email,
+            address: lead.address || null,
+            source: "manual",
+            labels: ["Lead"],
+          })
+          .select("id")
+          .single();
+        contactId = contact?.id ?? null;
+      }
+    } else if (lead.name) {
+      // No phone, no email — nothing safe to match on (name-only matching
+      // is deliberately never attempted anywhere in this codebase, per the
+      // same rule Meta Lead Ads ingestion already follows). Creates a new
+      // Contact, same as this function always did for this case.
+      const { data: contact } = await supabase
+        .from("contacts")
+        .insert({
+          org_id: orgId,
+          full_name: lead.name,
+          phone: null,
+          email: null,
+          address: lead.address || null,
+          source: "manual",
+          labels: ["Lead"],
+        })
+        .select("id")
+        .single();
       contactId = contact?.id ?? null;
     }
 

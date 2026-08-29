@@ -2145,20 +2145,37 @@ function LeadDetailDrawer({
       <SheetContent className="w-full overflow-y-auto sm:max-w-xl [&>button.absolute]:hidden">
         <SheetHeader className="space-y-3 border-b border-border pb-4">
           <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0 flex-1 text-left">
-              <div className="mb-1.5 flex items-center gap-2">
-                <Badge variant={leadStatusBadgeVariant(lead.rawStatus ?? lead.status)} className="text-[10px]">
-                  {leadStatusLabel(lead.rawStatus ?? lead.status)}
-                </Badge>
-                <div className="flex items-center gap-1" title="Automatically estimated from budget and status — not manually saved.">
-                  <ScoreIcon className={`h-3.5 w-3.5 ${scoreCls}`} />
-                  <span className="text-[11px] capitalize text-muted-foreground">{lead.score}</span>
+            {/* Lead avatar (Contact/Lead avatar consistency fix) — a Lead
+                has no avatar of its own; this always resolves from the
+                linked Contact (contactId/contactAvatarUrl/contactAvatarKey,
+                see leads-store.ts), the same ContactAvatar precedence used
+                in Conversations/Contacts/the Leads table row. Falls back to
+                the Lead's own id/name seed only when there's no linked
+                Contact. */}
+            <div className="flex min-w-0 flex-1 items-start gap-3 text-left">
+              <ContactAvatar
+                id={lead.contactId || lead.id}
+                name={lead.name}
+                avatarUrl={lead.contactAvatarUrl}
+                avatarKey={lead.contactAvatarKey}
+                size="md"
+                className="mt-0.5"
+              />
+              <div className="min-w-0 flex-1">
+                <div className="mb-1.5 flex items-center gap-2">
+                  <Badge variant={leadStatusBadgeVariant(lead.rawStatus ?? lead.status)} className="text-[10px]">
+                    {leadStatusLabel(lead.rawStatus ?? lead.status)}
+                  </Badge>
+                  <div className="flex items-center gap-1" title="Automatically estimated from budget and status — not manually saved.">
+                    <ScoreIcon className={`h-3.5 w-3.5 ${scoreCls}`} />
+                    <span className="text-[11px] capitalize text-muted-foreground">{lead.score}</span>
+                  </div>
                 </div>
+                <SheetTitle className="text-base leading-snug">{lead.name}</SheetTitle>
+                <SheetDescription className="mt-0.5 text-xs">
+                  {leadSourceLabel(lead.source)} · Owned by {ownerName}
+                </SheetDescription>
               </div>
-              <SheetTitle className="text-base leading-snug">{lead.name}</SheetTitle>
-              <SheetDescription className="mt-0.5 text-xs">
-                {leadSourceLabel(lead.source)} · Owned by {ownerName}
-              </SheetDescription>
             </div>
             <div className="text-right">
               <div className="text-xl font-semibold tabular-nums">{formatMoney(lead.estimatedBudget)}</div>

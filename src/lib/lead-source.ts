@@ -107,7 +107,8 @@ export type CanonicalLeadSource =
   | "phone_call"
   | "sms"
   | "email"
-  | "messenger";
+  | "messenger"
+  | "instagram";
 
 export const LEAD_SOURCE_LABELS: Record<CanonicalLeadSource, string> = {
   google_ads: "Google Ads",
@@ -126,6 +127,10 @@ export const LEAD_SOURCE_LABELS: Record<CanonicalLeadSource, string> = {
   // built-ins) so it renders at the end of the "Owned" channel group in the
   // Leads source filter without disturbing that group's existing order.
   messenger: "Messenger",
+  // Instagram Direct CRM Integration — 11th built-in, same reasoning as
+  // Messenger: Instagram now creates real Leads (source = "instagram",
+  // exact stored value — see lib/meta-instagram-crm.ts). Appended last.
+  instagram: "Instagram",
 };
 
 // Single ordered source-options export (Lead Source Filter Enhancement) —
@@ -182,6 +187,8 @@ const LEAD_SOURCE_CANONICAL_ALIASES: Record<string, string> = {
   email: "email",
   // Messenger
   messenger: "messenger",
+  // Instagram
+  instagram: "instagram",
   // Legacy built-ins (pre-refinement) — retained only for historical-data
   // casing consistency, never offered as new choices.
   "cold call": "cold_call",

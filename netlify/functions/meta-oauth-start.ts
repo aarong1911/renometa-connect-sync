@@ -45,7 +45,12 @@ const PRODUCT_SCOPES: Record<string, string[]> = {
   // on Messenger from Meta" is enabled and Meta's permissions screen shows
   // pages_messaging as "Ready for testing".
   "fb-messenger": ["pages_messaging", "pages_show_list", "pages_manage_metadata", "business_management"],
-  "instagram-direct": ["instagram_basic", "instagram_manage_messages", "pages_show_list", "pages_manage_metadata", "business_management"],
+  // pages_read_engagement added (Instagram Facebook-Login messaging audit)
+  // — Meta's Instagram API setup lists this as a required permission for
+  // messaging under this app's current architecture (Facebook Login +
+  // linked IG professional account), separate from the pages_manage_metadata
+  // this repo also needs internally for its own /subscribed_apps call.
+  "instagram-direct": ["instagram_basic", "instagram_manage_messages", "pages_read_engagement", "pages_show_list", "pages_manage_metadata", "business_management"],
   "meta-lead-ads": ["pages_show_list", "pages_manage_ads", "pages_manage_metadata", "pages_read_engagement", "business_management", "leads_retrieval"],
   "meta-ads": ["ads_management", "ads_read", "business_management"],
 };
