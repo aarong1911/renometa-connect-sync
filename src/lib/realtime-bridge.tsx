@@ -23,18 +23,17 @@
 // appointments were explicitly OUT of scope for S1.
 //
 // S2B adds ONE more: deal_activities INSERT -> Pipeline Pulse. This is the
-// only Command Center table added to the bridge — audited against the same
-// "clearly server-mutated, safely org-filterable, materially improves
-// freshness" bar as everything else here. projects/deals themselves
-// do NOT need a subscription: Active Projects, Pipeline Value,
-// and the Live Pipeline donut all read canonical useProjects()/
-// useDeals() (useSyncExternalStore singletons that already emit on every
-// mutation made through their own store functions), so they're already
-// live with zero realtime wiring. invoices/appointments/tasks-for-Recent-
-// Activity remain plain Query-backed reads with staleTime + focus-refetch,
-// not bridge subscriptions — none of them are being actively written by
-// another live user/session often enough during a single dashboard
-// viewing to justify a dedicated channel; see the S2B report.
+// only Command Center table added to the bridge at that phase — audited
+// against the same "clearly server-mutated, safely org-filterable,
+// materially improves freshness" bar as everything else here. At S2B time,
+// projects/deals were still useSyncExternalStore singletons (already live
+// with zero realtime wiring); both have since been migrated to Query (deals
+// in S4A, projects in S4B — see below) and now DO have subscriptions.
+// invoices/appointments/tasks-for-Recent-Activity remain plain Query-backed
+// reads with staleTime + focus-refetch, not bridge subscriptions — none of
+// them are being actively written by another live user/session often
+// enough during a single dashboard viewing to justify a dedicated channel;
+// see the S2B report.
 //
 // S3 (Contacts + Leads migration) promotes `contacts` from an UPDATE-only
 // conversation-name shim to a full INSERT/UPDATE/DELETE subscription, and
@@ -64,6 +63,18 @@
 // through Settings → Pipelines (rare, same-session), which invalidates
 // `["deals"]` itself; a cross-tab stage-config edit is caught by
 // focus-refetch. The DELETE-filter caveat above applies to `deals` too.
+//
+// S4B (Projects migration) adds `projects` INSERT/UPDATE/DELETE. Projects
+// is now TanStack Query-backed (projects-store.ts's `queryKeys.projects
+// (orgId)` list), so a Project written from a second tab or a server
+// process must invalidate it here. Fan-out:
+//   projects.* -> projects, dashboard.summary (Active Projects KPI /
+//                 Recent Activity "Project created" / Needs Attention
+//                 Projects rollup — that rollup reads useProjects()
+//                 directly for names, so invalidating `projects` alone
+//                 already refreshes it; dashboard.summary is included for
+//                 Recent Activity/the vs-last-month baseline).
+// Same DELETE-filter caveat as contacts/leads/deals above.
 //
 // Never logs row payloads (message bodies, contact PII) — every handler
 // below only ever logs the table name and event type, both safe.
@@ -115,6 +126,12 @@ export function RealtimeBridge(): null {
       // S4A: Deals/Pipeline is Query-backed (deals-store.ts). Refresh the
       // shared sales bundle + the Command Center's deal-derived numbers.
       queryClient.invalidateQueries({ queryKey: queryKeys.deals(orgId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.summary(orgId) });
+    };
+    const invalidateProjects = () => {
+      // S4B: Projects is Query-backed (projects-store.ts). Refresh the
+      // shared list + the Command Center numbers derived from it.
+      queryClient.invalidateQueries({ queryKey: queryKeys.projects(orgId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.summary(orgId) });
     };
     const invalidatePipelinePulse = () => {
@@ -194,6 +211,21 @@ export function RealtimeBridge(): null {
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "deal_activities", filter: `org_id=eq.${orgId}` },
         () => invalidatePipelinePulse(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "projects", filter: `org_id=eq.${orgId}` },
+        () => invalidateProjects(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "projects", filter: `org_id=eq.${orgId}` },
+        () => invalidateProjects(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "projects" },
+        () => invalidateProjects(),
       )
       .subscribe();
 

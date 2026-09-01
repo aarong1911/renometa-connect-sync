@@ -169,11 +169,15 @@ function patchContactsCache(fn: (list: Contact[]) => Contact[]) {
  *
  * A Contact's name/avatar/tags render in: the Contacts list, Conversations
  * rows, Leads' Contact enrichment, Command Center Recent-Activity avatars,
- * and — since S4A — Pipeline Deal cards / Deal drawer (deals-store.ts's
- * `["deals"]` bundle re-enriches its linked Contact on refetch). All of
- * those are Query-backed now, so a plain prefix invalidation covers them.
- * Projects are still a useSyncExternalStore singleton (not migrated yet),
- * so that one keeps its lazy `refreshProjects()` bridge until S4B.
+ * Pipeline Deal cards / Deal drawer (S4A — deals-store.ts's `["deals"]`
+ * bundle re-enriches its linked Contact on refetch), and — since S4B —
+ * Projects (projects-store.ts's `["projects"]` list embeds `client_name`
+ * via a server-side join, refreshed the same way; a linked Contact's
+ * AVATAR on Project surfaces was already independent of this store, since
+ * Project cards resolve it by joining the separately-loaded useContacts()
+ * list client-side rather than storing avatar fields on Project itself).
+ * All Contact-dependent domains are Query-backed now, so a plain prefix
+ * invalidation covers them — no more cross-store dynamic-import bridges.
  *
  * Deliberately scoped — NOT an invalidate-everything.
  */
@@ -183,10 +187,8 @@ function invalidateContactDependents() {
   void qc.invalidateQueries({ queryKey: ["conversations"] });
   void qc.invalidateQueries({ queryKey: ["leads"] });
   void qc.invalidateQueries({ queryKey: ["deals"] });
+  void qc.invalidateQueries({ queryKey: ["projects"] });
   void qc.invalidateQueries({ queryKey: ["dashboard"] });
-  // Projects are NOT Query-backed yet (S4B) — keep the lazy store refresh.
-  // Lazy import → no load-order/circular concern; failures are inert.
-  void import("@/lib/projects-store").then((m) => m.refreshProjects()).catch(() => {});
 }
 
 // ── Public hooks (unchanged shape) ──

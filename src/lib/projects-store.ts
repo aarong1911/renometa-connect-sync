@@ -1,9 +1,59 @@
 // src/lib/projects-store.ts
-import { useEffect, useSyncExternalStore } from "react";
+//
+// Platform State Sync Phase S4B — Projects shared server state.
+//
+// BEFORE S4B: a module-level `projects` array + a listener Set + `emit()` +
+// `useSyncExternalStore`, hydrated once by a top-level `void fetchProjects()`
+// call at import time. No realtime coverage; every mutation patched the
+// singleton locally after its own DB write.
+//
+// AFTER S4B: one TanStack Query per org (`queryKeys.projects(orgId)`).
+// `useProjects()` keeps its EXACT public shape — `{ projects, loading,
+// reload }`, not a bare array (unlike useContacts()/useDeals()/useLeads())
+// — as a thin wrapper over `useQuery`. `useProjectsLoading()` and
+// `getProjectName()` are preserved too. Every consumer (Projects page,
+// Command Center Active Projects KPI + Needs Attention Projects rollup,
+// Deal drawer's "Create Project", Files, Calendar, Tasks' project picker,
+// entity pickers, insights) reads the same cached list. The imperative
+// mutation functions (`createProject`/`updateProject`/`updateProjectStatus`)
+// keep their exact signatures; after a confirmed DB write they patch +
+// invalidate the shared client (query-client.ts / getQueryClient()) instead
+// of mutating the singleton. The central RealtimeBridge now also
+// invalidates `queryKeys.projects(orgId)` on any `projects` row change.
+//
+// UNCHANGED by S4B:
+//  - `mapProjectRow` normalisation (same server-side join for client_name —
+//    `contacts!client_id(full_name)` — same owner-profile join)
+//  - the completion_percentage / status transition rules in project-status.ts
+//  - the "Project marked Completed" / "progress updated" system notes
+//  - `triggerWorkflow("project_status_changed", …)`
+//  - Tasks' own architecture (still a separate useSyncExternalStore store,
+//    S4C) — Projects reads NO task data itself; task counts/overdue/next-
+//    task shown on Project cards are computed by the CONSUMING components
+//    from useTasks(), not from this store
+//  - Contact avatar resolution — Project surfaces (Projects page, Command
+//    Center) already resolve a linked Contact's avatar_url/avatar_key by
+//    joining the separately-loaded useContacts() list client-side (the
+//    Project type itself carries no avatar fields, only client_id/
+//    client_name), so avatar freshness was already independent of this
+//    store; only `client_name` (embedded via the server-side join at fetch
+//    time) depended on the old refreshProjects() bridge — see PART 19 below.
+
+import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
+import { getQueryClient } from "@/lib/query-client";
+import { useOrgId } from "@/lib/org-id";
+import { queryKeys } from "@/lib/query-keys";
 import type { ProjectType, ProjectPriority, BudgetRange } from "@/lib/project-status";
 import { getProgressAfterStageChange, isProgressManual } from "@/lib/project-status";
 
+// Canonical runtime status union (S4B audit): confirmed against actual DB
+// writes AND UI (STATUS_SELECT_OPTIONS in projects.index.tsx offers all 8;
+// PROJECT_STATUS_LABELS in project-status.ts labels all 8) — NOT stale.
+// "planning"/"contracted"/"pre-construction"/"active"/"punch-list" are the
+// normal board-progression statuses; "on-hold"/"cancelled"/"completed" are
+// reachable via the Edit form's status select but aren't columns on the
+// Projects board. No correction needed here; see the S4B report.
 export type ProjectStatus =
   | "planning"
   | "contracted"
@@ -102,81 +152,99 @@ export function mapProjectRow(row: any): Project {
   };
 }
 
-let projects: Project[] = [];
-let loaded = false;
+const PROJECT_SELECT = "*, contacts!client_id(full_name), owner_profile:profiles!owner_id(first_name,last_name,email)";
 
-const listeners = new Set<() => void>();
-
-function emit() {
-  for (const listener of listeners) listener();
-}
-
-async function fetchProjects() {
-  const orgId = await getOrgId();
-
-  if (!orgId) {
-    projects = [];
-    loaded = true;
-    emit();
-    return;
-  }
-
+/**
+ * The Projects list queryFn — org-scoped, newest-first, with client_name
+ * and owner name resolved via the same server-side joins the pre-S4B store
+ * used. Self-contained (no React, no other query's cache) so it is safe to
+ * run from `useQuery` or an imperative `refetchQueries`.
+ */
+export async function fetchProjectsForOrg(orgId: string): Promise<Project[]> {
   const { data, error } = await supabase
     .from("projects")
-    .select("*, contacts!client_id(full_name), owner_profile:profiles!owner_id(first_name,last_name,email)")
+    .select(PROJECT_SELECT)
     .eq("org_id", orgId)
     .order("created_at", { ascending: false });
 
   if (error) {
     console.error("[projects-store] fetch failed:", JSON.stringify(error, null, 2));
-    loaded = true;
-    emit();
-    return;
+    throw error;
   }
-
-  projects = (data ?? []).map(mapProjectRow);
-  loaded = true;
-  emit();
+  return (data ?? []).map(mapProjectRow);
 }
 
-void fetchProjects();
+// ── Query cache helpers ──────────────────────────────────────────────────
+
+const qc = () => getQueryClient();
+
+/** Read the currently-cached Projects list (any org key — normally exactly one). Read-only; used by mutations that need to resolve the pre-write row. */
+function getCachedProjects(): Project[] {
+  const entries = qc().getQueriesData<Project[]>({ queryKey: ["projects"] });
+  for (const [, data] of entries) {
+    if (Array.isArray(data)) return data;
+  }
+  return [];
+}
+
+/** Immediately reflect a CONFIRMED change into the cached Projects list(s) — only ever called with real persisted data, never speculatively. */
+function patchProjectsCache(fn: (list: Project[]) => Project[]) {
+  qc().setQueriesData<Project[]>({ queryKey: ["projects"] }, (old) => (Array.isArray(old) ? fn(old) : old));
+}
+
+function invalidateProjects() {
+  void qc().invalidateQueries({ queryKey: ["projects"] });
+}
+
+/** A new Project affects Command Center's Recent Activity (projects.created_at) and the "vs last month" baseline — not needed for status/edit writes, which the Active Projects KPI and Needs Attention rollup already pick up by reading useProjects() directly. */
+function invalidateProjectsWithDashboard() {
+  void qc().invalidateQueries({ queryKey: ["projects"] });
+  void qc().invalidateQueries({ queryKey: ["dashboard"] });
+}
+
+// ── Public hook (unchanged shape: { projects, loading, reload }) ──────────
+
+function useProjectsQuery() {
+  const orgId = useOrgId();
+  return useQuery({
+    queryKey: orgId ? queryKeys.projects(orgId) : ["projects", "_pending"],
+    queryFn: () => fetchProjectsForOrg(orgId as string),
+    enabled: !!orgId,
+    // Projects change less often than Deals/Leads — realtime + mutation
+    // invalidation are the primary freshness path, staleTime just caps
+    // redundant refetches on remount/focus churn.
+    staleTime: 75_000,
+  });
+}
 
 export function useProjects(): { projects: Project[]; loading: boolean; reload: () => void } {
-  useEffect(() => {
-    if (!loaded) void fetchProjects();
-  }, []);
-
-  const data = useSyncExternalStore(
-    (callback) => {
-      listeners.add(callback);
-      return () => listeners.delete(callback);
-    },
-    () => projects,
-    () => [],
-  );
-
-  return { projects: data, loading: !loaded, reload: () => void fetchProjects() };
+  const query = useProjectsQuery();
+  return {
+    projects: query.data ?? [],
+    loading: query.isLoading,
+    reload: () => { void query.refetch(); },
+  };
 }
 
 export function useProjectsLoading(): boolean {
-  return !loaded;
+  return useProjectsQuery().isLoading;
 }
 
 export function getProjectName(projectId: string): string {
-  return projects.find((project) => project.id === projectId)?.name ?? "Unassigned";
+  return getCachedProjects().find((project) => project.id === projectId)?.name ?? "Unassigned";
 }
 
-export function getProjects(): Project[] { return projects; }
-
-export async function refreshProjects() {
-  await fetchProjects();
+export async function refreshProjects(): Promise<void> {
+  await qc().refetchQueries({ queryKey: ["projects"] });
 }
+
+// ── Imperative mutations (unchanged signatures) ─────────────────────────────
 
 export async function updateProjectStatus(
   id: string,
   status: ProjectStatus,
 ): Promise<{ error: any }> {
-  const prev = projects.find((p) => p.id === id);
+  const prev = getCachedProjects().find((p) => p.id === id);
   const nextProgress = getProgressAfterStageChange({ currentProgress: prev?.completion_percentage, nextStatus: status });
 
   // Ordinary stage movement never writes completion_percentage (stays
@@ -193,8 +261,10 @@ export async function updateProjectStatus(
         project_id: id, author: "System", body: "Project marked Completed — progress set to 100%.",
       }).then(({ error: noteErr }) => { if (noteErr) console.error("[projects-store] completion note failed:", noteErr); });
     }
-    projects = projects.map((p) => (p.id === id ? { ...p, status, completion_percentage: status === "completed" ? nextProgress : p.completion_percentage } : p));
-    emit();
+    patchProjectsCache((list) =>
+      list.map((p) => (p.id === id ? { ...p, status, completion_percentage: status === "completed" ? nextProgress : p.completion_percentage } : p)),
+    );
+    invalidateProjects();
     const { triggerWorkflow } = await import("@/lib/trigger-workflow");
     triggerWorkflow("project_status_changed", {
       project: { id, name: prev.name }, fromStage: prev.status, toStage: status,
@@ -261,7 +331,7 @@ export async function createProject(input: CreateProjectInput): Promise<{ error:
   const { data, error } = await supabase
     .from("projects")
     .insert(payload)
-    .select("*, contacts!client_id(full_name), owner_profile:profiles!owner_id(first_name,last_name,email)")
+    .select(PROJECT_SELECT)
     .single();
 
   if (error || !data) {
@@ -270,8 +340,8 @@ export async function createProject(input: CreateProjectInput): Promise<{ error:
   }
 
   const project = mapProjectRow(data);
-  projects = [project, ...projects];
-  emit();
+  patchProjectsCache((list) => [project, ...list.filter((p) => p.id !== project.id)]);
+  invalidateProjectsWithDashboard();
   return { error: null, project };
 }
 
@@ -297,7 +367,7 @@ export type UpdateProjectInput = Partial<{
 
 /** Canonical partial-update writer for an existing Project — Phase 13.5 expanded this to the full editable field set (Phase 13.2's Description/Scope + Project Type and 13.4's Completion Percentage were the only fields before). Status is deliberately NOT here — updateProjectStatus() owns status transitions, progress-on-completion, and the one status activity note, so callers changing status must call that separately rather than smuggling `status` through this payload (see the Phase 13.5 report). */
 export async function updateProject(id: string, patch: UpdateProjectInput): Promise<{ error: any; project?: Project }> {
-  const prev = projects.find((p) => p.id === id);
+  const prev = getCachedProjects().find((p) => p.id === id);
   const payload: Record<string, any> = {};
   if (patch.name !== undefined) payload.name = patch.name;
   if (patch.clientId !== undefined) payload.client_id = patch.clientId;
@@ -321,7 +391,7 @@ export async function updateProject(id: string, patch: UpdateProjectInput): Prom
     .from("projects")
     .update(payload)
     .eq("id", id)
-    .select("*, contacts!client_id(full_name), owner_profile:profiles!owner_id(first_name,last_name,email)")
+    .select(PROJECT_SELECT)
     .single();
 
   if (error || !data) {
@@ -330,8 +400,8 @@ export async function updateProject(id: string, patch: UpdateProjectInput): Prom
   }
 
   const project = mapProjectRow(data);
-  projects = projects.map((p) => (p.id === id ? project : p));
-  emit();
+  patchProjectsCache((list) => list.map((p) => (p.id === id ? project : p)));
+  invalidateProjects();
 
   // One activity note per manual progress change — never alongside the
   // separate "marked Completed" note updateProjectStatus() writes, since

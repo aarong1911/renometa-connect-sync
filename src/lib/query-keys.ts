@@ -45,6 +45,11 @@ export const queryKeys = {
   // list — never a query per stage.
   deals: (orgId: string) => ["deals", orgId] as const,
 
+  // Platform State Sync Phase S4B — Projects. One key per org; the Projects
+  // page derives its status-grouped board columns/filters client-side from
+  // this single list (never a query per status). See projects-store.ts.
+  projects: (orgId: string) => ["projects", orgId] as const,
+
   conversations: {
     /**
      * Prefix/parent key — never used as an actual useQuery key itself
