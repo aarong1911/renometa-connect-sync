@@ -1,7 +1,41 @@
 // src/lib/deals-store.ts
+//
+// Platform State Sync Phase S4A — Deals / Pipeline shared server state.
+//
+// BEFORE S4A: three module-level singletons (`deals`, `pipelines`,
+// `stages`) + three listener Sets + three `emit*()` fns + `useSyncExternalStore`,
+// all hydrated by one `fetchSalesData()` (`loaded`/`loadingPromise` guard).
+// No realtime coverage; every mutation re-ran the whole `fetchSalesData()`.
+//
+// AFTER S4A: ONE TanStack Query per org (`queryKeys.deals(orgId)`) whose
+// payload is the same co-loaded bundle `{ deals, pipelines, stages }` the
+// old store hydrated together (a Deal can't be mapped without its stage,
+// and every screen that reads deals also reads stages). `useDeals()`,
+// `usePipelines()`, `usePipelineStages()` keep their EXACT public shapes —
+// they're now thin slices of that one shared query, so every consumer
+// (Pipeline board, Deal drawer, Leads, Inbox, Command Center, entity
+// pickers, account/contact related tabs) reads the same cache. The
+// imperative mutation functions keep their signatures; after a confirmed DB
+// write + `deal_activities` log they invalidate `["deals"]` (+ scoped
+// dependents) on the shared client instead of calling `fetchSalesData()`.
+// The central RealtimeBridge now also invalidates `queryKeys.deals(orgId)`
+// on any `deals` row change.
+//
+// UNCHANGED by S4A:
+//  - `mapDeal` / `mapStage` / `resolveDealStatusForOutcome` normalisation
+//  - `logDealActivity` and every activity it writes (created / stage_changed
+//    / won / lost / updated / contact_linked / contact_unlinked) — Pipeline
+//    Pulse and Recent Activity depend on these
+//  - the `convert_lead_to_deal` RPC path (server-side; `upsertDealFromCanonical`
+//    just reflects its result into the cache)
+//  - `getDealActivities` / `getDealContacts` one-off reads
+//  - all Pipeline Settings CRUD behaviour (pipelines / stages)
 
-import { useEffect, useSyncExternalStore } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
+import { getQueryClient } from "@/lib/query-client";
+import { useOrgId } from "@/lib/org-id";
+import { queryKeys } from "@/lib/query-keys";
 import type {
   AddDealInput,
   CreateDealInput,
@@ -130,25 +164,14 @@ const FALLBACK_STAGES: SalesPipelineStage[] = [
   updatedAt: "",
 }));
 
-let deals: Deal[] = [];
-let pipelines: SalesPipeline[] = [];
-let stages: SalesPipelineStage[] = [...FALLBACK_STAGES];
-let loaded = false;
-let loadingPromise: Promise<void> | null = null;
+// ── The co-loaded sales bundle (one Query payload) ────────────────────────
+export type SalesData = {
+  deals: Deal[];
+  pipelines: SalesPipeline[];
+  stages: SalesPipelineStage[];
+};
 
-const dealListeners = new Set<() => void>();
-const pipelineListeners = new Set<() => void>();
-const stageListeners = new Set<() => void>();
-
-function emitDeals() {
-  for (const listener of dealListeners) listener();
-}
-function emitPipelines() {
-  for (const listener of pipelineListeners) listener();
-}
-function emitStages() {
-  for (const listener of stageListeners) listener();
-}
+const EMPTY_SALES: SalesData = { deals: [], pipelines: [], stages: [...FALLBACK_STAGES] };
 
 function slugify(value: string): string {
   return value
@@ -388,123 +411,141 @@ export function mapDeal(args: {
   };
 }
 
-async function fetchSalesData(): Promise<void> {
-  if (loadingPromise) return loadingPromise;
-  loadingPromise = (async () => {
-    const orgId = await getOrgId();
-    if (!orgId) {
-      deals = [];
-      pipelines = [];
-      stages = [...FALLBACK_STAGES];
-      loaded = true;
-      emitDeals();
-      emitPipelines();
-      emitStages();
-      return;
-    }
+/**
+ * The sales bundle queryFn — org-scoped pipelines + stages + fully-enriched
+ * deals (contact / company / owner batch sub-selects, exactly as the pre-S4A
+ * store did). Self-contained (no React, no other query's cache) so it is
+ * safe to run from `useQuery`, `ensureQueryData`, or `refetchQueries`.
+ */
+export async function fetchSalesDataForOrg(orgId: string): Promise<SalesData> {
+  const [pipelineResult, stageResult, dealResult] = await Promise.all([
+    supabase
+      .from("pipelines")
+      .select("*")
+      .eq("org_id", orgId)
+      .eq("is_active", true)
+      .order("is_default", { ascending: false })
+      .order("created_at", { ascending: true }),
+    supabase.from("pipeline_stages").select("*").order("position", { ascending: true }),
+    supabase
+      .from("deals")
+      .select("*")
+      .eq("org_id", orgId)
+      .order("stage_order", { ascending: true })
+      .order("created_at", { ascending: false }),
+  ]);
+  if (pipelineResult.error) throw pipelineResult.error;
+  if (stageResult.error) throw stageResult.error;
+  if (dealResult.error) throw dealResult.error;
 
-    const [pipelineResult, stageResult, dealResult] = await Promise.all([
-      supabase
-        .from("pipelines")
-        .select("*")
-        .eq("org_id", orgId)
-        .eq("is_active", true)
-        .order("is_default", { ascending: false })
-        .order("created_at", { ascending: true }),
-      supabase.from("pipeline_stages").select("*").order("position", { ascending: true }),
-      supabase
-        .from("deals")
-        .select("*")
-        .eq("org_id", orgId)
-        .order("stage_order", { ascending: true })
-        .order("created_at", { ascending: false }),
-    ]);
-    if (pipelineResult.error) throw pipelineResult.error;
-    if (stageResult.error) throw stageResult.error;
-    if (dealResult.error) throw dealResult.error;
+  const pipelines = (pipelineResult.data ?? []).map(mapPipeline);
+  const pipelineIds = new Set(pipelines.map((pipeline) => pipeline.id));
+  const mappedStages = (stageResult.data ?? [])
+    .filter((row: any) => pipelineIds.has(row.pipeline_id))
+    .map(mapStage);
+  const stages = mappedStages.length ? mappedStages : [...FALLBACK_STAGES];
 
-    pipelines = (pipelineResult.data ?? []).map(mapPipeline);
-    const pipelineIds = new Set(pipelines.map((pipeline) => pipeline.id));
-    const mappedStages = (stageResult.data ?? [])
-      .filter((row: any) => pipelineIds.has(row.pipeline_id))
-      .map(mapStage);
-    stages = mappedStages.length ? mappedStages : [...FALLBACK_STAGES];
+  const rows = (dealResult.data ?? []) as SupabaseDealRow[];
+  const contactIds = [...new Set(rows.map((row) => row.contact_id).filter(Boolean))] as string[];
+  const companyIds = [...new Set(rows.map((row) => row.company_id).filter(Boolean))] as string[];
+  const ownerIds = [...new Set(rows.map((row) => row.assigned_to).filter(Boolean))] as string[];
 
-    const rows = (dealResult.data ?? []) as SupabaseDealRow[];
-    const contactIds = [...new Set(rows.map((row) => row.contact_id).filter(Boolean))] as string[];
-    const companyIds = [...new Set(rows.map((row) => row.company_id).filter(Boolean))] as string[];
-    const ownerIds = [...new Set(rows.map((row) => row.assigned_to).filter(Boolean))] as string[];
+  const [contactsResult, companiesResult, profilesResult] = await Promise.all([
+    contactIds.length
+      ? supabase
+          .from("contacts")
+          .select(
+            "id, full_name, email, phone, address, company_id, company, avatar_key, avatar_url",
+          )
+          .eq("org_id", orgId)
+          .in("id", contactIds)
+      : Promise.resolve({ data: [], error: null }),
+    companyIds.length
+      ? supabase
+          .from("companies")
+          .select("id, name, slug, logo_url, email, phone, address, city, state")
+          .eq("org_id", orgId)
+          .in("id", companyIds)
+      : Promise.resolve({ data: [], error: null }),
+    ownerIds.length
+      ? supabase
+          .from("profiles")
+          .select("id, first_name, last_name, email, avatar_url")
+          .in("id", ownerIds)
+      : Promise.resolve({ data: [], error: null }),
+  ]);
+  if (contactsResult.error) throw contactsResult.error;
+  if (companiesResult.error) throw companiesResult.error;
+  if (profilesResult.error) throw profilesResult.error;
 
-    const [contactsResult, companiesResult, profilesResult] = await Promise.all([
-      contactIds.length
-        ? supabase
-            .from("contacts")
-            .select(
-              "id, full_name, email, phone, address, company_id, company, avatar_key, avatar_url",
-            )
-            .eq("org_id", orgId)
-            .in("id", contactIds)
-        : Promise.resolve({ data: [], error: null }),
-      companyIds.length
-        ? supabase
-            .from("companies")
-            .select("id, name, slug, logo_url, email, phone, address, city, state")
-            .eq("org_id", orgId)
-            .in("id", companyIds)
-        : Promise.resolve({ data: [], error: null }),
-      ownerIds.length
-        ? supabase
-            .from("profiles")
-            .select("id, first_name, last_name, email, avatar_url")
-            .in("id", ownerIds)
-        : Promise.resolve({ data: [], error: null }),
-    ]);
-    if (contactsResult.error) throw contactsResult.error;
-    if (companiesResult.error) throw companiesResult.error;
-    if (profilesResult.error) throw profilesResult.error;
+  const contactsById = Object.fromEntries(
+    ((contactsResult.data ?? []) as ContactRow[]).map((row) => [row.id, row]),
+  );
+  const companiesById = Object.fromEntries(
+    ((companiesResult.data ?? []) as CompanyRow[]).map((row) => [row.id, row]),
+  );
+  const profilesById = Object.fromEntries(
+    ((profilesResult.data ?? []) as ProfileRow[]).map((row) => [row.id, row]),
+  );
+  const stagesById = Object.fromEntries(
+    stages.filter((stage) => stage.id.length > 20).map((stage) => [stage.id, stage]),
+  );
+  const deals = rows.map((row) =>
+    mapDeal({ row, contactsById, companiesById, profilesById, stagesById }),
+  );
 
-    const contactsById = Object.fromEntries(
-      ((contactsResult.data ?? []) as ContactRow[]).map((row) => [row.id, row]),
-    );
-    const companiesById = Object.fromEntries(
-      ((companiesResult.data ?? []) as CompanyRow[]).map((row) => [row.id, row]),
-    );
-    const profilesById = Object.fromEntries(
-      ((profilesResult.data ?? []) as ProfileRow[]).map((row) => [row.id, row]),
-    );
-    const stagesById = Object.fromEntries(
-      stages.filter((stage) => stage.id.length > 20).map((stage) => [stage.id, stage]),
-    );
-    deals = rows.map((row) =>
-      mapDeal({ row, contactsById, companiesById, profilesById, stagesById }),
-    );
-    loaded = true;
-    emitDeals();
-    emitPipelines();
-    emitStages();
-  })()
-    .catch((error) => {
-      console.error("[deals-store] fetch failed:", error);
-      loaded = true;
-      emitDeals();
-      emitPipelines();
-      emitStages();
-      throw error;
-    })
-    .finally(() => {
-      loadingPromise = null;
-    });
-  return loadingPromise;
+  return { deals, pipelines, stages };
 }
 
-function resolveStageBySlug(slug?: string | null) {
+// ── Query cache helpers (module-level; the shared client is one instance) ──
+
+const qc = () => getQueryClient();
+
+/** Read the currently-cached sales bundle (any org key — normally exactly one). Read-only; used by mutations that need to resolve a stage/pipeline before writing. */
+function getCachedSalesData(): SalesData {
+  const entries = qc().getQueriesData<SalesData>({ queryKey: ["deals"] });
+  for (const [, data] of entries) {
+    if (data) return data;
+  }
+  return EMPTY_SALES;
+}
+
+/** Guarantee the sales bundle is loaded (fetch once if missing), then return it — the Query-backed replacement for the old `ensureSalesDataLoaded()`. */
+async function ensureSalesData(): Promise<SalesData> {
+  const orgId = await getOrgId();
+  if (!orgId) return EMPTY_SALES;
+  return qc().ensureQueryData({
+    queryKey: queryKeys.deals(orgId),
+    queryFn: () => fetchSalesDataForOrg(orgId),
+  });
+}
+
+/** Immediately reflect a CONFIRMED change into the cached bundle so the UI updates before the reconciling refetch. Only ever called with real persisted data. */
+function patchSalesCache(fn: (data: SalesData) => SalesData) {
+  qc().setQueriesData<SalesData>({ queryKey: ["deals"] }, (old) => (old ? fn(old) : old));
+}
+
+function invalidateDeals() {
+  void qc().invalidateQueries({ queryKey: ["deals"] });
+}
+
+/**
+ * Deal change that also moves Command Center numbers (Pipeline Value KPI,
+ * Live Pipeline donut, Needs Attention Deals). Pipeline Pulse is NOT here —
+ * it reads `deal_activities`, whose INSERT already invalidates
+ * dashboard.pipelinePulse via the RealtimeBridge. Scoped fan-out — not
+ * invalidate-all.
+ */
+function invalidateDealsWithDependents() {
+  void qc().invalidateQueries({ queryKey: ["deals"] });
+  void qc().invalidateQueries({ queryKey: ["dashboard"] });
+}
+
+function resolveStageBySlug(stages: SalesPipelineStage[], slug?: string | null) {
   return slug ? (stages.find((stage) => stage.slug === slug) ?? null) : null;
 }
-function resolveStageById(id?: string | null) {
+function resolveStageById(stages: SalesPipelineStage[], id?: string | null) {
   return id ? (stages.find((stage) => stage.id === id) ?? null) : null;
-}
-async function ensureSalesDataLoaded() {
-  if (!loaded) await fetchSalesData();
 }
 
 async function findOrCreateContact(orgId: string, input: CreateDealInput): Promise<string | null> {
@@ -571,57 +612,37 @@ async function logDealActivity(args: {
   if (error) console.error("[deals-store] activity logging failed:", error);
 }
 
-export function getDeals() {
-  return deals;
-}
-export function useDeals() {
-  useEffect(() => {
-    if (!loaded) void fetchSalesData();
-  }, []);
-  return useSyncExternalStore(
-    (callback) => {
-      dealListeners.add(callback);
-      return () => dealListeners.delete(callback);
-    },
-    () => deals,
-    () => [],
-  );
-}
-export function getPipelines() {
-  return pipelines;
-}
-export function usePipelines() {
-  useEffect(() => {
-    if (!loaded) void fetchSalesData();
-  }, []);
-  return useSyncExternalStore(
-    (callback) => {
-      pipelineListeners.add(callback);
-      return () => pipelineListeners.delete(callback);
-    },
-    () => pipelines,
-    () => [],
-  );
-}
-export function getPipelineStages() {
-  return stages;
-}
-export function usePipelineStages() {
-  useEffect(() => {
-    if (!loaded) void fetchSalesData();
-  }, []);
-  return useSyncExternalStore(
-    (callback) => {
-      stageListeners.add(callback);
-      return () => stageListeners.delete(callback);
-    },
-    () => stages,
-    () => FALLBACK_STAGES,
-  );
+// ── Public hooks (unchanged shapes) ──────────────────────────────────────
+
+function useSalesData() {
+  const orgId = useOrgId();
+  return useQuery({
+    queryKey: orgId ? queryKeys.deals(orgId) : ["deals", "_pending"],
+    queryFn: () => fetchSalesDataForOrg(orgId as string),
+    enabled: !!orgId,
+    // Realtime + mutation invalidation drive freshness; staleTime just caps
+    // redundant refetches on remount/focus churn. refetchOnWindowFocus is
+    // inherited from the shared client defaults.
+    staleTime: 45_000,
+  });
 }
 
+export function useDeals(): Deal[] {
+  return useSalesData().data?.deals ?? [];
+}
+
+export function usePipelines(): SalesPipeline[] {
+  return useSalesData().data?.pipelines ?? [];
+}
+
+export function usePipelineStages(): SalesPipelineStage[] {
+  return useSalesData().data?.stages ?? FALLBACK_STAGES;
+}
+
+// ── Imperative mutations (unchanged signatures) ─────────────────────────────
+
 export async function addDeal(input: AddDealInput): Promise<Deal> {
-  await ensureSalesDataLoaded();
+  const { pipelines, stages } = await ensureSalesData();
   const orgId = await getOrgId();
   if (!orgId) throw new Error("Not authenticated");
   const pipeline =
@@ -630,8 +651,8 @@ export async function addDeal(input: AddDealInput): Promise<Deal> {
     pipelines[0];
   if (!pipeline) throw new Error("No active pipeline found");
   const stage =
-    resolveStageById(input.stageId) ??
-    resolveStageBySlug(input.stage) ??
+    resolveStageById(stages, input.stageId) ??
+    resolveStageBySlug(stages, input.stage) ??
     stages
       .filter((item) => item.pipelineId === pipeline.id)
       .sort((a, b) => a.position - b.position)[0];
@@ -693,8 +714,13 @@ export async function addDeal(input: AddDealInput): Promise<Deal> {
       value: Number(input.value ?? 0),
     },
   });
-  await fetchSalesData();
-  const created = deals.find((deal) => deal.id === data.id);
+  // Force a refetch so the returned Deal is the fully-enriched, mapped row
+  // (contact avatar/name, owner, stage) — same guarantee the old
+  // `await fetchSalesData(); deals.find(...)` gave. Then reconcile the
+  // Command Center's deal-backed numbers.
+  await qc().refetchQueries({ queryKey: ["deals"] });
+  void qc().invalidateQueries({ queryKey: ["dashboard"] });
+  const created = getCachedSalesData().deals.find((deal) => deal.id === data.id);
   if (!created) throw new Error("Deal created but could not be reloaded");
   return created;
 }
@@ -703,20 +729,25 @@ export async function updateDeal(
   id: string,
   patch: UpdateDealInput | Partial<Deal>,
 ): Promise<void> {
-  await ensureSalesDataLoaded();
+  const { deals, stages } = await ensureSalesData();
   const current = deals.find((deal) => deal.id === id);
   if (!current) throw new Error("Deal not found");
-  deals = deals.map((deal) => (deal.id === id ? ({ ...deal, ...patch } as Deal) : deal));
-  emitDeals();
+  // Optimistic: reflect the patch into the shared cache immediately so every
+  // consumer (Pipeline board, drawer, related tabs) updates without waiting
+  // for the reconciling refetch. Rolled back below if the write fails.
+  patchSalesCache((d) => ({
+    ...d,
+    deals: d.deals.map((deal) => (deal.id === id ? ({ ...deal, ...patch } as Deal) : deal)),
+  }));
   const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
   let nextStatus = current.status;
   let resolvedStage: SalesPipelineStage | null = null;
   let explicitOutcome: StageOutcome | null = null;
 
   if ("stageId" in patch && patch.stageId) {
-    resolvedStage = resolveStageById(patch.stageId);
+    resolvedStage = resolveStageById(stages, patch.stageId);
   } else if ("stage" in patch && patch.stage) {
-    resolvedStage = resolveStageBySlug(patch.stage);
+    resolvedStage = resolveStageBySlug(stages, patch.stage);
     if (!resolvedStage && (patch.stage === "won" || patch.stage === "lost")) {
       // No real stage matches "won"/"lost" — these strings are used as
       // virtual pseudo-stages elsewhere in the app (winning/losing a Deal
@@ -781,8 +812,11 @@ export async function updateDeal(
     .eq("id", id)
     .eq("org_id", current.orgId);
   if (error) {
-    deals = deals.map((deal) => (deal.id === id ? current : deal));
-    emitDeals();
+    // Roll back the optimistic patch to the exact pre-mutation row.
+    patchSalesCache((d) => ({
+      ...d,
+      deals: d.deals.map((deal) => (deal.id === id ? current : deal)),
+    }));
     throw error;
   }
   const stageChanged =
@@ -820,29 +854,32 @@ export async function updateDeal(
       metadata: { changed_fields: Object.keys(patch) },
     });
   }
-  await fetchSalesData();
+  // Reconcile: refetch the bundle (recomputes derived stage/status/enrichment
+  // fields the optimistic spread above can't) + refresh Command Center.
+  invalidateDealsWithDependents();
 }
 
 export async function deleteDeal(id: string): Promise<void> {
-  await ensureSalesDataLoaded();
+  const { deals } = await ensureSalesData();
   const current = deals.find((deal) => deal.id === id);
   if (!current) return;
-  const previous = deals;
-  deals = deals.filter((deal) => deal.id !== id);
-  emitDeals();
+  const previousDeals = deals;
+  patchSalesCache((d) => ({ ...d, deals: d.deals.filter((deal) => deal.id !== id) }));
   const { error } = await supabase.from("deals").delete().eq("id", id).eq("org_id", current.orgId);
   if (error) {
-    deals = previous;
-    emitDeals();
+    patchSalesCache((d) => ({ ...d, deals: previousDeals }));
     throw error;
   }
+  invalidateDealsWithDependents();
 }
 
 // Reflects a canonical Deal — plus the raw Contact/Company/Stage/Owner rows
 // that came back alongside it (e.g. from the convert_lead_to_deal RPC) —
-// into the reactive store without a second fetch. Reuses the exact same
+// into the shared Query cache without a second fetch. Reuses the exact same
 // mapDeal()/mapStage() logic every other read path already trusts, so the
-// resulting Deal is identical in shape to one loaded through fetchSalesData.
+// resulting Deal is identical in shape to one loaded through
+// fetchSalesDataForOrg. A follow-up `["deals"]` invalidation reconciles the
+// full bundle (stage_order, sibling deals, etc.) in the background.
 export function upsertDealFromCanonical(args: {
   deal: SupabaseDealRow;
   contact: ContactRow | null;
@@ -858,31 +895,19 @@ export function upsertDealFromCanonical(args: {
 
   const mapped = mapDeal({ row: args.deal, contactsById, companiesById, profilesById, stagesById });
 
-  // Stage is upserted into the reactive store BEFORE the deals emit fires,
-  // so anything re-rendering off useDeals() (e.g. Pipeline board columns
-  // filtered by stage) never observes the new Deal one tick ahead of the
-  // stage it belongs to.
-  if (!stages.some((s) => s.id === mappedStage.id)) {
-    stages = [...stages, mappedStage];
-    emitStages();
-  }
-
-  const existingIndex = deals.findIndex((d) => d.id === mapped.id);
-  deals = existingIndex >= 0
-    ? deals.map((d, i) => (i === existingIndex ? mapped : d))
-    : [mapped, ...deals];
-  emitDeals();
+  patchSalesCache((d) => {
+    const stages = d.stages.some((s) => s.id === mappedStage.id) ? d.stages : [...d.stages, mappedStage];
+    const idx = d.deals.findIndex((x) => x.id === mapped.id);
+    const deals = idx >= 0 ? d.deals.map((x, i) => (i === idx ? mapped : x)) : [mapped, ...d.deals];
+    return { ...d, deals, stages };
+  });
+  invalidateDealsWithDependents();
 
   return mapped;
 }
 
-export async function refreshDeals() {
-  await fetchSalesData();
-}
-export function setDealsState(next: Deal[]) {
-  deals = next;
-  loaded = true;
-  emitDeals();
+export async function refreshDeals(): Promise<void> {
+  await qc().refetchQueries({ queryKey: ["deals"] });
 }
 
 export async function getDealActivities(dealId: string): Promise<DealActivity[]> {
@@ -1011,15 +1036,14 @@ export async function linkDealContact(args: {
       role: args.role ?? null,
     },
   });
-  await fetchSalesData();
+  invalidateDeals();
 }
 
 // ── Pipeline Settings: real Supabase-backed CRUD ──────────────────────────
 // Additive only — every existing export above is untouched. All mutations
-// follow the same convention already used by addDeal/updateDeal: write to
-// Supabase, then await fetchSalesData() to refresh deals/pipelines/stages
-// together so the board, New Deal dialog, and Deal drawer all pick up the
-// change immediately without a page reload.
+// follow the same convention: write to Supabase, then invalidate/refetch
+// the shared sales Query so the board, New Deal dialog, and Deal drawer all
+// pick up the change immediately without a page reload.
 
 export async function createPipeline(input: {
   name: string;
@@ -1052,8 +1076,8 @@ export async function createPipeline(input: {
     .single();
   if (error) throw error;
 
-  await fetchSalesData();
-  const created = pipelines.find((p) => p.id === data.id);
+  await qc().refetchQueries({ queryKey: ["deals"] });
+  const created = getCachedSalesData().pipelines.find((p) => p.id === data.id);
   if (!created) throw new Error("Pipeline created but could not be reloaded");
   return created;
 }
@@ -1072,7 +1096,7 @@ export async function updatePipeline(
   if (patch.description !== undefined) update.description = patch.description?.trim() || null;
   const { error } = await supabase.from("pipelines").update(update).eq("id", id).eq("org_id", orgId);
   if (error) throw error;
-  await fetchSalesData();
+  invalidateDeals();
 }
 
 export async function renamePipeline(id: string, name: string): Promise<void> {
@@ -1095,13 +1119,14 @@ export async function setDefaultPipeline(id: string): Promise<void> {
     .eq("id", id)
     .eq("org_id", orgId);
   if (error) throw error;
-  await fetchSalesData();
+  invalidateDeals();
 }
 
 export async function setPipelineActive(id: string, isActive: boolean): Promise<void> {
   const orgId = await getOrgId();
   if (!orgId) throw new Error("Not authenticated");
   if (!isActive) {
+    const { pipelines } = getCachedSalesData();
     const activeCount = pipelines.filter((p) => p.isActive).length;
     const target = pipelines.find((p) => p.id === id);
     if (target?.isActive && activeCount <= 1) {
@@ -1114,7 +1139,7 @@ export async function setPipelineActive(id: string, isActive: boolean): Promise<
     .eq("id", id)
     .eq("org_id", orgId);
   if (error) throw error;
-  await fetchSalesData();
+  invalidateDeals();
 }
 
 export async function deletePipeline(id: string): Promise<void> {
@@ -1131,6 +1156,7 @@ export async function deletePipeline(id: string): Promise<void> {
     throw new Error(`Cannot delete this pipeline — ${count} deal${count === 1 ? "" : "s"} still reference it.`);
   }
 
+  const { pipelines } = getCachedSalesData();
   const target = pipelines.find((p) => p.id === id);
   if (target?.isActive && pipelines.filter((p) => p.isActive).length <= 1) {
     throw new Error("Cannot delete the only active pipeline.");
@@ -1140,7 +1166,7 @@ export async function deletePipeline(id: string): Promise<void> {
   if (stagesError) throw stagesError;
   const { error } = await supabase.from("pipelines").delete().eq("id", id).eq("org_id", orgId);
   if (error) throw error;
-  await fetchSalesData();
+  invalidateDeals();
 }
 
 export async function createPipelineStage(
@@ -1148,6 +1174,7 @@ export async function createPipelineStage(
   input: { name: string; color?: string; probability?: number; outcome?: StageOutcome },
 ): Promise<SalesPipelineStage> {
   if (!input.name?.trim()) throw new Error("Stage name is required");
+  const { pipelines, stages } = getCachedSalesData();
   const pipeline = pipelines.find((p) => p.id === pipelineId);
   if (!pipeline) throw new Error("Pipeline not found");
 
@@ -1170,8 +1197,8 @@ export async function createPipelineStage(
     .single();
   if (error) throw error;
 
-  await fetchSalesData();
-  const created = stages.find((s) => s.id === data.id);
+  await qc().refetchQueries({ queryKey: ["deals"] });
+  const created = getCachedSalesData().stages.find((s) => s.id === data.id);
   if (!created) throw new Error("Stage created but could not be reloaded");
   return created;
 }
@@ -1180,6 +1207,7 @@ export async function updatePipelineStage(
   stageId: string,
   patch: { name?: string; color?: string; probability?: number; outcome?: StageOutcome },
 ): Promise<void> {
+  const { stages } = getCachedSalesData();
   const stage = stages.find((s) => s.id === stageId);
   if (!stage) throw new Error("Stage not found");
 
@@ -1204,7 +1232,7 @@ export async function updatePipelineStage(
 
   const { error } = await supabase.from("pipeline_stages").update(update).eq("id", stageId);
   if (error) throw error;
-  await fetchSalesData();
+  invalidateDeals();
 }
 
 export async function renamePipelineStage(stageId: string, name: string): Promise<void> {
@@ -1240,10 +1268,11 @@ export async function reorderPipelineStages(pipelineId: string, orderedStageIds:
   const finalError = finalResults.find((r) => r.error)?.error;
   if (finalError) throw finalError;
 
-  await fetchSalesData();
+  invalidateDeals();
 }
 
 export async function deletePipelineStage(stageId: string): Promise<void> {
+  const { stages } = getCachedSalesData();
   const stage = stages.find((s) => s.id === stageId);
   if (!stage) throw new Error("Stage not found");
 
@@ -1263,7 +1292,7 @@ export async function deletePipelineStage(stageId: string): Promise<void> {
 
   const { error } = await supabase.from("pipeline_stages").delete().eq("id", stageId);
   if (error) throw error;
-  await fetchSalesData();
+  invalidateDeals();
 }
 
 export async function unlinkDealContact(args: { dealId: string; contactId: string }) {
@@ -1283,4 +1312,5 @@ export async function unlinkDealContact(args: { dealId: string; contactId: strin
     title: "Contact removed from deal",
     metadata: { contact_id: args.contactId },
   });
+  invalidateDeals();
 }

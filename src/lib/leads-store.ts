@@ -683,10 +683,13 @@ export async function convertLeadToDeal(payload: ConvertLeadPayload): Promise<Co
   const result = data as any;
 
   // Lead now Converted + a Deal exists + the Contact may have been created/
-  // reused. Deals/Pipeline are NOT Query-backed yet (S3 scope is
-  // Contacts+Leads) — the convert dialog still reflects the new deal into
-  // deals-store itself; here we only refresh what S3 owns.
+  // reused. S4A: Deals/Pipeline are Query-backed now — invalidate the
+  // shared sales bundle too so the new Deal shows in Pipeline / Command
+  // Center without a refresh, even if a caller doesn't also run
+  // upsertDealFromCanonical (the convert dialog does, which additionally
+  // splices the mapped Deal in for an instant reflection).
   invalidateLeadsWithDependents();
+  void qc().invalidateQueries({ queryKey: ["deals"] });
 
   return {
     lead: result.lead,

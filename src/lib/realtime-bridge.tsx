@@ -52,6 +52,19 @@
 // limitation (INSERT/UPDATE coverage + focus-refetch still catch up); no
 // migration is taken here to change replica identity.
 //
+// S4A (Deals / Pipeline migration) adds `deals` INSERT/UPDATE/DELETE. The
+// Deals/Pipeline domain is now TanStack Query-backed (deals-store.ts's one
+// `queryKeys.deals(orgId)` bundle), so a Deal written from a second tab or
+// a server process must invalidate it here. Fan-out:
+//   deals.* -> deals, dashboard.summary (Pipeline Value KPI / Live Pipeline
+//              donut / Needs Attention Deals). Pipeline Pulse is NOT added —
+//              it reads deal_activities, whose INSERT already invalidates
+//              dashboard.pipelinePulse above.
+// `pipelines` / `pipeline_stages` are NOT subscribed: they change only
+// through Settings → Pipelines (rare, same-session), which invalidates
+// `["deals"]` itself; a cross-tab stage-config edit is caught by
+// focus-refetch. The DELETE-filter caveat above applies to `deals` too.
+//
 // Never logs row payloads (message bodies, contact PII) — every handler
 // below only ever logs the table name and event type, both safe.
 
@@ -96,6 +109,12 @@ export function RealtimeBridge(): null {
       // so this one doesn't need to touch contacts.
       queryClient.invalidateQueries({ queryKey: queryKeys.leads(orgId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.conversations.all(orgId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.summary(orgId) });
+    };
+    const invalidateDeals = () => {
+      // S4A: Deals/Pipeline is Query-backed (deals-store.ts). Refresh the
+      // shared sales bundle + the Command Center's deal-derived numbers.
+      queryClient.invalidateQueries({ queryKey: queryKeys.deals(orgId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.summary(orgId) });
     };
     const invalidatePipelinePulse = () => {
@@ -155,6 +174,21 @@ export function RealtimeBridge(): null {
         "postgres_changes",
         { event: "DELETE", schema: "public", table: "leads" },
         () => invalidateLeads(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "deals", filter: `org_id=eq.${orgId}` },
+        () => invalidateDeals(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "deals", filter: `org_id=eq.${orgId}` },
+        () => invalidateDeals(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "deals" },
+        () => invalidateDeals(),
       )
       .on(
         "postgres_changes",

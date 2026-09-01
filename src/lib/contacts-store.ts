@@ -168,14 +168,12 @@ function patchContactsCache(fn: (list: Contact[]) => Contact[]) {
  * their own ad-hoc invalidation.
  *
  * A Contact's name/avatar/tags render in: the Contacts list, Conversations
- * rows, Leads' Contact enrichment, Command Center Recent-Activity avatars
- * (all Query-backed → invalidate) AND Pipeline Deal cards + Project linked-
- * Contact surfaces (still useSyncExternalStore singletons in this phase →
- * a store refresh, lazily imported to keep contacts-store's static import
- * graph unchanged / cycle-free). This last part is the S3-stabilization
- * fix for "quick avatar change updates Contacts but not Pipeline": the
- * quick path skipped the deals/projects refresh that Edit→Save did by
- * hand; now every path gets it.
+ * rows, Leads' Contact enrichment, Command Center Recent-Activity avatars,
+ * and — since S4A — Pipeline Deal cards / Deal drawer (deals-store.ts's
+ * `["deals"]` bundle re-enriches its linked Contact on refetch). All of
+ * those are Query-backed now, so a plain prefix invalidation covers them.
+ * Projects are still a useSyncExternalStore singleton (not migrated yet),
+ * so that one keeps its lazy `refreshProjects()` bridge until S4B.
  *
  * Deliberately scoped — NOT an invalidate-everything.
  */
@@ -184,10 +182,10 @@ function invalidateContactDependents() {
   void qc.invalidateQueries({ queryKey: ["contacts"] });
   void qc.invalidateQueries({ queryKey: ["conversations"] });
   void qc.invalidateQueries({ queryKey: ["leads"] });
+  void qc.invalidateQueries({ queryKey: ["deals"] });
   void qc.invalidateQueries({ queryKey: ["dashboard"] });
-  // Non-Query stores that resolve a linked Contact's avatar/name at fetch
-  // time. Lazy import → no load-order/circular concern; failures are inert.
-  void import("@/lib/deals-store").then((m) => m.refreshDeals()).catch(() => {});
+  // Projects are NOT Query-backed yet (S4B) — keep the lazy store refresh.
+  // Lazy import → no load-order/circular concern; failures are inert.
   void import("@/lib/projects-store").then((m) => m.refreshProjects()).catch(() => {});
 }
 

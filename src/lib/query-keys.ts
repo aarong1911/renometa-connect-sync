@@ -36,6 +36,15 @@ export const queryKeys = {
   contacts: (orgId: string) => ["contacts", orgId] as const,
   leads: (orgId: string) => ["leads", orgId] as const,
 
+  // Platform State Sync Phase S4A — Deals / Pipeline. ONE key per org whose
+  // Query payload is the co-loaded bundle `{ deals, pipelines, stages }`
+  // (deals-store.ts): a Deal can't be mapped without its stage, and every
+  // screen that reads deals also reads stages, so they share one fetch and
+  // one cache entry rather than three keys that would always invalidate
+  // together anyway. Stage columns are derived client-side from this one
+  // list — never a query per stage.
+  deals: (orgId: string) => ["deals", orgId] as const,
+
   conversations: {
     /**
      * Prefix/parent key — never used as an actual useQuery key itself
