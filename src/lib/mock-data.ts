@@ -300,10 +300,34 @@ export type Conversation = {
   senderDisplayName?: string;
   /** The most recent message's actual Gmail Subject header, decoded — used to prefill "Re: <subject>" when replying to an existing thread. Never fabricated. */
   emailSubject?: string;
+  /**
+   * The real Gmail thread_id a reply should attach to (Conversations
+   * Consolidation — see gmail-conversations.ts). A CRM-matched Contact's
+   * email conversation now merges every Gmail thread with that Contact into
+   * ONE conversation row (id `gm-contact-<contactId>`), so `id` alone can no
+   * longer be sliced to recover a real Gmail thread id the way a
+   * single-thread `gm-<thread_id>` conversation's could. This field always
+   * carries the actual thread_id to reply into (the most recently active
+   * one) — send-inbox-message.ts's `email_thread_id` param must read this,
+   * not derive it from `id`. Set for every real Gmail-backed email
+   * conversation (both consolidated and single-thread); absent for a
+   * brand-new conversation with no Gmail thread yet.
+   */
+  emailThreadId?: string;
   /** Contact.avatar_url passthrough (Messenger Attribution + Avatar Consistency Cleanup) — real remote photo (e.g. Meta profile picture), so the conversation list/header render the same image as Contact Details rather than a different generated one. Null when the contact has none. */
   avatarUrl?: string | null;
   /** Contact.avatar_key passthrough — user-picked local avatar, used when there's no avatarUrl. */
   avatarKey?: string | null;
+  /**
+   * True unread INBOUND message count for this conversation (Phase 9 — True
+   * Unread Message Count), derived from real per-message is_read state
+   * (sms_meta_messages.is_read) — never a separate maintained counter.
+   * Undefined/omitted for conversation sources that don't yet carry a real
+   * per-message read signal (Gmail, Voice — both always set `unread: false`
+   * today); `unread` (the boolean) remains the source of truth for those.
+   * When present, `unreadCount > 0` is exactly equivalent to `unread`.
+   */
+  unreadCount?: number;
 };
 
 export type Message = {
@@ -318,6 +342,13 @@ export type Message = {
   // local echo against the synced Gmail row; undefined for every other
   // channel and for email messages synced before this column existed.
   rfcMessageId?: string;
+  // The real sms_meta_messages.id (a bare uuid), distinct from `id` above
+  // (which is prefixed, e.g. "sm-msg-<uuid>", for React key/lookup
+  // purposes). Only set for SMS/WhatsApp/Messenger/Instagram messages —
+  // undefined for email/voice/note, which have no CRM-local delete support
+  // yet. Used by the "Delete message" action to call
+  // conversation-message-state.ts with the real database id.
+  dbId?: string;
 };
 
 export type WorkflowCategory = "Sales" | "Operations" | "Finance" | "Marketing" | "Client Care";

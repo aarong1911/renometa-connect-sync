@@ -1,6 +1,6 @@
 // src/routes/inbox.tsx
 import { createFileRoute, Link, Outlet, useLocation, useNavigate } from "@tanstack/react-router";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ComponentType } from "react";
 import { FaFacebookMessenger, FaInstagram, FaWhatsapp } from "react-icons/fa";
 import "./inbox.css";
@@ -99,7 +99,7 @@ import { supabase } from "@/lib/supabase";
 import { useVoiceConversations } from "@/lib/voice-conversations";
 import { useSmsMetaConversations } from "@/lib/sms-meta-conversations";
 import { analyzeSmsLength } from "@/lib/sms-segments";
-import { conversationMapKey, resolveConversationIdentity, useConversationArchiveStates } from "@/lib/conversation-states";
+import { conversationMapKey, resolveConversationIdentity, useConversationArchiveStates, useConversationStarStates } from "@/lib/conversation-states";
 import { normalizeEmail, useGmailConversations } from "@/lib/gmail-conversations";
 import { getOrgId } from "@/lib/org-id";
 import { UnmatchedGmailSenderBanner } from "@/components/inbox/unmatched-gmail-sender-banner";
@@ -107,6 +107,7 @@ import { GmailSenderAvatar } from "@/components/inbox/gmail-sender-avatar";
 import { unlinkGmailContactFromThread } from "@/lib/gmail-contact-actions";
 import { extractReplyAddress, resolveComposerRecipient } from "@/lib/composer-recipient";
 import { triggerGmailSync, fetchGmailConnectionStatus } from "@/lib/gmail-sync-client";
+import { tagDisplayLabel, tagComparisonKey, isManuallyAssignableTag } from "@/lib/tag-utils";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -132,7 +133,7 @@ function InboxLayout() {
   return <InboxPage />;
 }
 
-type FolderId = "all" | "unread" | "assigned" | "mentions" | "starred" | "unassigned" | "archived";
+type FolderId = "all" | "unread" | "assigned" | "starred" | "unassigned" | "archived";
 type ChannelFilter = "all" | "email" | "sms" | "voice" | "whatsapp" | "messenger" | "instagram";
 type ComposeChannel = "email" | "sms" | "note" | "whatsapp" | "messenger" | "instagram";
 
@@ -160,7 +161,6 @@ const folders: { id: FolderId; label: string; icon: typeof InboxIcon }[] = [
   { id: "all", label: "Inbox", icon: InboxIcon },
   { id: "unread", label: "Unread", icon: Circle },
   { id: "assigned", label: "Assigned to me", icon: CheckCheck },
-  { id: "mentions", label: "Mentions", icon: AtSign },
   { id: "starred", label: "Starred", icon: Star },
   { id: "unassigned", label: "Unassigned", icon: Filter },
   { id: "archived", label: "Archived", icon: Archive },
@@ -215,6 +215,22 @@ function InboxPage() {
   const [folder, setFolder] = useState<FolderId>("all");
   const [channelFilter, setChannelFilter] = useState<ChannelFilter>("all");
   const [activeId, setActiveId] = useState<string | undefined>(undefined);
+  // Records which conversation id the user genuinely, explicitly navigated
+  // to (a row click, a deep-link "Message" action, or picking a contact in
+  // New Conversation) — as opposed to `active` silently landing on a
+  // conversation via the passive fallback chain below (e.g. on first load,
+  // or historically when a filter change reshuffled the fallback pick).
+  // The auto-mark-read effect checks this before ever calling markRead, so
+  // a conversation can only be auto-read as a direct result of the user
+  // opening it — never as a side effect of a filter change, a query
+  // refetch/reorder, or another conversation leaving the current filter.
+  // Always set together with setActiveId via selectConversation() below —
+  // never call setActiveId directly for a genuine navigation action.
+  const explicitSelectionRef = useRef<string | null>(null);
+  const selectConversation = useCallback((id: string) => {
+    explicitSelectionRef.current = id;
+    setActiveId(id);
+  }, []);
   const [draft, setDraft] = useState("");
   const [subject, setSubject] = useState("");
   const [composeChannel, setComposeChannel] = useState<ComposeChannel>("sms");
@@ -227,13 +243,25 @@ function InboxPage() {
   const [tagManagerOpen, setTagManagerOpen] = useState(false);
   const [newTagName, setNewTagName] = useState("");
   const [managedTags, setManagedTags] = useState<{ label: string; color: string }[]>(() => {
+    // Same canonical Contact tag catalog Contacts uses (CANONICAL_CONTACT_TAGS
+    // in tag-utils.ts) — previously this was its own hardcoded, diverged
+    // list that invented "Estimate Sent"/"Hot" (not real Contact tags
+    // anywhere) while omitting real ones (Architect/Client/Homeowner/Lead/
+    // Past Client/Prospect/Vendor) from the "Assign tags" picker entirely.
+    // Only the color-per-label assignment is Inbox-specific; the label set
+    // itself must match Contacts exactly.
     const defaults = [
       { label: "VIP", color: "bg-amber-400" },
       { label: "New Lead", color: "bg-emerald-400" },
       { label: "Needs Reply", color: "bg-rose-400" },
-      { label: "Follow Up", color: "bg-sky-400" },
-      { label: "Estimate Sent", color: "bg-violet-400" },
-      { label: "Hot", color: "bg-orange-400" },
+      { label: "Follow Up", color: "bg-cyan-400" },
+      { label: "Lead", color: "bg-blue-400" },
+      { label: "Client", color: "bg-sky-400" },
+      { label: "Homeowner", color: "bg-lime-400" },
+      { label: "Past Client", color: "bg-fuchsia-400" },
+      { label: "Prospect", color: "bg-indigo-400" },
+      { label: "Vendor", color: "bg-orange-400" },
+      { label: "Architect", color: "bg-violet-400" },
     ];
 
     try {
@@ -275,13 +303,39 @@ function InboxPage() {
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduleDateTime, setScheduleDateTime] = useState("");
   const [appointmentDialogOpen, setAppointmentDialogOpen] = useState(false);
-  const [starredIds, setStarredIds] = useState<Set<string>>(new Set());
+  // Real, persisted Star state — replaces the old local-only starredIds Set
+  // OR'd with a hash(id)-based fake "isStarred" mock (see git history):
+  // that mock made an arbitrary ~20% of conversations appear pre-starred to
+  // every user, which is exactly the "fake counts displayed as production
+  // CRM data" problem this audit was asked to remove. Same table/column
+  // conversation_states.is_starred already used for Archive, just
+  // previously unused for its own stated purpose.
+  const { starredMap, setStarred } = useConversationStarStates();
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(new Set());
   const [aiDrafting, setAiDrafting] = useState(false);
   const [newConvOpen, setNewConvOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [pendingTemplate, setPendingTemplate] = useState<SharedMessageTemplate | null>(null);
+  // CRM-local soft delete confirmation — holds the real sms_meta_messages.id
+  // (Message.dbId) of the message pending confirmation, not the prefixed
+  // React-key `id`. null = dialog closed.
+  const [deleteMessageId, setDeleteMessageId] = useState<string | null>(null);
+  const [deletingMessage, setDeletingMessage] = useState(false);
+  const handleConfirmDeleteMessage = async () => {
+    if (!deleteMessageId) return;
+    setDeletingMessage(true);
+    try {
+      await deleteMessage(deleteMessageId);
+      toast.success("Message deleted from RenoMeta");
+      setDeleteMessageId(null);
+    } catch (error) {
+      console.error("[inbox] delete message failed:", error);
+      toast.error("Could not delete this message");
+    } finally {
+      setDeletingMessage(false);
+    }
+  };
   const [insertLog, appendInsertLog, clearInsertLog] = usePersistentInsertLog("inbox");
   const [showInsertLog, setShowInsertLog] = useState(false);
   const [dealDialogOpen, setDealDialogOpen] = useState(false);
@@ -295,13 +349,24 @@ function InboxPage() {
   // fallback, these channels only ever show real data. This is the only
   // source of actual message content for these 4 channels; Email has its
   // own separate real tables (not handled here).
-  const { conversations: realConvs, messages: realMsgs, refresh: refreshRealConvs, markRead } = useSmsMetaConversations();
+  const { conversations: realConvs, messages: realMsgs, refresh: refreshRealConvs, markRead, markUnread, deleteMessage } = useSmsMetaConversations();
   // Real Gmail history — no mock fallback, same principle as realConvs above.
   const { conversations: gmailConvs, messages: gmailMsgs, refresh: refreshGmailConvs } = useGmailConversations();
   // Manual "Sync Gmail" action in the channel toolbar (Email tab only) —
   // reuses the same gmail-sync.ts call Settings → Integrations already
   // makes, via the shared src/lib/gmail-sync-client.ts helper.
   const [gmailSyncing, setGmailSyncing] = useState(false);
+  // CRM relevance filter (Part 6 of the Conversations audit): by default,
+  // only show Gmail threads that resolve to a real saved Contact (a real
+  // UUID contactId — gmail-conversations.ts already returns a synthetic
+  // `gmail-unknown-<address>`/`gmail-unknown-thread-<id>` id for anything
+  // that doesn't match a contact by address or an explicit
+  // conversation_states link). This is a client-side view filter, not a
+  // fetch filter — gmailConvs itself is untouched so the existing "Create
+  // Contact"/"Create Lead"/"Link to Existing Contact" flow on an unmatched
+  // sender (UnmatchedGmailSenderBanner) stays fully reachable via this
+  // toggle rather than being removed outright.
+  const [showAllMail, setShowAllMail] = useState(false);
   const [gmailLastSyncAt, setGmailLastSyncAt] = useState<string | null>(null);
   useEffect(() => {
     if (channelFilter !== "email") return;
@@ -385,29 +450,30 @@ function InboxPage() {
     () => new Map(allStoreContacts.map((c) => [c.id, c])),
     [allStoreContacts]
   );
-  // One synthetic "start a conversation" placeholder per contact who has no
-  // real SMS thread yet, so every contact remains reachable even before a
-  // first message is sent. Contacts that already have a real SMS
-  // conversation (from realConvs) are excluded here to avoid showing both
-  // a placeholder and the real thread for the same contact.
-  const contactIdsWithRealSms = useMemo(
-    () => new Set(realConvs.filter((c) => c.channel === "sms").map((c) => c.contactId)),
-    [realConvs]
-  );
-  const placeholderConvs = useMemo<Conversation[]>(
-    () => allStoreContacts
-      .filter((c) => !contactIdsWithRealSms.has(c.id))
-      .map((c) => ({
-        id: `sb-${c.id}`,
-        contactId: c.id,
-        contactName: c.name,
-        channel: "sms" as const,
-        preview: c.phone || c.email || "No contact info",
-        lastAt: c.lastActivity ?? c.createdAt ?? new Date().toISOString(),
-        unread: false,
-      })),
-    [allStoreContacts, contactIdsWithRealSms]
-  );
+
+  // (S3 stabilization) The Conversation-header "Lead"/tag/Customer
+  // classification chip was removed — see the header render below. The
+  // useLeads()-derived "contact ids with an active Lead" set that fed it is
+  // gone with it; a Contact's Lead relationship is shown on the Contacts
+  // page (derived badge) and can be re-introduced to the Inbox right
+  // sidebar in a later pass if a product requirement asks for it.
+
+  // A Contact existing in the CRM does NOT mean a Conversation exists — the
+  // Inbox previously spread ONE synthetic "sb-<contactId>" row per Contact
+  // with no real SMS thread into allConversations below (removed), which is
+  // the exact root cause of the "Contacts appearing as fake Inbox rows"
+  // regression: every Contact with no message history at all showed up as
+  // a permanent Inbox row (timestamped from `contact.createdAt` — a
+  // Contact-record date, not any real communication — which is also why
+  // rows showed ages like "44w" unrelated to any actual activity), and
+  // opening one always landed on "No conversation history yet" because
+  // there was, correctly, no real thread behind it. A Contact with no
+  // communications remains reachable through the Contacts page and through
+  // "New Conversation" (NewConversationSheet below, which reads
+  // allStoreContacts directly and creates a real `local-conv-` entry only
+  // when the user explicitly picks a contact to message) — it must not
+  // appear passively in the Inbox list, sidebar counts, or channel tabs
+  // until at least one real communication record exists for it.
   const org = useOrganization();
   const [currentUserName, setCurrentUserName] = useState("");
   useEffect(() => {
@@ -421,52 +487,109 @@ function InboxPage() {
   }, []);
  
 
+  // CRM relevance filter — only SMS/WhatsApp/Messenger/Instagram/Voice are
+  // exempt (those channels only ever produce a conversation via a real
+  // contact/webhook already, per sms-meta-conversations.ts/
+  // voice-conversations.ts). Gmail is the one source that otherwise
+  // surfaces generic mailbox traffic (Google notices, marketing email,
+  // newsletters) with no CRM identity at all — see showAllMail above.
+  const crmRelevantGmailConvs = useMemo(
+    () => (showAllMail ? gmailConvs : gmailConvs.filter((c) => UUID_RE.test(c.contactId))),
+    [gmailConvs, showAllMail]
+  );
   const allConversations = useMemo(
     () => [
       ...realConvs,
-      ...gmailConvs,
-      ...placeholderConvs,
+      ...crmRelevantGmailConvs,
       ...voiceConvs,
       ...localConversations,
     ],
-    [realConvs, gmailConvs, placeholderConvs, voiceConvs, localConversations]
+    [realConvs, crmRelevantGmailConvs, voiceConvs, localConversations]
   );
 
-  // Deep-link entry (Part 13/14): every Contact always has at least a
-  // placeholder ("sb-<contactId>", channel sms — see placeholderConvs
-  // above) even with zero messages, so "find the best conversation for
-  // this contactId" doubles as the compose fallback with no separate
-  // branch needed — a real thread (sm-/voice-/gm-) is preferred when one
-  // exists, purely by sorting the same way the sidebar already does.
-  // Consumes ?contactId= once (clears it via replace) so refreshing the
-  // resulting /inbox URL doesn't re-trigger selection after the user has
-  // since picked something else; an unknown/inaccessible contactId simply
-  // finds nothing and leaves the existing empty state, no crash.
+  // Deep-link entry (from Contacts' "Message" action, ?contactId=…): prefer
+  // a real, already-persisted thread (sm-/voice-/gm-) when one exists. If
+  // this contact has no communication history at all, there is correctly no
+  // conversation row to select — rather than leaving an empty pane, this
+  // creates the SAME kind of local-conv- placeholder NewConversationSheet's
+  // own onSelect creates below (not the old always-on `sb-` row removed
+  // above), so the composer opens ready to send. Consumes ?contactId= once
+  // (clears it via replace) so refreshing the resulting /inbox URL doesn't
+  // re-trigger selection after the user has since picked something else; an
+  // unknown/inaccessible contactId simply finds nothing and leaves the
+  // existing empty state, no crash.
   useEffect(() => {
     if (!deepLinkContactId || contactsLoading) return;
-    const tier = (id: string) => (id.startsWith("sm-") || id.startsWith("voice-") || id.startsWith("gm-") ? 0 : id.startsWith("sb-") ? 1 : 2);
+    const tier = (id: string) => (id.startsWith("sm-") || id.startsWith("voice-") || id.startsWith("gm-") ? 0 : 1);
     const match = allConversations
       .filter((c) => c.contactId === deepLinkContactId)
       .sort((a, b) => tier(a.id) - tier(b.id) || new Date(b.lastAt).getTime() - new Date(a.lastAt).getTime())[0];
-    if (match) setActiveId(match.id);
+    if (match) {
+      selectConversation(match.id);
+    } else {
+      const contact = storeContactMap.get(deepLinkContactId);
+      if (contact) {
+        const newConv: Conversation = {
+          id: `local-conv-${Date.now()}`,
+          contactId: contact.id,
+          contactName: contact.name,
+          channel: "sms",
+          preview: "New conversation",
+          lastAt: new Date().toISOString(),
+          unread: false,
+        };
+        setLocalConversations((prev) => [newConv, ...prev]);
+        selectConversation(newConv.id);
+        setComposeChannel("sms");
+      }
+    }
     navigate({ search: (s) => ({ ...s, contactId: undefined }), replace: true });
-  }, [deepLinkContactId, contactsLoading, allConversations, navigate]);
+  }, [deepLinkContactId, contactsLoading, allConversations, storeContactMap, navigate]);
   const allMessages = useMemo(
     () => [...voiceMsgs, ...realMsgs, ...gmailMsgs],
     [voiceMsgs, realMsgs, gmailMsgs]
   );
 
-  const checkStarred = (id: string) => starredIds.has(id) || isStarred(id);
+  // Real "Assigned to me" / "Unassigned" — derived from the SAME
+  // contacts.owner field Contacts/the contact panel already use ("Owned by
+  // {owner}" above), not a separately maintained inbox-only concept.
+  // contacts.owner is a plain display-name string (legacy design, not a
+  // foreign key — see contacts-store.ts), so comparison is by trimmed,
+  // case-insensitive name against the signed-in user's own display name,
+  // consistent with how the rest of the app already treats this column.
+  // Replaces the old hash(id)-based fake isAssignedToMe/isUnassigned mocks,
+  // which classified conversations by a deterministic-but-meaningless
+  // formula unrelated to any real assignment.
+  const isUnassigned = (contactId: string) => {
+    const owner = storeContactMap.get(contactId)?.owner;
+    return !owner || owner === "—";
+  };
+  const isAssignedToMe = (contactId: string) => {
+    const owner = storeContactMap.get(contactId)?.owner;
+    return !!owner && owner !== "—" && !!currentUserName && owner.trim().toLowerCase() === currentUserName.trim().toLowerCase();
+  };
+
+  const checkStarred = (c: { id: string; contactId: string; channel: string }) => {
+    const key = conversationMapKey(c);
+    return key ? !!starredMap[key] : false;
+  };
+  const toggleStarred = async (c: { id: string; contactId: string; channel: string }) => {
+    try {
+      await setStarred(c, !checkStarred(c));
+    } catch (error) {
+      console.error("[inbox] star toggle failed:", error);
+      toast.error("Could not update star");
+    }
+  };
 
   const conversations = useMemo(() => {
     return allConversations
       .filter((c) => {
         if (channelFilter !== "all" && c.channel !== channelFilter) return false;
         if (folder === "unread" && !c.unread) return false;
-        if (folder === "starred" && !checkStarred(c.id)) return false;
-        if (folder === "unassigned" && !isUnassigned(c.id)) return false;
-        if (folder === "assigned" && !isAssignedToMe(c.id)) return false;
-        if (folder === "mentions" && !hasMention(c.id)) return false;
+        if (folder === "starred" && !checkStarred(c)) return false;
+        if (folder === "unassigned" && !isUnassigned(c.contactId)) return false;
+        if (folder === "assigned" && !isAssignedToMe(c.contactId)) return false;
         if (folder === "archived" && !checkArchived(c)) return false;
         if (folder !== "archived" && checkArchived(c)) return false;
 
@@ -496,11 +619,14 @@ function InboxPage() {
         return true;
       })
       .sort((a, b) => {
-        // Real conversations (sm- = SMS/WhatsApp/Messenger/Instagram with
-        // actual message history, voice- = voice calls) sort first, then
-        // empty placeholder contacts (sb-) with no messages yet, then
-        // anything else — then by recency within each group.
-        const tier = (id: string) => id.startsWith("sm-") || id.startsWith("voice-") || id.startsWith("gm-") ? 0 : id.startsWith("sb-") ? 1 : 2;
+        // Real, persisted conversations (sm- = SMS/WhatsApp/Messenger/
+        // Instagram, voice- = voice calls, gm- = Gmail threads) sort first;
+        // a conversation just started via "New Conversation"
+        // (local-conv-, no persisted history yet) sorts after — then by
+        // recency (real communication timestamps only — see
+        // sms-meta-conversations.ts/gmail-conversations.ts/
+        // voice-conversations.ts) within each group.
+        const tier = (id: string) => id.startsWith("sm-") || id.startsWith("voice-") || id.startsWith("gm-") ? 0 : 1;
         const td = tier(a.id) - tier(b.id);
         if (td !== 0) return td;
         return new Date(b.lastAt).getTime() - new Date(a.lastAt).getTime();
@@ -511,9 +637,10 @@ function InboxPage() {
     channelFilter,
     search,
     selectedTag,
-    starredIds,
+    starredMap,
     allConversations,
     storeContactMap,
+    currentUserName,
     contactTagOverrides,
     archivedMap,
   ]);
@@ -522,18 +649,50 @@ function InboxPage() {
     const list = allConversations;
     return {
       all: list.filter((c) => !checkArchived(c)).length,
-      unread: list.filter((c) => c.unread && !checkArchived(c)).length,
-      assigned: list.filter((c) => isAssignedToMe(c.id) && !checkArchived(c)).length,
-      mentions: list.filter((c) => hasMention(c.id) && !checkArchived(c)).length,
-      starred: list.filter((c) => checkStarred(c.id) && !checkArchived(c)).length,
-      unassigned: list.filter((c) => isUnassigned(c.id) && !checkArchived(c)).length,
+      // Unread is deliberately a MESSAGE total (Phase 9/True Unread Message
+      // Count follow-up), not a conversation count like every other folder
+      // here — this must match the per-conversation row badge and the
+      // sidebar Conversations badge exactly, or the three disagree (the
+      // reported bug). c.unreadCount is the real per-message count from
+      // sms-meta-conversations.ts; falls back to 1 for a conversation
+      // source with no real count yet (none exist today — Gmail/Voice are
+      // always unread:false, contributing 0 either way).
+      unread: list.filter((c) => !checkArchived(c)).reduce((sum, c) => sum + (c.unreadCount ?? (c.unread ? 1 : 0)), 0),
+      assigned: list.filter((c) => isAssignedToMe(c.contactId) && !checkArchived(c)).length,
+      starred: list.filter((c) => checkStarred(c) && !checkArchived(c)).length,
+      unassigned: list.filter((c) => isUnassigned(c.contactId) && !checkArchived(c)).length,
       archived: list.filter((c) => checkArchived(c)).length,
     } as Record<FolderId, number>;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allConversations, starredIds, archivedMap]);
+  }, [allConversations, storeContactMap, currentUserName, starredMap, archivedMap]);
 
-  // Prefer a non-voice conversation as the auto-selected default so email/SMS always has a contact with an address
-  const active = conversations.find((c) => c.id === activeId)
+  // Look up the active conversation in allConversations (UNFILTERED) first,
+  // not the folder/channel-filtered `conversations` list — this is what
+  // keeps a conversation on screen after it stops matching the current
+  // filter (e.g. it just got marked read while viewing the Unread folder),
+  // instead of `active` silently reassigning itself to whatever conversation
+  // happens to be first in the now-different filtered list.
+  //
+  // ROOT CAUSE of the "reading Messenger also auto-reads Instagram" cascade:
+  // this used to search the FILTERED `conversations` array as its primary
+  // lookup. Sequence: user clicks Messenger (Unread folder showing
+  // Messenger+Instagram) -> markRead -> Query invalidates -> Messenger's
+  // unreadCount hits 0 -> Messenger no longer passes the Unread folder
+  // filter -> next render, `conversations` (filtered) no longer contains
+  // it -> `conversations.find(id===activeId)` finds nothing even though
+  // `activeId` (state) still literally equals Messenger's id -> falls
+  // through to `conversations.find(!voice)`, which now resolves to
+  // Instagram (the only item left in the filtered list) -> `active.id`
+  // silently becomes Instagram's id, indistinguishable from the user having
+  // clicked it -> the auto-read effect (keyed on active.id) treated this as
+  // a fresh conversation to auto-mark-read. Fixed by making the PRIMARY
+  // lookup search the unfiltered `allConversations` — a still-selected
+  // conversation is always found there regardless of what the current
+  // folder/channel filter shows, so `active.id` no longer changes just
+  // because the filter's membership changed. The `conversations` (filtered)
+  // fallback below now only ever runs when activeId is unset or points to
+  // something that's gone from the app entirely (not just filtered out).
+  const active = allConversations.find((c) => c.id === activeId)
     ?? conversations.find((c) => !c.id.startsWith("voice-"))
     ?? conversations[0];
   const thread: LocalMessage[] = active
@@ -545,13 +704,84 @@ function InboxPage() {
       ].sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime())
     : [];
 
-  // Opening a conversation marks its unread inbound messages read. Only
-  // sms_meta_messages-backed channels carry a real is_read signal; other
-  // channels (voice, email, note) have nothing to mark here.
+  // Whether the active thread's ALREADY-LOADED messages include at least
+  // one inbound one — used to proactively disable "Mark as unread" (Part 4
+  // of the unread-cascade fix) rather than let the user trigger a request
+  // that the server will honestly report as a no-op. Uses the same
+  // `thread` data already rendered on screen, so this can never disagree
+  // with what the user is looking at; it's a UX nicety on top of, not a
+  // replacement for, the server's own real check (an outbound-only thread
+  // still safely no-ops server-side if this were ever stale).
+  const activeHasInboundMessage = thread.some((m) => m.direction === "in");
+
+  // Opening a conversation marks its unread inbound messages read — ONCE
+  // per conversation identity, not every time active.unread flips true.
+  //
+  // ROOT CAUSE of "Mark as unread immediately reverts to 0": this effect's
+  // dependency array included `active.unread` directly. That value is
+  // `unreadCount > 0`, recomputed fresh after every server round-trip
+  // (including the "Mark as unread" action's own refetch). Sequence that
+  // reproduced the bug: open a 3-unread conversation -> effect fires,
+  // marks read, active.unread flips true->false (effect reruns on that
+  // change too, but its own `!active.unread` guard makes it a no-op) ->
+  // user clicks "Mark as unread" -> server flips the latest inbound
+  // message back to is_read=false -> refetch -> active.unread flips
+  // false->true -> the DEPENDENCY ARRAY sees a changed value and reruns
+  // the WHOLE effect body -> `!active.unread` is now false, so it proceeds
+  // straight into ANOTHER markRead() call, immediately undoing the user's
+  // explicit action. The effect could not tell "just became unread because
+  // I navigated here" apart from "just became unread because the user
+  // explicitly asked for that."
+  //
+  // Fixed with `autoReadHandledForId` — records the conversation identity
+  // this effect has already acted on (read OR confirmed nothing to do).
+  // Once set for a given active.id, this effect no longer does anything
+  // for that id no matter how many more times active.unread toggles while
+  // the user stays there — an explicit "Mark as unread"/"Mark as read"
+  // from the menu is the only thing that can change is_read after that
+  // point. The moment active.id itself changes (navigating to a different
+  // conversation), the comparison naturally fails and this effect runs
+  // fresh for the new identity — which is also the correct "clear
+  // suppression on navigation" behavior with no separate reset needed.
+  // Only sms_meta_messages-backed channels carry a real is_read signal;
+  // other channels (voice, email, note) have nothing to mark here, but are
+  // still recorded as "handled" so a channel change doesn't leave a stale
+  // comparison.
+  //
+  // SECOND guard, on top of the allConversations-first `active` lookup
+  // above: `explicitSelectionRef.current !== active.id` blocks this effect
+  // unless the CURRENT active conversation is exactly the one the user
+  // most recently, genuinely navigated to via selectConversation() (a row
+  // click, a deep-link open, or New Conversation). Belt-and-suspenders with
+  // the `active` derivation fix — that fix already stops `active.id` from
+  // silently changing when a conversation drops out of the current filter,
+  // but this guard also independently blocks the initial passive-fallback
+  // pick on first load (activeId never set, explicitSelectionRef.current is
+  // still null) from being treated as a user-initiated open. A folder/
+  // channel filter change, a query refetch/reorder, or a conversation
+  // disappearing from the current filter can never satisfy this check on
+  // their own — only an actual call to selectConversation() sets the ref.
+  const explicitReadEligible = !!active && explicitSelectionRef.current === active.id;
+  const autoReadHandledForId = useRef<string | null>(null);
   useEffect(() => {
-    if (!active || !active.unread) return;
+    if (!active) return;
+    if (!explicitReadEligible) return;
+    if (autoReadHandledForId.current === active.id) return;
+
     const channel = active.channel;
-    if (channel !== "sms" && channel !== "whatsapp" && channel !== "messenger" && channel !== "instagram") return;
+    if (channel !== "sms" && channel !== "whatsapp" && channel !== "messenger" && channel !== "instagram") {
+      autoReadHandledForId.current = active.id;
+      return;
+    }
+    if (!active.unread) {
+      autoReadHandledForId.current = active.id;
+      return;
+    }
+
+    // Mark BEFORE the async call resolves — a re-render while this await
+    // is in flight (e.g. a realtime refetch) must not re-enter and fire a
+    // second concurrent markRead for the same conversation.
+    autoReadHandledForId.current = active.id;
     markRead(active.contactId, channel).catch((error) => {
       console.error("[inbox] auto markRead failed:", error);
     });
@@ -585,6 +815,8 @@ function InboxPage() {
       "bg-fuchsia-400": "border-fuchsia-400",
       "bg-cyan-400": "border-cyan-400",
       "bg-lime-400": "border-lime-400",
+      "bg-blue-400": "border-blue-400",
+      "bg-indigo-400": "border-indigo-400",
       "bg-slate-400": "border-slate-400",
     };
 
@@ -624,55 +856,114 @@ function InboxPage() {
     }
   };
 
-  // Selecting a conversation defaults the composer to THAT conversation's
-  // own channel (an Email thread composes Email, not whatever channel was
-  // last used elsewhere) — keyed only on activeId, so this fires exactly
-  // once per conversation switch and never re-fires (and never overrides a
-  // manual channel change) while the user stays on the same conversation.
-  // Voice has no composer, so a voice conversation leaves composeChannel
-  // exactly as it already was (last valid text channel, or the "sms"
-  // initial default) — the messenger/instagram validity check right below
-  // still applies afterward. Note is never a conversation channel, so it's
-  // never auto-selected here — only manually, from the compose tabs.
+  // Subject derivation for the newly-displayed conversation. Keyed on
+  // active?.id (the conversation actually being shown — see below), not the
+  // raw activeId state, and only email needs it — nothing here depends on
+  // contact hydration, so it can run immediately.
+  useEffect(() => {
+    if (!active || active.channel !== "email") return;
+    if (active.id.startsWith("gm-") && active.emailSubject) {
+      const already = /^re:/i.test(active.emailSubject.trim());
+      setSubject(already ? active.emailSubject : `Re: ${active.emailSubject}`);
+    } else {
+      // A brand-new email conversation (not an existing Gmail thread) —
+      // its own subject behavior is simply to start blank, never a
+      // leftover reply subject from whatever thread was open before.
+      setSubject("");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active?.id]);
+
+  // ── Default compose channel — ONE centralized effect, not two ──────────
+  //
+  // Fixes two distinct, previously-conflated bugs:
+  //
+  // BUG 1 (auto-selection never initializes composeChannel): `active` above
+  // is a FALLBACK chain — `conversations.find(id===activeId) ?? first
+  // non-voice ?? conversations[0]` — so the conversation actually on screen
+  // can differ from the `activeId` STATE whenever activeId is still
+  // undefined (first paint) or no longer present in the current filtered
+  // `conversations` list (e.g. the top channel filter just changed away
+  // from wherever the previously-active conversation lived). In both
+  // cases `active` (the rendered object) changes but the `activeId` STRING
+  // does not, so an effect keyed on raw `activeId` never re-fires — this is
+  // exactly why clicking the Messenger/Instagram top filter and having a
+  // thread auto-selected left the composer on "sms" (its untouched initial
+  // value) while a MANUAL row click (which does call setActiveId with a
+  // real id) worked. Fixed by keying on `active?.id` — the identity that's
+  // actually displayed — instead of the `activeId` state variable.
+  //
+  // BUG 2 (stale-state race between two effects): the previous code split
+  // this into two effects — one that unconditionally set composeChannel to
+  // the conversation's own channel, and a second "guard" that downgraded to
+  // SMS if the required Messenger/Instagram identity was missing. Both were
+  // keyed so they could fire in the SAME commit (e.g. on every activeId
+  // change), and the guard effect's condition read `composeChannel` from
+  // ITS OWN render closure — the value from BEFORE the first effect's
+  // setComposeChannel call had been applied. Switching from an active
+  // Messenger conversation directly to an Instagram one reproduced this
+  // exactly: the guard fired with the STALE composeChannel === "messenger"
+  // (leftover from before this render) against the NEW (Instagram) contact,
+  // which genuinely has no messenger_psid — satisfying the guard's downgrade
+  // condition and overwriting the first effect's correct "instagram" value
+  // with "sms" inside the same batch. Fixed by using exactly one effect
+  // that computes the target channel purely from `active.channel` plus the
+  // CURRENT render's `contact` fields — it never reads `composeChannel`
+  // itself to decide, so there is nothing for it to race against.
+  //
+  // Manual-override preservation: `initializedForConvId` records the last
+  // conversation identity this effect actually made a decision for. Once
+  // set, later re-renders for the SAME conversation (e.g. contact data
+  // refreshing in the background) skip straight past — so a manual compose
+  // tab click is never stomped while staying on one conversation. It is
+  // intentionally NOT set while still waiting on contactsLoading, so the
+  // effect re-fires and actually decides once loading completes, instead of
+  // permanently locking in a premature "sms" downgrade (the historical
+  // Messenger/WhatsApp bug this whole redesign traces back to).
+  const initializedForConvId = useRef<string | null>(null);
   useEffect(() => {
     if (!active) return;
     const channel = active.channel;
-    if (channel === "email" || channel === "sms" || channel === "whatsapp" || channel === "messenger" || channel === "instagram") {
-      setComposeChannel(channel);
+    if (channel !== "email" && channel !== "sms" && channel !== "whatsapp" && channel !== "messenger" && channel !== "instagram") {
+      // Voice/note: nothing to initialize — leave composeChannel exactly as
+      // it already was, and don't mark this id "handled" so a real
+      // text-capable selection later still gets evaluated fresh.
+      return;
     }
-    // Derive the subject for the newly-selected conversation. This effect
-    // is keyed ONLY on activeId, so it never re-fires while the user stays
-    // on the same conversation — a manual edit is therefore always safe
-    // (nothing here runs again until they actually switch threads). Once
-    // they DO switch, the previous thread's subject (auto-generated OR
-    // manually edited — either way, it belongs to a different thread now)
-    // must not leak into the newly-selected one, so this always sets an
-    // explicit value rather than only filling an empty field.
-    if (channel === "email") {
-      if (active.id.startsWith("gm-") && active.emailSubject) {
-        const already = /^re:/i.test(active.emailSubject.trim());
-        setSubject(already ? active.emailSubject : `Re: ${active.emailSubject}`);
-      } else {
-        // A brand-new email conversation (not an existing Gmail thread) —
-        // its own subject behavior is simply to start blank, never a
-        // leftover reply subject from whatever thread was open before.
-        setSubject("");
-      }
-    }
-    // Non-email channels never show the subject field at all — leave
-    // whatever subject text exists untouched rather than clearing it
-    // "unnecessarily".
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeId]);
 
-  // If the active conversation changes to a contact who doesn't have a
-  // Messenger/Instagram identifier on file, but composeChannel is still set
-  // to one of those, fall back to SMS rather than leaving the compose box
-  // pointed at a channel with no visible tab and no valid recipient.
-  useEffect(() => {
-    if (composeChannel === "messenger" && !contact?.messenger_psid) setComposeChannel("sms");
-    if (composeChannel === "instagram" && !contact?.instagram_igsid) setComposeChannel("sms");
-  }, [activeId, contact?.messenger_psid, contact?.instagram_igsid, composeChannel]);
+    // Messenger/Instagram need the real Contact record to know whether the
+    // platform identity actually exists — wait rather than guess. Do NOT
+    // mark initializedForConvId yet, so this effect re-fires (contactsLoading
+    // is a dependency below) the instant loading completes for this same
+    // conversation.
+    if ((channel === "messenger" || channel === "instagram") && contactsLoading) return;
+
+    if (initializedForConvId.current === active.id) return;
+    initializedForConvId.current = active.id;
+
+    const hasRequiredIdentity =
+      channel === "messenger" ? !!contact?.messenger_psid :
+      channel === "instagram" ? !!contact?.instagram_igsid :
+      true; // email/sms/whatsapp never gate on a Meta platform identity
+
+    // Temporary, safe diagnostic (dev builds only) — booleans/ids only,
+    // never the actual psid/igsid value, never message content, never a
+    // token. If Instagram still lands on "sms" after this fix, this line
+    // tells you whether it's this effect misfiring again vs. the resolved
+    // Contact genuinely lacking instagram_igsid (a data/backend question,
+    // not a frontend one) — see the audit report for the SQL to check that.
+    if (import.meta.env.DEV && (channel === "messenger" || channel === "instagram")) {
+      console.debug("[inbox] compose-channel default:", {
+        channel,
+        contactFound: !!contact,
+        contactId: active.contactId,
+        hasRequiredIdentity,
+        resolvedTo: hasRequiredIdentity ? channel : "sms",
+      });
+    }
+
+    setComposeChannel(hasRequiredIdentity ? channel : "sms");
+  }, [active?.id, active?.channel, contactsLoading, contact?.messenger_psid, contact?.instagram_igsid]);
 
   // Real activity timeline for the selected contact
   const { items: contactActivity } = useContactActivity(active?.contactId ?? null);
@@ -837,10 +1128,18 @@ function InboxPage() {
           from_name: mergeCtx.company_name,
           contact_id: active.contactId,
           // Gmail's own thread id (not an RFC Message-ID) — only meaningful
-          // when replying inside an existing gm-<thread_id> conversation, so
-          // send-inbox-message.ts can look up that thread's real threading
-          // headers itself. Omitted for a brand-new email conversation.
-          email_thread_id: composeChannel === "email" && active.id.startsWith("gm-") ? active.id.slice(3) : undefined,
+          // when replying inside an existing Gmail-backed email
+          // conversation, so send-inbox-message.ts can look up that
+          // thread's real threading headers itself. Read from
+          // active.emailThreadId — NOT sliced from active.id — because a
+          // CRM-matched conversation's id is now `gm-contact-<contactId>`
+          // (Conversations Consolidation, gmail-conversations.ts merges
+          // every thread for one Contact into one row), so the real thread
+          // to reply into is carried explicitly on the Conversation object
+          // (always the most recently active of that Contact's threads),
+          // not recoverable by slicing the id. Omitted for a brand-new
+          // email conversation with no Gmail thread yet.
+          email_thread_id: composeChannel === "email" ? active.emailThreadId : undefined,
         }),
       });
       if (!res.ok) {
@@ -983,19 +1282,22 @@ function InboxPage() {
 
   // ── Create Deal from this conversation's contact ────────────────────────────
   const activeContactHasRealId = !!active?.contactId && UUID_RE.test(active.contactId);
-  // A Gmail sender with no matching saved contact — shows "Not in contacts"
-  // instead of the generic "Customer" badge, plus Create Contact/Create
-  // Lead/Link to Existing Contact actions (see UnmatchedGmailSenderBanner).
+  // A Gmail sender with no matching saved contact — the UnmatchedGmailSenderBanner
+  // surfaces this state with Create Contact / Create Lead / Link actions.
   const activeIsUnmatchedGmailSender = !!active && active.channel === "email" && !activeContactHasRealId;
+
+  // (S3 stabilization) The Conversation header no longer renders a Contact
+  // tag / "Customer" / derived-"Lead" classification chip — the right
+  // sidebar's TAGS section is the single canonical place for that, and the
+  // "Customer" fallback was never backed by real Contact data.
 
   // Composer button label: "Reply" for a real, already-persisted thread
   // (sm- = SMS/WhatsApp/Messenger/Instagram, gm- = Gmail, voice- = voice
   // calls), "Send" for a conversation that doesn't have a persisted message
-  // yet (sb- = SMS placeholder for a contact with no thread yet, or
-  // local-conv- = the New Conversation sheet's brand-new placeholder).
-  // Deliberately keyed off the conversation id's identity, not thread
-  // length — a placeholder with a locally-echoed failed-send/note message
-  // is still a brand-new conversation, not an existing one.
+  // yet (local-conv- = the New Conversation sheet's/deep-link's brand-new
+  // placeholder). Deliberately keyed off the conversation id's identity,
+  // not thread length — a placeholder with a locally-echoed failed-send/
+  // note message is still a brand-new conversation, not an existing one.
   const activeIsExistingThread =
     !!active && (active.id.startsWith("sm-") || active.id.startsWith("gm-") || active.id.startsWith("voice-"));
 
@@ -1308,6 +1610,18 @@ function InboxPage() {
             </div>
             {channelFilter === "email" && (
               <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAllMail((v) => !v)}
+                  title="By default, only email tied to a saved Contact is shown. Toggle to see all synced mail, including unmatched senders."
+                  className={`h-8 shrink-0 rounded-md border px-2.5 text-[11px] font-medium transition-colors ${
+                    showAllMail
+                      ? "border-[#E8D4AA] bg-[#FAF3E4] text-[#9A6821]"
+                      : "border-[#E5E7EB] bg-white text-[#667085] hover:bg-[#F8FAFC]"
+                  }`}
+                >
+                  {showAllMail ? "Showing all mail" : "CRM contacts only"}
+                </button>
                 {gmailLastSyncAt && (
                   <span className="hidden text-[11px] text-muted-foreground sm:inline" title={new Date(gmailLastSyncAt).toLocaleString()}>
                     Last synced {relativeShort(gmailLastSyncAt)}
@@ -1353,12 +1667,13 @@ function InboxPage() {
                 key={c.id}
                 conv={c}
                 active={c.id === active?.id}
-                starred={checkStarred(c.id)}
+                starred={checkStarred(c)}
+                unassigned={isUnassigned(c.contactId)}
                 contactTags={
                   allStoreContacts.find((contact) => contact.id === c.contactId)?.tags ?? []
                 }
                 tagDefinitions={managedTags}
-                onClick={() => setActiveId(c.id)}
+                onClick={() => selectConversation(c.id)}
                 gmailAccountEmail={gmailAccountEmail}
                 gmailAccountPictureUrl={gmailAccountPictureUrl}
               />
@@ -1419,9 +1734,13 @@ function InboxPage() {
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 text-[15px] font-semibold">
                       <span className="truncate">{active.contactName}</span>
-                      <Badge variant="outline" className="h-4.5 shrink-0 px-1.5 text-[9px] uppercase">
-                        {activeContactTags[0] ?? (activeIsUnmatchedGmailSender ? "Not in contacts" : "Customer")}
-                      </Badge>
+                      {/* S3 stabilization: no Contact tag / "Customer" /
+                          derived-"Lead" classification chip in the header.
+                          That was a duplicate of the right sidebar's TAGS
+                          section (which is the canonical place), and the
+                          "Customer" fallback wasn't backed by any real
+                          Contact data. Name + channel identity + email/phone
+                          + controls are all still here. */}
                     </div>
                     {active.channel === "email" ? (
                       <SenderEmailLine senderEmail={active.senderEmail} className="mt-0.5" />
@@ -1443,18 +1762,12 @@ function InboxPage() {
                     variant="ghost"
                     size="sm"
                     className="h-8 px-2"
-                    title={checkStarred(active.id) ? "Unstar conversation" : "Star conversation"}
-                    onClick={() => {
-                      setStarredIds((prev) => {
-                        const next = new Set(prev);
-                        next.has(active.id) ? next.delete(active.id) : next.add(active.id);
-                        return next;
-                      });
-                    }}
+                    title={checkStarred(active) ? "Unstar conversation" : "Star conversation"}
+                    onClick={() => toggleStarred(active)}
                   >
                     <Star
                       className={`h-4 w-4 ${
-                        checkStarred(active.id)
+                        checkStarred(active)
                           ? "fill-amber-400 text-amber-400"
                           : "text-muted-foreground"
                       }`}
@@ -1496,6 +1809,15 @@ function InboxPage() {
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
+                      {/* Single dynamic action, never two simultaneous menu
+                          items — label/action switch on the SAME real
+                          unreadCount signal every other badge already uses
+                          (never a separate locally-tracked read/unread
+                          flag). Only sms_meta_messages-backed channels
+                          (sms/whatsapp/messenger/instagram) have real
+                          per-message unread state; email/voice/note keep
+                          the old static "Mark as read" no-op — there is no
+                          real unread concept to toggle there. */}
                       <DropdownMenuItem
                         onClick={async () => {
                           if (!active) return;
@@ -1504,21 +1826,73 @@ function InboxPage() {
                             toast.success("Marked as read");
                             return;
                           }
+                          const markingUnread = (active.unreadCount ?? 0) === 0;
                           try {
-                            await markRead(active.contactId, channel);
-                            toast.success("Marked as read");
+                            if (markingUnread) {
+                              // Server truth, not an assumed success — the
+                              // endpoint only marks the latest INBOUND
+                              // message unread and returns updated: 0 as a
+                              // safe no-op when there isn't one (never marks
+                              // an outbound message unread). The menu item
+                              // is already disabled ahead of time when the
+                              // loaded thread has no inbound message (see
+                              // activeHasInboundMessage below), so this
+                              // branch is mainly a safety net for a thread
+                              // that hasn't fully loaded yet.
+                              const result = await markUnread(active.contactId, channel);
+                              if (result.updated > 0) {
+                                toast.success("Marked as unread");
+                              } else {
+                                toast("No inbound message to mark unread");
+                              }
+                            } else {
+                              await markRead(active.contactId, channel);
+                              toast.success("Marked as read");
+                            }
                           } catch {
-                            toast.error("Could not mark as read");
+                            toast.error(markingUnread ? "Could not mark as unread" : "Could not mark as read");
                           }
                         }}
+                        disabled={
+                          !!active
+                          && (active.channel === "sms" || active.channel === "whatsapp" || active.channel === "messenger" || active.channel === "instagram")
+                          && (active.unreadCount ?? 0) === 0
+                          && !activeHasInboundMessage
+                        }
                       >
-                        Mark as read
+                        {active && (active.channel === "sms" || active.channel === "whatsapp" || active.channel === "messenger" || active.channel === "instagram") && (active.unreadCount ?? 0) === 0
+                          ? "Mark as unread"
+                          : "Mark as read"}
                       </DropdownMenuItem>
-                      <DropdownMenuItem onClick={() => toast.success("Conversation assigned")}>Assign to me</DropdownMenuItem>
+                      {activeContactHasRealId && (
+                        <DropdownMenuItem
+                          onClick={async () => {
+                            if (!active || !currentUserName) return;
+                            try {
+                              await updateContact(active.contactId, { owner: currentUserName });
+                              toast.success("Conversation assigned to you");
+                            } catch (error) {
+                              console.error("[inbox] assign to me failed:", error);
+                              toast.error("Could not assign this conversation");
+                            }
+                          }}
+                        >
+                          Assign to me
+                        </DropdownMenuItem>
+                      )}
                       {activeContactHasRealId && (
                         <DropdownMenuItem onClick={() => setDealDialogOpen(true)}>Create Deal</DropdownMenuItem>
                       )}
-                      {active?.channel === "email" && activeContactHasRealId && (
+                      {/* Only for a genuine single-thread email conversation
+                          (gm-<thread_id>). A CRM-matched, consolidated
+                          conversation (gm-contact-<contactId> — see
+                          Conversations Consolidation in
+                          gmail-conversations.ts) can represent SEVERAL
+                          merged Gmail threads, each with its own
+                          independent explicit-link state; "unlink" has no
+                          single well-defined target there, so it's hidden
+                          rather than operating on the wrong (or no) thread. */}
+                      {active?.channel === "email" && activeContactHasRealId && !active.id.startsWith("gm-contact-") && (
                         <DropdownMenuItem
                           onClick={async () => {
                             if (!active) return;
@@ -1540,16 +1914,8 @@ function InboxPage() {
                         </DropdownMenuItem>
                       )}
                       <DropdownMenuSeparator />
-                      <DropdownMenuItem
-                        onClick={() => {
-                          setStarredIds((prev) => {
-                            const next = new Set(prev);
-                            next.has(active.id) ? next.delete(active.id) : next.add(active.id);
-                            return next;
-                          });
-                        }}
-                      >
-                        {checkStarred(active.id) ? "Unstar conversation" : "Star conversation"}
+                      <DropdownMenuItem onClick={() => toggleStarred(active)}>
+                        {checkStarred(active) ? "Unstar conversation" : "Star conversation"}
                       </DropdownMenuItem>
                       <DropdownMenuItem
                         onClick={() => {
@@ -1620,6 +1986,13 @@ function InboxPage() {
                     </div>
                     <div className="space-y-4">
                       {group.messages.map((m) => (
+                        // onDelete intentionally omitted for now — the
+                        // deleted_at migration is still unapplied and the
+                        // server function's delete_message action is
+                        // disabled (returns 503) until it's live. See
+                        // conversation-message-state.ts. Re-enable by
+                        // restoring `m.dbId ? () => setDeleteMessageId(m.dbId!) : undefined`
+                        // once the migration is applied and confirmed.
                         <MessageBubble key={m.id} msg={m} />
                       ))}
                     </div>
@@ -1957,7 +2330,7 @@ function InboxPage() {
                         className={`h-6 gap-1.5 bg-white px-2 text-[11px] text-foreground ${getTagBorderColor(tag)}`}
                       >
                         <span className={`h-2 w-2 rounded-full ${getTagColor(tag)}`} />
-                        {tag}
+                        {tagDisplayLabel(tag)}
                       </Badge>
                     ))
                   ) : (
@@ -1983,7 +2356,11 @@ function InboxPage() {
                       Contact tags
                     </div>
                     <div className="max-h-64 space-y-1 overflow-y-auto">
-                      {managedTags.map((tag) => {
+                      {/* S3 stabilization: hide derived-relationship tags
+                          ("Lead"/"New Lead") from the manual assign picker —
+                          Lead status is derived from real Lead records, not
+                          a manually-assigned Contact tag. */}
+                      {managedTags.filter((t) => isManuallyAssignableTag(tagComparisonKey(t.label))).map((tag) => {
                         const selected = activeContactTags.some(
                           (item) => item.toLowerCase() === tag.label.toLowerCase(),
                         );
@@ -2178,7 +2555,7 @@ function InboxPage() {
           (conv) => conv.contactId === c.id && conv.channel === targetChannel,
         );
         if (existing) {
-          setActiveId(existing.id);
+          selectConversation(existing.id);
         } else {
           const newConv: Conversation = {
             id: `local-conv-${Date.now()}`,
@@ -2190,7 +2567,7 @@ function InboxPage() {
             unread: false,
           };
           setLocalConversations((prev) => [newConv, ...prev]);
-          setActiveId(newConv.id);
+          selectConversation(newConv.id);
         }
         setComposeChannel(targetChannel);
         setNewConvOpen(false);
@@ -2247,6 +2624,26 @@ function InboxPage() {
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
+    <AlertDialog open={deleteMessageId !== null} onOpenChange={(o) => { if (!o && !deletingMessage) setDeleteMessageId(null); }}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Delete this message?</AlertDialogTitle>
+          <AlertDialogDescription>
+            This removes the message from RenoMeta only. It will NOT be unsent, recalled, or deleted from Instagram, Messenger, WhatsApp, or the recipient's phone — the other party will still have it in their own conversation history.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={deletingMessage}>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            disabled={deletingMessage}
+            onClick={(e) => { e.preventDefault(); handleConfirmDeleteMessage(); }}
+          >
+            {deletingMessage ? "Deleting…" : "Delete message"}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
 
     <Sheet open={contactDrawerOpen} onOpenChange={setContactDrawerOpen}>
       <SheetContent side="right" className="w-full overflow-y-auto sm:max-w-md">
@@ -2289,7 +2686,7 @@ function InboxPage() {
                         className={`h-6 gap-1.5 bg-white px-2 text-[11px] text-foreground ${getTagBorderColor(tag)}`}
                       >
                         <span className={`h-2 w-2 rounded-full ${getTagColor(tag)}`} />
-                        {tag}
+                        {tagDisplayLabel(tag)}
                       </Badge>
                     ))
                   ) : (
@@ -2310,7 +2707,7 @@ function InboxPage() {
                     </Button>
                   </PopoverTrigger>
                   <PopoverContent align="start" className="w-64 p-2">
-                    {managedTags.map((tag) => {
+                    {managedTags.filter((t) => isManuallyAssignableTag(tagComparisonKey(t.label))).map((tag) => {
                       const selected = activeContactTags.some(
                         (item) => item.toLowerCase() === tag.label.toLowerCase(),
                       );
@@ -2611,6 +3008,7 @@ function ConversationRow({
   conv,
   active,
   starred,
+  unassigned,
   contactTags,
   tagDefinitions,
   onClick,
@@ -2620,6 +3018,8 @@ function ConversationRow({
   conv: Conversation;
   active: boolean;
   starred: boolean;
+  /** Real CRM state — the linked Contact has no `owner` set. See isUnassigned() in InboxPage. */
+  unassigned: boolean;
   contactTags: string[];
   tagDefinitions: { label: string; color: string }[];
   onClick: () => void;
@@ -2627,15 +3027,11 @@ function ConversationRow({
   gmailAccountPictureUrl?: string | null;
 }) {
   const badges = [
-    ...(hasMention(conv.id)
-      ? [{
-          key: "mentioned",
-          label: "Mentioned",
-          className:
-            "border-violet-300 bg-violet-50 text-violet-700 dark:border-violet-800 dark:bg-violet-950 dark:text-violet-300",
-        }]
-      : []),
-    ...(isUnassigned(conv.id)
+    // "Mentioned" was previously a hash(id)-based mock with no real @mention
+    // data behind it anywhere in the schema — removed rather than kept as a
+    // permanently-fake badge. A real @mentions feature would need a new
+    // table/column; flagged in the audit report rather than built here.
+    ...(unassigned
       ? [{
           key: "unassigned",
           label: "Unassigned",
@@ -2643,14 +3039,18 @@ function ConversationRow({
             "border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300",
         }]
       : []),
-    ...(conv.unread
-      ? [{
-          key: "needs-reply",
-          label: "Needs reply",
-          className:
-            "border-rose-300 bg-rose-50 text-rose-700 dark:border-rose-800 dark:bg-rose-950 dark:text-rose-300",
-        }]
-      : []),
+    // A derived "Needs reply" badge used to render here whenever
+    // conv.unread was true — removed (Needs Reply count-consistency audit):
+    // it read as the same thing as the real, canonical Contact tag "Needs
+    // Reply" (assignable from Contacts/the tag picker, counted in the
+    // sidebar Tags section), but was actually a completely different,
+    // derived-from-unread-state signal with no relationship to that tag —
+    // hence the sidebar showing "Needs Reply 0" while unread rows all
+    // displayed a same-looking badge. The row already has an unambiguous,
+    // real unread indicator (the numeric badge/dot below, sourced from the
+    // same conv.unreadCount), so this was also pure duplication, not just a
+    // naming collision. "Needs Reply" now refers to exactly one thing
+    // everywhere in the app: the real Contact tag.
     ...contactTags.slice(0, 3).map((tag) => {
       const definition = tagDefinitions.find(
         (item) => item.label.toLowerCase() === tag.toLowerCase(),
@@ -2658,7 +3058,11 @@ function ConversationRow({
 
       return {
         key: `tag-${tag}`,
-        label: tag,
+        // Raw stored value (e.g. "new_lead") formatted to a human-readable
+        // label ("New Lead") via the SAME canonical formatter Contacts uses
+        // (src/lib/tag-utils.ts) — one shared source, not a second inbox-
+        // only formatter, so a tag reads identically on both pages.
+        label: tagDisplayLabel(tag),
         className: conversationTagBadgeClasses(definition?.color ?? "bg-slate-400"),
       };
     }),
@@ -2733,13 +3137,26 @@ function ConversationRow({
         <span className="mt-2 h-2 w-2 shrink-0 rounded-full bg-gold" />
       )}
       {conv.unread && (
-        <span className="mt-2 h-2 w-2 shrink-0 rounded-full bg-info" />
+        // True unread INBOUND message count (Phase 9), not a maintained
+        // counter — sourced directly from sms_meta_messages.is_read via
+        // sms-meta-conversations.ts. Numeric badge when the exact count is
+        // known and > 0; falls back to the plain dot only for a
+        // conversation source with no real per-message count yet
+        // (conv.unreadCount undefined — none exist today, since Gmail/Voice
+        // always report unread:false).
+        typeof conv.unreadCount === "number" && conv.unreadCount > 0 ? (
+          <span className="mt-1.5 flex h-4.5 min-w-4.5 shrink-0 items-center justify-center rounded-full bg-info px-1 text-[10px] font-semibold leading-none text-white">
+            {conv.unreadCount > 99 ? "99+" : conv.unreadCount}
+          </span>
+        ) : (
+          <span className="mt-2 h-2 w-2 shrink-0 rounded-full bg-info" />
+        )
       )}
     </button>
   );
 }
 
-function MessageBubble({ msg }: { msg: LocalMessage }) {
+function MessageBubble({ msg, onDelete }: { msg: LocalMessage; onDelete?: () => void }) {
   const isOut = msg.direction === "out";
 
   // Internal note
@@ -2772,18 +3189,42 @@ function MessageBubble({ msg }: { msg: LocalMessage }) {
 
   // SMS / Email (+ scheduled variant)
   return (
-    <div className={`flex ${isOut ? "justify-end" : "justify-start"}`}>
+    <div className={`group flex ${isOut ? "justify-end" : "justify-start"}`}>
       <div className={`flex max-w-[72%] flex-col gap-1 sm:max-w-md lg:max-w-lg ${isOut ? "items-end" : "items-start"}`}>
-        <div
-          className={`conversation-message-bubble rounded-2xl border px-4 py-3 text-sm leading-relaxed ${
-            msg.isScheduled
-              ? "rounded-br-md border-dashed border-[#E3C98F] bg-[#FAF3E4] text-[#273142]"
-              : isOut
-                ? "rounded-br-md border-[#F0E0C1] bg-[#FAF3E4] text-[#273142]"
-                : "rounded-bl-md border-[#E5E7EB] bg-[#F3F4F6] text-[#273142]"
-          }`}
-        >
-          {msg.body}
+        <div className={`flex items-start gap-1 ${isOut ? "flex-row-reverse" : ""}`}>
+          <div
+            className={`conversation-message-bubble rounded-2xl border px-4 py-3 text-sm leading-relaxed ${
+              msg.isScheduled
+                ? "rounded-br-md border-dashed border-[#E3C98F] bg-[#FAF3E4] text-[#273142]"
+                : isOut
+                  ? "rounded-br-md border-[#F0E0C1] bg-[#FAF3E4] text-[#273142]"
+                  : "rounded-bl-md border-[#E5E7EB] bg-[#F3F4F6] text-[#273142]"
+            }`}
+          >
+            {msg.body}
+          </div>
+          {/* CRM-local delete only — see the confirmation dialog's copy.
+              Only offered for messages that carry a real database id
+              (SMS/WhatsApp/Messenger/Instagram, via Message.dbId); email,
+              voice, and notes have no delete support in this pass. */}
+          {onDelete && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className="mt-1 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-secondary group-hover:opacity-100"
+                  aria-label="Message actions"
+                >
+                  <MoreHorizontal className="h-3.5 w-3.5" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align={isOut ? "start" : "end"}>
+                <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={onDelete}>
+                  <Trash2 className="mr-2 h-3.5 w-3.5" /> Delete message
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
         </div>
         <div className={`conversation-message-meta flex items-center gap-1.5 px-1 text-[10px] ${isOut ? "text-[#9A7B45]" : "text-[#8A94A6]"}`}>
           <ChannelGlyph channel={msg.channel} />
@@ -3116,15 +3557,9 @@ function isLocalEmailReconciled(
   });
 }
 
-// Deterministic mock helpers (no random per render → no hydration drift)
-function hash(id: string) {
-  let h = 0;
-  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
-  return h;
-}
-function isStarred(id: string) { return hash(id) % 5 === 0; }
-function hasMention(id: string) { return hash(id) % 6 === 0; }
-function isUnassigned(id: string) { return hash(id) % 4 === 0; }
-function isAssignedToMe(id: string) { return hash(id) % 3 === 0; }
-// isArchived was replaced by the real, persisted useConversationArchiveStates()
-// hook (see conversation-states.ts) — this mock hash-based version is gone.
+// The old hash(id)-based fake isStarred/hasMention/isUnassigned/
+// isAssignedToMe mocks (and isArchived before them) are gone — every
+// conversation-list predicate is now backed by real, persisted data. See
+// checkStarred/isUnassigned/isAssignedToMe in InboxPage and
+// useConversationArchiveStates()/useConversationStarStates() in
+// conversation-states.ts.

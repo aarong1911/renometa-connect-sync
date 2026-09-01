@@ -1,14 +1,41 @@
 // src/lib/leads-store.ts
-// Supabase-backed leads store — maintains the same hook interface.
+//
+// Platform State Sync Phase S3 — Leads shared server state.
+//
+// BEFORE S3: a module-level `leads` array + listener Set + `emit()` +
+// `useSyncExternalStore`, isolated from the rest of the app's cache, with
+// no realtime coverage.
+//
+// AFTER S3: one TanStack Query per org (`queryKeys.leads(orgId)`).
+// `useLeads()` keeps its exact public shape (`Lead[]`, `[]` until loaded)
+// as a thin `useQuery` wrapper. All imperative mutation functions keep
+// their signatures; after a confirmed DB write / RPC they invalidate the
+// dependent query keys on the shared client (query-client.ts /
+// getQueryClient()). The central RealtimeBridge now also invalidates
+// `queryKeys.leads(orgId)` on any `leads` row change.
+//
+// UNCHANGED by S3:
+//  - the secure `convert_lead_to_deal` RPC path (no browser-side table
+//    writes were substituted for it)
+//  - the phone→email contact match/upsert precedence in addLead()
+//  - Lead-source / Lead-status normalisation
+//  - the converted-lead hard delete guard
+//  - Lead Notes: still localStorage-backed (see the note at the bottom).
+//    Migrating Lead Notes to the database is a SEPARATE data-model issue,
+//    deliberately out of S3 scope.
 
-import { useState, useEffect, useSyncExternalStore } from "react";
+import { useSyncExternalStore } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
 import type { Lead, LeadStatus, LeadScore } from "@/lib/mock-data";
 import { triggerWorkflow } from "@/lib/trigger-workflow";
 import { normalizeLeadStatusForWrite } from "@/lib/lead-status";
 import { normalizeLeadSource } from "@/lib/lead-source";
+import { queryKeys } from "@/lib/query-keys";
+import { getQueryClient } from "@/lib/query-client";
+import { useOrgId } from "@/lib/org-id";
 
-// ── Org helper ──
+// ── Org helper (pure) ──
 async function getOrgId(): Promise<string | null> {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return null;
@@ -83,16 +110,22 @@ function mapRow(row: any, contactMap: Record<string, any>): Lead {
   };
 }
 
-// ── Reactive store ──
-let leads: Lead[] = [];
-let loaded = false;
-const listeners = new Set<() => void>();
-function emit() { for (const l of listeners) l(); }
+// ── Query layer ──
 
-async function fetchLeads(): Promise<void> {
-  const orgId = await getOrgId();
-  if (!orgId) return;
-
+/**
+ * The Leads list queryFn — org-scoped, newest-first, with linked-Contact
+ * name/email/phone/avatar enrichment.
+ *
+ * Enrichment strategy: a single targeted `contacts` sub-select by id
+ * (minimal columns) INSIDE this queryFn, exactly as the pre-S3 store did.
+ * This was chosen over "read the shared Contacts query cache" because a
+ * queryFn must be self-sufficient — depending on another query being
+ * loaded/fresh first is the fragile option (ordering, partial cache, SSR).
+ * Freshness of the enriched avatar/name is instead guaranteed by the
+ * RealtimeBridge: a `contacts` row change invalidates `queryKeys.leads`
+ * too, so this re-runs and re-enriches.
+ */
+export async function fetchLeadsForOrg(orgId: string): Promise<Lead[]> {
   const { data, error } = await supabase
     .from("leads")
     .select("*")
@@ -101,10 +134,9 @@ async function fetchLeads(): Promise<void> {
 
   if (error) {
     console.error("[leads-store] fetch failed:", error);
-    return;
+    throw error;
   }
 
-  // Batch-fetch contacts for name/email/phone
   const contactIds = (data ?? [])
     .map((r: any) => r.contact_id)
     .filter(Boolean) as string[];
@@ -122,29 +154,68 @@ async function fetchLeads(): Promise<void> {
     }
   }
 
-  leads = (data ?? []).map((r: any) => mapRow(r, contactMap));
-  loaded = true;
-  emit();
+  return (data ?? []).map((r: any) => mapRow(r, contactMap));
 }
 
-// Initial fetch
-fetchLeads();
-
-// ── Public API ──
-
-export function getLeads(): Lead[] {
-  return leads;
+/** Flatten the shared Leads cache across whatever org keys exist (normally one). Read-only — used by the converted-lead delete guards. */
+function getCachedLeads(): Lead[] {
+  const entries = getQueryClient().getQueriesData<Lead[]>({ queryKey: ["leads"] });
+  for (const [, data] of entries) {
+    if (Array.isArray(data)) return data;
+  }
+  return [];
 }
 
-export function useLeads(): Lead[] {
-  useEffect(() => { if (!loaded) fetchLeads(); }, []);
-
-  return useSyncExternalStore(
-    (cb) => { listeners.add(cb); return () => listeners.delete(cb); },
-    () => leads,
-    () => [],
+/**
+ * Immediately reflect a CONFIRMED, NON-LOSSY field change into the cached
+ * Leads list(s) so the UI updates without waiting for the reconciling
+ * refetch. Only used for changes that don't need server-side enrichment
+ * (status / owner / removal) — creation and contact-touching edits go
+ * through invalidation only, since their in-memory row would be missing
+ * the linked-Contact avatar/name enrichment until the refetch.
+ */
+function patchLeadsCache(fn: (list: Lead[]) => Lead[]) {
+  getQueryClient().setQueriesData<Lead[]>({ queryKey: ["leads"] }, (old) =>
+    Array.isArray(old) ? fn(old) : old,
   );
 }
+
+const qc = () => getQueryClient();
+
+/** Leads changed — refresh the Leads list and the Inbox Lead-badge derivation. */
+function invalidateLeads() {
+  void qc().invalidateQueries({ queryKey: ["leads"] });
+  void qc().invalidateQueries({ queryKey: ["conversations"] });
+}
+
+/**
+ * Leads changed in a way that also affects Contact-derived displays and/or
+ * Command Center counts (create / delete / convert / a write that also
+ * touches the linked contacts row). Scoped fan-out — not invalidate-all.
+ */
+function invalidateLeadsWithDependents() {
+  void qc().invalidateQueries({ queryKey: ["leads"] });
+  void qc().invalidateQueries({ queryKey: ["contacts"] });
+  void qc().invalidateQueries({ queryKey: ["conversations"] });
+  void qc().invalidateQueries({ queryKey: ["dashboard"] });
+}
+
+// ── Public hook (unchanged shape) ──
+
+export function useLeads(): Lead[] {
+  const orgId = useOrgId();
+  const { data } = useQuery({
+    queryKey: orgId ? queryKeys.leads(orgId) : ["leads", "_pending"],
+    queryFn: () => fetchLeadsForOrg(orgId as string),
+    enabled: !!orgId,
+    // Leads mutate a little more often than Contacts (status/owner churn),
+    // but realtime + mutation invalidation are the real freshness path.
+    staleTime: 45_000,
+  });
+  return data ?? [];
+}
+
+// ── Imperative mutations (unchanged signatures) ──
 
 export async function addLead(lead: Omit<Lead, "id">): Promise<Lead> {
   const orgId = await getOrgId();
@@ -162,8 +233,16 @@ export async function addLead(lead: Omit<Lead, "id">): Promise<Lead> {
       // Exact match via the real (org_id, phone) unique constraint —
       // unchanged from prior behavior. ON CONFLICT DO UPDATE (not
       // ignoreDuplicates:true), so a matching existing Contact's
-      // name/email/address/source/labels get refreshed from this form,
-      // same as before this change.
+      // name/email/address/source get refreshed from this form.
+      //
+      // S3 stabilization: no longer writes labels: ["Lead"]. A Contact's
+      // Lead status is DERIVED from the real leads.contact_id relationship
+      // (contacts.tsx's derived badge, inbox's useLeads() indicator) — a
+      // persisted literal "Lead" tag is redundant and was the source of the
+      // "manually adding a Lead tag looks like it creates a Lead" model
+      // confusion. Omitting `labels` also means an existing Contact's real
+      // tags are no longer clobbered on conflict. Historical "Lead" labels
+      // on old rows are left untouched.
       const { data: contact } = await supabase
         .from("contacts")
         .upsert(
@@ -174,7 +253,6 @@ export async function addLead(lead: Omit<Lead, "id">): Promise<Lead> {
             email: lead.email || null,
             address: lead.address || null,
             source: "manual",
-            labels: ["Lead"],
           },
           { onConflict: "org_id,phone", ignoreDuplicates: false }
         )
@@ -212,7 +290,6 @@ export async function addLead(lead: Omit<Lead, "id">): Promise<Lead> {
             email: lead.email,
             address: lead.address || null,
             source: "manual",
-            labels: ["Lead"],
           })
           .select("id")
           .single();
@@ -232,7 +309,6 @@ export async function addLead(lead: Omit<Lead, "id">): Promise<Lead> {
           email: null,
           address: lead.address || null,
           source: "manual",
-          labels: ["Lead"],
         })
         .select("id")
         .single();
@@ -273,18 +349,17 @@ export async function addLead(lead: Omit<Lead, "id">): Promise<Lead> {
 
     if (!error && data) {
       const mapped: Lead = { ...lead, id: data.id, assignedTo: data.assigned_to ?? null };
-      leads = [mapped, ...leads];
-      emit();
+      // New Lead: Leads list + Contact Lead-badge + Inbox Lead-badge +
+      // Command Center New Leads / Recent Activity.
+      invalidateLeadsWithDependents();
       triggerWorkflow("new_lead", { lead: mapped }, contactId ?? undefined);
       return mapped;
     }
   }
 
-  // Fallback: add locally
-  const next: Lead = { ...lead, id: tempId };
-  leads = [next, ...leads];
-  emit();
-  return next;
+  // Fallback: no org / insert failed — return an unpersisted stub so the
+  // caller's flow doesn't crash (matches prior behavior). Nothing is cached.
+  return { ...lead, id: tempId };
 }
 
 export async function updateLead(
@@ -296,14 +371,12 @@ export async function updateLead(
   // or already exists in the database (see src/lib/lead-source.ts).
   updates: Partial<Pick<Lead, "name" | "email" | "phone" | "address" | "projectType" | "estimatedBudget" | "owner" | "notes">> & { source?: string },
 ): Promise<void> {
-  const current = leads.find((lead) => lead.id === id);
+  const current = getCachedLeads().find((lead) => lead.id === id);
   if (!current) return;
 
   // Lead-source normalization pass — normalize whatever the caller passed
-  // (or the current in-memory value, if source isn't part of this update)
-  // to the canonical machine value before it becomes part of `next`, the
-  // single source of truth this function both writes to the DB and keeps
-  // as the in-memory representation.
+  // (or the current cached value, if source isn't part of this update) to
+  // the canonical machine value.
   const normalizedSource = normalizeLeadSource(updates.source ?? current.source) || "website_form";
   const next: Lead = { ...current, ...updates, source: normalizedSource, lastActivity: new Date().toISOString() };
   const { data: leadRow, error: readError } = await supabase
@@ -362,8 +435,9 @@ export async function updateLead(
     throw error;
   }
 
-  leads = leads.map((lead) => lead.id === id ? next : lead);
-  emit();
+  // This write also touches the linked contacts row (name/email/phone/
+  // address), so fan out to contacts / conversations / dashboard too.
+  invalidateLeadsWithDependents();
 }
 
 export async function updateLeadStatus(id: string, status: LeadStatus): Promise<void> {
@@ -377,10 +451,10 @@ export async function updateLeadStatus(id: string, status: LeadStatus): Promise<
     throw error;
   }
 
-  leads = leads.map((l) =>
-    l.id === id ? { ...l, status, rawStatus: status, lastActivity: new Date().toISOString() } : l
+  patchLeadsCache((list) =>
+    list.map((l) => (l.id === id ? { ...l, status, rawStatus: status, lastActivity: new Date().toISOString() } : l)),
   );
-  emit();
+  invalidateLeads();
 }
 
 /**
@@ -401,10 +475,10 @@ export async function updateLeadsStatusBulk(ids: string[], status: LeadStatus): 
   }
 
   const idSet = new Set(ids);
-  leads = leads.map((l) =>
-    idSet.has(l.id) ? { ...l, status, rawStatus: status, lastActivity: new Date().toISOString() } : l
+  patchLeadsCache((list) =>
+    list.map((l) => (idSet.has(l.id) ? { ...l, status, rawStatus: status, lastActivity: new Date().toISOString() } : l)),
   );
-  emit();
+  invalidateLeads();
   return { failedIds: [] };
 }
 
@@ -429,8 +503,11 @@ export async function updateLeadOwner(id: string, memberId: string | null): Prom
     throw error;
   }
 
-  leads = leads.map((l) => (l.id === id ? { ...l, assignedTo: memberId, lastActivity: new Date().toISOString() } : l));
-  emit();
+  patchLeadsCache((list) =>
+    list.map((l) => (l.id === id ? { ...l, assignedTo: memberId, lastActivity: new Date().toISOString() } : l)),
+  );
+  // Owner isn't shown in Conversations/Command Center — Leads list only.
+  void qc().invalidateQueries({ queryKey: ["leads"] });
 }
 
 export async function updateLeadsOwnerBulk(ids: string[], memberId: string | null): Promise<{ failedIds: string[] }> {
@@ -446,8 +523,10 @@ export async function updateLeadsOwnerBulk(ids: string[], memberId: string | nul
   }
 
   const idSet = new Set(ids);
-  leads = leads.map((l) => (idSet.has(l.id) ? { ...l, assignedTo: memberId, lastActivity: new Date().toISOString() } : l));
-  emit();
+  patchLeadsCache((list) =>
+    list.map((l) => (idSet.has(l.id) ? { ...l, assignedTo: memberId, lastActivity: new Date().toISOString() } : l)),
+  );
+  void qc().invalidateQueries({ queryKey: ["leads"] });
   return { failedIds: [] };
 }
 
@@ -468,19 +547,15 @@ function isConvertedLead(lead: Pick<Lead, "status" | "convertedDealId">): boolea
  *
  * A converted lead is retained as a historical source record — this is a
  * hard, store-level guard (not just a UI-level one, per the Phase 9.2
- * consistency pass), checked against this function's own in-memory `leads`
- * state rather than trusting the caller to have already excluded it. If a
- * genuinely converted lead somehow isn't in local state yet (shouldn't
- * happen in practice), this fails open to the Supabase delete rather than
- * silently skipping — deleting a converted lead never cascades to its deal
- * either way (leads.converted_to_deal_id references deals(id) ON DELETE
- * SET NULL, the reverse direction; a lead row carries no ON DELETE CASCADE
- * onto deals). Use deleteLeadUnsafe() below only when a caller has already
- * made its own fully-informed decision to bypass this guard — nothing in
- * this codebase currently does.
+ * consistency pass), checked against the shared Leads cache rather than
+ * trusting the caller to have already excluded it. If a genuinely
+ * converted lead somehow isn't cached yet (shouldn't happen in practice),
+ * this fails open to the Supabase delete rather than silently skipping —
+ * deleting a converted lead never cascades to its deal either way
+ * (leads.converted_to_deal_id references deals(id) ON DELETE SET NULL).
  */
 export async function deleteLead(id: string): Promise<DeleteLeadResult> {
-  const current = leads.find((l) => l.id === id);
+  const current = getCachedLeads().find((l) => l.id === id);
   if (current && isConvertedLead(current)) {
     return { ok: false, error: CONVERTED_LEAD_MESSAGE, blocked: true };
   }
@@ -504,28 +579,28 @@ async function deleteLeadUnsafe(id: string): Promise<DeleteLeadResult> {
     return { ok: false, error: "Failed to delete this lead. Please try again." };
   }
 
-  leads = leads.filter((l) => l.id !== id);
-  emit();
+  patchLeadsCache((list) => list.filter((l) => l.id !== id));
+  invalidateLeadsWithDependents();
   return { ok: true };
 }
 
 export type BulkDeleteLeadsResult = { failedIds: string[]; skippedConvertedIds: string[] };
 
 /**
- * Bulk delete. Re-derives the converted/eligible split from this store's
- * own in-memory state rather than trusting the caller's `ids` list to have
- * already excluded converted leads — the UI does its own filtering too
- * (so the two should normally agree), but this is the actual enforcement
- * point. Issues one `.in("id", ids)` request for the eligible subset
- * rather than one delete per row.
+ * Bulk delete. Re-derives the converted/eligible split from the shared
+ * Leads cache rather than trusting the caller's `ids` list to have already
+ * excluded converted leads — the UI does its own filtering too (so the two
+ * should normally agree), but this is the actual enforcement point. Issues
+ * one `.in("id", ids)` request for the eligible subset.
  */
 export async function deleteLeadsBulk(ids: string[]): Promise<BulkDeleteLeadsResult> {
   if (ids.length === 0) return { failedIds: [], skippedConvertedIds: [] };
 
+  const cached = getCachedLeads();
   const skippedConvertedIds: string[] = [];
   const eligibleIds: string[] = [];
   for (const id of ids) {
-    const lead = leads.find((l) => l.id === id);
+    const lead = cached.find((l) => l.id === id);
     if (lead && isConvertedLead(lead)) skippedConvertedIds.push(id);
     else eligibleIds.push(id);
   }
@@ -540,8 +615,8 @@ export async function deleteLeadsBulk(ids: string[]): Promise<BulkDeleteLeadsRes
   }
 
   const idSet = new Set(eligibleIds);
-  leads = leads.filter((l) => !idSet.has(l.id));
-  emit();
+  patchLeadsCache((list) => list.filter((l) => !idSet.has(l.id)));
+  invalidateLeadsWithDependents();
   return { failedIds: [], skippedConvertedIds };
 }
 
@@ -606,12 +681,12 @@ export async function convertLeadToDeal(payload: ConvertLeadPayload): Promise<Co
   if (error) throw error;
 
   const result = data as any;
-  const leadRow = result.lead;
 
-  // Reflect the canonical Lead state locally — no refetch needed.
-  const contactMap = leadRow?.contact_id && result.contact ? { [leadRow.contact_id]: result.contact } : {};
-  leads = leads.map((l) => (l.id === leadRow.id ? mapRow(leadRow, contactMap) : l));
-  emit();
+  // Lead now Converted + a Deal exists + the Contact may have been created/
+  // reused. Deals/Pipeline are NOT Query-backed yet (S3 scope is
+  // Contacts+Leads) — the convert dialog still reflects the new deal into
+  // deals-store itself; here we only refresh what S3 owns.
+  invalidateLeadsWithDependents();
 
   return {
     lead: result.lead,
@@ -630,12 +705,11 @@ export async function convertLeadToDeal(payload: ConvertLeadPayload): Promise<Co
 }
 
 /**
- * Batched, awaited lead import (Stage 9.5) — unlike importLeads() below,
- * this awaits every insert and returns the real created rows (with real
- * ids) so the caller can log per-row import-job outcomes and support
- * rollback. Inserts run in small concurrent batches (not one huge
- * Promise.all over the whole file, not one request at a time either) to
- * bound load while still being meaningfully faster than fully sequential.
+ * Batched, awaited lead import (Stage 9.5) — awaits every insert and
+ * returns the real created rows (with real ids) so the caller can log
+ * per-row import-job outcomes and support rollback. Inserts run in small
+ * concurrent batches to bound load. Each addLead() already invalidates the
+ * Leads query; TanStack coalesces those within a tick.
  */
 export async function addLeadsBatch(newLeads: Omit<Lead, "id">[], batchSize = 25): Promise<{ created: Lead[]; failedIndexes: number[]; byIndex: (Lead | null)[] }> {
   const created: Lead[] = [];
@@ -649,33 +723,21 @@ export async function addLeadsBatch(newLeads: Omit<Lead, "id">[], batchSize = 25
       else failedIndexes.push(i + idx);
     });
   }
+  invalidateLeadsWithDependents();
   return { created, failedIndexes, byIndex };
 }
 
-export function importLeads(newLeads: Omit<Lead, "id">[]): number {
-  // Bulk import — async Supabase insert in background
-  const added = newLeads.map((l, i) => ({ ...l, id: `lead-import-${Date.now()}-${i}` } as Lead));
-  leads = [...added, ...leads];
-  emit();
-
-  // Fire-and-forget Supabase inserts
-  (async () => {
-    const orgId = await getOrgId();
-    if (!orgId) return;
-    for (const lead of newLeads) {
-      await addLead(lead);
-    }
-    await fetchLeads(); // Refresh to get real IDs
-  })();
-
-  return added.length;
-}
-
 export async function refreshLeads(): Promise<void> {
-  await fetchLeads();
+  await getQueryClient().refetchQueries({ queryKey: ["leads"] });
 }
 
-// ── Lead Notes (kept in localStorage for now — fast, no schema change) ──
+// ── Lead Notes ────────────────────────────────────────────────────────────
+//
+// STILL localStorage-backed — deliberately NOT migrated in S3. Lead Notes
+// are per-browser client state today (no `lead_notes` table); moving them
+// to the database is a separate data-model decision requiring a migration,
+// which S3 does not do. This is the ONE remaining `useSyncExternalStore`
+// in this file and it is intentional (client-only state, not server state).
 
 export type LeadNote = { id: string; text: string; createdAt: string };
 

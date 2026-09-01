@@ -6,6 +6,7 @@ import { Loader2 } from "lucide-react";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppShell } from "@/components/layout/app-shell";
+import { RealtimeBridge } from "@/lib/realtime-bridge";
 import { supabase } from "@/lib/supabase";
 import type { Session } from "@supabase/supabase-js";
 import {
@@ -75,6 +76,10 @@ function RootComponent() {
 
   return (
     <QueryClientProvider client={queryClient}>
+      {/* Org-scoped only — the portal is client-facing and has no org
+          session to resolve; mounting it there would just be dead weight
+          (useOrgId() would never resolve for a portal visitor anyway). */}
+      {!isPortalRoute && <RealtimeBridge />}
       <TooltipProvider delayDuration={150}>
         {isPortalRoute ? (
           <Outlet />

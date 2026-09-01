@@ -15,6 +15,7 @@
 // voice-conversations.ts — those channels' own org-id lookups are out of
 // scope for this pass and are left exactly as they were.
 
+import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 
 let cachedOrgId: string | null = null;
@@ -50,4 +51,28 @@ export async function getOrgId(): Promise<string | null> {
   })();
 
   return inFlight;
+}
+
+/**
+ * React hook wrapper around getOrgId() — Platform State Sync Phase S0/S1.
+ * Resolves once (getOrgId() is already memoized per user above, so a
+ * second component mounting this hook does not re-fire the network
+ * request), returns null until resolved. Used as the enabling condition +
+ * query-key input for every Query-backed Conversations hook
+ * (sms-meta-conversations.ts/gmail-conversations.ts/voice-conversations.ts)
+ * and by the central realtime bridge (realtime-bridge.tsx) — one shared
+ * implementation instead of each of those re-deriving org id its own way.
+ */
+export function useOrgId(): string | null {
+  const [orgId, setOrgId] = useState<string | null>(cachedOrgId);
+  useEffect(() => {
+    let cancelled = false;
+    getOrgId().then((id) => {
+      if (!cancelled) setOrgId(id);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return orgId;
 }

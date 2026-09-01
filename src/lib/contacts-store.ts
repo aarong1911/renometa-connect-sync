@@ -1,13 +1,39 @@
 // src/lib/contacts-store.ts
-// Supabase-backed contacts store — maintains the same hook interface
-// so existing page components work without changes.
+//
+// Platform State Sync Phase S3 — Contacts shared server state.
+//
+// BEFORE S3: a module-level `contacts` array + a listener Set + `emit()` +
+// `useSyncExternalStore`, i.e. an isolated hand-rolled cache with no
+// realtime coverage and no shared invalidation with the rest of the app.
+//
+// AFTER S3: one TanStack Query per org (`queryKeys.contacts(orgId)`).
+// `useContacts()` keeps its exact public shape (`Contact[]`, `[]` until
+// loaded) but is now a thin `useQuery` wrapper, so every consumer
+// (Contacts page, Inbox contact panel, Lead/Deal drawers, Command Center
+// avatar surfaces, entity pickers, …) reads the SAME cached list. The
+// imperative mutation functions (`addContact`/`updateContact`/… — called
+// directly from ~25 sites, not hooks) are unchanged in signature; after a
+// confirmed DB write they invalidate the relevant query keys on the shared
+// client (see query-client.ts / getQueryClient()) instead of mutating a
+// singleton. The central RealtimeBridge now also invalidates
+// `queryKeys.contacts(orgId)` on any `contacts` row change.
+//
+// `getOrgId()` is kept here as a PURE helper (identical to org-id.ts's, but
+// imported by ~12 other modules under this name) — not a cache.
+//
+// `mapRow` / `resolveCompanyNames` normalisation is unchanged from before —
+// same columns, same company-name batch resolve, same avatar/messenger
+// fields.
 
-import { useState, useEffect, useCallback, useSyncExternalStore } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
 import type { Contact } from "@/lib/mock-data";
 import { ensureCompanyContactAssociation } from "@/lib/companies-store";
+import { queryKeys } from "@/lib/query-keys";
+import { getQueryClient } from "@/lib/query-client";
+import { useOrgId } from "@/lib/org-id";
 
-// ── Org helper ──
+// ── Org helper (pure — NOT a cache) ──
 export async function getOrgId(): Promise<string | null> {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return null;
@@ -61,6 +87,15 @@ function mapRow(row: any): Contact {
     owner: row.owner ?? "—",
     lastActivity: row.updated_at ?? row.created_at ?? new Date().toISOString(),
     createdAt: row.created_at ?? new Date().toISOString(),
+    // Real columns (see supabase/migrations/20260904_meta_schema_baseline.sql),
+    // already fetched by the `select("*")` below and already declared on the
+    // Contact type — previously silently dropped here during row mapping,
+    // which meant every consumer of useContacts() (Inbox's composer channel
+    // gating, in particular) always saw them as undefined even for a real
+    // Messenger/Instagram contact. That's the actual root cause of the
+    // Messenger/Instagram compose tabs never appearing — not a rendering bug.
+    messenger_psid: row.messenger_psid ?? undefined,
+    instagram_igsid: row.instagram_igsid ?? undefined,
     avatar_key: row.avatar_key ?? null,
     // Real column, confirmed to exist in the live schema, currently never
     // written by any code path in this codebase (always null today) — kept
@@ -86,16 +121,14 @@ async function resolveCompanyNames(rows: Contact[]): Promise<Contact[]> {
   return rows.map((c) => (c.company_id ? { ...c, companyName: nameById.get(c.company_id) ?? null } : c));
 }
 
-// ── Reactive store ──
-let contacts: Contact[] = [];
-let loaded = false;
-const listeners = new Set<() => void>();
-function emit() { for (const l of listeners) l(); }
+// ── Query layer ──
 
-async function fetchContacts(): Promise<void> {
-  const orgId = await getOrgId();
-  if (!orgId) return;
-
+/**
+ * The Contacts list queryFn — org-scoped, newest-first, with companyName
+ * batch-resolved. Self-contained (no React, no other query's cache) so it
+ * is safe to run from `useQuery` or an imperative `refetchQueries`.
+ */
+export async function fetchContactsForOrg(orgId: string): Promise<Contact[]> {
   const { data, error } = await supabase
     .from("contacts")
     .select("*")
@@ -104,47 +137,99 @@ async function fetchContacts(): Promise<void> {
 
   if (error) {
     console.error("[contacts-store] fetch failed:", error);
-    return;
+    throw error;
   }
-
-  contacts = await resolveCompanyNames((data ?? []).map(mapRow));
-  loaded = true;
-  emit();
+  return resolveCompanyNames((data ?? []).map(mapRow));
 }
 
-// Initial fetch on first import
-fetchContacts();
-
-// ── Public API — same interface as before ──
-
-export function getContacts(): Contact[] {
-  return contacts;
+/** Broad prefix invalidation for the shared Contacts list (all orgs cached — normally exactly one). */
+function invalidateContactsQuery() {
+  void getQueryClient().invalidateQueries({ queryKey: ["contacts"] });
 }
 
-export function useContacts(): Contact[] {
-  // Trigger fetch if not loaded yet
-  useEffect(() => { if (!loaded) fetchContacts(); }, []);
-
-  return useSyncExternalStore(
-    (cb) => { listeners.add(cb); return () => listeners.delete(cb); },
-    () => contacts,
-    () => [],
+/**
+ * Immediately reflect a CONFIRMED change into the cached Contacts list(s)
+ * so the UI updates without waiting for the reconciling refetch. Only ever
+ * called with a real, persisted server row (from `.select().single()`) —
+ * never speculatively — so it cannot disagree with a failed write.
+ */
+function patchContactsCache(fn: (list: Contact[]) => Contact[]) {
+  getQueryClient().setQueriesData<Contact[]>({ queryKey: ["contacts"] }, (old) =>
+    Array.isArray(old) ? fn(old) : old,
   );
 }
 
-export function useContactsLoading(): boolean {
-  return !loaded;
+/**
+ * Dependency fan-out after a Contact write (name / avatar / tags / owner /
+ * delete). This is THE one canonical propagation path — every Contact
+ * mutation call site (the drawer's quick AvatarPicker, Edit→Save, tag
+ * chips, bulk actions, the convert-lead reflect) reaches it through
+ * updateContact/deleteContact/upsertContactFromRow, so none of them need
+ * their own ad-hoc invalidation.
+ *
+ * A Contact's name/avatar/tags render in: the Contacts list, Conversations
+ * rows, Leads' Contact enrichment, Command Center Recent-Activity avatars
+ * (all Query-backed → invalidate) AND Pipeline Deal cards + Project linked-
+ * Contact surfaces (still useSyncExternalStore singletons in this phase →
+ * a store refresh, lazily imported to keep contacts-store's static import
+ * graph unchanged / cycle-free). This last part is the S3-stabilization
+ * fix for "quick avatar change updates Contacts but not Pipeline": the
+ * quick path skipped the deals/projects refresh that Edit→Save did by
+ * hand; now every path gets it.
+ *
+ * Deliberately scoped — NOT an invalidate-everything.
+ */
+function invalidateContactDependents() {
+  const qc = getQueryClient();
+  void qc.invalidateQueries({ queryKey: ["contacts"] });
+  void qc.invalidateQueries({ queryKey: ["conversations"] });
+  void qc.invalidateQueries({ queryKey: ["leads"] });
+  void qc.invalidateQueries({ queryKey: ["dashboard"] });
+  // Non-Query stores that resolve a linked Contact's avatar/name at fetch
+  // time. Lazy import → no load-order/circular concern; failures are inert.
+  void import("@/lib/deals-store").then((m) => m.refreshDeals()).catch(() => {});
+  void import("@/lib/projects-store").then((m) => m.refreshProjects()).catch(() => {});
 }
 
-// Reflects a canonical Contact row (e.g. returned by the convert_lead_to_deal
-// RPC) into the reactive store without a refetch — inserts if new, replaces
-// if already known.
+// ── Public hooks (unchanged shape) ──
+
+export function useContacts(): Contact[] {
+  const orgId = useOrgId();
+  const { data } = useQuery({
+    queryKey: orgId ? queryKeys.contacts(orgId) : ["contacts", "_pending"],
+    queryFn: () => fetchContactsForOrg(orgId as string),
+    enabled: !!orgId,
+    // Realtime + mutation invalidation drive freshness; staleTime just
+    // caps redundant refetches on remount/focus churn.
+    staleTime: 90_000,
+  });
+  return data ?? [];
+}
+
+export function useContactsLoading(): boolean {
+  const orgId = useOrgId();
+  const { isLoading, isPending } = useQuery({
+    queryKey: orgId ? queryKeys.contacts(orgId) : ["contacts", "_pending"],
+    queryFn: () => fetchContactsForOrg(orgId as string),
+    enabled: !!orgId,
+    staleTime: 90_000,
+  });
+  // Before org id resolves the query is disabled (isPending, not fetching)
+  // — treat that as "still loading" to match the old `!loaded` semantics.
+  return !orgId || isLoading || (isPending as boolean);
+}
+
+// ── Imperative mutations (unchanged signatures) ──
+
+/**
+ * Reflects a canonical Contact row (e.g. returned by the
+ * convert_lead_to_deal RPC) into the shared cache. Returns the mapped
+ * Contact for the caller; the list is refreshed via invalidation rather
+ * than a hand-merged optimistic entry (the RPC has already persisted it).
+ */
 export function upsertContactFromRow(row: any): Contact {
-  const mapped = mapRow(row);
-  const idx = contacts.findIndex((c) => c.id === mapped.id);
-  contacts = idx >= 0 ? contacts.map((c, i) => (i === idx ? mapped : c)) : [mapped, ...contacts];
-  emit();
-  return mapped;
+  invalidateContactDependents();
+  return mapRow(row);
 }
 
 export async function addContact(contact: Omit<Contact, "id">, opts?: { source?: string }): Promise<Contact | null> {
@@ -185,8 +270,8 @@ export async function addContact(contact: Omit<Contact, "id">, opts?: { source?:
   }
 
   const [mapped] = await resolveCompanyNames([mapRow(data)]);
-  contacts = [mapped, ...contacts];
-  emit();
+  patchContactsCache((list) => [mapped, ...list.filter((c) => c.id !== mapped.id)]);
+  invalidateContactsQuery();
   return mapped;
 }
 
@@ -234,8 +319,10 @@ export async function updateContact(id: string, patch: Partial<Contact>): Promis
   }
 
   const [mapped] = await resolveCompanyNames([mapRow(data)]);
-  contacts = contacts.map((c) => c.id === id ? mapped : c);
-  emit();
+  patchContactsCache((list) => list.map((c) => (c.id === id ? mapped : c)));
+  // A Contact edit can change how it renders in Conversations / Leads /
+  // Recent Activity (name, avatar, tags), so fan out — not just contacts.
+  invalidateContactDependents();
   return mapped;
 }
 
@@ -245,10 +332,10 @@ export async function deleteContact(id: string): Promise<void> {
     console.error("[contacts-store] delete failed:", error);
     return;
   }
-  contacts = contacts.filter((c) => c.id !== id);
-  emit();
+  patchContactsCache((list) => list.filter((c) => c.id !== id));
+  invalidateContactDependents();
 }
 
 export async function refreshContacts(): Promise<void> {
-  await fetchContacts();
+  await getQueryClient().refetchQueries({ queryKey: ["contacts"] });
 }

@@ -1093,14 +1093,16 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
                     {contact ? (
                       <div className="space-y-4">
                         <div className="flex items-center gap-3">
-                          {contact.avatar_url ? (
-                            <Avatar className="h-12 w-12 shrink-0 ring-1 ring-black/5">
-                              <AvatarImage src={contact.avatar_url} alt={contact.name} className="object-cover" />
-                              <AvatarFallback className="bg-primary-soft text-xs font-semibold text-primary">{getInitials(contact.name)}</AvatarFallback>
-                            </Avatar>
-                          ) : (
-                            <ContactAvatar id={contact.id} name={contact.name} avatarKey={contact.avatar_key} size="lg" />
-                          )}
+                          {/* Live-test stabilization fix: this used to
+                              hand-roll its own avatar_url-vs-fallback branch
+                              in parallel with ContactAvatar's own identical
+                              precedence (avatar_url > avatarKey > generated >
+                              initials) — a second implementation that, unlike
+                              the canonical one, never recovered from a broken
+                              avatar_url (no onLoadingStatusChange fallback).
+                              ContactAvatar already accepts avatarUrl directly
+                              — no reason to duplicate its own logic here. */}
+                          <ContactAvatar id={contact.id} name={contact.name} avatarUrl={contact.avatar_url} avatarKey={contact.avatar_key} size="lg" />
                           <div className="min-w-0">
                             <p className="text-sm font-semibold truncate">{contact.name}</p>
                             {contact.company && <p className="text-[11px] text-muted-foreground truncate">{contact.company}</p>}
@@ -2108,16 +2110,15 @@ function ProjectCard({ project: p, contact, approvedCOTotal = 0, contractBaselin
         </div>
       </div>
 
-      {/* Contact row — same shared avatar system as Pipeline's DealCard (ContactAvatar: saved avatar_url > avatarKey > deterministic seed > initials), keyed off project.client_id so the same Contact renders the same avatar everywhere. */}
+      {/* Contact row — same shared avatar system as Pipeline's DealCard
+          (ContactAvatar: saved avatar_url > avatarKey > deterministic seed >
+          initials), keyed off project.client_id so the same Contact renders
+          the same avatar everywhere. Live-test stabilization fix: this used
+          to hand-roll a parallel avatar_url branch instead of actually
+          calling ContactAvatar with avatarUrl — the comment already claimed
+          parity with ContactAvatar's precedence, now the code does too. */}
       <div className="mt-2 flex items-center gap-2 px-3">
-        {contact?.avatar_url ? (
-          <Avatar className="h-7 w-7 shrink-0 ring-1 ring-black/5">
-            <AvatarImage src={contact.avatar_url} alt={p.client_name} className="object-cover" />
-            <AvatarFallback className="bg-primary-soft text-[10px] font-semibold text-primary">{getInitials(p.client_name)}</AvatarFallback>
-          </Avatar>
-        ) : (
-          <ContactAvatar id={contact?.id ?? p.client_id} name={p.client_name || "No contact"} avatarKey={contact?.avatar_key} size="sm" className="h-7 w-7" />
-        )}
+        <ContactAvatar id={contact?.id ?? p.client_id} name={p.client_name || "No contact"} avatarUrl={contact?.avatar_url} avatarKey={contact?.avatar_key} size="sm" className="h-7 w-7" />
         <div className="min-w-0">
           <p className="truncate text-xs font-medium" title={p.client_name}>{p.client_name || "No contact"}</p>
           {cityLine && <p className="truncate text-[10px] text-muted-foreground">{cityLine}</p>}

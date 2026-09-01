@@ -17,8 +17,7 @@
 //    integration_settings.gmail is null for every sampled org), so the
 //    SENT label is the only reliable signal, not an address comparison.
 //
-// Grouped by thread_id (one conversation per Gmail thread) rather than by
-// contact. Contact resolution order per thread:
+// Contact resolution per Gmail thread:
 //   1. An explicit conversation_states.contact_id link for this thread
 //      (set via "Link to Existing Contact" in inbox.tsx — see
 //      src/lib/conversation-states.ts's setGmailContactLink/
@@ -28,11 +27,31 @@
 //      org's send, approximated by "the address side that isn't on the
 //      SENT-labeled rows")
 //   3. Unmatched-sender fallback (synthetic `gmail-unknown-<address>` id)
+//
+// GROUPING (Conversations Consolidation): a CRM-matched thread (1 or 2
+// above resolved to a real Contact) is merged with every OTHER thread that
+// resolved to that SAME Contact into ONE conversation row, id
+// `gm-contact-<contactId>` — conversation identity for CRM-matched email is
+// CONTACT_ID + channel, not Gmail thread_id, matching every other channel
+// (sms-meta-conversations.ts already groups by contact_id+channel). An
+// UNMATCHED sender (3 above) is NOT consolidated — it stays exactly one
+// conversation per thread (id `gm-<thread_id>`, unchanged from before this
+// pass) since there is no stable Contact identity to merge multiple such
+// threads under, and unmatched senders are excluded from the default CRM-
+// relevance-filtered view anyway (see inbox.tsx's crmRelevantGmailConvs).
+//
+// Each individual gmail_messages row keeps its own real id
+// (`gm-msg-<row.id>`) and its own real `thread_id` (row.thread_id, used to
+// pick emailThreadId below) regardless of which conversation it's grouped
+// into — nothing about an underlying message's identity changes, only
+// which Conversation object its Message entries get attached to.
 
-import { useState, useEffect, useCallback } from "react";
+import { useCallback } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
 import type { Conversation, Message } from "@/lib/mock-data";
-import { getOrgId } from "@/lib/org-id";
+import { useOrgId } from "@/lib/org-id";
+import { queryKeys } from "@/lib/query-keys";
 
 export function normalizeEmail(raw: string | null | undefined): string {
   return (raw ?? "").trim().toLowerCase();
@@ -182,23 +201,13 @@ function firstToAddressRaw(toEmails: unknown): string {
   return "";
 }
 
-export function useGmailConversations(): {
-  conversations: Conversation[];
-  messages: Message[];
-  loading: boolean;
-  refresh: () => void;
-} {
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  const fetchData = useCallback(async () => {
-    const orgId = await getOrgId();
-    if (!orgId) {
-      setLoading(false);
-      return;
-    }
-
+// ── queryFn (Platform State Sync Phase S1) — unchanged business logic,
+// extracted from what used to be this file's useState-driven fetchData so
+// it can be cached under one shared query key instead of once per mounted
+// hook instance. Throws on error (react-query's own error state) instead
+// of the old console.error-and-swallow, matching the sms-meta-conversations.ts
+// adapter's shape.
+async function fetchGmailConversations(orgId: string): Promise<{ conversations: Conversation[]; messages: Message[] }> {
     const { data, error } = await supabase
       .from("gmail_messages")
       .select("id, thread_id, internal_date, snippet, from_email, to_emails, subject, labels, created_at, rfc_message_id")
@@ -206,17 +215,10 @@ export function useGmailConversations(): {
       .order("internal_date", { ascending: true })
       .limit(2000);
 
-    if (error) {
-      console.error("[gmail-conversations] fetch failed:", error);
-      setLoading(false);
-      return;
-    }
+    if (error) throw error;
 
     if (!data || data.length === 0) {
-      setConversations([]);
-      setMessages([]);
-      setLoading(false);
-      return;
+      return { conversations: [], messages: [] };
     }
 
     // Batch-fetch ALL org contacts (not just ones with an email) — needed
@@ -254,18 +256,31 @@ export function useGmailConversations(): {
       }
     }
 
-    // Group rows by thread_id — one conversation per Gmail thread.
-    const groups = new Map<string, any[]>();
+    // Group rows by thread_id first — contact resolution below still needs
+    // to reason per-thread (the "other party" address is derived from a
+    // specific thread's own inbound/outbound rows).
+    const rawGroups = new Map<string, any[]>();
     for (const row of data as any[]) {
       const key = row.thread_id || `gmail-no-thread-${row.id}`;
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key)!.push(row);
+      if (!rawGroups.has(key)) rawGroups.set(key, []);
+      rawGroups.get(key)!.push(row);
     }
 
-    const convs: Conversation[] = [];
-    const msgs: Message[] = [];
+    const isOutbound = (row: any) => Array.isArray(row.labels) && row.labels.includes("SENT");
 
-    for (const [threadId, groupRows] of groups) {
+    type ThreadInfo = {
+      threadId: string;
+      rows: any[]; // oldest -> newest
+      matchedContact?: { id: string; name: string; email: string };
+      contactId: string; // real UUID (matched) or synthetic (unmatched)
+      contactName: string;
+      displayName: string | null;
+      otherAddress: string;
+      otherAddressRaw: string;
+    };
+
+    const threadInfos: ThreadInfo[] = [];
+    for (const [threadId, groupRows] of rawGroups) {
       // Parse once per row, then sort oldest -> newest by the PARSED value
       // — not by relying on the SQL query's ordering of the raw column, so
       // thread order stays correct even for a row whose raw internal_date
@@ -275,9 +290,6 @@ export function useGmailConversations(): {
           - new Date(parseGmailTimestamp(b.internal_date, b.created_at)).getTime(),
       );
 
-      // Direction per row: SENT label present = outbound (from us).
-      const isOutbound = (row: any) => Array.isArray(row.labels) && row.labels.includes("SENT");
-
       // The "other party" address for this thread: on an outbound row, it's
       // the recipient; on an inbound row, it's the sender. Prefer the
       // address from an inbound row if one exists (the actual lead/contact),
@@ -286,8 +298,6 @@ export function useGmailConversations(): {
       const otherAddress = inboundRow
         ? extractAddress(inboundRow.from_email)
         : firstToAddress(rows[0]?.to_emails);
-      // Same address, case preserved — for display/prefill only (see
-      // Conversation.senderEmail below). Never used for matching.
       const otherAddressRaw = inboundRow
         ? extractRawAddress(inboundRow.from_email)
         : firstToAddressRaw(rows[0]?.to_emails);
@@ -302,52 +312,38 @@ export function useGmailConversations(): {
       const matchedContact = (explicitContactId ? contactById[explicitContactId] : undefined)
         ?? (otherAddress ? contactByEmail[otherAddress] : undefined);
       const contactId = matchedContact?.id ?? (otherAddress ? `gmail-unknown-${otherAddress}` : `gmail-unknown-thread-${threadId}`);
-      // Prefer the real contact's saved name, then the Gmail display name
-      // (e.g. "Jane Doe" from "Jane Doe <jane@x.com>" — see
-      // extractDisplayName), then fall back to the bare address.
       const displayName = inboundRow ? extractDisplayName(inboundRow.from_email) : null;
       const contactName = matchedContact?.name || displayName || otherAddress || "Unknown Sender";
 
-      // The newest row after the explicit oldest->newest sort above — the
-      // actual most-recent message in the thread, not just "whatever the
-      // DB query happened to return last."
-      const newestRow = rows[rows.length - 1];
-      const convId = `gm-${threadId}`;
-      const lastAt = parseGmailTimestamp(newestRow?.internal_date, newestRow?.created_at);
-      const previewRaw = newestRow?.snippet?.slice(0, 80) ?? newestRow?.subject ?? "";
+      threadInfos.push({ threadId, rows, matchedContact, contactId, contactName, displayName, otherAddress, otherAddressRaw });
+    }
 
-      convs.push({
-        id: convId,
-        contactId,
-        contactName,
-        channel: "email",
-        preview: decodeHtmlEntities(previewRaw),
-        unread: false,
-        lastAt,
-        // Case-PRESERVED address (not lowercased) — this is what Create
-        // Contact/Create Lead show and prefill; normalization only happens
-        // at match/storage time (see gmail-contact-actions.ts). Matching
-        // itself (contactByEmail, gmail-unknown-<address> ids) still uses
-        // the normalized `otherAddress` above.
-        senderEmail: otherAddressRaw || otherAddress || undefined,
-        // The Gmail From header's display-name portion, parsed directly
-        // (e.g. "Jane Doe" from "Jane Doe <jane@x.com>", or "Google" from
-        // "Google <no-reply@accounts.google.com>" — both genuinely present
-        // in the raw header, not fabricated). Used as the first-priority
-        // Create Contact/Lead name — see resolveGmailSenderName in
-        // gmail-contact-actions.ts. null when the header has no display
-        // name (a bare address).
-        senderDisplayName: displayName ?? undefined,
-        // Real Subject header from the newest message, decoded — used to
-        // prefill "Re: <subject>" when replying to this thread. Never a
-        // fabricated/generic subject.
-        emailSubject: newestRow?.subject ? decodeHtmlEntities(newestRow.subject) : undefined,
-      });
+    // Consolidation (Part 2/3 of the Conversations Consolidation pass):
+    // every thread that resolved to the SAME real Contact merges into one
+    // conversation, id `gm-contact-<contactId>`. An unmatched thread (no
+    // real Contact) is never merged with another unmatched thread — each
+    // stays its own conversation, id `gm-<thread_id>`, unchanged from
+    // before this pass.
+    const matchedByContact = new Map<string, ThreadInfo[]>();
+    const unmatchedThreads: ThreadInfo[] = [];
+    for (const info of threadInfos) {
+      if (info.matchedContact) {
+        const list = matchedByContact.get(info.matchedContact.id) ?? [];
+        list.push(info);
+        matchedByContact.set(info.matchedContact.id, list);
+      } else {
+        unmatchedThreads.push(info);
+      }
+    }
 
+    const convs: Conversation[] = [];
+    const msgs: Message[] = [];
+
+    // Shared per-row Message builder — identical for both branches below,
+    // extracted so the "no body column, snippet+subject is genuinely all
+    // there is" logic exists in exactly one place.
+    function pushMessagesForRows(rows: any[], convId: string) {
       for (const row of rows) {
-        // No body/body_html column exists on this table — snippet plus
-        // subject (when present and not already implied) is genuinely all
-        // there is; never invent a longer body than what's actually stored.
         const subject = row.subject ? decodeHtmlEntities(row.subject) : row.subject;
         const snippet = row.snippet ? decodeHtmlEntities(row.snippet) : row.snippet;
         const body = subject && snippet && !snippet.startsWith(subject)
@@ -366,18 +362,104 @@ export function useGmailConversations(): {
       }
     }
 
-    // Newest thread first — using the same parsed lastAt every conversation
-    // was just given above, not the raw column value.
+    // ── Unmatched senders: one conversation per thread, exactly as before ──
+    for (const info of unmatchedThreads) {
+      const newestRow = info.rows[info.rows.length - 1];
+      const convId = `gm-${info.threadId}`;
+      const lastAt = parseGmailTimestamp(newestRow?.internal_date, newestRow?.created_at);
+      const previewRaw = newestRow?.snippet?.slice(0, 80) ?? newestRow?.subject ?? "";
+
+      convs.push({
+        id: convId,
+        contactId: info.contactId,
+        contactName: info.contactName,
+        channel: "email",
+        preview: decodeHtmlEntities(previewRaw),
+        unread: false,
+        lastAt,
+        // Case-PRESERVED address (not lowercased) — this is what Create
+        // Contact/Create Lead show and prefill; normalization only happens
+        // at match/storage time (see gmail-contact-actions.ts).
+        senderEmail: info.otherAddressRaw || info.otherAddress || undefined,
+        senderDisplayName: info.displayName ?? undefined,
+        emailSubject: newestRow?.subject ? decodeHtmlEntities(newestRow.subject) : undefined,
+        emailThreadId: info.threadId,
+      });
+      pushMessagesForRows(info.rows, convId);
+    }
+
+    // ── CRM-matched: one conversation per Contact, merging every thread ────
+    for (const [contactId, infos] of matchedByContact) {
+      const allRows = infos.flatMap((i) => i.rows).sort(
+        (a, b) => new Date(parseGmailTimestamp(a.internal_date, a.created_at)).getTime()
+          - new Date(parseGmailTimestamp(b.internal_date, b.created_at)).getTime(),
+      );
+      const newestRow = allRows[allRows.length - 1];
+      // Real thread_id column on the newest merged row — this is what a
+      // reply must attach to (the most recently active of this Contact's
+      // threads), not any arbitrary/first thread. See emailThreadId on
+      // Conversation and its use in inbox.tsx's send handler.
+      const newestThreadId: string = newestRow.thread_id || infos[0].threadId;
+      const matchedContact = infos[0].matchedContact!; // same Contact for every info in this group, by construction
+      const convId = `gm-contact-${contactId}`;
+      const lastAt = parseGmailTimestamp(newestRow?.internal_date, newestRow?.created_at);
+      const previewRaw = newestRow?.snippet?.slice(0, 80) ?? newestRow?.subject ?? "";
+
+      convs.push({
+        id: convId,
+        contactId,
+        contactName: matchedContact.name || "Unknown Contact",
+        channel: "email",
+        preview: decodeHtmlEntities(previewRaw),
+        unread: false,
+        lastAt,
+        // The Contact's own stored email — not a per-thread "other
+        // address" anymore, since this row can represent several threads.
+        // extractReplyAddress (composer-recipient.ts) only needs a plain
+        // address, so no raw/case-preserved variant is needed here the way
+        // the unmatched-sender branch above needs for Create Contact/Lead
+        // prefill (not applicable — this Contact already exists).
+        senderEmail: matchedContact.email || undefined,
+        emailSubject: newestRow?.subject ? decodeHtmlEntities(newestRow.subject) : undefined,
+        emailThreadId: newestThreadId,
+      });
+      pushMessagesForRows(allRows, convId);
+    }
+
+    // Newest conversation first — using the same parsed lastAt every
+    // conversation was just given above, not the raw column value.
     convs.sort((a, b) => new Date(b.lastAt).getTime() - new Date(a.lastAt).getTime());
 
-    setConversations(convs);
-    setMessages(msgs);
-    setLoading(false);
-  }, []);
+    return { conversations: convs, messages: msgs };
+}
 
-  useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+export function useGmailConversations(): {
+  conversations: Conversation[];
+  messages: Message[];
+  loading: boolean;
+  refresh: () => void;
+} {
+  const orgId = useOrgId();
 
-  return { conversations, messages, loading, refresh: fetchData };
+  const query = useQuery({
+    queryKey: orgId ? queryKeys.conversations.gmail(orgId) : ["conversations", "gmail", "pending"],
+    queryFn: () => fetchGmailConversations(orgId as string),
+    enabled: !!orgId,
+    // No realtime source for gmail_messages (Gmail sync is manual/
+    // scheduled, not a live subscription) — the default staleTime tier is
+    // fine here; conversation_states/contacts changes (e.g. "Link to
+    // Existing Contact") still invalidate this via the central realtime
+    // bridge's broader conversations.all(orgId) invalidation.
+  });
+
+  const conversations = query.data?.conversations ?? [];
+  const messages = query.data?.messages ?? [];
+  const loading = !orgId || query.isPending;
+
+  const refresh = useCallback(() => {
+    query.refetch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orgId]);
+
+  return { conversations, messages, loading, refresh };
 }

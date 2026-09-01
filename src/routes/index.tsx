@@ -1,6 +1,7 @@
 // src/routes/index.tsx
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { ResponsiveContainer, PieChart, Pie, Cell, AreaChart, Area, YAxis } from "recharts";
 import { ROUTES } from "@/lib/routes";
 import {
@@ -8,15 +9,24 @@ import {
   Sparkles, UserPlus, DollarSign, Briefcase, CalendarDays, Zap, AlertTriangle,
   TrendingUp, Mail, ArrowRight, Clock, MessageCircle, Smartphone, Instagram,
   Workflow, MessageSquareWarning, Megaphone, CalendarClock, MapPin, User,
-  LayoutDashboard, CheckCircle2,
+  LayoutDashboard, CheckCircle2, ChevronDown,
 } from "lucide-react";
 import { PageHeader } from "@/components/layout/app-shell";
 import { supabase } from "@/lib/supabase";
 import { useOrganization } from "@/lib/organization";
 import { useTasks } from "@/lib/tasks-store";
 import { isActiveStatus } from "@/lib/task-status";
+import { parseDateOnlySafe, differenceInCalendarDaysSafe, todayDateOnly } from "@/lib/schedule-health";
 import { useDeals } from "@/lib/deals-store";
+import { useLeads } from "@/lib/leads-store";
+import { useProjects } from "@/lib/projects-store";
 import { useAICenterAgents } from "@/lib/ai-center-store";
+import { useOrgId } from "@/lib/org-id";
+import { queryKeys } from "@/lib/query-keys";
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useSmsMetaConversations } from "@/lib/sms-meta-conversations";
 import { useGmailConversations } from "@/lib/gmail-conversations";
 import { useWorkflows, type DbWorkflowRun } from "@/lib/workflows-store";
@@ -241,6 +251,60 @@ function cumulativeSeries(rows: { at: string | null | undefined; amount: number 
   return out;
 }
 
+// ─── Pipeline Pulse timeline (S2B) ──────────────────────────────────────────
+//
+// The user-selectable period for Pipeline Pulse. Distinct from SPARK_DAYS/
+// PULSE_DAYS above (those stay fixed 14-day windows for the KPI-row
+// sparklines and the AI Center card's voice-call stat respectively — this
+// feature is scoped to the Pipeline Pulse card only).
+export type PulsePeriodKey = "7d" | "14d" | "30d" | "90d" | "year";
+
+export const PULSE_PERIOD_OPTIONS: { key: PulsePeriodKey; label: string }[] = [
+  { key: "7d", label: "Last 7 days" },
+  { key: "14d", label: "Last 14 days" },
+  { key: "30d", label: "Last 30 days" },
+  { key: "90d", label: "Last 90 days" },
+  { key: "year", label: "This year" },
+];
+
+const PULSE_PERIOD_DAYS: Record<PulsePeriodKey, number> = { "7d": 7, "14d": 14, "30d": 30, "90d": 90, year: 366 };
+// Bucket width per period. Widened for 30d (regression fix): daily buckets
+// over 30 days produce a comb of one-day needle spikes (…0, 3, 0…) because
+// real pipeline events cluster on a handful of days. 3-day grouping keeps
+// ~10 points — enough to read momentum — while merging adjacent activity
+// into a truthful shape instead of isolated triangles. 7d/14d stay daily
+// (a short window with few points reads fine, and the headroomed Y domain
+// on the chart softens any lone spike); 90d weekly and year monthly are
+// unchanged. The Created/Won/Lost/Stage-Move COUNT tiles below the chart
+// remain exact real counts, independent of this bucketing.
+const PULSE_BUCKET_DAYS: Record<PulsePeriodKey, number> = { "7d": 1, "14d": 1, "30d": 3, "90d": 7, year: 30 };
+
+/** Real calendar start for a period — "year" is Jan 1 of the current year, not a rolling 366-day window. */
+function pulsePeriodStart(period: PulsePeriodKey, now: Date): Date {
+  if (period === "year") return new Date(now.getFullYear(), 0, 1);
+  const days = PULSE_PERIOD_DAYS[period];
+  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (days - 1));
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+/** Buckets real event dates into fixed-width intervals from `start` to `now` — used for Pipeline Pulse's chart only (see PULSE_BUCKET_DAYS above for why a fixed bucket width, not calendar-month-aware, is an acceptable approximation here). */
+function bucketByPeriod(dates: (string | null | undefined)[], start: Date, now: Date, bucketDays: number): number[] {
+  const startTime = new Date(start).getTime();
+  const totalDays = Math.max(1, Math.ceil((now.getTime() - startTime) / 86_400_000) + 1);
+  const bucketCount = Math.max(1, Math.ceil(totalDays / bucketDays));
+  const buckets = new Array(bucketCount).fill(0);
+  for (const raw of dates) {
+    if (!raw) continue;
+    const d = new Date(raw);
+    if (isNaN(d.getTime())) continue;
+    const diffDays = Math.floor((d.getTime() - startTime) / 86_400_000);
+    const idx = Math.floor(diffDays / bucketDays);
+    if (idx >= 0 && idx < bucketCount) buckets[idx] += 1;
+  }
+  return buckets;
+}
+
 // Resolves org id AND first_name from one auth call + one profiles query —
 // the main data effect below used to call supabase.auth.getUser() twice
 // back-to-back (once here, once again just to read first_name) and issue
@@ -430,8 +494,11 @@ const CARD_HEADER_BACKGROUNDS = {
   indigo: "bg-primary/10",
 } as const;
 
-function SectionCard({ title, icon, tint, action, children, className }: {
-  title: string; icon: React.ElementType; tint: keyof typeof CARD_ICON_COLORS; action?: React.ReactNode; children: React.ReactNode; className?: string;
+function SectionCard({ title, icon, tint, action, count, children, className }: {
+  title: string; icon: React.ElementType; tint: keyof typeof CARD_ICON_COLORS; action?: React.ReactNode;
+  /** Optional header count badge (e.g. Needs Attention's qualifying-item count). Omitted entirely when undefined — every other card is visually unchanged. */
+  count?: number;
+  children: React.ReactNode; className?: string;
 }) {
   const Icon = icon;
   // Every operational card gets a restrained category tint in its header.
@@ -443,6 +510,11 @@ function SectionCard({ title, icon, tint, action, children, className }: {
         <div className="flex items-center gap-1.5">
           <Icon className={cn("h-3.5 w-3.5", CARD_ICON_COLORS[tint])} />
           <span className="text-[13px] font-semibold tracking-tight text-foreground">{title}</span>
+          {count !== undefined && (
+            <span className="ml-0.5 rounded-full bg-secondary px-1.5 py-0.5 text-[10px] font-semibold leading-none text-muted-foreground tabular-nums">
+              {count}
+            </span>
+          )}
         </div>
         {action}
       </div>
@@ -459,76 +531,515 @@ function CardAction({ children, to }: { children: React.ReactNode; to: string })
   );
 }
 
+// ─── Needs Attention — category model ──────────────────────────────────────
+//
+// The card body shows ONLY a fixed 3-column category grid (3×2 for the six
+// categories today; the grid stays 3-wide and flows downward, so it can
+// extend to 9 later with no layout change). Clicking a tile opens a
+// portalled Popover with that category's records — the popover floats above
+// the page and never participates in dashboard grid sizing, so selecting a
+// category can't stretch the card or its row (the regression this replaces:
+// an inline flex-1 detail list that grew with the record count and, under
+// the row's 2xl:items-stretch, dragged Live Pipeline / Today's Tasks to the
+// same height). The order here is the grid fill order AND the sort
+// tie-break preference.
+type AttentionCategory = "tasks" | "conversations" | "leads" | "deals" | "projects" | "estimates";
+
+const ATTENTION_CATEGORY_ORDER: AttentionCategory[] = [
+  "tasks", "conversations", "leads", "deals", "projects", "estimates",
+];
+
+const ATTENTION_CATEGORY_LABELS: Record<AttentionCategory, string> = {
+  tasks: "Tasks", conversations: "Conversations", leads: "Leads",
+  deals: "Deals", projects: "Projects", estimates: "Estimates",
+};
+
+type AttentionItem = {
+  id: string;
+  category: AttentionCategory;
+  icon: React.ReactNode;
+  color: string;
+  bg: string;
+  title: string;
+  sub: string;
+  badge: string;
+  badgeColor: string;
+  /** Deep-link target — a real route string. */
+  href: string;
+  /** Optional search params for the deep-link (e.g. { dealId }, { estimateId }, { contactId }). */
+  search?: Record<string, string>;
+  /** Higher = more urgent. Drives per-category sort order. */
+  weight: number;
+  /** Days-based urgency metric (overdue days / days waiting / age) — used only for the tile status line. */
+  metricDays?: number;
+  /** For "tasks" items only: the linked project_id, if any. Consumed by the
+   *  Projects rollup category (grouping is by id, never by name). */
+  projectId?: string | null;
+};
+
+/** Contextual footer link for a category's popover — every target route already exists. */
+const ATTENTION_CATEGORY_FOOTER: Record<AttentionCategory, { to: string; label: string }> = {
+  tasks: { to: "/tasks", label: "View all tasks" },
+  conversations: { to: "/inbox", label: "View conversations" },
+  leads: { to: "/leads", label: "View leads" },
+  deals: { to: "/pipeline", label: "View pipeline" },
+  projects: { to: "/projects", label: "View projects" },
+  estimates: { to: "/estimates", label: "View estimates" },
+};
+
+/**
+ * The short status line under a category tile's count. Customer-facing copy
+ * only — never implementation language. An empty category reads "All clear"
+ * (or "No issues" for Leads/Projects, which have no qualifying rule yet —
+ * see the report; this is deliberately indistinguishable from a real "0"
+ * to the user).
+ */
+function attentionCategoryHint(cat: AttentionCategory, list: AttentionItem[]): string {
+  if (list.length === 0) return cat === "leads" || cat === "projects" ? "No issues" : "All clear";
+  switch (cat) {
+    case "tasks": {
+      const max = Math.max(0, ...list.map((i) => i.metricDays ?? 0));
+      return max > 0 ? `${max}d oldest overdue` : `${list.length} overdue`;
+    }
+    case "conversations": return `${list.length} unread`;
+    case "deals": return `${list.length} stalled`;
+    case "estimates": return `${list.length} to review`;
+    // Projects is a ROLLUP: `list` here is one synthetic row per affected
+    // project (see attentionByCategory), so `list.length` is the distinct
+    // affected-project count, not a task count.
+    case "projects": return `${list.length} affected project${list.length === 1 ? "" : "s"}`;
+    default: return `${list.length} to review`;
+  }
+}
+
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 function DashboardPage() {
   const org = useOrganization();
   const allTasks = useTasks();
   const allDeals = useDeals();
+  const allLeads = useLeads();
+  const { projects: allProjects } = useProjects();
   const { instances: aiAgents } = useAICenterAgents();
   const { conversations } = useSmsMetaConversations();
   const { conversations: gmailConversations } = useGmailConversations();
   const { workflows: allWorkflows, runs: workflowRuns } = useWorkflows();
   const allCampaigns = useMarketingCampaigns();
   const navigate = useNavigate();
+  const orgId = useOrgId();
 
-  const [userName, setUserName] = useState("there");
   const [newContactOpen, setNewContactOpen] = useState(false);
   const [newDealOpen, setNewDealOpen] = useState(false);
-  const [kpiData, setKpiData] = useState<{
-    leads: number;
-    leadsTrend: number | null;
-    pipelineNow: number;
-    pipelineTrend: number | null;
-    projects: number;
-    projectsTrend: number | null;
-    revenue: number;
-    revenueTrend: number | null;
-    bookingsToday: number;
-  }>({
-    leads: 0,
-    leadsTrend: null,
-    pipelineNow: 0,
-    pipelineTrend: null,
-    projects: 0,
-    projectsTrend: null,
-    revenue: 0,
-    revenueTrend: null,
-    bookingsToday: 0,
-  });
-  const [sparklines, setSparklines] = useState<{ leads: number[]; revenue: number[]; bookings: number[]; pipeline: number[]; projects: number[] }>({ leads: [], revenue: [], bookings: [], pipeline: [], projects: [] });
   const [inboxTab, setInboxTab] = useState<"all" | "unread">("all");
-  const [activity, setActivity] = useState<{ id: string; who: string; t: string; s: string; when: string; kind?: string }[]>([]);
   // Connected Gmail account identity + photo (see gmail-connection-status.ts)
   // — used only so Recent Conversations can render the same real logo/photo the
   // Conversations page shows, via the shared GmailSenderAvatar component.
   const [gmailAccountEmail, setGmailAccountEmail] = useState<string | null>(null);
   const [gmailAccountPictureUrl, setGmailAccountPictureUrl] = useState<string | null>(null);
-  // Real estimate rows (id/status/total/valid_until/updated_at) for the
-  // Estimates card — counted/summed client-side rather than issuing one
-  // query per status.
-  const [estimateRows, setEstimateRows] = useState<{ id: string; status: string; total: number; updated_at: string; valid_until: string | null; title: string; client_name: string | null; converted_deal_id: string | null; converted_project_id: string | null; deposit_amount: number }[]>([]);
-  // Dedicated "Next Booking" card (Phase 10.3 correction pass) — the
-  // single soonest non-terminal appointment. Deliberately its own card,
-  // never merged into Today's Tasks' nextUp candidates (see the nextUp
-  // memo below) — an appointment is not a task.
-  const [nextBooking, setNextBooking] = useState<{
-    id: string; scheduledAt: string; endsAt: string; durationMin: number;
-    title: string; contactName: string | null; status: string;
-    address: string | null; meetingUrl: string | null; assigneeName: string | null;
-  } | null>(null);
-  // Real deal_activities rows (activity_type + occurred_at) — genuine
-  // historical pipeline events (created/won/lost/stage_changed), not a
-  // fabricated trend. Powers the Pipeline Pulse card.
-  const [dealActivityRows, setDealActivityRows] = useState<{ activity_type: string; occurred_at: string }[]>([]);
-  // Real count of voice calls in the pulse window — a single bounded head
-  // count, not the full useVoiceConversations() hook (which also does
-  // contact-matching queries), since only a number is needed here.
-  const [voiceCallsCount, setVoiceCallsCount] = useState(0);
-  // Real leads.source values for the Marketing Activity card's "Leads by
-  // Source" breakdown — bare column values, grouped/counted client-side
-  // rather than server-side, since there's no existing aggregation for this.
-  const [leadSources, setLeadSources] = useState<string[]>([]);
+  // Pipeline Pulse's selected timeline — pure UI preference state (S2B),
+  // not server business state; no migration, no persistence required.
+  const [pulsePeriod, setPulsePeriod] = useState<PulsePeriodKey>("30d");
+  //
+  // userName, kpiData, sparklines, activity, estimateRows, nextBooking,
+  // voiceCallsCount, leadSources — all formerly individual useState pieces
+  // populated by one mount-only effect (Phase 8/10's "Command Center failed
+  // to load..." console error was this effect's only failure signal).
+  // Replaced (S2B) by dashboardSummaryQuery below — a single Query-backed
+  // fetch covering exactly the same data, with a real staleTime/refetch
+  // strategy instead of "fetch once, never again". See that query and the
+  // derived consts right after it for where each of these now comes from.
+  // ─── Dashboard summary — Query-backed (S2B) ────────────────────────────────
+  // Replaces the former mount-only `useEffect(..., [])` + a dozen setState
+  // calls covering the KPI row, sparklines, Next Booking, Recent Activity,
+  // and Needs Attention's estimate/task data. Internal fetch logic below is
+  // UNCHANGED from before this migration (same queries, same date-boundary
+  // math, same shapes) — only the OUTER mechanism moved from "fetch once on
+  // mount, never again" to a cached, invalidatable useQuery. New Leads
+  // count/trend and Active Projects' CURRENT count moved OUT of this query
+  // entirely (now derived from canonical useLeads()/useProjects() below —
+  // see the S2B report); deal_activities/Pipeline Pulse also moved out (see
+  // pipelinePulseQuery above, now its own dynamic-period query). Every
+  // OTHER raw read here still has no canonical shared store to draw from
+  // (invoices/appointments/estimates/tasks-for-Recent-Activity/voice_calls),
+  // consistent with "a dedicated Query is fine for date-window aggregates
+  // and dashboard-specific summaries" — this is exactly that, just no
+  // longer mount-only.
+  const dashboardSummaryQuery = useQuery({
+    queryKey: orgId ? queryKeys.dashboard.summary(orgId) : ["dashboard", "summary", "pending"],
+    enabled: !!orgId,
+    // Medium tier (platform audit) — real-time freshness for this bucket
+    // isn't critical (KPI counts, sparklines, recent-activity feed); a
+    // moderate staleTime plus the QueryClient's default
+    // refetchOnWindowFocus keeps it reasonably fresh without refetching
+    // this fairly large multi-query bucket on every remount.
+    staleTime: 60_000,
+    queryFn: async () => {
+      const { firstName } = await resolveOrgAndUser();
+
+      const now = new Date();
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+      const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString();
+      // Bookings Today (Phase 10.3 correction pass) needs the organization's
+      // own "today", not the visiting browser's — a booking at 11pm org-
+      // local could otherwise be miscounted as tomorrow (or vice versa) if
+      // the two timezones disagree. Scoped to just this one KPI rather than
+      // reworking every other date boundary above (monthStart/todayStart),
+      // which power unrelated cards not reported as broken.
+      const { data: orgTzRow } = await supabase.from("organizations").select("timezone").eq("id", orgId!).maybeSingle();
+      const orgTimezone = orgTzRow?.timezone || "America/New_York";
+      const orgTzYmd = now.toLocaleDateString("en-CA", { timeZone: orgTimezone });
+      // Classic no-library timezone-offset trick: the same instant rendered
+      // as a wall-clock string in UTC vs. in the target zone, re-parsed as
+      // local browser time — the difference is how far the zone sits from
+      // UTC at `now` (DST-aware since it uses `now`, not a fixed offset).
+      const orgTzOffsetMs =
+        new Date(now.toLocaleString("en-US", { timeZone: "UTC" })).getTime() -
+        new Date(now.toLocaleString("en-US", { timeZone: orgTimezone })).getTime();
+      const orgTodayStart = new Date(new Date(`${orgTzYmd}T00:00:00Z`).getTime() + orgTzOffsetMs).toISOString();
+      const orgTodayEnd = new Date(new Date(orgTodayStart).getTime() + 86_400_000).toISOString();
+      const sparkStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (SPARK_DAYS - 1)).toISOString();
+      const pulseStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (PULSE_DAYS - 1)).toISOString();
+
+      const [
+        { count: projLastCount },
+        { data: openDeals }, { data: lastDeals },
+        { data: paidInvoices }, { data: lastPaidInvoices },
+        { count: bookingsCount },
+        { data: leadSparkRows },
+        { data: revenueSparkRows },
+        { data: bookingSparkRows },
+        { data: openDealsForSpark },
+        { data: activeProjectsForSpark },
+        { data: allEstimateRows },
+        { data: completedTaskRows },
+        { count: voiceCallsPulseCount },
+        { data: leadSourceRows },
+        { data: nextBookingRows },
+        { data: apptActivityRows },
+      ] = await Promise.all([
+        supabase.from("projects").select("*", { count: "exact", head: true }).eq("org_id", orgId!).in("status", ["planning","contracted","pre-construction","active","punch-list"]).lt("created_at", monthStart),
+        supabase.from("deals").select("value").eq("org_id", orgId!).eq("status", "open"),
+        supabase.from("deals").select("value").eq("org_id", orgId).eq("status", "open").lt("created_at", monthStart),
+        supabase.from("invoices").select("total_amount").eq("org_id", orgId).eq("status", "paid").gte("created_at", monthStart),
+        supabase.from("invoices").select("total_amount").eq("org_id", orgId).eq("status", "paid").gte("created_at", lastMonthStart).lt("created_at", monthStart),
+        // BOOKINGS TODAY = every appointment scheduled for today (organization
+        // timezone) except cancelled/no_show — a no-show never happened, so
+        // it doesn't belong in a same-day booking count any more than a
+        // cancellation does. Completed appointments still count (they DID
+        // occur today), matching "every appointment scheduled for today
+        // except cancelled/no_show" rather than an "upcoming only" reading.
+        supabase.from("appointments").select("*", { count: "exact", head: true }).eq("org_id", orgId).not("status", "in", "(cancelled,no_show)").gte("scheduled_at", orgTodayStart).lt("scheduled_at", orgTodayEnd),
+        supabase.from("leads").select("created_at").eq("org_id", orgId).gte("created_at", sparkStart),
+        supabase.from("invoices").select("created_at, total_amount").eq("org_id", orgId).eq("status", "paid").gte("created_at", sparkStart),
+        supabase.from("appointments").select("scheduled_at").eq("org_id", orgId).neq("status", "cancelled").gte("scheduled_at", sparkStart),
+        // Full (unbounded) real created_at + value for every currently-open
+        // deal — needed (not just the last 14 days) so the running total
+        // has the right starting baseline on day one of the window.
+        supabase.from("deals").select("value, created_at").eq("org_id", orgId).eq("status", "open"),
+        supabase.from("projects").select("created_at").eq("org_id", orgId).in("status", ["planning","contracted","pre-construction","active","punch-list"]),
+        // Estimates card — every status, bounded to a reasonable page size
+        // rather than 5 separate per-status count queries. Also reused
+        // below for the Recent Activity feed's estimate-sent/viewed/
+        // accepted events (title/client_name), so no second query needed.
+        // Also the single source of truth for Needs Attention's stale-
+        // estimate detection (see attentionItems above) — deriving from
+        // this full set instead of a separate narrow query is what fixes
+        // the "most-recently-touched-10" truncation bug from Phase 8.
+        //
+        // TODO(Phase 8, deferred): still capped at 500 rows. An org with
+        // more than 500 estimates would get silently incomplete counts/
+        // totals here with no on-screen indication. Safely removing the
+        // cap needs either a paginated fetch or a server-side aggregate
+        // (e.g. an RPC returning per-status counts/sums), not just a higher
+        // limit — deferred rather than attempted in this correction pass.
+        supabase.from("estimates").select("id, status, total, updated_at, valid_until, title, client_name, created_at, converted_deal_id, converted_project_id, deposit_amount").eq("org_id", orgId).order("updated_at", { ascending: false }).limit(500),
+        // Tasks card "Completed recently" + Recent Activity — scoped
+        // directly by tasks.org_id (Phase 10.1 added a real column here),
+        // so this now includes Lead/Deal-linked tasks with no project too,
+        // not just project-scoped ones.
+        // "done" was never a valid tasks.status value (tasks_status_check
+        // only allows not_started/in_progress/on_hold/completed/cancelled)
+        // — this filter matched zero rows live until this fix.
+        supabase.from("tasks").select("id, title, completed_at").eq("org_id", orgId).eq("status", "completed").not("completed_at", "is", null).order("completed_at", { ascending: false }).limit(5),
+        // Fixed 14-day voice-call count for the AI Center card's own stat
+        // (unrelated to Pipeline Pulse's now-dynamic period — see
+        // pipelinePulseQuery above) — pulseStart here is just this constant
+        // window, not the user-selected Pipeline Pulse timeline.
+        supabase.from("voice_calls").select("*", { count: "exact", head: true }).eq("tenant_id", orgId).gte("started_at", pulseStart),
+        // Marketing Activity card's "Leads by Source" — bare source
+        // values only, grouped client-side (no existing aggregation for
+        // this anywhere in the app). Bounded to a reasonable page size.
+        supabase.from("leads").select("source").eq("org_id", orgId).limit(1000),
+        // Next Booking card (Phase 10.3 correction pass) — the single
+        // soonest non-terminal appointment, with the full detail set the
+        // dedicated card needs (assignee, location/meeting link, duration).
+        // Excludes every terminal status (cancelled/completed/no_show), not
+        // just cancelled — a completed or no-show appointment is not a real
+        // "next booking" even if its scheduled_at is still technically in
+        // the future relative to when it was marked done.
+        supabase.from("appointments")
+          .select("id, scheduled_at, ends_at, duration_min, title, contact_name, service, status, address, meeting_url, assigned_to, assignee:profiles!appointments_assigned_to_fkey(first_name,last_name)")
+          .eq("org_id", orgId)
+          .not("status", "in", "(cancelled,completed,no_show)")
+          .gte("scheduled_at", now.toISOString())
+          .order("scheduled_at", { ascending: true })
+          .limit(1),
+        // Recent Activity — appointment lifecycle events, merged into the
+        // same feed as Task/Lead/Estimate/Invoice/Call events below. Reads
+        // from appointment_activities (Phase 10.3's trigger-owned audit
+        // trail), never from application-side guessing.
+        supabase.from("appointment_activities")
+          .select("id, appointment_id, activity_type, summary, actor_id, created_at, appointments!inner(title, service, contact_name, org_id)")
+          .eq("org_id", orgId)
+          .order("created_at", { ascending: false })
+          .limit(5),
+      ]);
+
+      const pipelineNow = (openDeals ?? []).reduce((s: number, d: any) => s + Number(d.value ?? 0), 0);
+      const pipelineLast = (lastDeals ?? []).reduce((s: number, d: any) => s + Number(d.value ?? 0), 0);
+      const revNow = (paidInvoices ?? []).reduce((s: number, i: any) => s + Number(i.total_amount ?? 0), 0);
+      const revLast = (lastPaidInvoices ?? []).reduce((s: number, i: any) => s + Number(i.total_amount ?? 0), 0);
+      const pct = (a: number, b: number): number | null => b === 0 ? null : ((a - b) / b) * 100;
+
+      // New Leads count/trend and Active Projects' CURRENT count are no
+      // longer computed here — derived from canonical useLeads()/
+      // useProjects() in the component (see leadsKpi/projectsKpi below).
+      // `projLastCount` (raw, below) is still this query's job — neither
+      // store exposes created_at in a form that lets a point-in-time-in-
+      // the-past count be reconstructed client-side, so the "vs last
+      // month" % for Active Projects is finished in the component by
+      // combining this raw count with the live canonical current count.
+      const kpiData = {
+        pipelineNow, pipelineTrend: pct(pipelineNow, pipelineLast),
+        revenue: revNow, revenueTrend: pct(revNow, revLast),
+        bookingsToday: bookingsCount ?? 0,
+      };
+
+      const sparklines = {
+        leads: bucketCounts((leadSparkRows ?? []).map((r: any) => r.created_at), SPARK_DAYS),
+        revenue: bucketSums((revenueSparkRows ?? []).map((r: any) => ({ at: r.created_at, amount: Number(r.total_amount ?? 0) })), SPARK_DAYS),
+        bookings: bucketCounts((bookingSparkRows ?? []).map((r: any) => r.scheduled_at), SPARK_DAYS),
+        pipeline: cumulativeSeries((openDealsForSpark ?? []).map((r: any) => ({ at: r.created_at, amount: Number(r.value ?? 0) })), SPARK_DAYS),
+        projects: cumulativeSeries((activeProjectsForSpark ?? []).map((r: any) => ({ at: r.created_at, amount: 1 })), SPARK_DAYS),
+      };
+
+      const estimateRows = (allEstimateRows ?? []).map((e: any) => {
+        // Shared with the Estimates page (src/lib/estimate-totals.ts) so
+        // the two pages can't silently diverge on the total-calculation
+        // FORMULA. This dashboard doesn't fetch estimate_items (that would
+        // mean a second, per-estimate-items query on top of the 500-row
+        // estimates query above), so `items` is always empty here and the
+        // helper always returns the stored total unchanged — the Estimates
+        // page still wins when an estimate's stored total has gone stale
+        // relative to its real line items. Full parity is deferred; see
+        // the TODO on the estimates query above.
+        const stored = { subtotal: 0, tax_total: 0, total: Number(e.total ?? 0) };
+        const { total } = computeEffectiveEstimateTotals(stored, []);
+        return {
+          id: e.id, status: e.status, total, updated_at: e.updated_at, valid_until: e.valid_until ?? null,
+          title: e.title ?? "Untitled", client_name: e.client_name ?? null,
+          converted_deal_id: e.converted_deal_id ?? null, converted_project_id: e.converted_project_id ?? null,
+          deposit_amount: Number(e.deposit_amount ?? 0),
+        };
+      });
+
+      const voiceCallsCount = voiceCallsPulseCount ?? 0;
+      const leadSources = (leadSourceRows ?? []).map((r: any) => r.source).filter(Boolean);
+
+      let nextBooking: {
+        id: string; scheduledAt: string; endsAt: string; durationMin: number;
+        title: string; contactName: string | null; status: string;
+        address: string | null; meetingUrl: string | null; assigneeName: string | null;
+      } | null = null;
+      {
+        const row = (nextBookingRows ?? [])[0] as any;
+        if (row) {
+          const assignee = row.assignee;
+          const assigneeName = assignee ? `${assignee.first_name ?? ""} ${assignee.last_name ?? ""}`.trim() : null;
+          const endsAt = row.ends_at ?? new Date(new Date(row.scheduled_at).getTime() + (row.duration_min ?? 60) * 60000).toISOString();
+          nextBooking = {
+            id: row.id,
+            scheduledAt: row.scheduled_at,
+            endsAt,
+            durationMin: row.duration_min ?? 60,
+            title: row.title || row.service || "Appointment",
+            contactName: row.contact_name ?? null,
+            status: row.status,
+            address: row.address ?? null,
+            meetingUrl: row.meeting_url ?? null,
+            assigneeName: assigneeName || null,
+          };
+        }
+      }
+
+      const [{ data: recentLeads }, { data: recentCalls }, { data: recentInvoices }, { data: recentDealEvents }, { data: recentProjects }] = await Promise.all([
+        // id/avatar_url/avatar_key added to the join (S2 avatar audit) — a
+        // real Contact identity + its canonical avatar, not just a display
+        // name, so Recent Activity can render the SAME avatar Inbox/
+        // Contacts show for this Contact instead of a generated fallback
+        // seeded by the wrong (non-contact) id.
+        supabase.from("leads").select("id, created_at, contacts!contact_id(id, full_name, avatar_url, avatar_key), source").eq("org_id", orgId).order("created_at", { ascending: false }).limit(3),
+        // contact_id + avatar join added — voice_calls does carry contact_id
+        // when the caller matched a saved Contact (see
+        // voice-conversations.ts); null for an unmatched number, which
+        // correctly gets no ContactAvatar below (falls to the Phone icon).
+        supabase.from("voice_calls").select("id, started_at, caller_number, direction, summary, contact_id, contacts!contact_id(avatar_url, avatar_key)").eq("tenant_id", orgId).order("started_at", { ascending: false }).limit(2),
+        supabase.from("invoices").select("id, created_at, total_amount, contacts!client_id(id, full_name, avatar_url, avatar_key)").eq("org_id", orgId).eq("status", "paid").order("created_at", { ascending: false }).limit(2),
+        // Deal lifecycle — REAL persisted events from deal_activities (the
+        // same event log Pipeline Pulse reads, written by deals-store.ts's
+        // logDealActivity() on every actual create/win/lose). Only the three
+        // meaningful business milestones (created/won/lost) surface in the
+        // feed — never `updated`/`contact_linked`/`stage_changed` noise. The
+        // deal→contact join yields the canonical ContactAvatar identity for
+        // the row; a deal with no primary contact falls back to the deal
+        // name + the entity icon.
+        supabase.from("deal_activities").select("id, activity_type, title, description, occurred_at, deals!deal_id(name, contact_id, contacts!contact_id(id, full_name, avatar_url, avatar_key))").eq("org_id", orgId).in("activity_type", ["created", "won", "lost"]).order("occurred_at", { ascending: false }).limit(4),
+        // Project creation — `projects.created_at` is a real persisted
+        // timestamp (NOT `updated_at`, which would fabricate a "created"
+        // event from unrelated later edits). There is no project_activities
+        // table, so this is the only honest project signal available; the
+        // client_id→contacts join gives the row its canonical avatar.
+        supabase.from("projects").select("id, name, created_at, contacts!client_id(id, full_name, avatar_url, avatar_key)").eq("org_id", orgId).order("created_at", { ascending: false }).limit(3),
+      ]);
+
+      // contactId/avatarUrl/avatarKey (S2 avatar audit): populated ONLY
+      // when the source row actually has a stable Contact relationship —
+      // leads/invoices/calls join to a real contacts row above; estimates
+      // and tasks have no such link fetched here (estimates.client_id
+      // exists but the shared allEstimateRows query above isn't joined to
+      // contacts — left alone to avoid reshaping a query several other
+      // cards depend on; tasks have no contact relationship in the schema
+      // at all). Those items render the entity icon instead, same as
+      // appointments already do — never a name-matched or made-up avatar.
+      const items: { id: string; who: string; t: string; s: string; when: string; at: string; kind?: string; contactId?: string; avatarUrl?: string | null; avatarKey?: string | null }[] = [];
+      for (const l of recentLeads ?? []) {
+        const contact = (l as any).contacts;
+        items.push({ id: `l${l.id}`, who: contact?.full_name ?? "Someone", t: "New lead submitted", s: `via ${(l as any).source ?? "website"}`, when: "", at: l.created_at, kind: "lead", contactId: contact?.id, avatarUrl: contact?.avatar_url ?? null, avatarKey: contact?.avatar_key ?? null });
+      }
+      for (const c of recentCalls ?? []) {
+        const contact = (c as any).contacts;
+        items.push({ id: `c${c.id}`, who: c.caller_number ?? "Unknown", t: `${c.direction === "outbound" ? "Outbound" : "Inbound"} call`, s: c.summary?.slice(0, 50) ?? "", when: "", at: c.started_at, kind: "call", contactId: (c as any).contact_id ?? undefined, avatarUrl: contact?.avatar_url ?? null, avatarKey: contact?.avatar_key ?? null });
+      }
+      for (const inv of recentInvoices ?? []) {
+        const contact = (inv as any).contacts;
+        items.push({ id: `i${inv.id}`, who: contact?.full_name ?? "Client", t: "Invoice paid", s: fmtK(Number(inv.total_amount ?? 0)), when: "", at: inv.created_at, kind: "invoice", contactId: contact?.id, avatarUrl: contact?.avatar_url ?? null, avatarKey: contact?.avatar_key ?? null });
+      }
+      // Deal created / won / lost — real deal_activities rows (see the query
+      // above). `who` prefers the linked Contact's name so it reads like the
+      // other Contact-anchored rows; the avatar comes from that same joined
+      // contacts row (canonical S2 identity), or the entity icon when the
+      // deal has no primary contact.
+      for (const d of recentDealEvents ?? []) {
+        const deal = (d as any).deals;
+        const contact = deal?.contacts;
+        const label = d.activity_type === "won" ? "Deal won" : d.activity_type === "lost" ? "Deal lost" : "Deal created";
+        items.push({ id: `d${d.id}`, who: contact?.full_name ?? deal?.name ?? "Deal", t: label, s: contact?.full_name ? (deal?.name ?? "") : "", when: "", at: d.occurred_at, kind: "deal", contactId: contact?.id, avatarUrl: contact?.avatar_url ?? null, avatarKey: contact?.avatar_key ?? null });
+      }
+      // Project created — real `projects.created_at` (never `updated_at`).
+      for (const p of recentProjects ?? []) {
+        const contact = (p as any).contacts;
+        items.push({ id: `p${p.id}`, who: contact?.full_name ?? p.name ?? "Project", t: "Project created", s: contact?.full_name ? (p.name ?? "") : "", when: "", at: p.created_at, kind: "project", contactId: contact?.id, avatarUrl: contact?.avatar_url ?? null, avatarKey: contact?.avatar_key ?? null });
+      }
+      // Estimate sent/viewed/approved — real status + real updated_at, not a
+      // fabricated "sent" event log (this table has no separate history of
+      // status transitions, so "when this row was last updated" is the
+      // honest signal available). Canonical status vocabulary from
+      // src/lib/estimate-status.ts (Phase 10.4) — "accepted" was dead code,
+      // it never matched a live DB value.
+      for (const e of (allEstimateRows ?? []).slice(0, 3)) {
+        if (e.status === "sent" || e.status === "viewed" || e.status === "approved") {
+          const label = e.status === "approved" ? "Estimate approved" : e.status === "viewed" ? "Estimate viewed" : "Estimate sent";
+          items.push({ id: `e${e.id}`, who: e.client_name ?? "Client", t: label, s: e.title ?? "", when: "", at: e.updated_at ?? e.created_at, kind: "estimate" });
+        }
+      }
+      for (const t of (completedTaskRows ?? []).slice(0, 3)) {
+        items.push({ id: `t${t.id}`, who: "Task completed", t: t.title, s: "", when: "", at: t.completed_at, kind: "task" });
+      }
+      // Appointment lifecycle events (Phase 10.3 correction pass) — reads
+      // appointment_activities (trigger-owned, see
+      // supabase/migrations/20260807_calendar_appointments_completion.sql),
+      // merged into this same time-ordered feed rather than a separate
+      // Calendar-only activity list, so a scheduled/rescheduled/cancelled
+      // appointment shows up next to Lead/Task/Invoice events exactly like
+      // every other Recent Activity source.
+      for (const a of (apptActivityRows ?? []).slice(0, 4)) {
+        const appt = (a as any).appointments;
+        const label = APPOINTMENT_ACTIVITY_LABELS[a.activity_type as string] ?? a.summary;
+        const subject = appt?.title || appt?.service || "Appointment";
+        const who = appt?.contact_name ? `${subject} with ${appt.contact_name}` : subject;
+        items.push({ id: `aa${a.id}`, who, t: label, s: a.actor_id ? "" : "System", when: "", at: a.created_at, kind: "appointment" });
+      }
+      items.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+      const activity = items.slice(0, 6).map(it => ({ ...it, when: safeRelativeTime(it.at) }));
+
+      return {
+        firstName,
+        kpiData, sparklines, estimateRows, voiceCallsCount, leadSources, nextBooking, activity,
+        projLastCount: projLastCount ?? 0,
+      };
+    },
+  });
+
+  // Minimal error honesty (unchanged from the old mount-only effect): a
+  // failed fetch here used to be indistinguishable from "this org genuinely
+  // has no data" — every card would just quietly show its normal empty
+  // state. This at least surfaces the failure during development.
+  useEffect(() => {
+    if (dashboardSummaryQuery.error && import.meta.env.DEV) {
+      console.error("[Command Center] failed to load dashboard data:", (dashboardSummaryQuery.error as any)?.message ?? dashboardSummaryQuery.error);
+    }
+  }, [dashboardSummaryQuery.error]);
+
+  // Defaults mirror the old useState initial values exactly, so every
+  // downstream reference below (kpiData.revenue, sparklines.leads, etc.)
+  // continues to work unchanged while the query is still loading.
+  const kpiData = dashboardSummaryQuery.data?.kpiData ?? {
+    pipelineNow: 0, pipelineTrend: null as number | null,
+    revenue: 0, revenueTrend: null as number | null,
+    bookingsToday: 0,
+  };
+  const sparklines = dashboardSummaryQuery.data?.sparklines ?? { leads: [], revenue: [], bookings: [], pipeline: [], projects: [] };
+  const estimateRows = dashboardSummaryQuery.data?.estimateRows ?? [];
+  const voiceCallsCount = dashboardSummaryQuery.data?.voiceCallsCount ?? 0;
+  const leadSources = dashboardSummaryQuery.data?.leadSources ?? [];
+  const nextBooking = dashboardSummaryQuery.data?.nextBooking ?? null;
+  const activity = dashboardSummaryQuery.data?.activity ?? [];
+  const userName = dashboardSummaryQuery.data?.firstName || "there";
+
+  // New Leads — derived from canonical useLeads() (S2B), not a raw query.
+  // Same semantics as before this migration: `count` is ALL leads ever
+  // (not date-bounded — matches the original raw `leads` head-count with
+  // no created_at filter), `lastCount` is how many existed as of the start
+  // of this month, for the "vs last month" trend %. leads-store.ts's own
+  // useSyncExternalStore already reflects every Lead mutation immediately
+  // (create/update via its own emit()), so this KPI now updates the instant
+  // a Lead is created anywhere in the app — no query, no realtime
+  // subscription needed for this one.
+  const leadsKpi = useMemo(() => {
+    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime();
+    const lastCount = allLeads.filter(l => new Date(l.createdAt).getTime() < monthStart).length;
+    return { count: allLeads.length, lastCount };
+  }, [allLeads]);
+  const leadsTrend = leadsKpi.lastCount === 0 ? null : ((leadsKpi.count - leadsKpi.lastCount) / leadsKpi.lastCount) * 100;
+
+  // Active Projects — CURRENT count derived from canonical useProjects()
+  // (S2B), using the REAL persisted status set confirmed via project-
+  // status.ts and every other real consumer in the app (planning/
+  // contracted/pre-construction/active/punch-list) — NOT mock-data.ts's
+  // stale `ProjectStatus` type ("active"|"on-hold"|"cancelled"), which
+  // doesn't match live data and was never the source of truth; see the
+  // S2B report's status audit. `status` is compared as a plain string here
+  // specifically because that TS type is known-wrong, not worked around by
+  // guessing new values. Trend still combines this live count with
+  // `projLastCount` (a dedicated query — useProjects() has no created_at
+  // field to reconstruct a past-point-in-time count from).
+  const ACTIVE_PROJECT_STATUSES = ["planning", "contracted", "pre-construction", "active", "punch-list"];
+  const activeProjectsCount = useMemo(
+    () => allProjects.filter(p => ACTIVE_PROJECT_STATUSES.includes(p.status as string)).length,
+    [allProjects],
+  );
+  const projLastCount = dashboardSummaryQuery.data?.projLastCount ?? 0;
+  const projectsTrend = projLastCount === 0 ? null : ((activeProjectsCount - projLastCount) / projLastCount) * 100;
 
   useEffect(() => {
     fetchGmailConnectionStatus().then((status) => {
@@ -678,19 +1189,36 @@ function DashboardPage() {
     };
   }, [allDeals]);
 
-  const attentionItems = useMemo(() => {
+  const attentionItemsAll = useMemo<AttentionItem[]>(() => {
     const now = new Date();
-    const items: { id: string; icon: React.ReactNode; color: string; bg: string; title: string; sub: string; badge: string; badgeColor: string; href: string; weight: number }[] = [];
+    const items: AttentionItem[] = [];
 
     for (const t of allTasks) {
       if (!isActiveStatus(t.status)) continue;
-      const overdueDays = daysBetween(now, new Date(t.due));
-      if (overdueDays > 0) {
+      // Live-test stabilization fix (Needs Attention vs Tasks/Overdue count
+      // parity): this used to read `t.due`, which tasks-store silently
+      // falls back to `created_at` when a task has no real due date — so
+      // every UNDATED active task counted as "overdue" here, inflating the
+      // Needs Attention count well past the Tasks page's Overdue tab (which
+      // uses `dueDateRaw` via the shared schedule-health helpers). Now uses
+      // the same real, nullable due date + same helpers, so Needs
+      // Attention's overdue-task set is a true subset of the Tasks page's
+      // Overdue count — an undated task is simply never overdue.
+      const dueDate = parseDateOnlySafe(t.dueDateRaw);
+      if (!dueDate) continue;
+      const overdueDays = differenceInCalendarDaysSafe(todayDateOnly(), dueDate);
+      if (overdueDays !== null && overdueDays > 0) {
         items.push({
-          id: `task-${t.id}`, icon: <AlertTriangle className="h-4 w-4" />, color: "text-destructive", bg: "bg-destructive-soft ring-destructive-soft",
+          id: `task-${t.id}`, category: "tasks", icon: <AlertTriangle className="h-4 w-4" />, color: "text-destructive", bg: "bg-destructive-soft ring-destructive-soft",
           title: t.title, sub: `Overdue by ${overdueDays === 1 ? "1 day" : `${overdueDays} days`}`,
           badge: "Overdue", badgeColor: "bg-destructive-soft text-destructive-soft-foreground ring-1 ring-destructive-soft",
-          href: "/tasks", weight: 100 + Math.min(overdueDays, 30),
+          // No per-task deep link exists (the Tasks page opens details in a
+          // local-state drawer, not a URL param) — land on /tasks. Reported
+          // as a known limitation.
+          href: "/tasks", weight: 100 + Math.min(overdueDays, 30), metricDays: overdueDays,
+          // Captured so the Projects category can roll these up by project_id
+          // (never by name). A task with no project stays only in Tasks.
+          projectId: t.projectId ?? null,
         });
       }
     }
@@ -700,14 +1228,21 @@ function DashboardPage() {
     // that's accurate, not a gap to paper over). Weighted above estimates
     // per the requested priority order (overdue tasks, needs-reply
     // conversations, stale estimates, stale deals).
+    // Every unread thread qualifies (no longer capped at 3) — the tile
+    // count must reflect the COMPLETE category, and the detail list scrolls
+    // internally so it can show more than 3 without resizing the card.
     const unreadConvs = [...conversations, ...gmailConversations].filter(c => c.unread);
-    for (const c of unreadConvs.slice(0, 3)) {
+    for (const c of unreadConvs) {
       const hoursOld = Math.max(0, (now.getTime() - new Date(c.lastAt).getTime()) / 36e5);
       items.push({
-        id: `conv-${c.id}`, icon: <Mail className="h-4 w-4" />, color: "text-info", bg: "bg-info-soft ring-info-soft",
+        id: `conv-${c.id}`, category: "conversations", icon: <Mail className="h-4 w-4" />, color: "text-info", bg: "bg-info-soft ring-info-soft",
         title: c.contactName, sub: `${c.preview || "New message"}`,
         badge: "Needs Reply", badgeColor: "bg-info-soft text-info-soft-foreground ring-1 ring-info-soft",
-        href: "/inbox", weight: 80 + Math.min(Math.round(hoursOld), 20),
+        // inbox.tsx's own deep-link effect resolves ?contactId to the real
+        // contact+channel thread (same mechanism Recent Conversations and
+        // Contacts' "Message" action use). No contactId (rare) → bare /inbox.
+        href: "/inbox", search: (c as any).contactId ? { contactId: String((c as any).contactId) } : undefined,
+        weight: 80 + Math.min(Math.round(hoursOld), 20), metricDays: Math.round(hoursOld / 24),
       });
     }
     // Stale estimates — derived from the FULL estimates dataset already
@@ -741,10 +1276,10 @@ function DashboardPage() {
     for (const e of staleEstimates) {
       const days = daysBetween(now, new Date(e.updated_at));
       items.push({
-        id: `est-${e.id}`, icon: <FileText className="h-4 w-4" />, color: "text-info", bg: "bg-info-soft ring-info-soft",
+        id: `est-${e.id}`, category: "estimates", icon: <FileText className="h-4 w-4" />, color: "text-info", bg: "bg-info-soft ring-info-soft",
         title: e.title, sub: `${e.client_name ? `${e.client_name} · ` : ""}Waiting ${days} day${days === 1 ? "" : "s"}`,
         badge: "Estimate", badgeColor: "bg-info-soft text-info-soft-foreground ring-1 ring-info-soft",
-        href: "/estimates", weight: 55 + Math.min(days, 20),
+        href: "/estimates", search: { estimateId: e.id }, weight: 55 + Math.min(days, 20), metricDays: days,
       });
     }
     // Changes requested — the customer responded, this always outranks a
@@ -752,10 +1287,10 @@ function DashboardPage() {
     const changesRequested = estimateRows.filter((e) => e.status === "changes_requested");
     for (const e of changesRequested) {
       items.push({
-        id: `est-cr-${e.id}`, icon: <FileText className="h-4 w-4" />, color: "text-warning", bg: "bg-warning-soft ring-warning-soft",
+        id: `est-cr-${e.id}`, category: "estimates", icon: <FileText className="h-4 w-4" />, color: "text-warning", bg: "bg-warning-soft ring-warning-soft",
         title: e.title, sub: `${e.client_name ? `${e.client_name} · ` : ""}Changes requested`,
         badge: "Changes Requested", badgeColor: "bg-warning-soft text-warning-soft-foreground ring-1 ring-warning-soft",
-        href: "/estimates", weight: 90,
+        href: "/estimates", search: { estimateId: e.id }, weight: 90,
       });
     }
     // Proposal expiring within 3 days — still sent/viewed, not yet expired.
@@ -768,10 +1303,10 @@ function DashboardPage() {
     for (const e of expiringSoon) {
       const days = daysBetween(now, new Date(e.valid_until!));
       items.push({
-        id: `est-exp-${e.id}`, icon: <Clock className="h-4 w-4" />, color: "text-orange", bg: "bg-orange-soft ring-orange-soft",
+        id: `est-exp-${e.id}`, category: "estimates", icon: <Clock className="h-4 w-4" />, color: "text-orange", bg: "bg-orange-soft ring-orange-soft",
         title: e.title, sub: `${e.client_name ? `${e.client_name} · ` : ""}Expires in ${days} day${days === 1 ? "" : "s"}`,
         badge: "Expiring Soon", badgeColor: "bg-orange-soft text-orange-soft-foreground ring-1 ring-orange-soft",
-        href: "/estimates", weight: 70,
+        href: "/estimates", search: { estimateId: e.id }, weight: 70, metricDays: days,
       });
     }
     // Approved but not yet converted to a Deal or Project, or (once
@@ -780,305 +1315,115 @@ function DashboardPage() {
     const approvedAwaiting = estimateRows.filter((e) => e.status === "approved" && !e.converted_deal_id && !e.converted_project_id);
     for (const e of approvedAwaiting) {
       items.push({
-        id: `est-conv-${e.id}`, icon: <CheckCircle2 className="h-4 w-4" />, color: "text-success", bg: "bg-success-soft ring-success-soft",
+        id: `est-conv-${e.id}`, category: "estimates", icon: <CheckCircle2 className="h-4 w-4" />, color: "text-success", bg: "bg-success-soft ring-success-soft",
         title: e.title, sub: `${e.client_name ? `${e.client_name} · ` : ""}Approved — ready to convert`,
         badge: "Approved", badgeColor: "bg-success-soft text-success-soft-foreground ring-1 ring-success-soft",
-        href: "/estimates", weight: 65,
+        href: "/estimates", search: { estimateId: e.id }, weight: 65,
       });
     }
     const openDeals = allDeals.filter(d => d.stage !== "won" && d.stage !== "lost");
     for (const d of openDeals) {
       if (d.ageDays >= 14) {
         items.push({
-          id: `deal-${d.id}`, icon: <Clock className="h-4 w-4" />, color: "text-orange", bg: "bg-orange-soft ring-orange-soft",
+          id: `deal-${d.id}`, category: "deals", icon: <Clock className="h-4 w-4" />, color: "text-orange", bg: "bg-orange-soft ring-orange-soft",
           title: d.name, sub: `${d.contactName ? `${d.contactName} · ` : ""}Last activity ${d.ageDays}d ago`,
           badge: "Stale", badgeColor: "bg-orange-soft text-orange-soft-foreground ring-1 ring-orange-soft",
-          href: ROUTES.PIPELINE, weight: 30 + Math.min(d.ageDays, 20),
+          href: ROUTES.PIPELINE, search: { dealId: d.id }, weight: 30 + Math.min(d.ageDays, 20), metricDays: d.ageDays,
         });
       }
     }
-    items.sort((a, b) => b.weight - a.weight);
-    return items.slice(0, 3);
+    // NOTE: no atomic issue is ever pushed with category "leads" or
+    // "projects". Leads has no qualifying rule yet (tile shows 0 / "No
+    // issues"). Projects is a ROLLUP built downstream in attentionByCategory
+    // from the Project-linked task items above — it summarises existing
+    // atomic issues rather than adding new ones, so it is intentionally
+    // absent here and never affects this array's length (the header total).
+    items.sort((a, b) => (b.weight - a.weight)
+      || (ATTENTION_CATEGORY_ORDER.indexOf(a.category) - ATTENTION_CATEGORY_ORDER.indexOf(b.category)));
+    return items;
   }, [allTasks, estimateRows, allDeals, conversations, gmailConversations]);
 
-  useEffect(() => {
-    (async () => {
-      try {
-      const { orgId, firstName } = await resolveOrgAndUser();
-      if (!orgId) return;
-      if (firstName) setUserName(firstName);
+  const projectNameById = useMemo(
+    () => new Map(allProjects.map((p) => [p.id, p.name])),
+    [allProjects],
+  );
 
-      const now = new Date();
-      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-      const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString();
-      // Bookings Today (Phase 10.3 correction pass) needs the organization's
-      // own "today", not the visiting browser's — a booking at 11pm org-
-      // local could otherwise be miscounted as tomorrow (or vice versa) if
-      // the two timezones disagree. Scoped to just this one KPI rather than
-      // reworking every other date boundary above (monthStart/todayStart),
-      // which power unrelated cards not reported as broken.
-      //
-      // Reads timezone directly from `organizations` here rather than the
-      // useOrganization() hook value in closure scope: this effect has an
-      // empty dependency array (fires once on mount) and would otherwise
-      // capture whichever `org.timezone` happened to be current at that
-      // exact render — often still the "America/Los_Angeles" store default,
-      // since org data loads asynchronously and may not have resolved yet.
-      const { data: orgTzRow } = await supabase.from("organizations").select("timezone").eq("id", orgId).maybeSingle();
-      const orgTimezone = orgTzRow?.timezone || "America/New_York";
-      const orgTzYmd = now.toLocaleDateString("en-CA", { timeZone: orgTimezone });
-      // Classic no-library timezone-offset trick: the same instant rendered
-      // as a wall-clock string in UTC vs. in the target zone, re-parsed as
-      // local browser time — the difference is how far the zone sits from
-      // UTC at `now` (DST-aware since it uses `now`, not a fixed offset).
-      const orgTzOffsetMs =
-        new Date(now.toLocaleString("en-US", { timeZone: "UTC" })).getTime() -
-        new Date(now.toLocaleString("en-US", { timeZone: orgTimezone })).getTime();
-      const orgTodayStart = new Date(new Date(`${orgTzYmd}T00:00:00Z`).getTime() + orgTzOffsetMs).toISOString();
-      const orgTodayEnd = new Date(new Date(orgTodayStart).getTime() + 86_400_000).toISOString();
-      const sparkStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (SPARK_DAYS - 1)).toISOString();
-      const pulseStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (PULSE_DAYS - 1)).toISOString();
+  // Qualifying items grouped by category (each list stays weight-sorted).
+  // Every declared category always has an entry (possibly empty) so the
+  // grid is stable and never reflows as counts change.
+  const attentionByCategory = useMemo(() => {
+    const map = new Map<AttentionCategory, AttentionItem[]>();
+    for (const cat of ATTENTION_CATEGORY_ORDER) map.set(cat, []);
+    for (const it of attentionItemsAll) map.get(it.category)!.push(it);
 
-      const [
-        { count: projCount }, { count: projLastCount },
-        { count: leadsCount }, { count: leadsLastCount },
-        { data: openDeals }, { data: lastDeals },
-        { data: paidInvoices }, { data: lastPaidInvoices },
-        { count: bookingsCount },
-        { data: leadSparkRows },
-        { data: revenueSparkRows },
-        { data: bookingSparkRows },
-        { data: openDealsForSpark },
-        { data: activeProjectsForSpark },
-        { data: allEstimateRows },
-        { data: completedTaskRows },
-        { data: dealActivityPulseRows },
-        { count: voiceCallsPulseCount },
-        { data: leadSourceRows },
-        { data: nextBookingRows },
-        { data: apptActivityRows },
-      ] = await Promise.all([
-        supabase.from("projects").select("*", { count: "exact", head: true }).eq("org_id", orgId).in("status", ["planning","contracted","pre-construction","active","punch-list"]),
-        supabase.from("projects").select("*", { count: "exact", head: true }).eq("org_id", orgId).in("status", ["planning","contracted","pre-construction","active","punch-list"]).lt("created_at", monthStart),
-        supabase.from("leads").select("*", { count: "exact", head: true }).eq("org_id", orgId),
-        supabase.from("leads").select("*", { count: "exact", head: true }).eq("org_id", orgId).lt("created_at", monthStart),
-        supabase.from("deals").select("value").eq("org_id", orgId).eq("status", "open"),
-        supabase.from("deals").select("value").eq("org_id", orgId).eq("status", "open").lt("created_at", monthStart),
-        supabase.from("invoices").select("total_amount").eq("org_id", orgId).eq("status", "paid").gte("created_at", monthStart),
-        supabase.from("invoices").select("total_amount").eq("org_id", orgId).eq("status", "paid").gte("created_at", lastMonthStart).lt("created_at", monthStart),
-        // BOOKINGS TODAY = every appointment scheduled for today (organization
-        // timezone) except cancelled/no_show — a no-show never happened, so
-        // it doesn't belong in a same-day booking count any more than a
-        // cancellation does. Completed appointments still count (they DID
-        // occur today), matching "every appointment scheduled for today
-        // except cancelled/no_show" rather than an "upcoming only" reading.
-        supabase.from("appointments").select("*", { count: "exact", head: true }).eq("org_id", orgId).not("status", "in", "(cancelled,no_show)").gte("scheduled_at", orgTodayStart).lt("scheduled_at", orgTodayEnd),
-        supabase.from("leads").select("created_at").eq("org_id", orgId).gte("created_at", sparkStart),
-        supabase.from("invoices").select("created_at, total_amount").eq("org_id", orgId).eq("status", "paid").gte("created_at", sparkStart),
-        supabase.from("appointments").select("scheduled_at").eq("org_id", orgId).neq("status", "cancelled").gte("scheduled_at", sparkStart),
-        // Full (unbounded) real created_at + value for every currently-open
-        // deal — needed (not just the last 14 days) so the running total
-        // has the right starting baseline on day one of the window.
-        supabase.from("deals").select("value, created_at").eq("org_id", orgId).eq("status", "open"),
-        supabase.from("projects").select("created_at").eq("org_id", orgId).in("status", ["planning","contracted","pre-construction","active","punch-list"]),
-        // Estimates card — every status, bounded to a reasonable page size
-        // rather than 5 separate per-status count queries. Also reused
-        // below for the Recent Activity feed's estimate-sent/viewed/
-        // accepted events (title/client_name), so no second query needed.
-        // Also the single source of truth for Needs Attention's stale-
-        // estimate detection (see attentionItems above) — deriving from
-        // this full set instead of a separate narrow query is what fixes
-        // the "most-recently-touched-10" truncation bug from Phase 8.
-        //
-        // TODO(Phase 8, deferred): still capped at 500 rows. An org with
-        // more than 500 estimates would get silently incomplete counts/
-        // totals here with no on-screen indication. Safely removing the
-        // cap needs either a paginated fetch or a server-side aggregate
-        // (e.g. an RPC returning per-status counts/sums), not just a higher
-        // limit — deferred rather than attempted in this correction pass.
-        supabase.from("estimates").select("id, status, total, updated_at, valid_until, title, client_name, created_at, converted_deal_id, converted_project_id, deposit_amount").eq("org_id", orgId).order("updated_at", { ascending: false }).limit(500),
-        // Tasks card "Completed recently" + Recent Activity — scoped
-        // directly by tasks.org_id (Phase 10.1 added a real column here),
-        // so this now includes Lead/Deal-linked tasks with no project too,
-        // not just project-scoped ones.
-        // "done" was never a valid tasks.status value (tasks_status_check
-        // only allows not_started/in_progress/on_hold/completed/cancelled)
-        // — this filter matched zero rows live until this fix.
-        supabase.from("tasks").select("id, title, completed_at").eq("org_id", orgId).eq("status", "completed").not("completed_at", "is", null).order("completed_at", { ascending: false }).limit(5),
-        // Pipeline Pulse — real historical deal events (deals-store.ts's
-        // logDealActivity), not a fabricated trend. created/won/lost/
-        // stage_changed are the meaningful event types for a momentum view.
-        supabase.from("deal_activities").select("activity_type, occurred_at").eq("org_id", orgId).in("activity_type", ["created", "won", "lost", "stage_changed"]).gte("occurred_at", pulseStart).order("occurred_at", { ascending: true }),
-        supabase.from("voice_calls").select("*", { count: "exact", head: true }).eq("tenant_id", orgId).gte("started_at", pulseStart),
-        // Marketing Activity card's "Leads by Source" — bare source
-        // values only, grouped client-side (no existing aggregation for
-        // this anywhere in the app). Bounded to a reasonable page size.
-        supabase.from("leads").select("source").eq("org_id", orgId).limit(1000),
-        // Next Booking card (Phase 10.3 correction pass) — the single
-        // soonest non-terminal appointment, with the full detail set the
-        // dedicated card needs (assignee, location/meeting link, duration).
-        // Excludes every terminal status (cancelled/completed/no_show), not
-        // just cancelled — a completed or no-show appointment is not a real
-        // "next booking" even if its scheduled_at is still technically in
-        // the future relative to when it was marked done.
-        supabase.from("appointments")
-          .select("id, scheduled_at, ends_at, duration_min, title, contact_name, service, status, address, meeting_url, assigned_to, assignee:profiles!appointments_assigned_to_fkey(first_name,last_name)")
-          .eq("org_id", orgId)
-          .not("status", "in", "(cancelled,completed,no_show)")
-          .gte("scheduled_at", now.toISOString())
-          .order("scheduled_at", { ascending: true })
-          .limit(1),
-        // Recent Activity — appointment lifecycle events, merged into the
-        // same feed as Task/Lead/Estimate/Invoice/Call events below. Reads
-        // from appointment_activities (Phase 10.3's trigger-owned audit
-        // trail), never from application-side guessing.
-        supabase.from("appointment_activities")
-          .select("id, appointment_id, activity_type, summary, actor_id, created_at, appointments!inner(title, service, contact_name, org_id)")
-          .eq("org_id", orgId)
-          .order("created_at", { ascending: false })
-          .limit(5),
-      ]);
+    // ── Projects = ROLLUP category ────────────────────────────────────────
+    // The Projects tile/popover summarises Project-linked ATOMIC issues that
+    // already exist elsewhere in attentionItemsAll — today, the only
+    // supported Project issue is an overdue qualifying Task with a real
+    // project_id. Structure is issue-type-agnostic (a per-project aggregate)
+    // so milestone / estimate / financial Project signals can be folded in
+    // later without touching the UI.
+    //
+    // CRITICAL: these synthetic rows are NOT appended to attentionItemsAll,
+    // so they do NOT change the header total (attentionItemsAll.length =
+    // unique atomic issues). A task that affects a project is counted once,
+    // under Tasks; its Project row is an organisational summary, not a new
+    // issue — the visible tile-count sum can therefore exceed the header,
+    // by design. Tasks with no project_id never produce a Project row
+    // (no "Unknown Project").
+    const byProject = new Map<string, { taskCount: number; oldestOverdueDays: number }>();
+    for (const it of map.get("tasks")!) {
+      if (!it.projectId) continue;
+      const agg = byProject.get(it.projectId) ?? { taskCount: 0, oldestOverdueDays: 0 };
+      agg.taskCount += 1;
+      agg.oldestOverdueDays = Math.max(agg.oldestOverdueDays, it.metricDays ?? 0);
+      byProject.set(it.projectId, agg);
+    }
+    const projectRows: AttentionItem[] = [...byProject.entries()]
+      .map(([projectId, agg]) => ({
+        id: `proj-${projectId}`,
+        category: "projects" as const,
+        icon: <Briefcase className="h-4 w-4" />,
+        color: "text-orange",
+        bg: "bg-orange-soft ring-orange-soft",
+        title: projectNameById.get(projectId) ?? "Project",
+        sub: `${agg.taskCount} overdue task${agg.taskCount === 1 ? "" : "s"}`
+          + (agg.oldestOverdueDays > 0 ? ` · Oldest ${agg.oldestOverdueDays}d overdue` : ""),
+        badge: String(agg.taskCount),
+        badgeColor: "bg-orange-soft text-orange-soft-foreground ring-1 ring-orange-soft",
+        href: "/projects",
+        search: { projectId },
+        // Highest-impact first: most qualifying overdue tasks, then oldest
+        // overdue task as tie-break.
+        weight: agg.taskCount * 1000 + Math.min(agg.oldestOverdueDays, 999),
+        metricDays: agg.oldestOverdueDays,
+        projectId,
+      }))
+      .sort((a, b) => b.weight - a.weight);
+    map.set("projects", projectRows);
 
-      const pipelineNow = (openDeals ?? []).reduce((s: number, d: any) => s + Number(d.value ?? 0), 0);
-      const pipelineLast = (lastDeals ?? []).reduce((s: number, d: any) => s + Number(d.value ?? 0), 0);
-      const revNow = (paidInvoices ?? []).reduce((s: number, i: any) => s + Number(i.total_amount ?? 0), 0);
-      const revLast = (lastPaidInvoices ?? []).reduce((s: number, i: any) => s + Number(i.total_amount ?? 0), 0);
-      const pct = (a: number, b: number): number | null => b === 0 ? null : ((a - b) / b) * 100;
+    return map;
+  }, [attentionItemsAll, projectNameById]);
 
-      setKpiData({
-        leads: leadsCount ?? 0, leadsTrend: pct(leadsCount ?? 0, leadsLastCount ?? 0),
-        pipelineNow, pipelineTrend: pct(pipelineNow, pipelineLast),
-        projects: projCount ?? 0, projectsTrend: pct(projCount ?? 0, projLastCount ?? 0),
-        revenue: revNow, revenueTrend: pct(revNow, revLast),
-        bookingsToday: bookingsCount ?? 0,
-      });
+  // Which category's popover is open (null = none). Only one at a time;
+  // opened on tile click, closed by outside-click / Escape (Radix Popover
+  // defaults) or by navigating from a record. Purely local UI state — the
+  // popover is portalled, so this never affects dashboard layout.
+  const [openAttentionCat, setOpenAttentionCat] = useState<AttentionCategory | null>(null);
 
-      setSparklines({
-        leads: bucketCounts((leadSparkRows ?? []).map((r: any) => r.created_at), SPARK_DAYS),
-        revenue: bucketSums((revenueSparkRows ?? []).map((r: any) => ({ at: r.created_at, amount: Number(r.total_amount ?? 0) })), SPARK_DAYS),
-        bookings: bucketCounts((bookingSparkRows ?? []).map((r: any) => r.scheduled_at), SPARK_DAYS),
-        pipeline: cumulativeSeries((openDealsForSpark ?? []).map((r: any) => ({ at: r.created_at, amount: Number(r.value ?? 0) })), SPARK_DAYS),
-        projects: cumulativeSeries((activeProjectsForSpark ?? []).map((r: any) => ({ at: r.created_at, amount: 1 })), SPARK_DAYS),
-      });
+  // Header count: the number of UNIQUE ATOMIC attention issues —
+  // `attentionItemsAll.length` (overdue tasks + unread conversations +
+  // qualifying deals + qualifying estimates). Never derived from visible
+  // rows. NOTE: this is deliberately NOT the sum of the visible tile
+  // counts. Projects is a rollup of Task issues, so its tile count adds to
+  // the visible sum but not to the header — e.g. Tasks 33 + Deals 4 +
+  // Projects 5 shows a visible sum of 42 while the header stays 37.
 
-      setEstimateRows((allEstimateRows ?? []).map((e: any) => {
-        // Shared with the Estimates page (src/lib/estimate-totals.ts) so
-        // the two pages can't silently diverge on the total-calculation
-        // FORMULA. This dashboard doesn't fetch estimate_items (that would
-        // mean a second, per-estimate-items query on top of the 500-row
-        // estimates query above), so `items` is always empty here and the
-        // helper always returns the stored total unchanged — the Estimates
-        // page still wins when an estimate's stored total has gone stale
-        // relative to its real line items. Full parity is deferred; see
-        // the TODO on the estimates query above.
-        const stored = { subtotal: 0, tax_total: 0, total: Number(e.total ?? 0) };
-        const { total } = computeEffectiveEstimateTotals(stored, []);
-        return {
-          id: e.id, status: e.status, total, updated_at: e.updated_at, valid_until: e.valid_until ?? null,
-          title: e.title ?? "Untitled", client_name: e.client_name ?? null,
-          converted_deal_id: e.converted_deal_id ?? null, converted_project_id: e.converted_project_id ?? null,
-          deposit_amount: Number(e.deposit_amount ?? 0),
-        };
-      }));
-
-      setDealActivityRows((dealActivityPulseRows ?? []).map((r: any) => ({
-        activity_type: r.activity_type, occurred_at: r.occurred_at,
-      })));
-
-      setVoiceCallsCount(voiceCallsPulseCount ?? 0);
-
-      setLeadSources((leadSourceRows ?? []).map((r: any) => r.source).filter(Boolean));
-
-      {
-        const row = (nextBookingRows ?? [])[0] as any;
-        if (row) {
-          const assignee = row.assignee;
-          const assigneeName = assignee ? `${assignee.first_name ?? ""} ${assignee.last_name ?? ""}`.trim() : null;
-          const endsAt = row.ends_at ?? new Date(new Date(row.scheduled_at).getTime() + (row.duration_min ?? 60) * 60000).toISOString();
-          setNextBooking({
-            id: row.id,
-            scheduledAt: row.scheduled_at,
-            endsAt,
-            durationMin: row.duration_min ?? 60,
-            title: row.title || row.service || "Appointment",
-            contactName: row.contact_name ?? null,
-            status: row.status,
-            address: row.address ?? null,
-            meetingUrl: row.meeting_url ?? null,
-            assigneeName: assigneeName || null,
-          });
-        } else {
-          setNextBooking(null);
-        }
-      }
-
-      const [{ data: recentLeads }, { data: recentCalls }, { data: recentInvoices }] = await Promise.all([
-        supabase.from("leads").select("id, created_at, contacts!contact_id(full_name), source").eq("org_id", orgId).order("created_at", { ascending: false }).limit(3),
-        supabase.from("voice_calls").select("id, started_at, caller_number, direction, summary").eq("tenant_id", orgId).order("started_at", { ascending: false }).limit(2),
-        supabase.from("invoices").select("id, created_at, total_amount, contacts!client_id(full_name)").eq("org_id", orgId).eq("status", "paid").order("created_at", { ascending: false }).limit(2),
-      ]);
-
-      const items: { id: string; who: string; t: string; s: string; when: string; at: string; kind?: string }[] = [];
-      for (const l of recentLeads ?? []) {
-        const name = (l as any).contacts?.full_name ?? "Someone";
-        items.push({ id: `l${l.id}`, who: name, t: "New lead submitted", s: `via ${(l as any).source ?? "website"}`, when: "", at: l.created_at });
-      }
-      for (const c of recentCalls ?? []) {
-        items.push({ id: `c${c.id}`, who: c.caller_number ?? "Unknown", t: `${c.direction === "outbound" ? "Outbound" : "Inbound"} call`, s: c.summary?.slice(0, 50) ?? "", when: "", at: c.started_at });
-      }
-      for (const inv of recentInvoices ?? []) {
-        const name = (inv as any).contacts?.full_name ?? "Client";
-        items.push({ id: `i${inv.id}`, who: name, t: "Invoice paid", s: fmtK(Number(inv.total_amount ?? 0)), when: "", at: inv.created_at });
-      }
-      // Estimate sent/viewed/approved — real status + real updated_at, not a
-      // fabricated "sent" event log (this table has no separate history of
-      // status transitions, so "when this row was last updated" is the
-      // honest signal available). Canonical status vocabulary from
-      // src/lib/estimate-status.ts (Phase 10.4) — "accepted" was dead code,
-      // it never matched a live DB value.
-      for (const e of (allEstimateRows ?? []).slice(0, 3)) {
-        if (e.status === "sent" || e.status === "viewed" || e.status === "approved") {
-          const label = e.status === "approved" ? "Estimate approved" : e.status === "viewed" ? "Estimate viewed" : "Estimate sent";
-          items.push({ id: `e${e.id}`, who: e.client_name ?? "Client", t: label, s: e.title ?? "", when: "", at: e.updated_at ?? e.created_at });
-        }
-      }
-      for (const t of (completedTaskRows ?? []).slice(0, 3)) {
-        items.push({ id: `t${t.id}`, who: "Task completed", t: t.title, s: "", when: "", at: t.completed_at });
-      }
-      // Appointment lifecycle events (Phase 10.3 correction pass) — reads
-      // appointment_activities (trigger-owned, see
-      // supabase/migrations/20260807_calendar_appointments_completion.sql),
-      // merged into this same time-ordered feed rather than a separate
-      // Calendar-only activity list, so a scheduled/rescheduled/cancelled
-      // appointment shows up next to Lead/Task/Invoice events exactly like
-      // every other Recent Activity source.
-      for (const a of (apptActivityRows ?? []).slice(0, 4)) {
-        const appt = (a as any).appointments;
-        const label = APPOINTMENT_ACTIVITY_LABELS[a.activity_type as string] ?? a.summary;
-        const subject = appt?.title || appt?.service || "Appointment";
-        const who = appt?.contact_name ? `${subject} with ${appt.contact_name}` : subject;
-        items.push({ id: `aa${a.id}`, who, t: label, s: a.actor_id ? "" : "System", when: "", at: a.created_at, kind: "appointment" });
-      }
-      items.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
-      setActivity(items.slice(0, 6).map(it => ({ ...it, when: safeRelativeTime(it.at) })));
-      } catch (err: any) {
-        // Minimal error honesty: a failed query here used to be
-        // indistinguishable from "this org genuinely has no data" — every
-        // card would just quietly show its normal empty state. This at
-        // least surfaces the failure during development instead of
-        // silently swallowing it. A full per-card error UI is deferred —
-        // see the Phase 8 correction report.
-        if (import.meta.env.DEV) {
-          console.error("[Command Center] failed to load dashboard data:", err?.message ?? err);
-        }
-      }
-    })();
-  }, []);
 
   const KPIS: Kpi[] = [
     {
-      icon: UserPlus, accent: "#3B82F6", label: "New Leads", value: String(kpiData.leads),
-      trend: kpiData.leadsTrend === null ? undefined : { delta: `${Math.abs(Math.round(kpiData.leadsTrend))}%`, up: kpiData.leadsTrend >= 0 }, href: ROUTES.LEADS,
+      icon: UserPlus, accent: "#3B82F6", label: "New Leads", value: String(leadsKpi.count),
+      trend: leadsTrend === null ? undefined : { delta: `${Math.abs(Math.round(leadsTrend))}%`, up: leadsTrend >= 0 }, href: ROUTES.LEADS,
       // 14-day daily lead-creation counts — real rows, not derived/estimated.
       // Rendered even when every day is genuinely zero (e.g. all existing
       // leads predate the 14-day window) — a flat real zero isn't fake data.
@@ -1091,7 +1436,18 @@ function DashboardPage() {
       // balance — it's a running total of the *currently* open deals'
       // real values, ordered by their real creation dates. Every point is
       // a real deal/value/date; nothing here is invented.
-      icon: DollarSign, accent: "#10B981", label: "Pipeline Value", value: fmtK(kpiData.pipelineNow),
+      // Current value reads from pipelineDistribution.totalValue — the SAME
+      // canonical useDeals()-derived open-pipeline sum the Live Pipeline
+      // donut/legend already show (Command Center audit, S2), not the
+      // separate one-shot `deals` query this used to read (kpiData.pipelineNow
+      // — a snapshot from page load that never updated when a deal changed
+      // elsewhere, and used a second, independently-written "is this deal
+      // open" rule that could in principle disagree with the donut's). The
+      // trend % below still needs a real "value as of last month" snapshot
+      // the shared store doesn't carry, so it stays sourced from
+      // kpiData.pipelineTrend (a dedicated one-shot query) — a documented,
+      // narrower boundary, not the whole metric.
+      icon: DollarSign, accent: "#10B981", label: "Pipeline Value", value: fmtK(pipelineDistribution.totalValue),
       trend: kpiData.pipelineTrend === null ? undefined : { delta: `${Math.abs(Math.round(kpiData.pipelineTrend))}%`, up: kpiData.pipelineTrend >= 0 }, href: ROUTES.PIPELINE,
       sparkline: sparklines.pipeline,
     },
@@ -1100,8 +1456,8 @@ function DashboardPage() {
       // status, not a status-change history — this is a running total of
       // the currently-active projects by their real creation dates, not a
       // certified count-per-day.
-      icon: Briefcase, accent: "#8B5CF6", label: "Active Projects", value: String(kpiData.projects),
-      trend: kpiData.projectsTrend === null ? undefined : { delta: `${Math.abs(Math.round(kpiData.projectsTrend))}%`, up: kpiData.projectsTrend >= 0 }, href: ROUTES.PROJECTS,
+      icon: Briefcase, accent: "#8B5CF6", label: "Active Projects", value: String(activeProjectsCount),
+      trend: projectsTrend === null ? undefined : { delta: `${Math.abs(Math.round(projectsTrend))}%`, up: projectsTrend >= 0 }, href: ROUTES.PROJECTS,
       sparkline: sparklines.projects,
     },
     {
@@ -1209,25 +1565,74 @@ function DashboardPage() {
     return { sent, scheduled, drafts, topSources, maxSourceCount, totalLeadsWithSource: leadSources.length };
   }, [allCampaigns, leadSources]);
 
-  // ─── Pipeline Pulse — real deal_activities events only ────────────────────
+  // ─── Pipeline Pulse — real deal_activities events, dynamic timeline ────────
+  // Pipeline Pulse root-cause fix (S2A) + always-visible timeline (S2B):
+  // deal_activities is a REAL event log, written by deals-store.ts's
+  // logDealActivity() on every actual create/win/lose/stage-change — the
+  // schema/logging were never the problem, a fixed 14-day window with an
+  // all-or-nothing "not enough history" gate was. S2B replaces the fixed
+  // window with the user-selectable `pulsePeriod` (default: last 30 days,
+  // per this phase's spec) and makes the card ALWAYS render the chart/tiles
+  // — real zeros for a quiet period, never a card-collapsing empty state.
+  //
+  // Query-backed (not mount-only): queryKeys.dashboard.pipelinePulse(orgId,
+  // period) — a distinct cache entry per period, so switching back to an
+  // already-viewed period is instant with no refetch, and the central
+  // RealtimeBridge invalidates every period's cached entry together on any
+  // deal_activities change (see realtime-bridge.tsx), satisfying "create/
+  // move/win a deal -> Pipeline Pulse updates without refresh" with no
+  // component-owned subscription.
+  const pipelinePulseQuery = useQuery({
+    queryKey: orgId ? queryKeys.dashboard.pipelinePulse(orgId, pulsePeriod) : ["dashboard", "pipelinePulse", "pending"],
+    queryFn: async () => {
+      const now = new Date();
+      const start = pulsePeriodStart(pulsePeriod, now);
+      const { data, error } = await supabase
+        .from("deal_activities")
+        .select("activity_type, occurred_at")
+        .eq("org_id", orgId!)
+        .in("activity_type", ["created", "won", "lost", "stage_changed"])
+        .gte("occurred_at", start.toISOString())
+        .order("occurred_at", { ascending: true });
+      if (error) throw error;
+      return (data ?? []).map((r: any) => ({ activity_type: r.activity_type as string, occurred_at: r.occurred_at as string }));
+    },
+    enabled: !!orgId,
+    staleTime: 30_000,
+  });
+  const dealActivityRows = pipelinePulseQuery.data ?? [];
+
   const pipelinePulse = useMemo(() => {
+    const now = new Date();
+    const start = pulsePeriodStart(pulsePeriod, now);
+    const bucketDays = PULSE_BUCKET_DAYS[pulsePeriod];
+
     const created = dealActivityRows.filter(r => r.activity_type === "created");
     const won = dealActivityRows.filter(r => r.activity_type === "won");
     const lost = dealActivityRows.filter(r => r.activity_type === "lost");
     const stageChanged = dealActivityRows.filter(r => r.activity_type === "stage_changed");
 
-    const createdSpark = bucketCounts(created.map(r => r.occurred_at), PULSE_DAYS);
-    const wonSpark = bucketCounts(won.map(r => r.occurred_at), PULSE_DAYS);
-    const lostSpark = bucketCounts(lost.map(r => r.occurred_at), PULSE_DAYS);
-
-    const hasEnoughData = dealActivityRows.length >= 2;
-
     return {
-      hasEnoughData,
-      createdSpark, wonSpark, lostSpark,
+      // Real signal, purely informational now (S2B) — the chart/tiles
+      // render unconditionally regardless of this value; it only toggles
+      // the small "No pipeline movement in this period" note.
+      hasWindowActivity: dealActivityRows.length > 0,
+      createdSpark: bucketByPeriod(created.map(r => r.occurred_at), start, now, bucketDays),
+      wonSpark: bucketByPeriod(won.map(r => r.occurred_at), start, now, bucketDays),
+      lostSpark: bucketByPeriod(lost.map(r => r.occurred_at), start, now, bucketDays),
       createdCount: created.length, wonCount: won.length, lostCount: lost.length, stageChangedCount: stageChanged.length,
     };
-  }, [dealActivityRows]);
+  }, [dealActivityRows, pulsePeriod]);
+
+  // All-time fallback counts for the "no activity in the window" message —
+  // derived from the SAME canonical allDeals (useDeals()) the Live Pipeline
+  // donut already uses, not a new query and not fabricated: real current
+  // deal statuses, just not scoped to the last PULSE_DAYS days.
+  const pipelineAllTime = useMemo(() => ({
+    open: allDeals.filter(d => d.status === "open").length,
+    won: allDeals.filter(d => d.status === "won").length,
+    lost: allDeals.filter(d => d.status === "lost").length,
+  }), [allDeals]);
 
   return (
     <>
@@ -1260,23 +1665,85 @@ function DashboardPage() {
           wrapping to a second row at xl, single column below lg. */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-start 2xl:items-stretch">
         <div className="col-span-1 lg:col-span-6 2xl:col-span-4 h-full">
-          <SectionCard title="Needs Attention" icon={AlertTriangle} tint="orange" action={<CardAction to="/tasks">View all</CardAction>} className="h-full 2xl:min-h-[198px]">
-            <ul className="divide-y divide-border/70 -m-3">
-              {attentionItems.length === 0 ? (
-                <li className="px-3.5 py-6 text-center text-sm text-muted-foreground">You're all caught up</li>
-              ) : attentionItems.map((it) => (
-                <li key={it.id} className="flex items-center gap-2.5 px-3 py-1.5 hover:bg-secondary/40 transition-colors cursor-pointer">
-                  <Link to={it.href} className="contents">
-                    <div className={cn("h-8 w-8 rounded-lg grid place-items-center ring-1 shrink-0", it.bg, it.color)}>{it.icon}</div>
-                    <div className="flex-1 min-w-0">
-                      <div className="text-[13px] font-medium truncate text-foreground">{it.title}</div>
-                      <div className="text-[11.5px] text-muted-foreground truncate mt-0.5">{it.sub}</div>
-                    </div>
-                    <span className={cn("text-[10px] font-semibold px-1.5 py-1 rounded-md shrink-0", it.badgeColor)}>{it.badge}</span>
-                  </Link>
-                </li>
-              ))}
-            </ul>
+          <SectionCard title="Needs Attention" icon={AlertTriangle} tint="orange" count={attentionItemsAll.length} action={<CardAction to="/tasks">View all</CardAction>} className="h-full 2xl:min-h-[198px]">
+            {/* Card body = ONLY the category grid (3 cols x 2 rows for the
+                six categories). No inline detail list, no flex-1 panel, no
+                internal scroll region here, so the card's height is fixed
+                by its own small grid and can never stretch the dashboard
+                row. `h-full` + `grid-rows-2` lets the tiles fill the card's
+                2xl:min-h-[198px] cleanly (no dead whitespace) without ever
+                exceeding it. Records live in a portalled Popover (below). */}
+            <div className="-m-3 grid h-full grid-cols-2 sm:grid-cols-3 sm:grid-rows-2 gap-px bg-border/60">
+              {ATTENTION_CATEGORY_ORDER.map((cat) => {
+                const list = attentionByCategory.get(cat) ?? [];
+                const open = openAttentionCat === cat;
+                const hint = attentionCategoryHint(cat, list);
+                const footer = ATTENTION_CATEGORY_FOOTER[cat];
+                return (
+                  <Popover key={cat} open={open} onOpenChange={(o) => setOpenAttentionCat(o ? cat : null)}>
+                    <PopoverTrigger asChild>
+                      <button
+                        type="button"
+                        className={cn(
+                          "group flex min-w-0 flex-col justify-center gap-1 px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring",
+                          open ? "bg-orange-soft/70" : "bg-card hover:bg-secondary/50",
+                        )}
+                      >
+                        <span className={cn("truncate text-[11px] font-medium transition-colors", open ? "text-foreground" : "text-muted-foreground group-hover:text-foreground")}>
+                          {ATTENTION_CATEGORY_LABELS[cat]}
+                        </span>
+                        <span className={cn("text-[19px] font-semibold leading-none tabular-nums", list.length > 0 ? "text-foreground" : "text-muted-foreground/50")}>
+                          {list.length}
+                        </span>
+                        <span className="truncate text-[10.5px] text-muted-foreground/80">{hint}</span>
+                      </button>
+                    </PopoverTrigger>
+                    {/* Portalled: floats above the page, never affects
+                        dashboard geometry. Own scroll area; outside-click
+                        and Escape close via Radix defaults. */}
+                    <PopoverContent align="start" sideOffset={6} className="w-[340px] p-0">
+                      <div className="flex items-center gap-2 border-b px-3 py-2 text-[12px] font-semibold">
+                        {ATTENTION_CATEGORY_LABELS[cat]} <span className="text-muted-foreground">&middot; {list.length}</span>
+                      </div>
+                      <div className="max-h-[300px] overflow-y-auto overscroll-contain">
+                        {list.length === 0 ? (
+                          <p className="px-3 py-8 text-center text-[12px] text-muted-foreground">Nothing needs attention here</p>
+                        ) : (
+                          <ul className="divide-y divide-border/60">
+                            {list.map((it) => (
+                              <li key={it.id}>
+                                <Link
+                                  to={it.href}
+                                  search={it.search as never}
+                                  onClick={() => setOpenAttentionCat(null)}
+                                  className="flex items-start gap-2.5 px-3 py-2 hover:bg-secondary/40 transition-colors"
+                                >
+                                  <div className={cn("mt-0.5 h-6 w-6 rounded-md grid place-items-center ring-1 shrink-0", it.bg, it.color)}>{it.icon}</div>
+                                  <div className="min-w-0 flex-1">
+                                    <div className="text-[12px] font-medium truncate text-foreground">{it.title}</div>
+                                    <div className="text-[11px] text-muted-foreground truncate">{it.sub}</div>
+                                  </div>
+                                  <span className={cn("text-[9px] font-semibold px-1.5 py-0.5 rounded shrink-0", it.badgeColor)}>{it.badge}</span>
+                                </Link>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                      <div className="border-t px-3 py-2">
+                        <Link
+                          to={footer.to}
+                          onClick={() => setOpenAttentionCat(null)}
+                          className="flex items-center gap-1 text-[11px] font-medium text-primary hover:underline"
+                        >
+                          {footer.label} <ArrowRight className="h-3 w-3" />
+                        </Link>
+                      </div>
+                    </PopoverContent>
+                  </Popover>
+                );
+              })}
+            </div>
           </SectionCard>
         </div>
 
@@ -1449,53 +1916,94 @@ function DashboardPage() {
         </div>
 
         <div className="col-span-1 lg:col-span-6 2xl:col-span-4 h-full">
-          <SectionCard title="Pipeline Pulse" icon={TrendingUp} tint="blue" action={<CardAction to={ROUTES.PIPELINE}>View full report</CardAction>} className="h-full 2xl:min-h-[200px]">
-            {!pipelinePulse.hasEnoughData ? (
-              <div className="h-full flex flex-col items-center justify-center text-center">
-                <p className="text-[13px] font-medium text-muted-foreground">Not enough pipeline history yet</p>
-                <p className="text-[11.5px] text-muted-foreground mt-0.5">As deals are created, moved, won, or lost, real momentum will show up here.</p>
-              </div>
-            ) : (
-              <>
-                <div className="flex items-center gap-3 text-[10.5px] text-muted-foreground mb-1">
-                  <span className="flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-full bg-info" /> Created</span>
-                  <span className="flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-full bg-success" /> Won</span>
-                  <span className="flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-full bg-destructive" /> Lost</span>
-                </div>
-                <div className="h-20 -mx-1">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart margin={{ top: 4, right: 4, bottom: 4, left: 4 }}
-                      data={pipelinePulse.createdSpark.map((v, i) => ({ created: v, won: pipelinePulse.wonSpark[i] ?? 0, lost: pipelinePulse.lostSpark[i] ?? 0 }))}
+          <SectionCard
+            title="Pipeline Pulse"
+            icon={TrendingUp}
+            tint="blue"
+            action={
+              <div className="flex items-center gap-2">
+                {/* Compact timeline selector (S2B) — pure UI state, not
+                    persisted/migrated. Changing it only changes which
+                    deal_activities window this card queries/displays; it
+                    never touches the Pipeline page or any deal data. */}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      className="flex items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground hover:bg-secondary/60 hover:text-foreground transition-colors"
                     >
-                      <defs>
-                        <linearGradient id="pulse-created" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="0%" stopColor="#3B82F6" stopOpacity={0.18} />
-                          <stop offset="100%" stopColor="#3B82F6" stopOpacity={0} />
-                        </linearGradient>
-                      </defs>
-                      <YAxis hide domain={["dataMin", "dataMax"]} />
-                      <Area type="monotone" dataKey="created" stroke="#3B82F6" strokeWidth={2} fill="url(#pulse-created)" dot={false} isAnimationActive={false} />
-                      <Area type="monotone" dataKey="won" stroke="#22C55E" strokeWidth={1.5} fill="none" dot={false} isAnimationActive={false} />
-                      <Area type="monotone" dataKey="lost" stroke="#EF4444" strokeWidth={1.5} fill="none" dot={false} isAnimationActive={false} />
-                    </AreaChart>
-                  </ResponsiveContainer>
-                </div>
-                <div className="mt-1.5 grid grid-cols-4 gap-2 pt-1.5 border-t border-border/70">
-                  {[
-                    { l: "Created", v: String(pipelinePulse.createdCount), c: "text-info" },
-                    { l: "Won", v: String(pipelinePulse.wonCount), c: "text-success" },
-                    { l: "Lost", v: String(pipelinePulse.lostCount), c: "text-destructive" },
-                    { l: "Stage Moves", v: String(pipelinePulse.stageChangedCount), c: "text-orange" },
-                  ].map((s) => (
-                    <div key={s.l}>
-                      <div className="text-[9.5px] uppercase tracking-wider text-muted-foreground">{s.l}</div>
-                      <div className={cn("text-[13px] font-semibold mt-0.5 tabular-nums", s.c)}>{s.v}</div>
-                    </div>
-                  ))}
-                </div>
-                <p className="text-[10px] text-muted-foreground mt-1">Last {PULSE_DAYS} days</p>
-              </>
+                      {PULSE_PERIOD_OPTIONS.find(p => p.key === pulsePeriod)?.label}
+                      <ChevronDown className="h-3 w-3" />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    {PULSE_PERIOD_OPTIONS.map((p) => (
+                      <DropdownMenuItem key={p.key} onClick={() => setPulsePeriod(p.key)}>
+                        {p.label}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                <CardAction to={ROUTES.PIPELINE}>View pipeline</CardAction>
+              </div>
+            }
+            className="h-full 2xl:min-h-[200px]"
+          >
+            {/* Chart/tiles ALWAYS render (S2B) — a quiet period is real
+                zeros, not a reason to collapse the whole card. The old
+                behavior (replacing this entire card with an empty-state
+                message) is gone; only a small note appears when the
+                selected period has no logged activity. */}
+            <div className="flex items-center gap-3 text-[10.5px] text-muted-foreground mb-1">
+              <span className="flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-full bg-info" /> Created</span>
+              <span className="flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-full bg-success" /> Won</span>
+              <span className="flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-full bg-destructive" /> Lost</span>
+            </div>
+            <div className="h-20 -mx-1">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart margin={{ top: 4, right: 4, bottom: 4, left: 4 }}
+                  data={pipelinePulse.createdSpark.map((v, i) => ({ created: v, won: pipelinePulse.wonSpark[i] ?? 0, lost: pipelinePulse.lostSpark[i] ?? 0 }))}
+                >
+                  <defs>
+                    <linearGradient id="pulse-created" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#3B82F6" stopOpacity={0.18} />
+                      <stop offset="100%" stopColor="#3B82F6" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  {/* Y domain anchored at 0 (not dataMin) with ~30% headroom
+                      above the peak and a floor of 4 — so a lone bucket of
+                      2-3 events no longer slams to the top edge as a needle,
+                      and a zero-activity period renders as a calm flat line
+                      along the bottom rather than a stretched axis. */}
+                  <YAxis hide domain={[0, (dataMax: number) => Math.max(4, Math.ceil((dataMax || 0) * 1.3))]} />
+                  <Area type="monotone" dataKey="created" stroke="#3B82F6" strokeWidth={2} fill="url(#pulse-created)" baseValue={0} dot={false} isAnimationActive={false} />
+                  <Area type="monotone" dataKey="won" stroke="#22C55E" strokeWidth={1.5} fill="none" baseValue={0} dot={false} isAnimationActive={false} />
+                  <Area type="monotone" dataKey="lost" stroke="#EF4444" strokeWidth={1.5} fill="none" baseValue={0} dot={false} isAnimationActive={false} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+            {!pipelinePulse.hasWindowActivity && (
+              <p className="text-[10.5px] text-muted-foreground text-center -mt-1 mb-1">No pipeline movement in this period</p>
             )}
+            <div className="mt-1.5 grid grid-cols-4 gap-2 pt-1.5 border-t border-border/70">
+              {[
+                { l: "Created", v: String(pipelinePulse.createdCount), c: "text-info" },
+                { l: "Won", v: String(pipelinePulse.wonCount), c: "text-success" },
+                { l: "Lost", v: String(pipelinePulse.lostCount), c: "text-destructive" },
+                { l: "Stage Moves", v: String(pipelinePulse.stageChangedCount), c: "text-orange" },
+              ].map((s) => (
+                <div key={s.l}>
+                  <div className="text-[9.5px] uppercase tracking-wider text-muted-foreground">{s.l}</div>
+                  <div className={cn("text-[13px] font-semibold mt-0.5 tabular-nums", s.c)}>{s.v}</div>
+                </div>
+              ))}
+            </div>
+            {/* Current pipeline inventory shown as clearly-separate supporting
+                context (S2B) — never combined with the selected period's
+                activity numbers above into one ambiguous figure. */}
+            <p className="text-[10px] text-muted-foreground mt-1">
+              {PULSE_PERIOD_OPTIONS.find(p => p.key === pulsePeriod)?.label} · Pipeline now: {pipelineAllTime.open} open, {pipelineAllTime.won} won, {pipelineAllTime.lost} lost
+            </p>
           </SectionCard>
         </div>
 
@@ -1522,7 +2030,14 @@ function DashboardPage() {
                 </li>
               ) : inboxPreview.map((m) => (
                 <li key={m.id} className={cn("flex items-center gap-2.5 px-3.5 py-2 cursor-pointer transition-colors", m.unread ? "bg-info-soft/40" : "hover:bg-secondary/40")}>
-                  <Link to="/inbox" className="contents">
+                  {/* search={{contactId}} — inbox.tsx's own deep-link effect
+                      (already used by Contacts' "Message" action) resolves
+                      this to the real contact+channel thread and opens it,
+                      preferring an existing sm-/gm-/voice- conversation over
+                      a placeholder. Previously this just linked to bare
+                      "/inbox", landing on whatever Inbox auto-selects rather
+                      than the conversation actually clicked. */}
+                  <Link to="/inbox" search={{ contactId: m.contactId }} className="contents">
                     <div className="relative shrink-0">
                       {m.channel === "email" ? (
                         <GmailSenderAvatar
@@ -1534,7 +2049,23 @@ function DashboardPage() {
                           size="sm"
                         />
                       ) : (
-                        <ContactAvatar id={m.id} name={m.contactName} size="sm" />
+                        // Command Center avatar audit (S2): was `id={m.id}`
+                        // — the CONVERSATION id (e.g. `sm-<contactId>::
+                        // messenger`), not the Contact id, and avatarUrl/
+                        // avatarKey were never passed at all. ContactAvatar
+                        // seeds its generated fallback off `id`, so this (a)
+                        // never showed a real avatar_url (Meta profile
+                        // picture, user-picked avatar) and (b) gave the SAME
+                        // Contact a DIFFERENT generated avatar per channel,
+                        // since the conversation id differs by channel even
+                        // for one Contact — disagreeing with Inbox/Contacts,
+                        // which correctly seed by contact_id. Conversation
+                        // already carries contactId/avatarUrl/avatarKey
+                        // (sms-meta-conversations.ts/gmail-conversations.ts
+                        // both populate them from the real contacts row) —
+                        // using them here is the same canonical resolution
+                        // Inbox/Contacts already use, not a new one.
+                        <ContactAvatar id={m.contactId} name={m.contactName} avatarUrl={m.avatarUrl} avatarKey={m.avatarKey} size="sm" />
                       )}
                       <span className="absolute -right-1 -bottom-1 h-4 w-4 rounded-full bg-card ring-2 ring-card grid place-items-center text-muted-foreground">
                         {m.channel === "whatsapp" ? <MessageCircle className="h-2.5 w-2.5" /> : m.channel === "instagram" ? <Instagram className="h-2.5 w-2.5" /> : m.channel === "messenger" ? <MessageCircle className="h-2.5 w-2.5" /> : m.channel === "email" ? <Mail className="h-2.5 w-2.5" /> : <Smartphone className="h-2.5 w-2.5" />}
@@ -1592,12 +2123,28 @@ function DashboardPage() {
               <ul className="-my-0.5 max-h-[132px] min-h-0 overflow-y-auto overflow-x-hidden">
                 {activity.map((it) => (
                   <li key={it.id} className="flex min-w-0 items-center gap-2.5 py-1.5 hover:bg-secondary/40 -mx-2 px-2 rounded-md transition-colors">
-                    {it.kind === "appointment" ? (
-                      <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-info-soft text-info">
-                        <CalendarClock className="h-4 w-4" />
-                      </span>
+                    {it.contactId ? (
+                      // Real Contact identity — same canonical resolution
+                      // (contact_id + avatar_url/avatar_key) Inbox/Contacts
+                      // use, never a name-matched or invented avatar. See
+                      // the item-construction loop above for exactly which
+                      // sources this is populated from.
+                      <ContactAvatar id={it.contactId} name={it.who} avatarUrl={it.avatarUrl} avatarKey={it.avatarKey} size="sm" />
                     ) : (
-                      <ContactAvatar id={it.id} name={it.who} size="sm" />
+                      // No stable Contact relationship for this item's
+                      // source (or none matched) — a real entity icon per
+                      // kind, never ContactAvatar seeded by a non-contact id.
+                      <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-info-soft text-info">
+                        {it.kind === "appointment" ? <CalendarClock className="h-4 w-4" />
+                          : it.kind === "call" ? <Smartphone className="h-4 w-4" />
+                          : it.kind === "estimate" ? <FileText className="h-4 w-4" />
+                          : it.kind === "task" ? <CheckSquare className="h-4 w-4" />
+                          : it.kind === "lead" ? <UserPlus className="h-4 w-4" />
+                          : it.kind === "deal" ? <TrendingUp className="h-4 w-4" />
+                          : it.kind === "project" ? <Briefcase className="h-4 w-4" />
+                          : it.kind === "invoice" ? <DollarSign className="h-4 w-4" />
+                          : <Clock className="h-4 w-4" />}
+                      </span>
                     )}
                     <div className="flex-1 min-w-0 overflow-hidden">
                       <div className="truncate text-[12.5px] font-medium">{it.t}</div>

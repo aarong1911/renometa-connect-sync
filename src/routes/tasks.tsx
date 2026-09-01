@@ -322,12 +322,50 @@ function TasksPage() {
     return { total, completed, inProgress, overdue };
   }, [filtered]);
 
+  // Board-specific source (live-test stabilization fix): the Kanban has an
+  // explicit column PER status, including the two terminal ones
+  // (Completed/Cancelled) — but `filtered` above is built from
+  // `topViewTasks`, which for the "Overdue"/"Due Soon" top-view scopes (and
+  // `dueFilter`'s date-window options) excludes a task the INSTANT it
+  // reaches a terminal status (isOverdue/isDueWithinDays both gate on
+  // isActiveStatus). Dragging a card to Completed/Cancelled while on one of
+  // those scopes made it vanish from the board entirely instead of landing
+  // in its real destination column — the exact reported bug. Every other
+  // filter (search/owner/priority/related/project/statusFilter) is real
+  // narrowing criteria with no such exclusion problem and still applies
+  // here identically to `filtered`; only the date-window-based topView/
+  // dueFilter scoping is intentionally left out of this one.
+  const boardFiltered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return tasks.filter((t) => {
+      if (topView === "my" && (!currentUserId || t.assignedTo !== currentUserId)) return false;
+      const matchesSearch =
+        !q ||
+        t.title.toLowerCase().includes(q) ||
+        t.assignee.toLowerCase().includes(q) ||
+        (t.projectId ? projectName(t.projectId).toLowerCase().includes(q) : false);
+      if (!matchesSearch) return false;
+      if (ownerFilter === "me") { if (!currentUserId || t.assignedTo !== currentUserId) return false; }
+      else if (ownerFilter === "unassigned" && t.assignedTo) return false;
+      else if (ownerFilter !== "all" && t.assignedTo !== ownerFilter) return false;
+      if (priorityFilter !== "all" && t.priority !== priorityFilter) return false;
+      if (statusFilter !== "all" && t.status !== statusFilter) return false;
+      if (relatedFilter === "unlinked" && (t.entityType || isProjectTask(t))) return false;
+      if (relatedFilter === "lead" && t.entityType !== "lead") return false;
+      if (relatedFilter === "deal" && t.entityType !== "deal") return false;
+      if (relatedFilter === "project" && (!t.projectId || t.entityType)) return false;
+      if (projectFilter === "none" && t.projectId) return false;
+      else if (projectFilter !== "all" && projectFilter !== "none" && t.projectId !== projectFilter) return false;
+      return true;
+    });
+  }, [tasks, topView, query, ownerFilter, priorityFilter, relatedFilter, statusFilter, projectFilter, currentUserId]);
+
   const grouped = useMemo(() => {
     const map = new Map<TaskStatus, Task[]>(TASK_STATUS_ORDER.map((s) => [s, []]));
-    for (const task of filtered) map.get(task.status)?.push(task);
+    for (const task of boardFiltered) map.get(task.status)?.push(task);
     for (const list of map.values()) list.sort((a, b) => compareTasks(a, b, currentUserId));
     return map;
-  }, [filtered, currentUserId]);
+  }, [boardFiltered, currentUserId]);
 
   const projectGroups = useMemo(() => {
     const map = new Map<string, Task[]>();
@@ -383,6 +421,18 @@ function TasksPage() {
   const singleProjectContext = projectFilter !== "all" && projectFilter !== "none";
   const showKanban = view === "board" && (topView !== "all" || groupBy === "status");
   const showProjectGroups = view === "board" && topView === "all" && groupBy === "project";
+
+  // Live-test stabilization fix (Completed/Cancelled cards disappearing):
+  // the Kanban renders from `boardFiltered` (which deliberately keeps
+  // terminal-status tasks even under the Overdue/Due Soon scopes), but the
+  // whole content region's empty-state gate below was still keyed off
+  // `filtered` — which DOES drop a task the instant it goes
+  // Completed/Cancelled under those scopes. Completing the last
+  // overdue/due-soon task therefore blanked the entire board (columns and
+  // all) instead of showing the card land in its terminal column. Gate the
+  // board on its own source; every other view still uses `filtered`.
+  const boardMode = view === "board" && !showProjectGroups;
+  const contentIsEmpty = boardMode ? boardFiltered.length === 0 : filtered.length === 0;
 
   const emptyStateCopy = hasActiveFilters
     ? { title: "No tasks match your filters.", hint: "Try clearing filters to see more." }
@@ -567,7 +617,7 @@ function TasksPage() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-hidden">
-      {filtered.length === 0 ? (
+      {contentIsEmpty ? (
         <Card className="flex h-full min-h-40 flex-col items-center justify-center gap-1 border-dashed p-8 text-center">
           <p className="text-sm font-medium text-foreground">{emptyStateCopy.title}</p>
           {emptyStateCopy.hint && <p className="text-xs text-muted-foreground">{emptyStateCopy.hint}</p>}

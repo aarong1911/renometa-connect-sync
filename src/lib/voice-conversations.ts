@@ -6,27 +6,24 @@
 // contact (e.g. from an SMS thread) shows up under their real name and
 // merges into the same identity rather than appearing as a separate
 // unnamed "(954) 871-8466" conversation per call.
+//
+// Platform State Sync Phase S1: converted to a thin useQuery adapter, same
+// pattern/rationale as sms-meta-conversations.ts and gmail-conversations.ts
+// — grouping/matching logic below is unchanged, just extracted into a
+// standalone queryFn cached under queryKeys.conversations.voice(orgId)
+// instead of being fetched once per mounted hook instance. Voice had no
+// realtime subscription before this change and still doesn't (voice_calls
+// is out of scope for the central realtime bridge in S1 — nothing in the
+// audit found a live source that would push new rows while Inbox is open,
+// unlike sms_meta_messages) — so this hook's freshness is governed by the
+// QueryClient's default staleTime/refetch-on-focus only, not a regression
+// from its previous always-fetch-on-mount behavior.
 
-import { useState, useEffect, useCallback } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
 import type { Conversation, Message } from "@/lib/mock-data";
-
-async function getOrgId(): Promise<string | null> {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return null;
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("organization_id")
-    .eq("id", user.id)
-    .maybeSingle();
-  if (profile?.organization_id) return profile.organization_id;
-  const { data: membership } = await supabase
-    .from("org_memberships")
-    .select("org_id")
-    .eq("member_id", user.id)
-    .maybeSingle();
-  return membership?.org_id ?? null;
-}
+import { useOrgId } from "@/lib/org-id";
+import { queryKeys } from "@/lib/query-keys";
 
 function formatCallerNumber(raw: string | null | undefined): string {
   if (!raw) return "";
@@ -63,22 +60,8 @@ function formatTranscriptPreview(transcript: any): string {
   return "Voice call";
 }
 
-export function useVoiceConversations(): {
-  conversations: Conversation[];
-  messages: Message[];
-  loading: boolean;
-} {
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  const fetch = useCallback(async () => {
-    const orgId = await getOrgId();
-    if (!orgId) {
-      setLoading(false);
-      return;
-    }
-
+// ── queryFn (Platform State Sync Phase S1) ──────────────────────────────
+async function fetchVoiceConversations(orgId: string): Promise<{ conversations: Conversation[]; messages: Message[] }> {
     const { data, error } = await supabase
       .from("voice_calls")
       .select(`
@@ -99,17 +82,10 @@ export function useVoiceConversations(): {
       .order("started_at", { ascending: false })
       .limit(200);
 
-    if (error) {
-      console.error("[voice-conversations] fetch failed:", error);
-      setLoading(false);
-      return;
-    }
+    if (error) throw error;
 
     if (!data || data.length === 0) {
-      setConversations([]);
-      setMessages([]);
-      setLoading(false);
-      return;
+      return { conversations: [], messages: [] };
     }
 
     // Batch-fetch ALL org contacts with a phone number — needed both for
@@ -220,14 +196,25 @@ export function useVoiceConversations(): {
       }
     }
 
-    setConversations(convs);
-    setMessages(msgs);
-    setLoading(false);
-  }, []);
+    return { conversations: convs, messages: msgs };
+}
 
-  useEffect(() => {
-    fetch();
-  }, [fetch]);
+export function useVoiceConversations(): {
+  conversations: Conversation[];
+  messages: Message[];
+  loading: boolean;
+} {
+  const orgId = useOrgId();
+
+  const query = useQuery({
+    queryKey: orgId ? queryKeys.conversations.voice(orgId) : ["conversations", "voice", "pending"],
+    queryFn: () => fetchVoiceConversations(orgId as string),
+    enabled: !!orgId,
+  });
+
+  const conversations = query.data?.conversations ?? [];
+  const messages = query.data?.messages ?? [];
+  const loading = !orgId || query.isPending;
 
   return { conversations, messages, loading };
 }

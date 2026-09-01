@@ -7,21 +7,38 @@
 // must be applied). Organization-wide.
 //
 // Identity rule (channel-first, not contact-first):
-//   - Gmail (channel "email"): ALWAYS keyed by external_conversation_key =
-//     `gmail:<thread_id>` — the Gmail thread is the stable, permanent
-//     identity for a conversation. contact_id may ALSO be stored on the row
-//     when the thread currently resolves to a saved contact, but it is
-//     metadata only — it is never the lookup key, and re-linking/matching a
-//     different contact later must never change which row (or its archived
-//     state) is found. This is deliberate: a contact_id-first lookup would
-//     "lose" a Gmail thread's archive state the moment its sender becomes a
-//     saved contact (lookup silently switches to a brand-new, unarchived
-//     contact_id row) — keying on the thread itself avoids that entirely.
+//   - Gmail, UNMATCHED sender (conversation id `gm-<thread_id>`): keyed by
+//     external_conversation_key = `gmail:<thread_id>` — the Gmail thread is
+//     the stable, permanent identity. Unchanged since this table's original
+//     design; contact_id may ALSO be stored as metadata (an explicit link)
+//     but is never the lookup key.
+//   - Gmail, CRM-MATCHED Contact (conversation id `gm-contact-<contactId>` —
+//     see the Conversations Consolidation pass in gmail-conversations.ts,
+//     which merges every thread matched to the same real Contact into one
+//     conversation): keyed by external_conversation_key = `email:<contactId>`.
+//     COMPATIBILITY NOTE, reported per that pass's own audit requirement:
+//     this is a NEW key format. It does not require a migration
+//     (external_conversation_key is a plain `text` column with no format
+//     constraint), but it means archive/star state previously saved under
+//     the OLD per-thread `gmail:<thread_id>` key for a thread that is now
+//     part of a consolidated Contact conversation will NOT be found under
+//     the new key — that old row is not deleted, just orphaned/unreferenced.
+//     A contact whose email conversation was previously archived or starred
+//     under its old per-thread identity will appear un-archived/un-starred
+//     after this change and needs to be re-archived/re-starred once under
+//     the new key. Narrow blast radius (only contacts who both (a) have a
+//     CRM-matched email thread and (b) had explicitly archived/starred it
+//     before this pass), and accepted as the "safest backward-compatible"
+//     option available without a schema migration — see the audit report
+//     for the full reasoning.
 //   - SMS / WhatsApp / Messenger / Instagram: unchanged — always contact_id
 //     + channel, exactly as before Gmail support was added.
 //
-// Archive only in this pass; is_starred exists in the table for forward
-// compatibility but has no read/write path here.
+// is_starred now has a real read/write path too — see
+// useConversationStarStates() below, added alongside the Conversations
+// audit that replaced the old hash(id)-based fake "isStarred" mock in
+// inbox.tsx with this real, persisted, org-wide column (same table/column
+// that already existed for this purpose, just previously unused).
 
 import { useCallback, useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
@@ -39,16 +56,17 @@ export type ConversationIdentity = {
 /**
  * Resolves the archive identity for a conversation.
  *
- * Gmail (channel "email") ALWAYS resolves externalKey to `gmail:<thread_id>`
- * — derived from the conversation id, which gmail-conversations.ts always
- * builds as `gm-<thread_id>`, so no change to that file's mapping logic is
- * needed. contactId is included alongside when the conversation currently
- * resolves to a real (UUID) contact, but callers must use externalKey as
- * the identity/lookup key for email — contactId is metadata only.
+ * Gmail (channel "email") ALWAYS resolves externalKey via
+ * gmailExternalKeyForConversationId — `email:<contactId>` for a CRM-matched
+ * (consolidated) conversation, `gmail:<thread_id>` for an unmatched one (see
+ * that function). contactId is included alongside when the conversation
+ * currently resolves to a real (UUID) contact, but callers must use
+ * externalKey as the identity/lookup key for email — contactId is metadata
+ * only.
  *
  * All other channels: a real (UUID) contactId is the identity, same as
- * before. A non-email conversation with no real contact id (e.g. an `sb-`
- * SMS placeholder) has no safe identity and resolves to all-null.
+ * before. A non-email conversation with no real contact id has no safe
+ * identity and resolves to all-null.
  */
 export function resolveConversationIdentity(conv: { id: string; contactId: string; channel: string }): ConversationIdentity {
   const realContactId = UUID_RE.test(conv.contactId) ? conv.contactId : null;
@@ -60,9 +78,19 @@ export function resolveConversationIdentity(conv: { id: string; contactId: strin
   return { contactId: realContactId, externalKey: null };
 }
 
-/** `gm-<thread_id>` (gmail-conversations.ts's conversation id) -> `gmail:<thread_id>`, or null if not a Gmail conversation id. */
+/**
+ * Gmail conversation id -> external_conversation_key.
+ *   `gm-contact-<contactId>` (a CRM-matched, consolidated conversation —
+ *     see gmail-conversations.ts) -> `email:<contactId>`.
+ *   `gm-<thread_id>` (an unmatched sender, one conversation per thread,
+ *     unchanged since this table's original design) -> `gmail:<thread_id>`.
+ *   Anything else (not a Gmail conversation id) -> null.
+ * The `gm-contact-` check must come first — it's also a `gm-` prefix.
+ */
 export function gmailExternalKeyForConversationId(conversationId: string): string | null {
-  return conversationId.startsWith("gm-") ? `gmail:${conversationId.slice(3)}` : null;
+  if (conversationId.startsWith("gm-contact-")) return `email:${conversationId.slice("gm-contact-".length)}`;
+  if (conversationId.startsWith("gm-")) return `gmail:${conversationId.slice(3)}`;
+  return null;
 }
 
 // The lookup key: externalKey takes priority (Gmail), otherwise contactId
@@ -204,6 +232,111 @@ export function useConversationArchiveStates(): {
   );
 
   return { archivedMap, loading, error, refresh: fetchData, setArchived };
+}
+
+export function useConversationStarStates(): {
+  /** Map of `${identity}::${channel}` -> true for every conversation currently starred. Absence = not starred. */
+  starredMap: Record<string, boolean>;
+  loading: boolean;
+  refresh: () => void;
+  setStarred: (conv: { id: string; contactId: string; channel: string }, starred: boolean) => Promise<void>;
+} {
+  const [starredMap, setStarredMap] = useState<Record<string, boolean>>({});
+  const [loading, setLoading] = useState(true);
+
+  const fetchData = useCallback(async () => {
+    const orgId = await getOrgId();
+    if (!orgId) {
+      setLoading(false);
+      return;
+    }
+
+    const { data, error: fetchError } = await supabase
+      .from("conversation_states")
+      .select("contact_id, external_conversation_key, channel, is_starred")
+      .eq("org_id", orgId)
+      .eq("is_starred", true);
+
+    if (fetchError) {
+      console.error("[conversation-states] star fetch failed:", fetchError);
+      setLoading(false);
+      return;
+    }
+
+    const next: Record<string, boolean> = {};
+    for (const row of data ?? []) {
+      const key = identityMapKey({ contactId: row.contact_id, externalKey: row.external_conversation_key }, row.channel);
+      if (key) next[key] = true;
+    }
+    setStarredMap(next);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  const setStarred = useCallback(
+    async (conv: { id: string; contactId: string; channel: string }, starred: boolean) => {
+      const orgId = await getOrgId();
+      if (!orgId) throw new Error("Not authenticated");
+
+      const identity = resolveConversationIdentity(conv);
+      if (!identity.contactId && !identity.externalKey) {
+        throw new Error("This conversation has no stable identity to star");
+      }
+      const mapKey = identityMapKey(identity, conv.channel)!;
+      const previous = starredMap[mapKey] ?? false;
+
+      setStarredMap((current) => {
+        const next = { ...current };
+        if (starred) next[mapKey] = true;
+        else delete next[mapKey];
+        return next;
+      });
+
+      try {
+        let query = supabase
+          .from("conversation_states")
+          .select("id")
+          .eq("org_id", orgId)
+          .eq("channel", conv.channel);
+        query = identity.externalKey
+          ? query.eq("external_conversation_key", identity.externalKey)
+          : query.eq("contact_id", identity.contactId!);
+        const { data: existing, error: selectError } = await query.maybeSingle();
+        if (selectError) throw selectError;
+
+        const payload = {
+          org_id: orgId,
+          contact_id: identity.contactId,
+          external_conversation_key: identity.externalKey,
+          channel: conv.channel,
+          is_starred: starred,
+          updated_at: new Date().toISOString(),
+        };
+
+        if (existing) {
+          const { error: updateError } = await supabase.from("conversation_states").update(payload).eq("id", existing.id);
+          if (updateError) throw updateError;
+        } else {
+          const { error: insertError } = await supabase.from("conversation_states").insert(payload);
+          if (insertError) throw insertError;
+        }
+      } catch (err) {
+        setStarredMap((current) => {
+          const next = { ...current };
+          if (previous) next[mapKey] = true;
+          else delete next[mapKey];
+          return next;
+        });
+        throw err;
+      }
+    },
+    [starredMap],
+  );
+
+  return { starredMap, loading, refresh: fetchData, setStarred };
 }
 
 // ── Gmail thread ↔ contact linking ──────────────────────────────────────

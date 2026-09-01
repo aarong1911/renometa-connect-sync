@@ -1249,9 +1249,16 @@ function DealCard({
       </div>
 
       <div className="mb-3 flex items-center gap-2">
+        {/* Live-test stabilization fix (Lead/Deal/Project avatar audit):
+            deals-store.ts already fetches and maps deal.contactAvatarUrl
+            (a real contacts.avatar_url join, confirmed) — this call simply
+            never read it, so a Contact with a real saved photo showed it
+            correctly on the Lead row but always fell back to the generated
+            avatar here on the exact same Contact's Deal card. */}
         <ContactAvatar
           id={deal.contactId}
           name={deal.contactName || "No contact"}
+          avatarUrl={deal.contactAvatarUrl}
           avatarKey={deal.contactAvatarKey}
           size="sm"
           className="h-7 w-7"
@@ -1413,6 +1420,7 @@ function PipelineList({
                     <ContactAvatar
                       id={deal.contactId}
                       name={deal.contactName || "No contact"}
+                      avatarUrl={deal.contactAvatarUrl}
                       avatarKey={deal.contactAvatarKey}
                       size="sm"
                     />

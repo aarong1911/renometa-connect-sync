@@ -16,6 +16,7 @@ import {
 import { useCurrentUserRole, filterNavGroups, canAccessSettings } from "@/lib/permissions";
 import { useOrganization } from "@/lib/organization";
 import { useSmsMetaConversations } from "@/lib/sms-meta-conversations";
+import { useConversationArchiveStates, conversationMapKey } from "@/lib/conversation-states";
 import { ContactAvatar } from "@/components/ui/contact-avatar";
 import { signOut } from "@/lib/auth";
 import { supabase } from "@/lib/supabase";
@@ -67,6 +68,7 @@ export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle:
   const role      = useCurrentUserRole();
   const org       = useOrganization();
   const { conversations } = useSmsMetaConversations();
+  const { archivedMap } = useConversationArchiveStates();
 
   const [logoUrl, setLogoUrl] = useState<string | null>(() => {
     try { return localStorage.getItem(LOGO_KEY) || null; } catch { return null; }
@@ -144,7 +146,23 @@ export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle:
     return !moreSpecificMatchExists;
   };
 
-  const unreadCount = conversations.filter(c => c.unread).length;
+  // Same single source of truth + same units as the Inbox page's "Unread"
+  // folder badge and each conversation row's numeric badge (a real
+  // unread INBOUND message total, not a count of conversations that have
+  // any unread message) — previously this counted CONVERSATIONS
+  // (`.filter(c => c.unread).length`), which could disagree with the other
+  // two badges even when all three were reading correct underlying data,
+  // simply because they were counting different things. Archived
+  // conversations are excluded here too, matching the Inbox folder counts'
+  // own archived-exclusion (an archived conversation's unread messages
+  // don't surface anywhere in the main Inbox view, so they shouldn't
+  // inflate the nav badge either).
+  const unreadCount = conversations
+    .filter((c) => {
+      const key = conversationMapKey(c);
+      return !(key && archivedMap[key]);
+    })
+    .reduce((sum, c) => sum + (c.unreadCount ?? (c.unread ? 1 : 0)), 0);
   const displayLogo = logoUrl || org.logoUrl;
   // Tenant-derived only — no hardcoded product/company name fallback.
   // org.companyName itself already resolves from this org's own

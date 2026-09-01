@@ -46,6 +46,7 @@ import { type Contact } from "@/lib/mock-data";
 import {
   useContacts, updateContact, deleteContact, refreshContacts, getOrgId, addContact,
 } from "@/lib/contacts-store";
+import { useLeads } from "@/lib/leads-store";
 import { NewContactDialog } from "@/components/contacts/new-contact-dialog";
 import { ContactRelatedTab } from "@/components/contacts/contact-related-tab";
 import { CommunicationTab } from "@/components/contacts/communication-tab";
@@ -54,12 +55,12 @@ import { useContactNotes, type ContactNote } from "@/lib/contact-notes";
 import {
   normalizeTags, buildCanonicalTagOptions, contactHasCanonicalTag,
   tagColorClasses, tagComparisonKey, assignTagColors, type TagColorClasses,
+  CANONICAL_CONTACT_TAGS, isManuallyAssignableTag,
 } from "@/lib/tag-utils";
 import { TagPicker } from "@/components/contacts/tag-picker";
 import { contactSourceLabel, contactSourceComparisonKey } from "@/lib/lead-source";
 import { normalizeEmail, normalizePhoneForComparison, findDuplicateContactCandidates, type ContactDuplicateCandidate } from "@/lib/identity-normalization";
 import { useCompanies } from "@/lib/companies-store";
-import { refreshDeals } from "@/lib/deals-store";
 import { AddressAutocomplete } from "@/components/ui/address-autocomplete";
 import { formatPhone } from "@/lib/format";
 import { useContactActivity } from "@/lib/contact-activity";
@@ -112,19 +113,9 @@ function outlineOnlyTagColors(colors: TagColorClasses): TagColorClasses {
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const DEFAULT_CONTACT_TAGS = [
-  "Architect",
-  "Client",
-  "Follow Up",
-  "Homeowner",
-  "Lead",
-  "Needs Reply",
-  "New Lead",
-  "Past Client",
-  "Prospect",
-  "Vendor",
-  "VIP",
-] as const;
+// Single source of truth — see CANONICAL_CONTACT_TAGS in tag-utils.ts
+// (Conversations must import the same constant, not keep its own copy).
+const DEFAULT_CONTACT_TAGS = CANONICAL_CONTACT_TAGS;
 
 
 // Labels filter chips are now derived from real loaded contact data (see
@@ -290,27 +281,16 @@ function ContactsPage() {
   // leads.contact_id the same way — see leads-store.ts). Only holds contact
   // ids that have at least one linked Lead; membership alone is all the
   // display/filter logic below needs.
-  const [contactIdsWithLeads, setContactIdsWithLeads] = useState<Set<string>>(new Set());
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const orgId = await getOrgId();
-      if (!orgId || cancelled) return;
-      const { data, error } = await supabase
-        .from("leads")
-        .select("contact_id")
-        .eq("org_id", orgId)
-        .not("contact_id", "is", null);
-      if (error) {
-        console.error("[contacts] leads lookup for Lead tag failed:", error.message);
-        return;
-      }
-      if (!cancelled) {
-        setContactIdsWithLeads(new Set((data ?? []).map((r: any) => r.contact_id as string)));
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [contacts]);
+  // S3 stabilization: derive from the shared Query-backed useLeads() store
+  // rather than this page's own one-off `leads` fetch. Same membership set
+  // (contact ids with ≥1 linked Lead), but it now updates the instant any
+  // Lead is created/converted/deleted anywhere in the app — no unrelated
+  // contacts refetch required to flip the derived "Lead" badge on.
+  const allLeads = useLeads();
+  const contactIdsWithLeads = useMemo(
+    () => new Set(allLeads.map((l) => l.contactId).filter((id): id is string => !!id)),
+    [allLeads],
+  );
 
   // True display tags for a contact — real stored tags, plus a derived
   // "Lead" badge appended ONLY when the contact has a linked Lead AND
@@ -391,6 +371,17 @@ function ContactsPage() {
       ...(contacts ?? []),
     ] as Contact[]);
   }, [contacts]);
+
+  // Options for the manual tag PICKERS (drawer "add tag", bulk "add tag") —
+  // labelFilterOptions minus the derived-relationship tags ("Lead"/"New
+  // Lead"). The FILTER-chip row still uses labelFilterOptions unchanged, so
+  // filtering Contacts by "Lead" keeps working (it matches the derived
+  // relationship via effectiveTags). S3 stabilization: a Contact becomes a
+  // Lead through a real Lead record, never by manually adding a tag.
+  const manualTagOptions = useMemo(
+    () => labelFilterOptions.filter((o) => isManuallyAssignableTag(o.key)),
+    [labelFilterOptions],
+  );
 
   // One color assignment for the full canonical tag universe currently
   // loaded — computed once here and reused everywhere a tag renders
@@ -972,7 +963,7 @@ function ContactsPage() {
               <Download className="mr-1.5 h-3.5 w-3.5" /> Export selected
             </Button>
             <TagPicker
-              options={labelFilterOptions}
+              options={manualTagOptions}
               colorFor={colorForTag}
               onSelect={(sel) => handleBulkAddTag(sel.label)}
               placeholder="Add tag…"
@@ -1178,7 +1169,7 @@ function ContactsPage() {
       <ContactDrawer
         contact={selected}
         companies={companies}
-        tagOptions={labelFilterOptions}
+        tagOptions={manualTagOptions}
         colorForTag={colorForTag}
         hasLinkedLead={!!selected && contactIdsWithLeads.has(selected.id)}
         onOpenChange={(o) => { if (!o) navigate({ search: { contactId: undefined }, replace: true }); }}
@@ -1562,8 +1553,8 @@ export function ContactDrawer({
       company: editForm.companyId ? "" : editForm.company,
       source: editForm.source,
     });
-    // Refresh deals so deal cards show updated contact info
-    refreshDeals().catch(() => {});
+    // (Deals/Projects refresh is handled inside updateContact()'s canonical
+    // dependency fan-out now — no per-call-site refresh needed here.)
     setSaving(false);
     setEditing(false);
     toast.success("Contact saved");

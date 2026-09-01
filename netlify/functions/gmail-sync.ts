@@ -51,8 +51,14 @@ const CORS = {
 };
 
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
-const DEFAULT_LIMIT = 50;
+// RenoMeta Connect is a CRM inbox, not a general Gmail client — normal
+// sync/refresh should be lightweight: the last 7 days, max 10 messages.
+// Both are provider-side filters (Gmail's own `q=newer_than:7d` search
+// operator + `maxResults`), not a client-side fetch-everything-then-filter
+// — this avoids pulling months of unrelated mailbox history on every sync.
+const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 100;
+const DEFAULT_WINDOW_DAYS = 7;
 const DETAIL_FETCH_CONCURRENCY = 8;
 
 // ── Gmail API helpers ────────────────────────────────────────────────────
@@ -148,9 +154,15 @@ export const handler: Handler = async (event) => {
     return { statusCode: 403, headers: CORS, body: JSON.stringify({ error: "No organization found for this user" }) };
   }
 
-  let reqBody: { limit?: number } = {};
+  let reqBody: { limit?: number; windowDays?: number } = {};
   try { reqBody = event.body ? JSON.parse(event.body) : {}; } catch { /* default to {} */ }
   const limit = Math.min(Math.max(1, Number(reqBody.limit) || DEFAULT_LIMIT), MAX_LIMIT);
+  // Gmail search-syntax date filter, not a client-side post-filter — keeps
+  // "ordinary Conversations loading" from ever pulling months of history in
+  // the first place. windowDays is only overridable by a future explicit
+  // "Load more history" action; every normal call uses the 7-day default.
+  const windowDays = Math.max(1, Number(reqBody.windowDays) || DEFAULT_WINDOW_DAYS);
+  const gmailQuery = encodeURIComponent(`newer_than:${windowDays}d`);
 
   const startedAt = new Date().toISOString();
 
@@ -200,7 +212,7 @@ export const handler: Handler = async (event) => {
   // Attempt the call with the current token first — token_expires_at on
   // some rows is null/unreliable, so a live 401 is the source of truth for
   // "this token no longer works", not the stored expiry timestamp.
-  let listRes = await gmailFetch(`/messages?maxResults=${limit}`, accessToken);
+  let listRes = await gmailFetch(`/messages?maxResults=${limit}&q=${gmailQuery}`, accessToken);
 
   if (listRes.status === 401) {
     if (!integration.refresh_token_encrypted) {
@@ -218,7 +230,7 @@ export const handler: Handler = async (event) => {
         .from("integrations")
         .update({ access_token_encrypted: encryptToBytea(newToken), token_expires_at: expiresAt })
         .eq("id", integration.id);
-      listRes = await gmailFetch(`/messages?maxResults=${limit}`, accessToken);
+      listRes = await gmailFetch(`/messages?maxResults=${limit}&q=${gmailQuery}`, accessToken);
     } catch (error: any) {
       console.error("[gmail-sync] token refresh failed:", error.message);
       const msg = "Gmail connection has expired and could not be renewed automatically. Reconnect Gmail for this organization to continue syncing.";

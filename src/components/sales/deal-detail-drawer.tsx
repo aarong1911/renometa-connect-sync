@@ -1900,9 +1900,15 @@ export function DealDetailDrawer({
                         key={link.id}
                         className="flex items-center gap-3 rounded-lg border bg-card p-3"
                       >
+                        {/* Live-test stabilization fix: DealContactSummary
+                            already carries avatarUrl (deals-store.ts) —
+                            this call simply never read it, so the same
+                            Contact's real photo showed elsewhere but not in
+                            this linked-contacts list. */}
                         <ContactAvatar
                           id={contact?.id ?? link.contactId}
                           name={contact?.fullName ?? "Contact"}
+                          avatarUrl={contact?.avatarUrl}
                           avatarKey={contact?.avatarKey}
                           size="md"
                         />

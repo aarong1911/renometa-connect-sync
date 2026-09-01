@@ -8,6 +8,7 @@
 // soon"; Delete showed "Event deleted" without ever calling Supabase).
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { createFileRoute } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -53,6 +54,8 @@ import {
 } from "@/lib/appointment-status";
 import { AppointmentDialog } from "@/components/calendar/appointment-dialog";
 import { AppointmentDetailSheet } from "@/components/calendar/appointment-detail-sheet";
+import { useOrgId } from "@/lib/org-id";
+import { queryKeys } from "@/lib/query-keys";
 
 export const Route = createFileRoute("/calendar")({
   component: CalendarPage,
@@ -207,6 +210,8 @@ function CalendarPage() {
   // phases/milestones have no such store yet, so they're fetched once,
   // org-wide, here — matching the "fetch once, filter in memory" shape
   // rather than one query per visible Project.
+  const queryClient = useQueryClient();
+  const dashboardOrgId = useOrgId();
   const { projects, reload: reloadProjects } = useProjects();
   const projectsById = useMemo(() => new Map(projects.map((p) => [p.id, p])), [projects]);
   const allTasks = useTasks();
@@ -403,7 +408,20 @@ function CalendarPage() {
     setDetailId(null);
     setEditingAppointment(appt);
   };
-  const handleSaved = () => { void fetchAppointments(); };
+  // Every appointment mutation on this page (create / edit / reschedule /
+  // delete / cancel / complete / no-show / confirm / …) funnels through
+  // here via AppointmentDialog#onSaved and AppointmentDetailSheet#onChanged.
+  // Besides refetching this page's own list, invalidate the Command
+  // Center's summary query so its "Bookings Today" / "Next Booking" widgets
+  // update without a browser refresh. Previously nothing invalidated
+  // dashboard.summary, so delete (and status changes) left the dashboard
+  // showing a stale Next Booking until a full reload — the reported bug.
+  const handleSaved = () => {
+    void fetchAppointments();
+    if (dashboardOrgId) {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.summary(dashboardOrgId) });
+    }
+  };
 
   // ── KPI cards (Part 16 / 38) — computed over the loaded 3-month window,
   // same range the page already queries; "Today"/"Upcoming"/"Confirmed" are

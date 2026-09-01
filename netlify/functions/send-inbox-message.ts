@@ -4,6 +4,8 @@ import { createClient } from "@supabase/supabase-js";
 import nodemailer from "nodemailer";
 import crypto from "node:crypto";
 import { getOrgSecret, setOrgSecret } from "./lib/org-secret-store";
+import { getMetaPageAccessToken, MetaPageTokenMissingError } from "./lib/meta-page-access";
+import { MetaGraphApiError } from "./lib/meta-graph-api";
 
 const CORS = {
   "Content-Type": "application/json",
@@ -446,8 +448,36 @@ export const handler: Handler = async (event) => {
         // or IGSID (Instagram), resolved by the caller from
         // contacts.messenger_psid / contacts.instagram_igsid, NOT a phone
         // number or username.
+        //
+        // /me/messages is Page-scoped: it rejects the stored long-lived USER
+        // token with OAuthException/190 — the same class of rejection
+        // already proven for every other Page-scoped Graph call this app
+        // makes (leadgen_forms, subscribed_apps, inbound profile lookups).
+        // A transient Page access token must be derived on demand from the
+        // connection's own page_id and never persisted or logged.
+        if (!conn.page_id) {
+          return { statusCode: 422, headers: CORS, body: JSON.stringify({ error: `No Page on file for this ${channel} connection — try reconnecting in Settings` }) };
+        }
+        let pageAccessToken: string;
+        try {
+          pageAccessToken = await getMetaPageAccessToken(accessToken, conn.page_id as string);
+        } catch (e) {
+          const reconnectRequired = e instanceof MetaPageTokenMissingError
+            || (e instanceof MetaGraphApiError && (e.metaType === "OAuthException" || e.metaCode === 190));
+          if (e instanceof MetaGraphApiError) {
+            console.error(`[send-inbox-message] ${channel} page token derivation failed`, {
+              httpStatus: e.httpStatus, metaType: e.metaType, metaCode: e.metaCode, metaErrorSubcode: e.metaErrorSubcode, fbTraceId: e.fbTraceId,
+            });
+          }
+          return {
+            statusCode: reconnectRequired ? 409 : 502,
+            headers: CORS,
+            body: JSON.stringify({ error: reconnectRequired ? `${channel === "messenger" ? "Messenger" : "Instagram"} connection needs to be reconnected in Settings → Integrations` : "Could not verify your Meta connection right now — please try again" }),
+          };
+        }
+
         const res = await fetch(
-          `https://graph.facebook.com/v21.0/me/messages?access_token=${encodeURIComponent(accessToken)}`,
+          `https://graph.facebook.com/v21.0/me/messages?access_token=${encodeURIComponent(pageAccessToken)}`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -458,8 +488,16 @@ export const handler: Handler = async (event) => {
           },
         );
         if (!res.ok) {
+          // Sanitized — never surfaces Meta's raw error text to the client
+          // or logs; safe structured fields only, never the message body.
           const err: any = await res.json().catch(() => ({}));
-          throw new Error(err?.error?.message ?? `${channel} send failed (${res.status})`);
+          const metaCode = typeof err?.error?.code === "number" ? err.error.code : null;
+          const metaType = typeof err?.error?.type === "string" ? err.error.type : null;
+          console.error(`[send-inbox-message] ${channel} send failed`, { httpStatus: res.status, metaType, metaCode });
+          const reconnectRequired = metaType === "OAuthException" || metaCode === 190;
+          throw new Error(reconnectRequired
+            ? `${channel === "messenger" ? "Messenger" : "Instagram"} connection needs to be reconnected in Settings → Integrations`
+            : `Could not send this ${channel === "messenger" ? "Messenger" : "Instagram"} message right now — please try again`);
         }
         const pageResult: any = await res.json().catch(() => ({}));
         providerMessageId = pageResult?.message_id ?? null;

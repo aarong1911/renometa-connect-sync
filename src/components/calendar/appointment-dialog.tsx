@@ -38,6 +38,7 @@ import {
 } from "@/lib/appointments-store";
 import { AppointmentEntityPicker } from "@/components/appointments/entity-picker";
 import { formatUsPhone } from "@/lib/phone";
+import { useContacts } from "@/lib/contacts-store";
 
 const ENTITY_TYPE_OPTIONS: { value: AppointmentEntityType | "none"; label: string }[] = [
   { value: "none", label: "None" },
@@ -156,6 +157,8 @@ export function AppointmentDialog({
 }) {
   const org = useOrganization();
   const teamMembers = useTeam().filter((m) => m.status === "active");
+  const contacts = useContacts();
+  const contactsById = useMemo(() => new Map(contacts.map((c) => [c.id, c])), [contacts]);
   const isEdit = !!appointment;
 
   const [form, setForm] = useState<FormState>(() => blankForm(org.timezone));
@@ -466,7 +469,32 @@ export function AppointmentDialog({
                 <AppointmentEntityPicker
                   entityType={form.entityType}
                   value={form.entityId}
-                  onSelect={(id, label) => setForm((f) => ({ ...f, entityId: id, entityLabel: label }))}
+                  onSelect={(id, label) =>
+                    setForm((f) => {
+                      const next = { ...f, entityId: id, entityLabel: label };
+                      // Auto-fill customer details from the linked Contact
+                      // (Issue 5). Only when the Related record is a Contact
+                      // AND the selected id actually changed — this is a
+                      // one-shot fill on an explicit user pick, never a
+                      // continuous re-sync, so any manual edit the user
+                      // makes afterwards is preserved for as long as the
+                      // same Contact stays selected. Picking a different
+                      // Contact replaces all three fields (blank when that
+                      // Contact has no phone/email). Edit mode: the saved
+                      // appointment fields are left exactly as loaded until
+                      // the user deliberately changes the related Contact
+                      // here.
+                      if (f.entityType === "contact" && id && id !== f.entityId) {
+                        const c = contactsById.get(id);
+                        if (c) {
+                          next.contactName = c.name && c.name !== "Unknown" ? c.name : "";
+                          next.contactPhone = formatUsPhone(c.phone);
+                          next.contactEmail = c.email ?? "";
+                        }
+                      }
+                      return next;
+                    })
+                  }
                 />
               )}
             </div>

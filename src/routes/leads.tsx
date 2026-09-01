@@ -1397,7 +1397,17 @@ function LeadsPage() {
                     </td>
                     <td className="cursor-pointer px-3 py-3.5" onClick={() => openLead(lead)}>
                       <div className="flex min-w-[210px] items-center gap-3">
-                        <ContactAvatar id={lead.contactId || lead.id} name={lead.name} avatarUrl={lead.contactAvatarUrl} avatarKey={lead.contactAvatarKey} size="sm" />
+                        {/* Live-test stabilization fix: was `lead.contactId
+                            || lead.id` — falling back to the LEAD's own id
+                            (not a Contact identity at all) when contactId is
+                            unset, which seeds the generated fallback avatar
+                            from the wrong identity. ContactAvatar already
+                            falls back to seeding by `name` when `id` is
+                            undefined (see contact-avatar.tsx), which is the
+                            correct behavior for a lead with no linked
+                            Contact yet — no need to substitute a non-Contact
+                            id here. */}
+                        <ContactAvatar id={lead.contactId ?? undefined} name={lead.name} avatarUrl={lead.contactAvatarUrl} avatarKey={lead.contactAvatarKey} size="sm" />
                         <div className="min-w-0">
                           <div className="truncate font-medium text-foreground">{lead.name || "Unknown"}</div>
                           <div className="truncate text-xs text-muted-foreground">{lead.email || "No email"}</div>
@@ -2149,12 +2159,15 @@ function LeadDetailDrawer({
                 has no avatar of its own; this always resolves from the
                 linked Contact (contactId/contactAvatarUrl/contactAvatarKey,
                 see leads-store.ts), the same ContactAvatar precedence used
-                in Conversations/Contacts/the Leads table row. Falls back to
-                the Lead's own id/name seed only when there's no linked
-                Contact. */}
+                in Conversations/Contacts/the Leads table row.
+                Live-test stabilization fix: previously fell back to the
+                LEAD's OWN id when unlinked — seeding the generated avatar
+                from a non-Contact identity, forbidden by the avatar audit.
+                ContactAvatar already seeds by `name` when `id` is
+                undefined, which is the correct behavior here instead. */}
             <div className="flex min-w-0 flex-1 items-start gap-3 text-left">
               <ContactAvatar
-                id={lead.contactId || lead.id}
+                id={lead.contactId ?? undefined}
                 name={lead.name}
                 avatarUrl={lead.contactAvatarUrl}
                 avatarKey={lead.contactAvatarKey}

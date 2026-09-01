@@ -12,6 +12,52 @@
 //   - display label   (tagDisplayLabel /
 //                       buildCanonicalTagOptions) — what to actually show
 
+// THE canonical Contact tag catalog — moved here from contacts.tsx (Conversations
+// Cleanup audit) after finding Conversations (src/routes/inbox.tsx) had grown
+// its own, second, hardcoded default tag list ("managedTags") that had
+// silently diverged: it included "Estimate Sent"/"Hot" (never part of this
+// list, never recognized by Contacts) and was missing Architect/Client/
+// Homeowner/Lead/Past Client/Prospect/Vendor entirely — so Conversations'
+// "Assign tags" picker could invent tags Contacts doesn't know about while
+// omitting real canonical ones. Both pages must import THIS single array
+// rather than keep their own copy, or they will drift apart again.
+export const CANONICAL_CONTACT_TAGS = [
+  "Architect",
+  "Client",
+  "Follow Up",
+  "Homeowner",
+  "Lead",
+  "Needs Reply",
+  "New Lead",
+  "Past Client",
+  "Prospect",
+  "Vendor",
+  "VIP",
+] as const;
+
+/**
+ * Canonical comparison keys (see tagComparisonKey) for tags that represent a
+ * DERIVED CRM relationship — the Contact's connection to a real Lead
+ * opportunity record — NOT a manually-assignable Contact label.
+ *
+ * They stay in CANONICAL_CONTACT_TAGS so legacy rows that already carry a
+ * literal "Lead"/"New Lead" label still normalise, dedupe, colour, and
+ * FILTER correctly (and so those historical labels are never destructively
+ * removed). But `isManuallyAssignableTag()` excludes them from every
+ * manual tag PICKER: a person is a Lead because a Lead record links to
+ * them (leads.contact_id), not because someone typed "Lead" as a tag —
+ * see contacts.tsx's derived Lead badge and inbox's useLeads()-derived
+ * indicator. Removing them from the pickers is what stops the
+ * "manually adding a Lead tag looks like it should create a Lead" model
+ * confusion found in S3 live testing.
+ */
+export const DERIVED_RELATIONSHIP_TAG_KEYS: ReadonlySet<string> = new Set(["lead", "new lead"]);
+
+/** False for derived-relationship tags ("Lead"/"New Lead") — those are shown automatically from real Lead records and must never appear as a manual pick option. */
+export function isManuallyAssignableTag(key: string): boolean {
+  return !DERIVED_RELATIONSHIP_TAG_KEYS.has(key);
+}
+
 /**
  * Canonical comparison key: trims whitespace, lowercases, treats
  * underscores/hyphens as spaces, and collapses repeated whitespace. Two

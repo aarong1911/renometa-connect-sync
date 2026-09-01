@@ -1,5 +1,5 @@
 // src/components/contacts/new-contact-dialog.tsx
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { Link } from "@tanstack/react-router";
 import { Button } from "@/components/ui/button";
@@ -9,16 +9,20 @@ import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
 } from "@/components/ui/dialog";
 import { AddressAutocomplete } from "@/components/ui/address-autocomplete";
-import { Loader2, AlertTriangle } from "lucide-react";
+import { Loader2, AlertTriangle, X } from "lucide-react";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useTeam } from "@/lib/organization";
 import { addContact, getOrgId } from "@/lib/contacts-store";
 import { findDuplicateContactCandidates, type ContactDuplicateCandidate } from "@/lib/identity-normalization";
-import { parseTagInput } from "@/lib/tag-utils";
+import {
+  CANONICAL_CONTACT_TAGS, buildCanonicalTagOptions, isManuallyAssignableTag,
+  normalizeTags, tagComparisonKey, tagColorClasses,
+} from "@/lib/tag-utils";
+import { TagPicker } from "@/components/contacts/tag-picker";
 import { formatPhone } from "@/lib/format";
 import type { Contact } from "@/lib/mock-data";
 
-const BLANK_FORM = { name: "", email: "", phone: "", address: "", company: "", companyId: "", tags: "", owner: "" };
+const BLANK_FORM = { name: "", email: "", phone: "", address: "", company: "", companyId: "", tags: [] as string[], owner: "" };
 
 /**
  * Shared "New Contact" dialog — used by the Contacts page and reused from
@@ -48,6 +52,17 @@ export function NewContactDialog({
   // values than what's now in the form.
   const [duplicatesCheckedFor, setDuplicatesCheckedFor] = useState<string | null>(null);
   const teamMembers = useTeam();
+
+  // Canonical Contact-tag options for the picker — same catalog Contacts
+  // uses (CANONICAL_CONTACT_TAGS via buildCanonicalTagOptions), MINUS the
+  // derived-relationship tags ("Lead"/"New Lead"): a Contact becomes a Lead
+  // through a real Lead record, never by tagging. No second hardcoded list.
+  const tagOptions = useMemo(
+    () =>
+      buildCanonicalTagOptions(CANONICAL_CONTACT_TAGS.map((t, i) => ({ id: `seed-${i}`, tags: [t] })))
+        .filter((o) => isManuallyAssignableTag(o.key)),
+    [],
+  );
 
   function close() {
     onOpenChange(false);
@@ -87,7 +102,7 @@ export function NewContactDialog({
     }
 
     setSaving(true);
-    const tags = parseTagInput(form.tags);
+    const tags = normalizeTags(form.tags);
     const result = await addContact({
       name: form.name.trim(),
       email: form.email.trim(),
@@ -189,13 +204,37 @@ export function NewContactDialog({
               )}
             </div>
             <div className="grid gap-1.5">
-              <Label htmlFor="nc-tags">Tags</Label>
-              <Input
-                id="nc-tags"
-                value={form.tags}
-                onChange={(e) => setForm((f) => ({ ...f, tags: e.target.value }))}
-                placeholder="Homeowner, VIP…"
-              />
+              <Label>Tags</Label>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {form.tags.map((t) => {
+                  const colors = tagColorClasses(tagComparisonKey(t));
+                  return (
+                    <span
+                      key={t}
+                      className={`inline-flex h-6 items-center gap-1 rounded border bg-transparent pl-2 pr-1 text-[11px] font-medium ${colors.chip}`}
+                    >
+                      {t}
+                      <button
+                        type="button"
+                        onClick={() => setForm((f) => ({ ...f, tags: f.tags.filter((x) => x !== t) }))}
+                        className="rounded-full p-0.5 hover:bg-black/10"
+                        aria-label={`Remove ${t}`}
+                      >
+                        <X className="h-2.5 w-2.5" />
+                      </button>
+                    </span>
+                  );
+                })}
+                <TagPicker
+                  options={tagOptions}
+                  excludeKeys={form.tags.map(tagComparisonKey)}
+                  colorFor={(key) => tagColorClasses(key)}
+                  onSelect={(sel) =>
+                    setForm((f) => ({ ...f, tags: normalizeTags([...f.tags, sel.label]) }))
+                  }
+                  placeholder="Select or create a tag…"
+                />
+              </div>
             </div>
             <div className="col-span-2 grid gap-1.5">
               <Label>Owner</Label>
