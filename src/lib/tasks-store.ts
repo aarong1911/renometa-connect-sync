@@ -1,9 +1,54 @@
 // src/lib/tasks-store.ts
-import { useEffect, useState, useSyncExternalStore } from "react";
+//
+// Platform State Sync Phase S4C — Tasks shared server state.
+//
+// BEFORE S4C: a module-level `tasks` array + a listener Set + `emit()` +
+// `useSyncExternalStore`, hydrated by a top-level `fetchTasks()` call at
+// import time. No realtime coverage. Mutations were "persist-first" — the
+// local array was only patched AFTER the DB write confirmed (the store's
+// own docstring called this "optimistic" but it never applied anything
+// ahead of the response, so there was no rollback path and none was
+// needed).
+//
+// AFTER S4C: one TanStack Query per org (`queryKeys.tasks(orgId)`).
+// `useTasks()` keeps its EXACT public shape — a bare `Task[]` (`[]` until
+// loaded) — as a thin `useQuery` wrapper. `useTasksLoading()`,
+// `useTasksForEntity()`, `useTaskActivity()`, and every imperative mutation
+// (`addTask`/`updateTask`/`deleteTask`/`completeTask`/`reopenTask`/
+// `cancelTask`/`restoreTask`/`refreshTasks`) keep their exact signatures.
+// Every consumer (Tasks page board/list/filters/project-groups, the
+// canonical Task drawer, entity Task panels on Lead/Deal, Project detail
+// task panels, Command Center Today's Tasks + Needs Attention atomic tasks
+// + its Projects rollup, Calendar's task overlay) reads the same cached
+// list. After a confirmed DB write, mutations patch + invalidate the shared
+// client (query-client.ts / getQueryClient()) instead of the singleton.
+// The central RealtimeBridge now also invalidates `queryKeys.tasks(orgId)`
+// on any `tasks` row change.
+//
+// UNCHANGED by S4C:
+//  - `mapRow` normalisation (same TASK_COLUMNS select + assignee_profile
+//    join, same fields incl. the legacy `due` created_at fallback that the
+//    canonical overdue/due-soon rules DON'T use — they read `dueDateRaw`)
+//  - `getTaskStatusPatch()` completed_at lifecycle (task-status.ts) — the
+//    one place Mark complete / Reopen / Cancel / Restore / status select /
+//    drag agree
+//  - schedule-health.ts (pure logic, no store dependency — untouched)
+//  - `getTaskActivity` / `useTaskActivity` / `getTasksForEntity` one-off
+//    reads (task_activities is a separate small per-task table, never
+//    folded into the shared list)
+//  - Projects: Task rows carry a bare `projectId`; project NAME resolution
+//    stays in the consuming components via projects-store's cache reader —
+//    the Task queryFn has zero Project dependency (no circular Query dep)
+
+import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
 import type { Task, TaskEntityType, TaskActivity, TaskActivityType } from "@/lib/mock-data";
 import { getTaskStatusPatch, type TaskStatus } from "@/lib/task-status";
 import { getTeam } from "@/lib/organization";
+import { getQueryClient } from "@/lib/query-client";
+import { useOrgId } from "@/lib/org-id";
+import { queryKeys } from "@/lib/query-keys";
 
 export type { TaskStatus, TaskPriority, TaskActivity, TaskActivityType } from "@/lib/mock-data";
 
@@ -128,30 +173,18 @@ const TASK_COLUMNS = `
   assignee_profile:profiles!tasks_assigned_to_fkey(first_name,last_name,email)
 `;
 
-let tasks: Task[] = [];
-let loaded = false;
-let currentOrgId: string | null = null;
-
-const listeners = new Set<() => void>();
-
-function emit() {
-  for (const listener of listeners) listener();
-}
-
-async function fetchTasks() {
-  const { orgId } = await getSessionContext();
-  currentOrgId = orgId;
-  if (!orgId) {
-    tasks = [];
-    loaded = true;
-    emit();
-    return;
-  }
-
-  // Scoped directly by tasks.org_id (Phase 10.1) — no longer requires a
-  // projects!inner(org_id) join, so a lead/deal-linked task with no
-  // project still shows up. Pre-existing project-only tasks are backfilled
-  // with org_id by the Phase 10.1 migration.
+/**
+ * The Tasks list queryFn — org-scoped, ordered by due_date then created_at,
+ * with assignee display resolved via the same server-side `profiles` join
+ * the pre-S4C store used. Self-contained (no React, no other query's cache)
+ * so it is safe to run from `useQuery` or an imperative `refetchQueries`.
+ *
+ * Scoped directly by tasks.org_id (Phase 10.1) — no longer requires a
+ * projects!inner(org_id) join, so a lead/deal-linked task with no project
+ * still shows up. Pre-existing project-only tasks are backfilled with
+ * org_id by the Phase 10.1 migration.
+ */
+export async function fetchTasksForOrg(orgId: string): Promise<Task[]> {
   const { data, error } = await supabase
     .from("tasks")
     .select(TASK_COLUMNS)
@@ -161,45 +194,71 @@ async function fetchTasks() {
 
   if (error) {
     console.error("[tasks-store] fetch failed:", error);
-    loaded = true;
-    emit();
-    return;
+    throw error;
   }
-
-  tasks = (data ?? []).map(mapRow);
-  loaded = true;
-  emit();
+  return (data ?? []).map(mapRow);
 }
 
-fetchTasks();
+// ── Query cache helpers ──────────────────────────────────────────────────
+
+const qc = () => getQueryClient();
+
+/** Read the currently-cached Tasks list (any org key — normally exactly one). Read-only; used by updateTask() to resolve the pre-write row for completed_at lifecycle. */
+function getCachedTasks(): Task[] {
+  const entries = qc().getQueriesData<Task[]>({ queryKey: ["tasks"] });
+  for (const [, data] of entries) {
+    if (Array.isArray(data)) return data;
+  }
+  return [];
+}
+
+/** Immediately reflect a CONFIRMED change into the cached Tasks list(s) — only ever called AFTER a successful DB write (matching the pre-S4C "persist-first" model), never speculatively, so no rollback path is needed. */
+function patchTasksCache(fn: (list: Task[]) => Task[]) {
+  qc().setQueriesData<Task[]>({ queryKey: ["tasks"] }, (old) => (Array.isArray(old) ? fn(old) : old));
+}
+
+function invalidateTasks() {
+  void qc().invalidateQueries({ queryKey: ["tasks"] });
+}
+
+/** A task STATUS change (complete/reopen/cancel/restore/drag/status-select) or a delete additionally affects the Command Center's Recent Activity "Task completed" feed, which is served by dashboardSummaryQuery's own `completed` sub-query — not by useTasks(). Today's Tasks + Needs Attention read useTasks() directly, so `["tasks"]` alone refreshes those. */
+function invalidateTasksWithDashboard() {
+  void qc().invalidateQueries({ queryKey: ["tasks"] });
+  void qc().invalidateQueries({ queryKey: ["dashboard"] });
+}
+
+// ── Public hooks (unchanged shapes) ─────────────────────────────────────
+
+function useTasksQuery() {
+  const orgId = useOrgId();
+  return useQuery({
+    queryKey: orgId ? queryKeys.tasks(orgId) : ["tasks", "_pending"],
+    queryFn: () => fetchTasksForOrg(orgId as string),
+    enabled: !!orgId,
+    // Tasks change frequently — realtime + mutation invalidation are the
+    // primary freshness path; staleTime just caps redundant refetches on
+    // remount/focus churn. refetchOnWindowFocus inherited from the shared
+    // client defaults. Background refetch keeps the prior list (no blank).
+    staleTime: 30_000,
+  });
+}
 
 export function useTasks(): Task[] {
-  useEffect(() => {
-    if (!loaded) void fetchTasks();
-  }, []);
-
-  return useSyncExternalStore(
-    (callback) => {
-      listeners.add(callback);
-      return () => listeners.delete(callback);
-    },
-    () => tasks,
-    () => [],
-  );
+  return useTasksQuery().data ?? [];
 }
 
 export function useTasksLoading(): boolean {
-  return !loaded;
+  return useTasksQuery().isLoading;
 }
 
 export async function refreshTasks() {
-  await fetchTasks();
+  await qc().refetchQueries({ queryKey: ["tasks"] });
 }
 
 /**
  * Client-side filter of the already-loaded shared task list — no extra
  * query per entity detail view (Phase 10.1 performance requirement).
- * Reactive: re-renders whenever the shared `tasks` store changes (create/
+ * Reactive: re-renders whenever the shared tasks query changes (create/
  * update/delete/refresh), same as useTasks().
  */
 export function useTasksForEntity(entityType: TaskEntityType, entityId: string | null | undefined): Task[] {
@@ -276,8 +335,8 @@ export async function addTask(task: CreateTaskInput): Promise<Task | null> {
   }
 
   const mapped = mapRow(data);
-  tasks = [mapped, ...tasks];
-  emit();
+  patchTasksCache((list) => [mapped, ...list.filter((t) => t.id !== mapped.id)]);
+  invalidateTasks();
   return mapped;
 }
 
@@ -288,12 +347,12 @@ export type TaskPatch = Omit<Partial<Task>, "entityType" | "entityId"> & {
 };
 
 /**
- * Updates a task. Optimistic: local state only changes after the database
- * write is confirmed — no rollback needed because nothing is applied
- * ahead of the response. Any status change is routed through
- * getTaskStatusPatch() (src/lib/task-status.ts) — the one place
- * completed_at lifecycle rules are decided — so Mark complete / Reopen /
- * Cancel / Restore / the status selector / drag-and-drop can never
+ * Updates a task. Persist-first: the shared cache is only patched AFTER the
+ * database write is confirmed — nothing is applied ahead of the response,
+ * so there is no rollback path (and none is needed). Any status change is
+ * routed through getTaskStatusPatch() (src/lib/task-status.ts) — the one
+ * place completed_at lifecycle rules are decided — so Mark complete /
+ * Reopen / Cancel / Restore / the status selector / drag-and-drop can never
  * disagree with each other.
  */
 export async function updateTask(id: string, patch: TaskPatch): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -306,7 +365,7 @@ export async function updateTask(id: string, patch: TaskPatch): Promise<{ ok: tr
 
   if (patch.title !== undefined) update.title = patch.title;
   if (patch.status !== undefined) {
-    const current = tasks.find((t) => t.id === id);
+    const current = getCachedTasks().find((t) => t.id === id);
     const resolved = getTaskStatusPatch(patch.status, current?.completedAt);
     resolvedStatus = resolved.status;
     resolvedCompletedAt = resolved.completedAt;
@@ -340,26 +399,32 @@ export async function updateTask(id: string, patch: TaskPatch): Promise<{ ok: tr
     return { ok: false, error: error.message };
   }
 
-  tasks = tasks.map((task) => {
-    if (task.id !== id) return task;
-    const { entityType, entityId, status, completedAt, ...rest } = patch;
-    void status; void completedAt; // superseded by resolvedStatus/resolvedCompletedAt below
-    const next: Task = { ...task, ...rest };
-    if (resolvedStatus !== undefined) next.status = resolvedStatus;
-    if (resolvedCompletedAt !== undefined) next.completedAt = resolvedCompletedAt;
-    if (entityType !== undefined) next.entityType = entityType ?? undefined;
-    if (entityId !== undefined) next.entityId = entityId ?? undefined;
-    // assignee/assigneeInitials are cached display fields derived from
-    // assigned_to — the plain spread above only updates the id, so they
-    // must be recomputed here or the UI keeps showing the pre-update name.
-    if (patch.assignedTo !== undefined) {
-      const { assignee, assigneeInitials } = resolveAssigneeDisplay(patch.assignedTo);
-      next.assignee = assignee;
-      next.assigneeInitials = assigneeInitials;
-    }
-    return next;
-  });
-  emit();
+  patchTasksCache((list) =>
+    list.map((task) => {
+      if (task.id !== id) return task;
+      const { entityType, entityId, status, completedAt, ...rest } = patch;
+      void status; void completedAt; // superseded by resolvedStatus/resolvedCompletedAt below
+      const next: Task = { ...task, ...rest };
+      if (resolvedStatus !== undefined) next.status = resolvedStatus;
+      if (resolvedCompletedAt !== undefined) next.completedAt = resolvedCompletedAt;
+      if (entityType !== undefined) next.entityType = entityType ?? undefined;
+      if (entityId !== undefined) next.entityId = entityId ?? undefined;
+      // assignee/assigneeInitials are cached display fields derived from
+      // assigned_to — the plain spread above only updates the id, so they
+      // must be recomputed here or the UI keeps showing the pre-update name.
+      if (patch.assignedTo !== undefined) {
+        const { assignee, assigneeInitials } = resolveAssigneeDisplay(patch.assignedTo);
+        next.assignee = assignee;
+        next.assigneeInitials = assigneeInitials;
+      }
+      return next;
+    }),
+  );
+  // A status change also affects Command Center Recent Activity's "Task
+  // completed" feed (dashboardSummaryQuery's own sub-query); a plain
+  // title/priority/assignee/due/project edit does not.
+  if (patch.status !== undefined) invalidateTasksWithDashboard();
+  else invalidateTasks();
   return { ok: true };
 }
 
@@ -371,8 +436,8 @@ export async function deleteTask(id: string) {
     return;
   }
 
-  tasks = tasks.filter((task) => task.id !== id);
-  emit();
+  patchTasksCache((list) => list.filter((task) => task.id !== id));
+  invalidateTasksWithDashboard();
 }
 
 export async function completeTask(id: string) {

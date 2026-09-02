@@ -50,6 +50,14 @@ export const queryKeys = {
   // this single list (never a query per status). See projects-store.ts.
   projects: (orgId: string) => ["projects", orgId] as const,
 
+  // Platform State Sync Phase S4C — Tasks. One key per org; the Tasks board
+  // columns, list filters, overdue/due-soon views, project groups, the
+  // Command Center's Today's Tasks + Needs Attention (atomic tasks) + its
+  // Projects rollup, and every entity Task panel are all derived
+  // client-side from this single list (never a query per status/filter).
+  // See tasks-store.ts.
+  tasks: (orgId: string) => ["tasks", orgId] as const,
+
   conversations: {
     /**
      * Prefix/parent key — never used as an actual useQuery key itself

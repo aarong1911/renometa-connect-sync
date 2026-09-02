@@ -76,6 +76,18 @@
 //                 Recent Activity/the vs-last-month baseline).
 // Same DELETE-filter caveat as contacts/leads/deals above.
 //
+// S4C (Tasks migration) adds `tasks` INSERT/UPDATE/DELETE. Tasks is now
+// TanStack Query-backed (tasks-store.ts's `queryKeys.tasks(orgId)` list),
+// so a Task written from a second tab or a server process must invalidate
+// it here. Fan-out:
+//   tasks.* -> tasks, dashboard.summary. The Command Center's Today's Tasks
+//              widget and Needs Attention (atomic overdue tasks + the
+//              Projects rollup built from them) all read useTasks()
+//              directly, so `["tasks"]` alone refreshes those;
+//              dashboard.summary is included because Recent Activity's
+//              "Task completed" feed is served by its own sub-query.
+// Same DELETE-filter caveat as everything above.
+//
 // Never logs row payloads (message bodies, contact PII) — every handler
 // below only ever logs the table name and event type, both safe.
 
@@ -132,6 +144,14 @@ export function RealtimeBridge(): null {
       // S4B: Projects is Query-backed (projects-store.ts). Refresh the
       // shared list + the Command Center numbers derived from it.
       queryClient.invalidateQueries({ queryKey: queryKeys.projects(orgId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.summary(orgId) });
+    };
+    const invalidateTasks = () => {
+      // S4C: Tasks is Query-backed (tasks-store.ts). Refresh the shared
+      // list (Tasks page, entity panels, Project task panels, Command
+      // Center Today's Tasks + Needs Attention) + Recent Activity's
+      // "Task completed" sub-query.
+      queryClient.invalidateQueries({ queryKey: queryKeys.tasks(orgId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.summary(orgId) });
     };
     const invalidatePipelinePulse = () => {
@@ -226,6 +246,21 @@ export function RealtimeBridge(): null {
         "postgres_changes",
         { event: "DELETE", schema: "public", table: "projects" },
         () => invalidateProjects(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "tasks", filter: `org_id=eq.${orgId}` },
+        () => invalidateTasks(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "tasks", filter: `org_id=eq.${orgId}` },
+        () => invalidateTasks(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "tasks" },
+        () => invalidateTasks(),
       )
       .subscribe();
 
