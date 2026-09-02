@@ -33,6 +33,7 @@ import {
   confirmAppointment, startAppointment, completeAppointment, reopenAppointment,
   cancelAppointment, restoreAppointment, markAppointmentNoShow,
 } from "@/lib/appointments-store";
+import { useContacts } from "@/lib/contacts-store";
 
 function fmtDateTime(iso: string, tz: string): string {
   return new Date(iso).toLocaleString("en-US", {
@@ -68,6 +69,17 @@ export function AppointmentDetailSheet({
   onChanged?: () => void;
 }) {
   const { appointment, loading, refresh } = useAppointment(open ? appointmentId : null);
+  // Issue 1 (post-S4D): when the appointment has a resolvable linked
+  // Contact, that Contact's CURRENT name is the canonical display —
+  // `appointment.contact_name` is only a denormalized snapshot (fallback
+  // for unlinked / deleted-Contact / imported rows). Reads the shared
+  // Contacts Query, so a rename reflects here with no refresh and without
+  // rewriting the appointment row.
+  const contacts = useContacts();
+  const linkedContactName = appointment?.contactId
+    ? contacts.find((c) => c.id === appointment.contactId)?.name
+    : undefined;
+  const displayContactName = linkedContactName || appointment?.contactName || null;
   const { activity } = useAppointmentActivities(open ? appointmentId : null);
   const [busy, setBusy] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
@@ -152,9 +164,9 @@ export function AppointmentDetailSheet({
                   </div>
                 )}
 
-                {(appointment.contactName || appointment.contactPhone || appointment.contactEmail) && (
+                {(displayContactName || appointment.contactPhone || appointment.contactEmail) && (
                   <div className="space-y-1.5 rounded-lg border border-border bg-background p-2.5">
-                    {appointment.contactName && <div className="text-xs font-medium">{appointment.contactName}</div>}
+                    {displayContactName && <div className="text-xs font-medium">{displayContactName}</div>}
                     {appointment.contactPhone && (
                       <a href={`tel:${appointment.contactPhone}`} className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground">
                         <Phone className="h-3 w-3" /> {formatUsPhone(appointment.contactPhone)}

@@ -8,7 +8,6 @@
 // soon"; Delete showed "Event deleted" without ever calling Supabase).
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { createFileRoute } from "@tanstack/react-router";
-import { useQueryClient } from "@tanstack/react-query";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -28,6 +27,7 @@ import { useOrganization, useTeam, type TeamMember } from "@/lib/organization";
 import { supabase } from "@/lib/supabase";
 import { useProjects, type Project } from "@/lib/projects-store";
 import { useTasks } from "@/lib/tasks-store";
+import { useContacts } from "@/lib/contacts-store";
 import type { Task } from "@/lib/mock-data";
 // Canonical Task drawer/edit dialog — the same component the global Tasks
 // page uses (Phase 13.2C), so a Task event opens in place on Calendar
@@ -44,7 +44,7 @@ import {
   type PlanningCalendarEvent, type PlanningEventSourceType, type PlanningEventTypeFilter,
 } from "@/lib/calendar-events";
 import {
-  listAppointments, getAppointment, type Appointment,
+  useAppointments, getAppointment, type Appointment,
 } from "@/lib/appointments-store";
 import {
   APPOINTMENT_STATUS_ORDER, APPOINTMENT_STATUS_LABELS, APPOINTMENT_STATUS_TINT,
@@ -54,8 +54,6 @@ import {
 } from "@/lib/appointment-status";
 import { AppointmentDialog } from "@/components/calendar/appointment-dialog";
 import { AppointmentDetailSheet } from "@/components/calendar/appointment-detail-sheet";
-import { useOrgId } from "@/lib/org-id";
-import { queryKeys } from "@/lib/query-keys";
 
 export const Route = createFileRoute("/calendar")({
   component: CalendarPage,
@@ -196,8 +194,6 @@ function CalendarPage() {
   const [entityFilter, setEntityFilter] = useState<EntityFilter>("all");
   const [hideCancelled, setHideCancelled] = useState(true);
 
-  const [appointments, setAppointments] = useState<Appointment[]>([]);
-  const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [lastSynced, setLastSynced] = useState<Date | null>(null);
 
@@ -210,11 +206,28 @@ function CalendarPage() {
   // phases/milestones have no such store yet, so they're fetched once,
   // org-wide, here — matching the "fetch once, filter in memory" shape
   // rather than one query per visible Project.
-  const queryClient = useQueryClient();
-  const dashboardOrgId = useOrgId();
+  // S4D: the whole org's appointments from the shared Query; the visible
+  // 3-month window is derived client-side below (see `appointments`), so
+  // every Calendar view + entity panel + the Command Center now share one
+  // cache and update on any mutation with no per-page fetch.
+  const { appointments: allAppointments, loading, reload: reloadAppointments } = useAppointments();
   const { projects, reload: reloadProjects } = useProjects();
   const projectsById = useMemo(() => new Map(projects.map((p) => [p.id, p])), [projects]);
   const allTasks = useTasks();
+  // Issue 1 (post-S4D): a linked Contact's CURRENT name is the canonical
+  // label for its appointments. `appointment.contactName` is only a
+  // denormalized snapshot — a Contact rename must NOT require rewriting
+  // every appointment row. Resolve live from the shared Contacts Query
+  // (which the Contacts realtime/invalidation path already keeps fresh),
+  // then override `contactName` on the range slice below so every Calendar
+  // view (side card / week & day grid / agenda / month) shows one
+  // consistent, current name with no refresh.
+  const contacts = useContacts();
+  const contactNameById = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const c of contacts) if (c.id && c.name) m.set(c.id, c.name);
+    return m;
+  }, [contacts]);
   const tasksById = useMemo(() => new Map(allTasks.map((t) => [t.id, t])), [allTasks]);
   const allTeamMembers = useTeam();
   const assigneesById = useMemo(() => new Map(allTeamMembers.map((m) => [m.id, m])), [allTeamMembers]);
@@ -274,16 +287,31 @@ function CalendarPage() {
     [projects, phases, milestones, allTasks],
   );
 
-  const fetchAppointments = useCallback(async () => {
-    const rangeStart = new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1);
-    const rangeEnd = new Date(cursor.getFullYear(), cursor.getMonth() + 2, 0);
-    const rows = await listAppointments(rangeStart, rangeEnd);
-    setAppointments(rows);
-    setLoading(false);
-    setLastSynced(new Date());
-  }, [cursor]);
+  // Visible-window slice of the shared org-wide list — same ±1-month
+  // padding the old range fetch used, so every downstream derivation
+  // (`filtered`, `eventsByDay`, the KPI cards) is unchanged. Also overrides
+  // each row's `contactName` with the LIVE linked-Contact name (Issue 1)
+  // when it resolves and actually differs — falling back to the
+  // denormalized snapshot for unlinked / deleted-Contact / imported rows.
+  const appointments = useMemo(() => {
+    const rangeStart = new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1).getTime();
+    const rangeEnd = new Date(cursor.getFullYear(), cursor.getMonth() + 2, 0).getTime();
+    let changed = false;
+    const inWindow = allAppointments.filter((a) => {
+      const t = new Date(a.scheduledAt).getTime();
+      return t >= rangeStart && t <= rangeEnd;
+    });
+    const next = inWindow.map((a) => {
+      const live = a.contactId ? contactNameById.get(a.contactId) : undefined;
+      if (live && live !== a.contactName) { changed = true; return { ...a, contactName: live }; }
+      return a;
+    });
+    return changed ? next : inWindow;
+  }, [allAppointments, cursor, contactNameById]);
 
-  useEffect(() => { void fetchAppointments(); }, [fetchAppointments]);
+  // "Last refreshed …" footer text — bumped whenever the shared list
+  // changes (fetch / refetch / realtime / mutation patch).
+  useEffect(() => { setLastSynced(new Date()); }, [allAppointments]);
 
   useEffect(() => {
     const update = () => setNowTick(new Date());
@@ -294,7 +322,7 @@ function CalendarPage() {
 
   const handleSync = async () => {
     setSyncing(true);
-    await fetchAppointments();
+    await reloadAppointments();
     setSyncing(false);
     toast.success("Calendar refreshed", { description: `${appointments.length} appointments loaded` });
   };
@@ -408,20 +436,16 @@ function CalendarPage() {
     setDetailId(null);
     setEditingAppointment(appt);
   };
-  // Every appointment mutation on this page (create / edit / reschedule /
-  // delete / cancel / complete / no-show / confirm / …) funnels through
-  // here via AppointmentDialog#onSaved and AppointmentDetailSheet#onChanged.
-  // Besides refetching this page's own list, invalidate the Command
-  // Center's summary query so its "Bookings Today" / "Next Booking" widgets
-  // update without a browser refresh. Previously nothing invalidated
-  // dashboard.summary, so delete (and status changes) left the dashboard
-  // showing a stale Next Booking until a full reload — the reported bug.
-  const handleSaved = () => {
-    void fetchAppointments();
-    if (dashboardOrgId) {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.summary(dashboardOrgId) });
-    }
-  };
+  // S4D: appointment mutations now own their own invalidation — every
+  // create/update/reschedule/status/delete in appointments-store.ts patches
+  // the shared `["appointments"]` list AND invalidates
+  // `["dashboard"]` (Bookings Today / Next Booking). So this callback,
+  // still wired to AppointmentDialog#onSaved / AppointmentDetailSheet#
+  // onChanged, no longer needs to do anything — the shared cache updates
+  // for every consumer (this page, the Command Center, every entity panel)
+  // regardless of which surface triggered the write. Kept as a no-op so the
+  // dialog/sheet props stay stable.
+  const handleSaved = () => {};
 
   // ── KPI cards (Part 16 / 38) — computed over the loaded 3-month window,
   // same range the page already queries; "Today"/"Upcoming"/"Confirmed" are

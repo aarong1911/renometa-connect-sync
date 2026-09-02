@@ -88,6 +88,17 @@
 //              "Task completed" feed is served by its own sub-query.
 // Same DELETE-filter caveat as everything above.
 //
+// S4D (Calendar / Appointments migration) adds `appointments`
+// INSERT/UPDATE/DELETE. Appointments is now TanStack Query-backed
+// (appointments-store.ts's `queryKeys.appointments(orgId)` list), so an
+// appointment written from a second tab or a server process (voice AI /
+// Calendly / Google Calendar sync) must invalidate it here. Fan-out:
+//   appointments.* -> appointments, dashboard.summary (Bookings Today
+//                     count / Bookings sparkline / Next Booking card —
+//                     all served by dashboardSummaryQuery's own
+//                     appointment sub-queries, not by useAppointments()).
+// Same DELETE-filter caveat as everything above.
+//
 // Never logs row payloads (message bodies, contact PII) — every handler
 // below only ever logs the table name and event type, both safe.
 
@@ -152,6 +163,14 @@ export function RealtimeBridge(): null {
       // Center Today's Tasks + Needs Attention) + Recent Activity's
       // "Task completed" sub-query.
       queryClient.invalidateQueries({ queryKey: queryKeys.tasks(orgId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.summary(orgId) });
+    };
+    const invalidateAppointments = () => {
+      // S4D: Appointments is Query-backed (appointments-store.ts). Refresh
+      // the shared list (Calendar views + every entity Appointments panel +
+      // the detail sheet) + the Command Center's Bookings Today / Bookings
+      // sparkline / Next Booking sub-queries.
+      queryClient.invalidateQueries({ queryKey: queryKeys.appointments(orgId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.summary(orgId) });
     };
     const invalidatePipelinePulse = () => {
@@ -261,6 +280,21 @@ export function RealtimeBridge(): null {
         "postgres_changes",
         { event: "DELETE", schema: "public", table: "tasks" },
         () => invalidateTasks(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "appointments", filter: `org_id=eq.${orgId}` },
+        () => invalidateAppointments(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "appointments", filter: `org_id=eq.${orgId}` },
+        () => invalidateAppointments(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "appointments" },
+        () => invalidateAppointments(),
       )
       .subscribe();
 

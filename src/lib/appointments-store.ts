@@ -1,23 +1,55 @@
 // src/lib/appointments-store.ts
 //
-// Phase 10.3 — canonical BROWSER-SIDE appointment store, mirroring the
-// shape of src/lib/tasks-store.ts. Reads/writes public.appointments
-// directly (org-scoped, real user ids), targets the full schema added by
-// supabase/migrations/20260807_calendar_appointments_completion.sql
-// (title/appointment_type/assigned_to/entity_type/entity_id/ends_at/
-// time_zone/meeting_url/reminder_minutes/completed_at/cancelled_at/
-// google_* columns) — every write path in this file requires that
-// migration to be deployed. Until then, inserts/updates that touch the
-// new columns will fail with a Postgres "column does not exist" error;
-// see the Phase 10.3 report for the exact deployment sequence.
+// Platform State Sync Phase S4D — Calendar / Appointments shared server state.
 //
-// Unlike tasks-store.ts (loads the whole org's tasks once), appointments
-// are read range-scoped (Calendar only ever needs a visible date window),
-// so this store exposes range-aware fetch/hook functions instead of one
-// giant always-loaded list.
+// BEFORE S4D: this file was a bag of stateless async functions plus THREE
+// instance-local hooks that each kept their own `useState` + `useEffect`
+// fetch and their own `refresh()`:
+//   - `calendar.tsx` held a private `useState<Appointment[]>` + a
+//     `useCallback` range fetch (`listAppointments(rangeStart, rangeEnd)`)
+//   - every `EntityAppointmentsPanel` (Contact/Lead/Deal/Project/Account)
+//     had its own `useAppointmentsForEntity` list
+//   - every `AppointmentDetailSheet` had its own `useAppointment(id)` row
+// There was NO shared cache and NO realtime. The consequence (Phase 10.3
+// gap): an appointment created/edited/deleted from an entity panel only
+// refreshed THAT panel — the Calendar page and the Command Center's
+// Bookings Today / Next Booking stayed stale until a remount/refocus.
+//
+// AFTER S4D: ONE TanStack Query per org (`queryKeys.appointments(orgId)`) —
+// the whole org's appointment list, with every Calendar view (day/week/
+// month/agenda), every entity panel, and every detail sheet derived from
+// it CLIENT-SIDE (by date / status / entity). `useAppointments()` is the
+// new shared hook; `useAppointment(id)` and `useAppointmentsForEntity(...)`
+// keep their exact return shapes but are now pure slices of that one query.
+// All mutations (`createAppointment` / `updateAppointment` /
+// `deleteAppointment` + the status helpers that delegate to them) patch +
+// invalidate `["appointments"]` AND `queryKeys.dashboard.summary(orgId)`
+// (the Command Center's three appointment sub-queries) on the shared
+// client — so no caller has to remember dashboard invalidation. The
+// central RealtimeBridge also invalidates `["appointments"]` on any
+// `appointments` row change.
+//
+// UNCHANGED by S4D:
+//  - `mapRow` normalisation (same APPOINTMENT_COLUMNS select + assignee
+//    join), timezone handling (`time_zone` stored verbatim; every render
+//    formats with `toLocaleString({ timeZone })` — no UTC/local drift)
+//  - `getAppointmentStatusPatch()` completed_at / cancelled_at lifecycle
+//    (appointment-status.ts) — the one place status transitions resolve
+//  - the Contact-autofill logic in appointment-dialog.tsx (form-level, not
+//    here)
+//  - `getAppointment` one-off read (still used by the "open Edit from
+//    detail sheet" paths), `listAppointmentActivities` /
+//    `useAppointmentActivities` (separate small per-appointment table),
+//    `findAssigneeConflict` (pure), `getSessionContext` (pure)
+//  - calendar-events.ts (pure Task/phase/milestone overlay mapping — never
+//    touched appointments; Tasks stay their own S4C query)
 
 import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
+import { getQueryClient } from "@/lib/query-client";
+import { useOrgId } from "@/lib/org-id";
+import { queryKeys } from "@/lib/query-keys";
 import {
   getAppointmentStatusPatch,
   type AppointmentStatus, type AppointmentType, type AppointmentSource, type AppointmentEntityType,
@@ -159,26 +191,92 @@ function mapRow(row: any): Appointment {
   };
 }
 
-/** One-off, range-scoped fetch — the Calendar page's core query. Not cached/shared (each view keeps its own visible range). */
-export async function listAppointments(rangeStart: Date, rangeEnd: Date): Promise<Appointment[]> {
-  const { orgId } = await getSessionContext();
-  if (!orgId) return [];
-
+/**
+ * The Appointments list queryFn — the WHOLE org's appointments (org-scoped,
+ * scheduled_at ascending), with assignee display resolved via the same
+ * server-side `profiles` join the pre-S4D reads used. Self-contained (no
+ * React, no other query's cache). Calendar views filter this to their
+ * visible window client-side (never a query per date/view). Entity panels
+ * filter it by (entity_type, entity_id).
+ */
+export async function fetchAppointmentsForOrg(orgId: string): Promise<Appointment[]> {
   const { data, error } = await supabase
     .from("appointments")
     .select(APPOINTMENT_COLUMNS)
     .eq("org_id", orgId)
-    .gte("scheduled_at", rangeStart.toISOString())
-    .lte("scheduled_at", rangeEnd.toISOString())
     .order("scheduled_at", { ascending: true });
 
   if (error) {
-    console.error("[appointments-store] listAppointments failed:", error);
-    return [];
+    console.error("[appointments-store] fetch failed:", error);
+    throw error;
   }
   return (data ?? []).map(mapRow);
 }
 
+// ── Query cache helpers ──────────────────────────────────────────────────
+
+const qc = () => getQueryClient();
+
+/** Immediately reflect a CONFIRMED change into the cached list(s) — only ever called AFTER a successful DB write, never speculatively, so no rollback path is needed. */
+function patchAppointmentsCache(fn: (list: Appointment[]) => Appointment[]) {
+  qc().setQueriesData<Appointment[]>({ queryKey: ["appointments"] }, (old) => (Array.isArray(old) ? fn(old) : old));
+}
+
+/**
+ * Every appointment mutation (create / update / reschedule / status /
+ * delete) can change the Command Center's Bookings Today count, its
+ * Bookings sparkline, and its Next Booking card — all served by
+ * dashboardSummaryQuery's own `appointments` sub-queries (index.tsx), not
+ * by useAppointments(). So the shared list AND dashboard.summary are the
+ * two real dependents; nothing else (contacts/leads/deals/projects/tasks
+ * link TO an appointment but render none of its data).
+ */
+function invalidateAppointmentsWithDashboard() {
+  void qc().invalidateQueries({ queryKey: ["appointments"] });
+  void qc().invalidateQueries({ queryKey: ["dashboard"] });
+}
+
+// ── Public hooks ─────────────────────────────────────────────────────────
+
+function useAppointmentsQuery() {
+  const orgId = useOrgId();
+  return useQuery({
+    queryKey: orgId ? queryKeys.appointments(orgId) : ["appointments", "_pending"],
+    queryFn: () => fetchAppointmentsForOrg(orgId as string),
+    enabled: !!orgId,
+    // Appointments change frequently — realtime + mutation invalidation are
+    // the primary freshness path; staleTime just caps redundant refetches
+    // on remount/focus churn. Background refetch keeps the prior list (no
+    // Calendar blanking / event flicker).
+    staleTime: 30_000,
+  });
+}
+
+/** THE shared Appointments hook (S4D). One org-wide list; every Calendar view + entity panel filters it client-side. `reload()` forces a refetch of the shared query for every observer and resolves when it settles (so a "Refresh" button can await it). */
+export function useAppointments(): { appointments: Appointment[]; loading: boolean; reload: () => Promise<void> } {
+  const query = useAppointmentsQuery();
+  return {
+    appointments: query.data ?? [],
+    loading: query.isLoading,
+    reload: () => query.refetch().then(() => undefined),
+  };
+}
+
+/**
+ * One appointment by id — now a PURE slice of the shared list (the detail
+ * sheet is only ever opened for an appointment already visible in a list,
+ * so it's always cached). `{ appointment, loading, refresh }` shape kept;
+ * `refresh` refetches the shared query. If an id somehow isn't cached yet
+ * (e.g. a cross-tab create before realtime lands), `appointment` is null
+ * until the next refetch — the sheet handles null gracefully.
+ */
+export function useAppointment(id: string | null | undefined) {
+  const { appointments, loading, reload } = useAppointments();
+  const appointment = id ? (appointments.find((a) => a.id === id) ?? null) : null;
+  return { appointment, loading: loading && !appointment, refresh: reload };
+}
+
+/** One appointment by id — one-off (non-reactive) fetch. Used by "open Edit" flows that need the full row before the shared list may have it. */
 export async function getAppointment(id: string): Promise<Appointment | null> {
   const { data, error } = await supabase
     .from("appointments")
@@ -193,22 +291,18 @@ export async function getAppointment(id: string): Promise<Appointment | null> {
   return data ? mapRow(data) : null;
 }
 
-/** Reactive hook — fetches once on entity change; call `refresh()` after any mutation to pull the updated row. */
-export function useAppointment(id: string | null | undefined) {
-  const [appointment, setAppointment] = useState<Appointment | null>(null);
-  const [loading, setLoading] = useState(!!id);
-
-  const refresh = async () => {
-    if (!id) { setAppointment(null); setLoading(false); return; }
-    setLoading(true);
-    const row = await getAppointment(id);
-    setAppointment(row);
-    setLoading(false);
-  };
-
-  useEffect(() => { void refresh(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [id]);
-
-  return { appointment, loading, refresh };
+/**
+ * Org-scoped, entity-linked appointments for CRM detail panels
+ * (Contact/Lead/Deal/Company/Project) — now a CLIENT-SIDE filter of the
+ * shared list (was its own per-panel useState + fetch). `{ appointments,
+ * loading, refresh }` shape kept.
+ */
+export function useAppointmentsForEntity(entityType: AppointmentEntityType, entityId: string | null | undefined) {
+  const { appointments, loading, reload } = useAppointments();
+  const filtered = entityId
+    ? appointments.filter((a) => a.entityType === entityType && a.entityId === entityId)
+    : [];
+  return { appointments: filtered, loading: loading && filtered.length === 0, refresh: reload };
 }
 
 export type CreateAppointmentInput = {
@@ -289,7 +383,10 @@ export async function createAppointment(input: CreateAppointmentInput): Promise<
     console.error("[appointments-store] createAppointment failed:", error);
     return { ok: false, error: error?.message ?? "Could not create the appointment." };
   }
-  return { ok: true, appointment: mapRow(data) };
+  const appointment = mapRow(data);
+  patchAppointmentsCache((list) => [appointment, ...list.filter((a) => a.id !== appointment.id)]);
+  invalidateAppointmentsWithDashboard();
+  return { ok: true, appointment };
 }
 
 export type UpdateAppointmentInput = Partial<Omit<CreateAppointmentInput, "scheduledAt" | "endsAt">> & {
@@ -354,7 +451,10 @@ export async function updateAppointment(id: string, patch: UpdateAppointmentInpu
     console.error("[appointments-store] updateAppointment failed:", error);
     return { ok: false, error: error?.message ?? "Could not update the appointment." };
   }
-  return { ok: true, appointment: mapRow(data) };
+  const appointment = mapRow(data);
+  patchAppointmentsCache((list) => list.map((a) => (a.id === id ? appointment : a)));
+  invalidateAppointmentsWithDashboard();
+  return { ok: true, appointment };
 }
 
 export async function deleteAppointment(id: string): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -363,6 +463,8 @@ export async function deleteAppointment(id: string): Promise<{ ok: true } | { ok
     console.error("[appointments-store] deleteAppointment failed:", error);
     return { ok: false, error: error.message };
   }
+  patchAppointmentsCache((list) => list.filter((a) => a.id !== id));
+  invalidateAppointmentsWithDashboard();
   return { ok: true };
 }
 
@@ -424,7 +526,7 @@ export function useAppointmentActivities(appointmentId: string | null | undefine
   return { activity, loading };
 }
 
-/** Client-side overlap check against an already-loaded window of appointments — used by the create/edit dialog for the non-blocking assignee-conflict warning (Part 31). Excludes cancelled/no_show and the appointment being edited. */
+/** Client-side overlap check against an already-loaded window of appointments — used by the create/edit dialog for the non-blocking assignee-conflict warning. Excludes cancelled/no_show and the appointment being edited. */
 export function findAssigneeConflict(
   appointments: Appointment[],
   assignedTo: string,
@@ -441,41 +543,4 @@ export function findAssigneeConflict(
     new Date(a.scheduledAt).getTime() < newEnd &&
     new Date(a.endsAt).getTime() > newStart,
   ) ?? null;
-}
-
-/** Org-scoped, entity-linked appointments for CRM detail panels (Contact/Lead/Deal/Company/Project). Not paginated — same small-cap pattern as tasks-store.ts's getTasksForEntity. */
-export async function listAppointmentsForEntity(entityType: AppointmentEntityType, entityId: string): Promise<Appointment[]> {
-  const { orgId } = await getSessionContext();
-  if (!orgId) return [];
-
-  const { data, error } = await supabase
-    .from("appointments")
-    .select(APPOINTMENT_COLUMNS)
-    .eq("org_id", orgId)
-    .eq("entity_type", entityType)
-    .eq("entity_id", entityId)
-    .order("scheduled_at", { ascending: false })
-    .limit(50);
-
-  if (error) {
-    console.error("[appointments-store] listAppointmentsForEntity failed:", error);
-    return [];
-  }
-  return (data ?? []).map(mapRow);
-}
-
-export function useAppointmentsForEntity(entityType: AppointmentEntityType, entityId: string | null | undefined) {
-  const [appointments, setAppointments] = useState<Appointment[]>([]);
-  const [loading, setLoading] = useState(!!entityId);
-
-  const refresh = async () => {
-    if (!entityId) { setAppointments([]); setLoading(false); return; }
-    setLoading(true);
-    setAppointments(await listAppointmentsForEntity(entityType, entityId));
-    setLoading(false);
-  };
-
-  useEffect(() => { void refresh(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [entityType, entityId]);
-
-  return { appointments, loading, refresh };
 }

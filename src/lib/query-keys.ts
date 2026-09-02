@@ -58,6 +58,15 @@ export const queryKeys = {
   // See tasks-store.ts.
   tasks: (orgId: string) => ["tasks", orgId] as const,
 
+  // Platform State Sync Phase S4D — Calendar / Appointments. One key per
+  // org: the whole org's appointment list. Every Calendar view (day / week
+  // / month / agenda), every entity Appointments panel (Contact / Lead /
+  // Deal / Project / Account), and the Appointment detail sheet are all
+  // derived client-side from this single list (never a query per date /
+  // view / entity). Tasks stay their own S4C query — Calendar composes the
+  // two client-side. See appointments-store.ts.
+  appointments: (orgId: string) => ["appointments", orgId] as const,
+
   conversations: {
     /**
      * Prefix/parent key — never used as an actual useQuery key itself
