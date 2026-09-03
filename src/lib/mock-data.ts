@@ -262,6 +262,15 @@ export type Task = {
   dueDateRaw?: string | null;
   /** Phase 13.2B — the raw tasks.start_date column (previously unmapped). Powers Project Timeline duration bars (start_date + due_date) and Calendar. Null = no start date was set. */
   startDateRaw?: string | null;
+  /**
+   * Optional wall-clock time of day for `dueDateRaw`, from tasks.due_time.
+   * Canonical app shape: "HH:MM" (24-hour, zero-padded), e.g. "10:30".
+   * Null/undefined = date-only (no specific time). Interpreted in the
+   * org/calendar timezone together with dueDateRaw — never carries its own
+   * date or offset. Presentation-only: does NOT feed overdue/due-soon
+   * qualification (schedule-health stays date-only on dueDateRaw).
+   */
+  dueTime?: string | null;
 };
 
 /** Centralized aliases (Phase 10.2) — named references to Task's own existing literal unions, not a new/parallel vocabulary. Use these instead of re-typing the union elsewhere. */

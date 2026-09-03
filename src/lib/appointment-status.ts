@@ -216,6 +216,37 @@ export function getMeetingLocationFromAppointment(a: {
   return { meetingLocationType: "other" };
 }
 
+/**
+ * The address to DISPLAY / USE for an appointment, honoring the
+ * inherit-vs-override tri-state (appointments.address_is_override, surfaced
+ * as `addressIsOverride`). Pure — the caller supplies the linked Contact's
+ * *current* address (from the shared Contacts query), so an inheriting
+ * appointment tracks Contact address edits with no DB rewrite.
+ *
+ * Semantics only apply in "property_address" meeting mode. Office / "other"
+ * modes return `appointment.address` unchanged.
+ *
+ *   addressIsOverride === true  → appointment.address (explicit override)
+ *   addressIsOverride === false → contactAddress ?? appointment.address
+ *   addressIsOverride == null   → appointment.address (legacy / authoritative)
+ */
+export function resolveAppointmentAddress(
+  appointment: {
+    address: string | null;
+    addressIsOverride: boolean | null;
+    meetingUrl: string | null;
+    metadata: Record<string, unknown>;
+  },
+  contactAddress: string | null | undefined,
+): string | null {
+  const { meetingLocationType } = getMeetingLocationFromAppointment(appointment);
+  if (meetingLocationType !== "property_address") return appointment.address ?? null;
+  if (appointment.addressIsOverride === false) {
+    return (contactAddress?.trim() || null) ?? appointment.address ?? null;
+  }
+  return appointment.address ?? null;
+}
+
 /** An appointment counts as "active" (not yet in a terminal state) for KPI/filter purposes. */
 export function isActiveAppointmentStatus(status: AppointmentStatus): boolean {
   return status !== "completed" && status !== "cancelled" && status !== "no_show";

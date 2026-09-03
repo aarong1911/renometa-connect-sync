@@ -26,7 +26,7 @@ import { formatUsPhone } from "@/lib/phone";
 import {
   APPOINTMENT_STATUS_LABELS, APPOINTMENT_STATUS_TINT, APPOINTMENT_STATUS_ICONS,
   APPOINTMENT_TYPE_LABELS, APPOINTMENT_SOURCE_LABELS, APPOINTMENT_ENTITY_TYPE_LABELS,
-  MEETING_LOCATION_TYPE_LABELS, getMeetingLocationFromAppointment,
+  MEETING_LOCATION_TYPE_LABELS, getMeetingLocationFromAppointment, resolveAppointmentAddress,
 } from "@/lib/appointment-status";
 import {
   useAppointment, useAppointmentActivities, deleteAppointment,
@@ -76,10 +76,17 @@ export function AppointmentDetailSheet({
   // Contacts Query, so a rename reflects here with no refresh and without
   // rewriting the appointment row.
   const contacts = useContacts();
-  const linkedContactName = appointment?.contactId
-    ? contacts.find((c) => c.id === appointment.contactId)?.name
+  const linkedContact = appointment?.contactId
+    ? contacts.find((c) => c.id === appointment.contactId)
     : undefined;
+  const linkedContactName = linkedContact?.name;
   const displayContactName = linkedContactName || appointment?.contactName || null;
+  // Honors the address inherit/override tri-state — in inherit mode this is
+  // the Contact's CURRENT address (from the shared Contacts Query), so an
+  // edit to the Contact's address shows here with no appointment rewrite.
+  const displayAddress = appointment
+    ? resolveAppointmentAddress(appointment, linkedContact?.address)
+    : null;
   const { activity } = useAppointmentActivities(open ? appointmentId : null);
   const [busy, setBusy] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
@@ -180,7 +187,7 @@ export function AppointmentDetailSheet({
                   </div>
                 )}
 
-                {(appointment.address || appointment.meetingUrl) && (
+                {(displayAddress || appointment.meetingUrl) && (
                   <div className="space-y-1 rounded-md border border-border bg-background p-2.5">
                     <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
                       {meetingLocation && MEETING_LOCATION_TYPE_LABELS[meetingLocation.meetingLocationType]}
@@ -188,13 +195,13 @@ export function AppointmentDetailSheet({
                         ? ` · ${meetingLocation.meetingLocationLabel}`
                         : ""}
                     </div>
-                    {appointment.address && (
+                    {displayAddress && (
                       <a
-                        href={`https://maps.google.com/?q=${encodeURIComponent(appointment.address)}`}
+                        href={`https://maps.google.com/?q=${encodeURIComponent(displayAddress)}`}
                         target="_blank" rel="noopener noreferrer"
                         className="flex items-start gap-2 text-[11px] text-muted-foreground hover:text-foreground"
                       >
-                        <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {appointment.address}
+                        <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {displayAddress}
                       </a>
                     )}
                     {appointment.meetingUrl && (

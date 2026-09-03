@@ -43,7 +43,40 @@ export type PlanningCalendarEvent = {
   isCancelled: boolean;
   isOverdue: boolean;
   assigneeId?: string | null;
+  /**
+   * task_due only — the Task's optional wall-clock time ("HH:MM", from
+   * tasks.due_time via Task.dueTime), interpreted in the org/calendar
+   * timezone. Absent = date-only, rendered in the all-day row exactly like
+   * every other planning event. Presentation-only: never feeds
+   * overdue/due-soon (that stays date-only in schedule-health).
+   */
+  dueTime?: string | null;
+  /**
+   * task_due only — minutes from midnight (org-local) derived from
+   * `dueTime`, for placement on the Calendar hour grid. Absent = not
+   * timed. Nothing time-based is persisted; this is computed at render.
+   */
+  startMinutes?: number;
+  /**
+   * task_due only — `startMinutes` + a fixed 30-minute visual duration.
+   * Purely so a timed task block has a height on the grid; no end time is
+   * ever written back to the database.
+   */
+  endMinutes?: number;
 };
+
+/** "HH:MM" (24h, org-local wall-clock) -> minutes from midnight, or null if unparseable/out of range. */
+function dueTimeToMinutes(raw: string | null | undefined): number | null {
+  const m = (raw ?? "").match(/^(\d{1,2}):(\d{2})/);
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (!Number.isFinite(h) || !Number.isFinite(min) || h > 23 || min > 59) return null;
+  return h * 60 + min;
+}
+
+/** Fixed visual length of a timed task block on the hour grid — rendering only, never persisted. */
+const TIMED_TASK_VISUAL_DURATION_MIN = 30;
 
 export type PlanningEventTypeFilter = "project_dates" | "phase_dates" | "milestones" | "tasks";
 
@@ -142,11 +175,18 @@ export function buildPlanningEvents(params: {
     const isCancelled = t.status === "cancelled";
     const overdue = !isDone && !isCancelled && (differenceInCalendarDaysSafe(today, d) ?? -1) > 0;
     const project = t.projectId ? projectsById.get(t.projectId) : undefined;
+    // Optional time-of-day: only meaningful alongside a real due date (which
+    // `d` already guarantees). `startMinutes` is org-local wall-clock — the
+    // renderer places it on the grid without any UTC/browser-local shift.
+    const startMinutes = dueTimeToMinutes(t.dueTime);
     events.push({
       id: `task_due:${t.id}`, sourceType: "task_due", title: t.title,
       date: d, colorKey: "amber", projectId: t.projectId ?? "", projectName: project?.name ?? "",
       taskId: t.id, status: t.status, isCompleted: isDone, isCancelled, isOverdue: overdue,
       assigneeId: t.assignedTo ?? null,
+      dueTime: startMinutes != null ? t.dueTime ?? null : null,
+      startMinutes: startMinutes ?? undefined,
+      endMinutes: startMinutes != null ? startMinutes + TIMED_TASK_VISUAL_DURATION_MIN : undefined,
     });
   }
 

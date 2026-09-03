@@ -84,6 +84,16 @@ type FormState = {
   contactPhone: string;
   contactEmail: string;
   address: string;
+  /**
+   * Property-address mode tri-state (mirrors appointments.address_is_override):
+   *   null  → legacy row, address untouched by the user this session → keep
+   *           whatever the row had (do not reinterpret on save).
+   *   false → inherit the linked Contact's current address (the field shows
+   *           that address; `address` is saved only as a fallback snapshot).
+   *   true  → this address is an explicit appointment-specific override.
+   * Any manual edit of the property-address field flips this to true.
+   */
+  addressIsOverride: boolean | null;
   meetingLocationType: MeetingLocationType;
   meetingLocationLabel: string;
   meetingMode: MeetingMode;
@@ -98,6 +108,8 @@ function blankForm(timeZone: string): FormState {
     date: todayInputValue(), startTime: "09:00", endTime: "10:00", timeZone,
     assignedTo: "unassigned", entityType: "none", entityId: null, entityLabel: "",
     contactName: "", contactPhone: "", contactEmail: "", address: "",
+    // New appointments always carry an explicit intent (never legacy null).
+    addressIsOverride: false,
     meetingLocationType: "property_address", meetingLocationLabel: "", meetingMode: "in_person", meetingUrl: "",
     notes: "", reminderMinutes: [],
   };
@@ -117,6 +129,7 @@ function formFromAppointment(a: Appointment): FormState {
     entityType: a.entityType ?? "none", entityId: a.entityId, entityLabel: a.assigneeName ?? "",
     contactName: a.contactName ?? "", contactPhone: formatUsPhone(a.contactPhone), contactEmail: a.contactEmail ?? "",
     address: a.address ?? "",
+    addressIsOverride: a.addressIsOverride,
     meetingLocationType: location.meetingLocationType,
     meetingLocationLabel: location.meetingLocationLabel ?? "",
     meetingMode: location.meetingMode ?? "in_person",
@@ -165,10 +178,29 @@ export function AppointmentDialog({
   const [saving, setSaving] = useState(false);
   const [conflictWarning, setConflictWarning] = useState<string | null>(null);
 
+  // The Contact currently linked in the form (only contact-typed entities
+  // resolve here) and its live address — used for the "inherit vs. override"
+  // property-address affordance below.
+  const linkedContact = form.entityType === "contact" && form.entityId ? contactsById.get(form.entityId) : undefined;
+  const linkedContactAddress = linkedContact?.address?.trim() ?? "";
+
   useEffect(() => {
     if (!open) return;
     if (appointment) {
-      setForm(formFromAppointment(appointment));
+      const base = formFromAppointment(appointment);
+      // Inherit mode: the field shows the linked Contact's CURRENT address,
+      // not the stored fallback snapshot. Only resolvable for contact-linked
+      // appointments; other entity types just show the stored address.
+      if (
+        base.addressIsOverride === false &&
+        base.meetingLocationType === "property_address" &&
+        appointment.entityType === "contact" &&
+        appointment.entityId
+      ) {
+        const linked = contactsById.get(appointment.entityId);
+        if (linked?.address?.trim()) base.address = linked.address.trim();
+      }
+      setForm(base);
     } else {
       setForm({
         ...blankForm(org.timezone),
@@ -291,6 +323,15 @@ export function AppointmentDialog({
       ...(form.meetingLocationType === "other" ? { meetingLocationLabel: form.meetingLocationLabel.trim(), meetingMode: form.meetingMode } : {}),
     };
 
+    // Inherit-vs-override is only meaningful in property-address mode.
+    // Office / "other" leave the column untouched (undefined -> not written).
+    // A surviving `null` means the user never touched the property address on
+    // a legacy row this session -> keep legacy semantics, don't reinterpret.
+    const resolvedAddressIsOverride =
+      form.meetingLocationType === "property_address" && form.addressIsOverride !== null
+        ? form.addressIsOverride
+        : undefined;
+
     const entityType = form.entityType === "none" ? null : form.entityType;
     const commonPatch = {
       title: form.title.trim(),
@@ -307,6 +348,7 @@ export function AppointmentDialog({
       contactPhone: formatUsPhone(form.contactPhone) || null,
       contactEmail: form.contactEmail || null,
       address: resolvedAddress,
+      ...(resolvedAddressIsOverride !== undefined ? { addressIsOverride: resolvedAddressIsOverride } : {}),
       meetingUrl: resolvedMeetingUrl,
       notes: form.notes || null,
       reminderMinutes: form.reminderMinutes.length ? form.reminderMinutes : null,
@@ -490,6 +532,13 @@ export function AppointmentDialog({
                           next.contactName = c.name && c.name !== "Unknown" ? c.name : "";
                           next.contactPhone = formatUsPhone(c.phone);
                           next.contactEmail = c.email ?? "";
+                          // Address: in inherit mode (false) the property
+                          // address follows the newly-picked Contact; in
+                          // override mode (true) or legacy (null) the
+                          // appointment-specific address is kept as-is.
+                          if (f.addressIsOverride === false) {
+                            next.address = c.address?.trim() ?? "";
+                          }
                         }
                       }
                       return next;
@@ -535,13 +584,38 @@ export function AppointmentDialog({
               <Label htmlFor="ap-property-address">Property address</Label>
               <AddressAutocomplete
                 value={form.address}
-                onChange={(v) => setForm((f) => ({ ...f, address: v }))}
+                onChange={(v) => setForm((f) => ({ ...f, address: v, addressIsOverride: true }))}
                 onSelect={(parts) =>
-                  setForm((f) => ({ ...f, address: [parts.street, parts.city, `${parts.state} ${parts.zip}`].filter(Boolean).join(", ") }))
+                  setForm((f) => ({
+                    ...f,
+                    address: [parts.street, parts.city, `${parts.state} ${parts.zip}`].filter(Boolean).join(", "),
+                    addressIsOverride: true,
+                  }))
                 }
                 placeholder="123 Main St, City, ST"
               />
-              {!form.address && (
+              {linkedContact && (
+                <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                  <Checkbox
+                    checked={form.addressIsOverride === false}
+                    onCheckedChange={(checked) =>
+                      setForm((f) =>
+                        checked === true
+                          ? { ...f, addressIsOverride: false, address: linkedContactAddress }
+                          : { ...f, addressIsOverride: true },
+                      )
+                    }
+                  />
+                  Use {linkedContact.name || "contact"}&rsquo;s current address
+                  {linkedContactAddress ? ` (${linkedContactAddress})` : " (none on file)"}
+                </label>
+              )}
+              {form.addressIsOverride === false && (
+                <p className="text-[11px] text-muted-foreground">
+                  Inheriting the contact&rsquo;s address — it will update automatically if their address changes.
+                </p>
+              )}
+              {!form.address && form.addressIsOverride !== false && (
                 <p className="text-[11px] text-muted-foreground">No property address on file — enter one above, or switch to Office or Other.</p>
               )}
             </div>

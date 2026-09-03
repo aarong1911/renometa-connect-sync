@@ -49,7 +49,7 @@ import {
 import {
   APPOINTMENT_STATUS_ORDER, APPOINTMENT_STATUS_LABELS, APPOINTMENT_STATUS_TINT,
   APPOINTMENT_TYPE_ORDER, APPOINTMENT_TYPE_LABELS, APPOINTMENT_TYPE_ICONS,
-  APPOINTMENT_ENTITY_TYPE_LABELS, isActiveAppointmentStatus,
+  APPOINTMENT_ENTITY_TYPE_LABELS, isActiveAppointmentStatus, resolveAppointmentAddress,
   type AppointmentStatus, type AppointmentType, type AppointmentEntityType,
 } from "@/lib/appointment-status";
 import { AppointmentDialog } from "@/components/calendar/appointment-dialog";
@@ -97,6 +97,14 @@ function apptTimeLabel(iso: string, tz: string): string {
 function apptMinutes(iso: string, tz: string): number {
   const [h, m] = apptTimeLabel(iso, tz).split(":").map(Number);
   return h * 60 + m;
+}
+/** Minutes-from-midnight -> "10:30 AM". Used for timed task planning events, whose time is a plain org-local wall-clock value (no tz conversion). */
+function minutesLabel(min: number): string {
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  const suffix = h < 12 ? "AM" : "PM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${String(m).padStart(2, "0")} ${suffix}`;
 }
 /** Never "0 ev"/"0 events" — an empty day shows no count at all. */
 function formatDayEventCount(count: number): string | null {
@@ -170,6 +178,9 @@ function PlanningEventChip({ event, onOpen, compact = false }: { event: Planning
       aria-label={`${PLANNING_EVENT_SOURCE_LABEL[event.sourceType]}: ${event.title}${state === "overdue" ? ", Overdue" : ""}`}
     >
       <Icon className="h-2.5 w-2.5 shrink-0" />
+      {event.dueTime && (
+        <span className="shrink-0 tabular-nums opacity-80">{minutesLabel(event.startMinutes ?? 0)}</span>
+      )}
       <span className="truncate">{compact ? event.title : event.title}</span>
       {state === "overdue" && <AlertTriangle className="h-2.5 w-2.5 shrink-0 text-destructive" />}
     </button>
@@ -226,6 +237,15 @@ function CalendarPage() {
   const contactNameById = useMemo(() => {
     const m = new Map<string, string>();
     for (const c of contacts) if (c.id && c.name) m.set(c.id, c.name);
+    return m;
+  }, [contacts]);
+  // Same live-resolution idea for the property address: an appointment in
+  // "inherit" mode (addressIsOverride === false) shows the linked Contact's
+  // CURRENT address, so editing a Contact's address updates every Calendar
+  // view with no appointment rewrite. Override / legacy rows are untouched.
+  const contactAddressById = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const c of contacts) if (c.id && c.address) m.set(c.id, c.address);
     return m;
   }, [contacts]);
   const tasksById = useMemo(() => new Map(allTasks.map((t) => [t.id, t])), [allTasks]);
@@ -302,12 +322,22 @@ function CalendarPage() {
       return t >= rangeStart && t <= rangeEnd;
     });
     const next = inWindow.map((a) => {
-      const live = a.contactId ? contactNameById.get(a.contactId) : undefined;
-      if (live && live !== a.contactName) { changed = true; return { ...a, contactName: live }; }
+      const liveName = a.contactId ? contactNameById.get(a.contactId) : undefined;
+      const liveAddress = resolveAppointmentAddress(a, a.contactId ? contactAddressById.get(a.contactId) : undefined);
+      const nameChanged = !!liveName && liveName !== a.contactName;
+      const addressChanged = liveAddress !== a.address;
+      if (nameChanged || addressChanged) {
+        changed = true;
+        return {
+          ...a,
+          ...(nameChanged ? { contactName: liveName } : {}),
+          ...(addressChanged ? { address: liveAddress } : {}),
+        };
+      }
       return a;
     });
     return changed ? next : inWindow;
-  }, [allAppointments, cursor, contactNameById]);
+  }, [allAppointments, cursor, contactNameById, contactAddressById]);
 
   // "Last refreshed …" footer text — bumped whenever the shared list
   // changes (fetch / refetch / realtime / mutation patch).
@@ -840,6 +870,11 @@ function DayPanelPlanningCard({ event, onOpen }: { event: PlanningCalendarEvent;
           {temporalStateLabel(event, state)}
         </Badge>
       </div>
+      {event.dueTime && (
+        <div className="text-[11px] font-medium tabular-nums text-muted-foreground">
+          {minutesLabel(event.startMinutes ?? 0)}
+        </div>
+      )}
       {event.projectName && (
         <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
           <FolderKanban className="h-3 w-3" /> {event.projectName}
@@ -904,7 +939,9 @@ function TimeGrid({
   const nowMinutes = now ? now.getHours() * 60 + now.getMinutes() : null;
   const nowTop = nowMinutes !== null ? (nowMinutes / 60) * HOUR_PX : 0;
   const nowLabel = now ? now.toLocaleTimeString("default", { hour: "numeric", minute: "2-digit" }) : "";
-  const hasAllDay = days.some((d) => (planningEventsByDay.get(ymd(d)) ?? []).length > 0);
+  // Timed task events (startMinutes set) are placed on the hour grid below,
+  // not in the all-day row — so the all-day row only counts date-only ones.
+  const hasAllDay = days.some((d) => (planningEventsByDay.get(ymd(d)) ?? []).some((e) => e.startMinutes == null));
   const gridTemplate = weekGridTemplate(days.length);
 
   return (
@@ -954,7 +991,7 @@ function TimeGrid({
             <div className="bg-card px-1 py-1 text-[9px] font-medium uppercase text-muted-foreground">All day</div>
             {days.map((d) => {
               const key = ymd(d);
-              const dayPlanning = planningEventsByDay.get(key) ?? [];
+              const dayPlanning = (planningEventsByDay.get(key) ?? []).filter((e) => e.startMinutes == null);
               return (
                 <div key={key} className="space-y-0.5 bg-card p-1">
                   {dayPlanning.slice(0, 3).map((e) => <PlanningEventChip key={e.id} event={e} onOpen={onOpenPlanning} />)}
@@ -975,10 +1012,43 @@ function TimeGrid({
           {days.map((d) => {
             const key = ymd(d);
             const dayEvents = (eventsByDay.get(key) ?? []).slice().sort((a, b) => a.scheduledAt.localeCompare(b.scheduledAt));
+            const timedPlanning = (planningEventsByDay.get(key) ?? []).filter((e) => e.startMinutes != null);
             const showNow = nowMinutes !== null && key === todayKey;
             return (
               <div key={key} className="relative border-l border-border" style={{ height: HOUR_PX * 24 }}>
                 {HOURS.map((h) => (<div key={h} className="absolute inset-x-0 border-t border-border/60" style={{ top: h * HOUR_PX }} />))}
+                {timedPlanning.map((e) => {
+                  // Rendering-only placement — startMinutes/endMinutes are
+                  // derived from Task.dueTime at build time (30-min visual
+                  // block), nothing time-based is persisted.
+                  const startMin = e.startMinutes ?? 0;
+                  const endMin = e.endMinutes ?? startMin + 30;
+                  const top = (startMin / 60) * HOUR_PX;
+                  const height = ((endMin - startMin) / 60) * HOUR_PX - 2;
+                  const pState = getPlanningEventTemporalState(e);
+                  const PIcon = PLANNING_EVENT_ICON[e.sourceType];
+                  return (
+                    <button
+                      key={e.id}
+                      type="button"
+                      onClick={() => onOpenPlanning(e)}
+                      className={cn(
+                        "absolute left-1 right-1 cursor-pointer overflow-hidden rounded border px-1.5 py-1 text-left text-[10px] shadow-sm transition-shadow hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
+                        PLANNING_EVENT_CHIP_TONE[e.colorKey],
+                        pState === "completed" && "opacity-60 line-through",
+                        pState === "cancelled" && "opacity-50",
+                      )}
+                      style={{ top, height }}
+                    >
+                      <div className="flex items-center gap-1 truncate font-semibold">
+                        <PIcon className="h-2.5 w-2.5 shrink-0" />
+                        <span className="truncate">{e.title}</span>
+                        {pState === "overdue" && <AlertTriangle className="h-2.5 w-2.5 shrink-0 text-destructive" />}
+                      </div>
+                      <div className="truncate tabular-nums opacity-80">{minutesLabel(startMin)}</div>
+                    </button>
+                  );
+                })}
                 {dayEvents.map((a) => {
                   const startMin = apptMinutes(a.scheduledAt, a.timeZone);
                   const endMin = Math.max(apptMinutes(a.endsAt, a.timeZone), startMin + 30);
@@ -1065,7 +1135,9 @@ function AgendaView({
                     onClick={() => onOpenPlanning(e)}
                     className="flex w-full items-center gap-3 rounded-md border border-border p-2 text-left hover:bg-secondary/30 transition-colors"
                   >
-                    <span className="w-16 shrink-0 text-[11px] font-medium text-muted-foreground">All day</span>
+                    <span className="w-16 shrink-0 text-[11px] font-medium tabular-nums text-muted-foreground">
+                      {e.dueTime ? minutesLabel(e.startMinutes ?? 0) : "All day"}
+                    </span>
                     <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                     <span className={cn("min-w-0 flex-1 truncate text-xs font-medium", state === "completed" && "text-muted-foreground line-through")}>{e.title}</span>
                     {e.projectName && <span className="hidden shrink-0 truncate text-[11px] text-muted-foreground sm:inline">{e.projectName}</span>}

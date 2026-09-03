@@ -76,6 +76,17 @@ export type Appointment = {
   contactPhone: string | null;
   contactEmail: string | null;
   address: string | null;
+  /**
+   * Property-address mode only (metadata.meetingLocationType ===
+   * "property_address"). Tri-state, from appointments.address_is_override:
+   *   null  → legacy row / unknown intent → `address` is authoritative,
+   *           shown as-is, no Contact inheritance.
+   *   false → explicitly inherit → display the linked Contact's *current*
+   *           address; `address` is only a fallback snapshot.
+   *   true  → explicit override → `address` is authoritative.
+   * Office / "other" location modes ignore this entirely.
+   */
+  addressIsOverride: boolean | null;
   meetingUrl: string | null;
   notes: string | null;
   budget: string | null;
@@ -170,6 +181,11 @@ function mapRow(row: any): Appointment {
     contactPhone: row.contact_phone ?? null,
     contactEmail: row.contact_email ?? null,
     address: row.address ?? null,
+    // Tri-state — a missing/NULL column stays null (legacy semantics), only
+    // an explicit true/false is carried through.
+    addressIsOverride: row.address_is_override === null || row.address_is_override === undefined
+      ? null
+      : Boolean(row.address_is_override),
     meetingUrl: row.meeting_url ?? null,
     notes: row.notes ?? null,
     budget: row.budget ?? null,
@@ -321,6 +337,14 @@ export type CreateAppointmentInput = {
   contactPhone?: string | null;
   contactEmail?: string | null;
   address?: string | null;
+  /**
+   * Property-address mode only. Pass an explicit true/false for every
+   * appointment the app creates or edits — true = the address is an
+   * appointment-specific override, false = inherit the linked Contact's
+   * current address. Omitted → column left untouched (create: stays NULL /
+   * legacy; update: unchanged). Never write null explicitly.
+   */
+  addressIsOverride?: boolean;
   meetingUrl?: string | null;
   notes?: string | null;
   reminderMinutes?: number[] | null;
@@ -366,6 +390,7 @@ export async function createAppointment(input: CreateAppointmentInput): Promise<
     contact_phone: input.contactPhone?.trim() || null,
     contact_email: input.contactEmail?.trim() || null,
     address: input.address?.trim() || null,
+    ...(input.addressIsOverride !== undefined ? { address_is_override: input.addressIsOverride } : {}),
     meeting_url: input.meetingUrl?.trim() || null,
     notes: input.notes?.trim() || null,
     reminder_minutes: input.reminderMinutes ?? null,
@@ -407,6 +432,7 @@ export async function updateAppointment(id: string, patch: UpdateAppointmentInpu
   if (patch.contactPhone !== undefined) update.contact_phone = patch.contactPhone?.trim() || null;
   if (patch.contactEmail !== undefined) update.contact_email = patch.contactEmail?.trim() || null;
   if (patch.address !== undefined) update.address = patch.address?.trim() || null;
+  if (patch.addressIsOverride !== undefined) update.address_is_override = patch.addressIsOverride;
   if (patch.meetingUrl !== undefined) update.meeting_url = patch.meetingUrl?.trim() || null;
   if (patch.notes !== undefined) update.notes = patch.notes?.trim() || null;
   if (patch.reminderMinutes !== undefined) update.reminder_minutes = patch.reminderMinutes;

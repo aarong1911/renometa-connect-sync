@@ -63,6 +63,30 @@ export function fmtDueOrNone(dueRaw: string | null | undefined) {
   return dueRaw ? fmtDue(dueRaw) : "No due date";
 }
 
+/** "HH:MM" (24h wall-clock) -> "10:30 AM". Returns "" for anything unparseable. */
+export function fmtDueTimeLabel(hhmm: string | null | undefined) {
+  const m = (hhmm ?? "").match(/^(\d{1,2}):(\d{2})/);
+  if (!m) return "";
+  let h = parseInt(m[1], 10);
+  if (Number.isNaN(h) || h > 23) return "";
+  const suffix = h < 12 ? "AM" : "PM";
+  h = h % 12;
+  if (h === 0) h = 12;
+  return `${h}:${m[2]} ${suffix}`;
+}
+
+/**
+ * Due-date detail line. With a time: "Sep 3, 10:30 AM". Date only: "Sep 3"
+ * (never a spurious "12:00 AM"). No due date: "No due date". The time is a
+ * plain org-local wall-clock string — rendered as-is, never shifted by the
+ * viewer's timezone.
+ */
+export function fmtDueDetail(dueRaw: string | null | undefined, dueTime: string | null | undefined) {
+  if (!dueRaw) return "No due date";
+  const time = fmtDueTimeLabel(dueTime);
+  return time ? `${fmtDue(dueRaw)}, ${time}` : fmtDue(dueRaw);
+}
+
 export function projectName(id: string | undefined) {
   return id ? getProjectName(id) : "No project";
 }
@@ -286,7 +310,7 @@ export function TaskDetailSheet({
                 }
               />
               <Fact label="Assignee" value={resolveAssigneeName(task, assigneesById) ?? "Unassigned"} />
-              <Fact label="Due" value={fmtDueOrNone(task.dueDateRaw)} />
+              <Fact label="Due" value={fmtDueDetail(task.dueDateRaw, task.dueTime)} />
               <Fact
                 label="Priority"
                 value={PRIORITIES.find((priority) => priority.id === task.priority)?.label ?? ""}
@@ -392,6 +416,10 @@ export function TaskFormDialog({
   const [due, setDue] = useState(
     task ? task.due.slice(0, 10) : new Date().toISOString().slice(0, 10),
   );
+  // Optional time-of-day companion to `due`. "" = date-only (the default,
+  // and what clearing the field means). Native <input type="time"> value is
+  // already "HH:MM", the canonical Task.dueTime shape.
+  const [dueTime, setDueTime] = useState(task?.dueTime ?? "");
 
   // Global "Related to" picker. None/Lead/Deal, independent of Project — a
   // task may have a project, a Lead/Deal link, both, or neither.
@@ -427,6 +455,7 @@ export function TaskFormDialog({
       projectId: projectId === NO_PROJECT ? undefined : projectId,
       assignedTo: assignedTo === "unassigned" ? null : assignedTo,
       due: new Date(due).toISOString(),
+      dueTime: dueTime || null,
       priority,
       status,
       entityType: relatedTo === "none" ? null : relatedTo,
@@ -457,7 +486,7 @@ export function TaskFormDialog({
 
   return (
     <Dialog open={open} onOpenChange={(dialogOpen) => !dialogOpen && onClose()}>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="max-w-[560px]">
         <DialogHeader>
           <DialogTitle>{isEdit ? "Edit Task" : "New Task"}</DialogTitle>
           <DialogDescription>
@@ -476,11 +505,11 @@ export function TaskFormDialog({
             />
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-1.5">
-              <Label>Project</Label>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid min-w-0 gap-1.5">
+              <Label htmlFor="task-project">Project</Label>
               <Select value={projectId} onValueChange={setProjectId}>
-                <SelectTrigger>
+                <SelectTrigger id="task-project" className="w-full min-w-0">
                   <SelectValue placeholder="Select project" />
                 </SelectTrigger>
                 <SelectContent>
@@ -494,10 +523,10 @@ export function TaskFormDialog({
               </Select>
             </div>
 
-            <div className="space-y-1.5">
-              <Label>Assignee</Label>
+            <div className="grid min-w-0 gap-1.5">
+              <Label htmlFor="task-assignee">Assignee</Label>
               <Select value={assignedTo} onValueChange={setAssignedTo}>
-                <SelectTrigger>
+                <SelectTrigger id="task-assignee" className="w-full min-w-0">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -512,9 +541,12 @@ export function TaskFormDialog({
             </div>
           </div>
 
-          <div className="space-y-1.5">
-            <Label>Related to</Label>
-            <div className="grid grid-cols-2 gap-3">
+          <div className="grid gap-1.5">
+            <Label htmlFor="task-related-type">Related to</Label>
+            {/* Single column until a Lead/Deal type is chosen — the second
+                cell only appears (and the row only splits) once the entity
+                picker is actually useful, so there is no empty half-row. */}
+            <div className={cn("grid gap-3", relatedTo !== "none" && "sm:grid-cols-2")}>
               <Select
                 value={relatedTo}
                 onValueChange={(value) => {
@@ -522,7 +554,7 @@ export function TaskFormDialog({
                   setRelatedEntityId(null);
                 }}
               >
-                <SelectTrigger>
+                <SelectTrigger id="task-related-type" className="w-full min-w-0">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -533,30 +565,53 @@ export function TaskFormDialog({
               </Select>
 
               {relatedTo !== "none" && (
-                <EntityPicker
-                  entityType={relatedTo}
-                  value={relatedEntityId}
-                  onSelect={setRelatedEntityId}
-                />
+                <div className="min-w-0">
+                  <EntityPicker
+                    entityType={relatedTo}
+                    value={relatedEntityId}
+                    onSelect={setRelatedEntityId}
+                  />
+                </div>
               )}
             </div>
           </div>
 
-          <div className="grid grid-cols-3 gap-3">
-            <div className="space-y-1.5">
-              <Label htmlFor="task-due">Due</Label>
+          {/* Scheduling — two balanced two-column rows matching the rest of
+              the modal's rhythm. Due date / Due time keep the Appointment
+              dialog's labelled-cell + bare <Input type="time"> treatment
+              (same h-9 primitive, no custom icon). */}
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid min-w-0 gap-1.5">
+              <Label htmlFor="task-due">Due date</Label>
               <Input
                 id="task-due"
                 type="date"
                 value={due}
-                onChange={(e) => setDue(e.target.value)}
+                onChange={(e) => {
+                  const nextDue = e.target.value;
+                  setDue(nextDue);
+                  // No date → no time-only orphan (matches the store rule).
+                  if (!nextDue) setDueTime("");
+                }}
               />
             </div>
 
-            <div className="space-y-1.5">
-              <Label>Priority</Label>
+            <div className="grid min-w-0 gap-1.5">
+              <Label htmlFor="task-due-time">Due time</Label>
+              <Input
+                id="task-due-time"
+                type="time"
+                value={dueTime}
+                onChange={(e) => setDueTime(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid min-w-0 gap-1.5">
+              <Label htmlFor="task-priority">Priority</Label>
               <Select value={priority} onValueChange={(value) => setPriority(value as Priority)}>
-                <SelectTrigger>
+                <SelectTrigger id="task-priority" className="w-full min-w-0">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -569,10 +624,10 @@ export function TaskFormDialog({
               </Select>
             </div>
 
-            <div className="space-y-1.5">
-              <Label>Status</Label>
+            <div className="grid min-w-0 gap-1.5">
+              <Label htmlFor="task-status">Status</Label>
               <Select value={status} onValueChange={(value) => setStatus(value as TaskStatus)}>
-                <SelectTrigger>
+                <SelectTrigger id="task-status" className="w-full min-w-0">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>

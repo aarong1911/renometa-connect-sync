@@ -165,7 +165,20 @@ function mapRow(row: any): Task {
     milestoneId: row.milestone_id ?? null,
     dueDateRaw: row.due_date ?? null,
     startDateRaw: row.start_date ?? null,
+    dueTime: normalizeDueTime(row.due_time),
   };
+}
+
+/**
+ * Postgres `time` comes back as "HH:MM:SS" (or "HH:MM:SS.ffffff"). The
+ * canonical app shape is "HH:MM" (see Task.dueTime). Null/empty stays null.
+ */
+function normalizeDueTime(raw: unknown): string | null {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const m = s.match(/^(\d{2}):(\d{2})/);
+  return m ? `${m[1]}:${m[2]}` : null;
 }
 
 const TASK_COLUMNS = `
@@ -322,6 +335,9 @@ export async function addTask(task: CreateTaskInput): Promise<Task | null> {
   }
   if (task.phaseId) insertPayload.phase_id = task.phaseId;
   if (task.milestoneId) insertPayload.milestone_id = task.milestoneId;
+  // due_time is a companion to due_date only — an orphan time with no date
+  // would never render anywhere, so only persist it when both are present.
+  if (task.dueTime && dueDate) insertPayload.due_time = task.dueTime;
 
   const { data, error } = await supabase
     .from("tasks")
@@ -374,6 +390,11 @@ export async function updateTask(id: string, patch: TaskPatch): Promise<{ ok: tr
   }
   if (patch.priority !== undefined) update.priority = toDbPriority(patch.priority);
   if (patch.due !== undefined) update.due_date = patch.due ? patch.due.slice(0, 10) : null;
+  // Optional time-of-day. Only written when explicitly present in the patch,
+  // so an unrelated-field update never clears it. Empty string / null clears
+  // it. Clearing the due date also clears any orphaned time.
+  if (patch.dueTime !== undefined) update.due_time = patch.dueTime || null;
+  if (patch.due !== undefined && !patch.due) update.due_time = null;
   if (patch.assignedTo !== undefined) update.assigned_to = patch.assignedTo;
   if (patch.phaseId !== undefined) update.phase_id = patch.phaseId;
   if (patch.milestoneId !== undefined) update.milestone_id = patch.milestoneId;
@@ -405,6 +426,8 @@ export async function updateTask(id: string, patch: TaskPatch): Promise<{ ok: tr
       const { entityType, entityId, status, completedAt, ...rest } = patch;
       void status; void completedAt; // superseded by resolvedStatus/resolvedCompletedAt below
       const next: Task = { ...task, ...rest };
+      // Mirror the "clearing due date clears orphan time" DB rule above.
+      if (patch.due !== undefined && !patch.due) next.dueTime = null;
       if (resolvedStatus !== undefined) next.status = resolvedStatus;
       if (resolvedCompletedAt !== undefined) next.completedAt = resolvedCompletedAt;
       if (entityType !== undefined) next.entityType = entityType ?? undefined;
