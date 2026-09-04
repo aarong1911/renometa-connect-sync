@@ -36,6 +36,19 @@ export const queryKeys = {
   contacts: (orgId: string) => ["contacts", orgId] as const,
   leads: (orgId: string) => ["leads", orgId] as const,
 
+  // Platform State Sync Phase S5A — Companies / Accounts. ONE key per org:
+  // the whole org's company list. Named `companies` to match the table, the
+  // store file (companies-store.ts) and the public hook (`useCompanies`) —
+  // "Accounts" is only the UI label for this same data, so there is NO
+  // separate `accounts` key/cache (that would be two caches for one set of
+  // rows). The Accounts list page, the Contacts page's account column,
+  // Estimates/Projects/entity-picker account dropdowns, and the duplicate-
+  // candidate check all derive from this single list client-side. The
+  // account detail route still loads its row by slug via
+  // `fetchCompanyBySlug` (authoritative, can't wait for the list) but that
+  // read now warms/patches this same cache.
+  companies: (orgId: string) => ["companies", orgId] as const,
+
   // Platform State Sync Phase S4A — Deals / Pipeline. ONE key per org whose
   // Query payload is the co-loaded bundle `{ deals, pipelines, stages }`
   // (deals-store.ts): a Deal can't be mapped without its stage, and every

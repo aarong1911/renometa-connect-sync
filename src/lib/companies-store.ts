@@ -5,12 +5,33 @@
 // src/routes/companies.tsx, src/routes/accounts_.$accountSlug.tsx, and
 // src/lib/deals-store.ts, and each file ran its own ad hoc
 // `supabase.from("companies")` query. This consolidates reads/writes
-// behind one reactive store — callers are being migrated gradually (per
+// behind one canonical store — callers are being migrated gradually (per
 // instruction), not all in one pass, so existing page-level dialogs that
 // already work (e.g. companies.tsx's logo upload, accounts_.$accountSlug's
 // company_notes/company_activities/company_contacts UI) are left in place
 // and only their *data-access* points are redirected here where it was
 // safe to do so without touching working UI.
+//
+// Platform State Sync Phase S5A (Companies / Accounts migration):
+// BEFORE — a module-level `companies` array + a listener Set + `emit()` +
+// `useSyncExternalStore`, hydrated by a top-level `fetchCompanies()` call
+// at import time, with NO realtime coverage.
+// AFTER — one TanStack Query per org (`queryKeys.companies(orgId)`).
+// `useCompanies()` keeps its EXACT public shape — a bare `Company[]` (`[]`
+// until loaded) — as a thin `useQuery` wrapper. `useCompaniesLoading()`,
+// every imperative mutation (`addCompany`/`updateCompany`/`deleteCompany`/
+// `upsertCompanyLocal`/`fetchCompanies`/`refreshCompanies`), the slug
+// helpers, `fetchCompanyBySlug`, `ensureCompanyContactAssociation`,
+// `resolvePrimaryContactForCompany`, `countCompanyLinkedRecords` and
+// `findCompanyDuplicateCandidates` keep their exact signatures — so no
+// caller (companies.tsx / accounts_.$accountSlug.tsx / contacts.tsx /
+// estimates.tsx / projects.index.tsx / entity-picker / convert-lead /
+// new-deal / NewVendorModal / import-jobs-store) changes. After a
+// confirmed DB write, mutations patch + invalidate the shared client
+// (query-client.ts / getQueryClient()) instead of the singleton. The
+// central RealtimeBridge now also invalidates `queryKeys.companies(orgId)`
+// on any `companies` row change and `["contacts"]`/`["companies"]` on any
+// `company_contacts` row change.
 //
 // Live schema (confirmed via a direct check, not assumed from any prior
 // type): companies has id, org_id, name, industry, website, phone, email,
@@ -19,8 +40,11 @@
 // owner UUID column exists), tags (real text[]), created_by, created_at,
 // updated_at, slug. No archive/soft-delete column exists.
 
-import { useEffect, useSyncExternalStore } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
+import { getQueryClient } from "@/lib/query-client";
+import { useOrgId } from "@/lib/org-id";
+import { queryKeys } from "@/lib/query-keys";
 
 export async function getOrgId(): Promise<string | null> {
   const { data: { user } } = await supabase.auth.getUser();
@@ -143,16 +167,15 @@ export async function createUniqueCompanySlug(
   }
 }
 
-// ── Reactive store ──────────────────────────────────────────────────────
-let companies: Company[] = [];
-let loaded = false;
-const listeners = new Set<() => void>();
-function emit() { for (const l of listeners) l(); }
+// ── Shared Query state (S5A) ────────────────────────────────────────────
 
-export async function fetchCompanies(): Promise<void> {
-  const orgId = await getOrgId();
-  if (!orgId) return;
-
+/**
+ * The Companies list queryFn — org-scoped, ordered by name, same
+ * `select("*")` + `mapRow` normalisation the pre-S5A singleton used.
+ * Self-contained (no React, no other query's cache) so it is safe to run
+ * from `useQuery` or an imperative `refetchQueries`.
+ */
+export async function fetchCompaniesForOrg(orgId: string): Promise<Company[]> {
   const { data, error } = await supabase
     .from("companies")
     .select("*")
@@ -161,35 +184,79 @@ export async function fetchCompanies(): Promise<void> {
 
   if (error) {
     console.error("[companies-store] fetch failed:", error);
-    return;
+    throw error;
   }
-
-  companies = (data ?? []).map(mapRow);
-  loaded = true;
-  emit();
+  return (data ?? []).map(mapRow);
 }
 
-fetchCompanies();
+const qc = () => getQueryClient();
+
+/** Read the currently-cached Companies list (any org key — normally exactly one). Read-only. */
+function getCachedCompanies(): Company[] {
+  for (const [, data] of qc().getQueriesData<Company[]>({ queryKey: ["companies"] })) {
+    if (Array.isArray(data)) return data;
+  }
+  return [];
+}
+
+/** Reflect a CONFIRMED change into the cached Companies list(s) — only ever called AFTER a successful DB write (persist-first), never speculatively. */
+function patchCompaniesCache(fn: (list: Company[]) => Company[]) {
+  qc().setQueriesData<Company[]>({ queryKey: ["companies"] }, (old) => (Array.isArray(old) ? fn(old) : old));
+}
+
+function invalidateCompanies() {
+  void qc().invalidateQueries({ queryKey: ["companies"] });
+}
+
+/**
+ * A company RENAME (or any field the sales bundle denormalises) also
+ * affects deals-store: `fetchSalesDataForOrg` snapshots `company.name` onto
+ * each deal as `companyName` at fetch time, so a stale `["deals"]` would
+ * keep showing the old account name until refetched. Every OTHER surface
+ * that shows an account name (Accounts list, Contacts list, Estimates,
+ * Projects, entity pickers) reads `useCompanies()` live and needs no extra
+ * invalidation. Command Center does not use Company/Account data at all.
+ */
+function invalidateCompaniesAndDeals() {
+  void qc().invalidateQueries({ queryKey: ["companies"] });
+  void qc().invalidateQueries({ queryKey: ["deals"] });
+}
+
+/**
+ * `fetchCompanies()` kept for API compatibility (NewVendorModal calls it to
+ * make sure the list is warm) — now just refetches the shared query.
+ */
+export async function fetchCompanies(): Promise<void> {
+  await qc().refetchQueries({ queryKey: ["companies"] });
+}
+
+function useCompaniesQuery() {
+  const orgId = useOrgId();
+  return useQuery({
+    queryKey: orgId ? queryKeys.companies(orgId) : ["companies", "_pending"],
+    queryFn: () => fetchCompaniesForOrg(orgId as string),
+    enabled: !!orgId,
+    // Companies change infrequently — mutation invalidation + realtime +
+    // focus-refetch are the primary freshness path; staleTime just caps
+    // redundant refetches on remount/focus churn.
+    staleTime: 90_000,
+  });
+}
 
 export function useCompanies(): Company[] {
-  useEffect(() => { if (!loaded) void fetchCompanies(); }, []);
-  return useSyncExternalStore(
-    (cb) => { listeners.add(cb); return () => listeners.delete(cb); },
-    () => companies,
-    () => [],
-  );
+  return useCompaniesQuery().data ?? [];
 }
 
 export function useCompaniesLoading(): boolean {
-  return !loaded;
+  return useCompaniesQuery().isLoading;
 }
 
 export function getCompanyById(id: string): Company | undefined {
-  return companies.find((c) => c.id === id);
+  return getCachedCompanies().find((c) => c.id === id);
 }
 
 export function getCompanyBySlug(slug: string): Company | undefined {
-  return companies.find((c) => c.slug === slug);
+  return getCachedCompanies().find((c) => c.slug === slug);
 }
 
 /**
@@ -218,11 +285,14 @@ export async function fetchCompanyBySlug(slug: string): Promise<Company | null> 
   return mapped;
 }
 
-/** Reflects a canonical row into the reactive store without a refetch. */
+/** Reflects a canonical row into the shared Query cache without a refetch. */
 export function upsertCompanyLocal(company: Company): void {
-  const idx = companies.findIndex((c) => c.id === company.id);
-  companies = idx >= 0 ? companies.map((c, i) => (i === idx ? company : c)) : [...companies, company].sort((a, b) => a.name.localeCompare(b.name));
-  emit();
+  patchCompaniesCache((list) => {
+    const idx = list.findIndex((c) => c.id === company.id);
+    return idx >= 0
+      ? list.map((c, i) => (i === idx ? company : c))
+      : [...list, company].sort((a, b) => a.name.localeCompare(b.name));
+  });
 }
 
 export type NewCompanyInput = Partial<Omit<Company, "id" | "org_id" | "slug" | "created_at" | "updated_at" | "created_by">> & { name: string };
@@ -264,6 +334,10 @@ export async function addCompany(input: NewCompanyInput): Promise<Company | null
 
   const mapped = mapRow(data);
   upsertCompanyLocal(mapped);
+  // A brand-new account has no associations yet — only the Accounts list
+  // needs to know. (Kept as an explicit invalidate on top of the cache
+  // patch so a second tab / the realtime bridge race resolves consistently.)
+  invalidateCompanies();
   return mapped;
 }
 
@@ -297,6 +371,9 @@ export async function updateCompany(id: string, patch: Partial<Company>): Promis
 
   const mapped = mapRow(data);
   upsertCompanyLocal(mapped);
+  // Rename/website/etc. can change the account name deals-store snapshots
+  // onto each deal — refresh both. See invalidateCompaniesAndDeals().
+  invalidateCompaniesAndDeals();
   return mapped;
 }
 
@@ -500,13 +577,18 @@ export async function deleteCompany(id: string): Promise<DeleteCompanyResult> {
     return { ok: false, error: "Failed to delete this account. Please try again." };
   }
 
-  companies = companies.filter((c) => c.id !== id);
-  emit();
+  patchCompaniesCache((list) => list.filter((c) => c.id !== id));
+  void qc().invalidateQueries({ queryKey: ["companies"] });
+  // The company_contacts rows just removed above changed which contacts
+  // resolve an account; deals that referenced this company are unblocked
+  // only when there are none (so this is defensive, not load-bearing).
+  void qc().invalidateQueries({ queryKey: ["contacts"] });
+  void qc().invalidateQueries({ queryKey: ["deals"] });
   return { ok: true };
 }
 
 export async function refreshCompanies(): Promise<void> {
-  await fetchCompanies();
+  await qc().refetchQueries({ queryKey: ["companies"] });
 }
 
 /**
@@ -541,7 +623,7 @@ export function findCompanyDuplicateCandidates(
   const candidates: CompanyDuplicateCandidate[] = [];
   const seen = new Set<string>();
 
-  for (const c of companies) {
+  for (const c of getCachedCompanies()) {
     if (excludeCompanyId && c.id === excludeCompanyId) continue;
     if (normalizedName && normalizeCompanyName(c.name) === normalizedName && !seen.has(c.id)) {
       seen.add(c.id);

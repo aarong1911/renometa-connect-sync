@@ -99,6 +99,31 @@
 //                     appointment sub-queries, not by useAppointments()).
 // Same DELETE-filter caveat as everything above.
 //
+// S5A (Companies / Accounts migration) adds `companies` INSERT/UPDATE/
+// DELETE and `company_contacts` INSERT/UPDATE/DELETE. `useCompanies()` is
+// now TanStack Query-backed (companies-store.ts's `queryKeys.companies
+// (orgId)` list). Fan-out:
+//   companies.*        -> companies, deals (deals-store snapshots
+//                         `company.name` onto each deal as `companyName`
+//                         at fetch time, so a rename must refetch the
+//                         sales bundle; every other account-name surface
+//                         reads useCompanies() live). Command Center does
+//                         NOT use company data, so dashboard.summary is
+//                         deliberately NOT invalidated here.
+//   company_contacts.* -> contacts (the Contacts list / Accounts list
+//                         contact-count derive the account link from
+//                         contacts.company_id, but a company_contacts-only
+//                         link — e.g. convert_lead_to_deal — should still
+//                         nudge the contact surfaces), companies (any
+//                         association-derived count on the Accounts list).
+// The account DETAIL route (accounts_.$accountSlug.tsx) keeps its existing
+// instance-local load-by-slug model and its own contact/notes/activities
+// state — it is not driven by these queries, so a cross-tab edit refreshes
+// the Accounts LIST and every useCompanies() consumer, not that one
+// page's local copy (unchanged from before S5A; documented boundary).
+// Same DELETE-filter caveat as everything above (companies/company_contacts
+// DELETE events carry only the PK; the org_id filter is omitted on DELETE).
+//
 // Never logs row payloads (message bodies, contact PII) — every handler
 // below only ever logs the table name and event type, both safe.
 
@@ -172,6 +197,22 @@ export function RealtimeBridge(): null {
       // sparkline / Next Booking sub-queries.
       queryClient.invalidateQueries({ queryKey: queryKeys.appointments(orgId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.summary(orgId) });
+    };
+    const invalidateCompanies = () => {
+      // S5A: Companies/Accounts is Query-backed (companies-store.ts).
+      // Refresh the shared list + the sales bundle that snapshots the
+      // account name onto each deal. NOT dashboard — Command Center has no
+      // company/account data.
+      queryClient.invalidateQueries({ queryKey: queryKeys.companies(orgId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.deals(orgId) });
+    };
+    const invalidateCompanyContacts = () => {
+      // S5A: a Contact<->Account association change. The Query-backed
+      // surfaces resolve the account link from contacts.company_id, but a
+      // company_contacts-only write (convert_lead_to_deal, "link existing
+      // contact") should still nudge the contact + account lists.
+      queryClient.invalidateQueries({ queryKey: queryKeys.contacts(orgId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.companies(orgId) });
     };
     const invalidatePipelinePulse = () => {
       // Prefix match (no `period` argument) — invalidates every cached
@@ -295,6 +336,36 @@ export function RealtimeBridge(): null {
         "postgres_changes",
         { event: "DELETE", schema: "public", table: "appointments" },
         () => invalidateAppointments(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "companies", filter: `org_id=eq.${orgId}` },
+        () => invalidateCompanies(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "companies", filter: `org_id=eq.${orgId}` },
+        () => invalidateCompanies(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "companies" },
+        () => invalidateCompanies(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "company_contacts", filter: `org_id=eq.${orgId}` },
+        () => invalidateCompanyContacts(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "company_contacts", filter: `org_id=eq.${orgId}` },
+        () => invalidateCompanyContacts(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "company_contacts" },
+        () => invalidateCompanyContacts(),
       )
       .subscribe();
 
