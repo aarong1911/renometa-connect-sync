@@ -65,6 +65,18 @@ export const queryKeys = {
   companyNotes: (orgId: string, companyId: string) => ["companyNotes", orgId, companyId] as const,
   companyActivities: (orgId: string, companyId: string) => ["companyActivities", orgId, companyId] as const,
 
+  // Platform State Sync Phase S5C — Files (public.project_files metadata,
+  // despite the table name this is the whole org's document library, not
+  // just per-project attachments — project_id is nullable ("Workspace"
+  // files)). ONE key per org: files-store.ts's `useFiles()` is the single
+  // caller of this domain — there is no per-entity file panel anywhere in
+  // the app today (Project Photos uses the same table but its own
+  // separate, already-working module — project-photos.ts — deliberately
+  // left alone, see the S5C report), so a targeted filesForEntity(...) key
+  // would be speculative. Client-side filter/search/sort over this one
+  // list, same as before.
+  files: (orgId: string) => ["files", orgId] as const,
+
   // Platform State Sync Phase S4A — Deals / Pipeline. ONE key per org whose
   // Query payload is the co-loaded bundle `{ deals, pipelines, stages }`
   // (deals-store.ts): a Deal can't be mapped without its stage, and every

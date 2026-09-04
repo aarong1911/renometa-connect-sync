@@ -162,15 +162,19 @@ function FilesPage() {
     };
   }, [files]);
 
-  const onFiles = (list: FileList | null, projectId?: string) => {
-    if (!list) return;
-    let added = 0;
-    Array.from(list).forEach((f) => {
-      const url = URL.createObjectURL(f);
-      addFile({ name: f.name, size: f.size, projectId, url });
-      added += 1;
-    });
-    if (added) toast.success(`${added} file${added > 1 ? "s" : ""} uploaded`);
+  // S5C.1 — real Storage upload, awaited per file, honestly reported.
+  // Previously this fired addFile() without awaiting it and always showed
+  // a success toast regardless of outcome, which is how a silently-
+  // failing (or, before S5C.1, not-really-uploading) file could show
+  // "uploaded" and then never appear.
+  const onFiles = async (list: FileList | null, projectId?: string) => {
+    if (!list || list.length === 0) return;
+    const results = await Promise.all(Array.from(list).map((f) => addFile({ file: f, projectId })));
+    const succeeded = results.filter((r) => r.ok).length;
+    if (succeeded > 0) toast.success(`${succeeded} file${succeeded > 1 ? "s" : ""} uploaded`);
+    for (const r of results) {
+      if (!r.ok) toast.error(r.error);
+    }
   };
 
   const openFile = (f: FileRecord) => navigate({ search: { fileId: f.id }, replace: true });
@@ -197,7 +201,7 @@ function FilesPage() {
               type="file"
               multiple
               hidden
-              onChange={(e) => { onFiles(e.target.files); e.target.value = ""; }}
+              onChange={(e) => { void onFiles(e.target.files); e.target.value = ""; }}
             />
             <Button variant="outline" size="sm">
               <FolderInput className="mr-1.5 h-4 w-4" />
@@ -295,7 +299,7 @@ function FilesPage() {
             onDragOver={(e) => { e.preventDefault(); }}
             onDrop={(e) => {
               e.preventDefault();
-              onFiles(e.dataTransfer.files);
+              void onFiles(e.dataTransfer.files);
             }}
           >
             <Table>
@@ -438,7 +442,13 @@ function FileRowMenu({ file }: { file: FileRecord }) {
         <DropdownMenuSeparator />
         <DropdownMenuItem
           className="text-destructive focus:text-destructive"
-          onClick={() => { deleteFile(file.id); toast.success("File deleted"); }}
+          onClick={() => {
+            void (async () => {
+              const result = await deleteFile(file.id);
+              if (result.ok) toast.success("File deleted");
+              else toast.error(result.error);
+            })();
+          }}
         >
           <Trash2 className="mr-2 h-4 w-4" /> Delete
         </DropdownMenuItem>
@@ -581,7 +591,13 @@ function FileDrawer({ file, onOpenChange }: { file: FileRecord | null; onOpenCha
               size="sm"
               variant="ghost"
               className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-              onClick={() => { deleteFile(file.id); toast.success("File deleted"); onOpenChange(false); }}
+              onClick={() => {
+                void (async () => {
+                  const result = await deleteFile(file.id);
+                  if (result.ok) { toast.success("File deleted"); onOpenChange(false); }
+                  else toast.error(result.error);
+                })();
+              }}
             >
               <Trash2 className="mr-1.5 h-3.5 w-3.5" /> Delete
             </Button>

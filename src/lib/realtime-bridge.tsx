@@ -134,6 +134,19 @@
 // table. `company_notes`/`company_activities` are new subscriptions.
 // Same DELETE-filter caveat as everything above.
 //
+// S5C (Files migration) adds `project_files` INSERT/UPDATE/DELETE.
+// files-store.ts's useFiles() is now TanStack Query-backed
+// (queryKeys.files(orgId)), the single caller across the app (no
+// entity-specific file panels exist today), so a file uploaded/renamed/
+// moved/deleted from a second tab must invalidate it here. No denormalized
+// file count exists on any other row (Contact/Project/Deal/Company/
+// dashboard) — confirmed by search — so this fans out to nothing else.
+// project-photos.ts (Project detail Photos tab) reads this same table
+// through its own separate, non-Query module — out of S5C scope — but a
+// photo INSERT/UPDATE/DELETE still correctly refreshes the Files page's
+// list via this same handler (it's a real project_files row either way).
+// Same DELETE-filter caveat as everything above.
+//
 // Never logs row payloads (message bodies, contact PII) — every handler
 // below only ever logs the table name and event type, both safe.
 
@@ -235,6 +248,11 @@ export function RealtimeBridge(): null {
     const invalidateCompanyActivities = () => {
       // S5B: Account detail Activity feed.
       queryClient.invalidateQueries({ queryKey: ["companyActivities", orgId] });
+    };
+    const invalidateFiles = () => {
+      // S5C: Files is Query-backed (files-store.ts). No denormalized file
+      // count exists anywhere else, so this refreshes only the Files list.
+      queryClient.invalidateQueries({ queryKey: queryKeys.files(orgId) });
     };
     const invalidatePipelinePulse = () => {
       // Prefix match (no `period` argument) — invalidates every cached
@@ -418,6 +436,21 @@ export function RealtimeBridge(): null {
         "postgres_changes",
         { event: "DELETE", schema: "public", table: "company_activities" },
         () => invalidateCompanyActivities(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "project_files", filter: `org_id=eq.${orgId}` },
+        () => invalidateFiles(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "project_files", filter: `org_id=eq.${orgId}` },
+        () => invalidateFiles(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "project_files" },
+        () => invalidateFiles(),
       )
       .subscribe();
 
