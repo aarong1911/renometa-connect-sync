@@ -70,8 +70,14 @@ import { Textarea } from "@/components/ui/textarea";
 import { supabase } from "@/lib/supabase";
 import { cn } from "@/lib/utils";
 import { formatMoney, formatDateShort } from "@/lib/format";
-import { fetchCompanyBySlug, updateCompany, findCompanyDuplicateCandidates, type CompanyDuplicateCandidate } from "@/lib/companies-store";
+import { fetchCompanyBySlug, updateCompany, useCompanies, findCompanyDuplicateCandidates, type CompanyDuplicateCandidate } from "@/lib/companies-store";
 import { useDeals } from "@/lib/deals-store";
+import { useContacts, refreshContacts } from "@/lib/contacts-store";
+import { useProjects } from "@/lib/projects-store";
+import {
+  useCompanyContacts, useCompanyNotes, useCompanyActivities,
+  invalidateCompanyContacts, invalidateCompanyNotes, invalidateCompanyActivities,
+} from "@/lib/company-relations";
 
 export const Route = createFileRoute("/accounts_/$accountSlug")({
   component: AccountDetailsPage,
@@ -284,11 +290,7 @@ function AccountDetailsPage() {
   const { accountSlug } = Route.useParams();
   const navigate = useNavigate();
   const [company, setCompany] = useState<Company | null>(null);
-  const [contacts, setContacts] = useState<LinkedContact[]>([]);
-  const [contactOptions, setContactOptions] = useState<ContactOption[]>([]);
-  const [notes, setNotes] = useState<CompanyNote[]>([]);
-  const [activities, setActivities] = useState<CompanyActivity[]>([]);
-  const [projects, setProjects] = useState<RelatedProject[]>([]);
+  const [orgId, setOrgId] = useState<string | null>(null);
   const [estimates, setEstimates] = useState<RelatedEstimate[]>([]);
   const [invoices, setInvoices] = useState<RelatedInvoice[]>([]);
   const [dealActivities, setDealActivities] = useState<DealActivityRow[]>([]);
@@ -302,21 +304,28 @@ function AccountDetailsPage() {
   const [newDealOpen, setNewDealOpen] = useState(false);
   const [editingNote, setEditingNote] = useState<CompanyNote | null>(null);
 
+  // S5B — identity resolution ONLY. Contacts/notes/activities are now
+  // Query-backed (company-relations.ts) and refresh themselves; this no
+  // longer runs the 10-query cascade the pre-S5B version did on every
+  // contact/note mutation.
   const loadAccount = useCallback(async () => {
     setLoading(true);
     setNotFound(false);
 
-    const orgId = await getOrgId();
-    if (!orgId) {
+    const resolvedOrgId = await getOrgId();
+    if (!resolvedOrgId) {
       toast.error("Could not determine your workspace.");
       setLoading(false);
       return;
     }
+    setOrgId(resolvedOrgId);
 
     // Phase 9.4 — routed through the canonical companies-store's slug
     // lookup (org-scoped, same query this page always ran) so a successful
-    // load also populates the shared reactive cache other pages read from,
-    // instead of this page silently keeping its own separate copy.
+        // load also populates the shared reactive cache other pages read from,
+    // instead of this page silently keeping its own separate copy. Kept as
+    // the authoritative deep-link path (Part 4/19) — it cannot wait for
+    // the shared companies list to be populated first.
     const loadedCompanyFromStore = await fetchCompanyBySlug(accountSlug);
 
     if (!loadedCompanyFromStore) {
@@ -325,99 +334,83 @@ function AccountDetailsPage() {
       return;
     }
 
-    const loadedCompany = loadedCompanyFromStore as unknown as Company;
-    const resolvedCompanyId = loadedCompany.id;
-
-    setCompany(loadedCompany);
-
-    const [contactsResult, optionsResult, notesResult, activitiesResult] = await Promise.all([
-      supabase
-        .from("company_contacts")
-        .select(
-          "id, contact_id, relationship_title, is_primary, contact:contacts(id, full_name, email, phone, avatar_url, avatar_key)",
-        )
-        .eq("company_id", resolvedCompanyId)
-        .eq("org_id", orgId)
-        .order("is_primary", { ascending: false }),
-      supabase
-        .from("contacts")
-        .select("id, full_name, email, phone, avatar_url, avatar_key")
-        .eq("org_id", orgId)
-        .order("full_name"),
-      supabase
-        .from("company_notes")
-        .select("*")
-        .eq("company_id", resolvedCompanyId)
-        .eq("org_id", orgId)
-        .order("is_pinned", { ascending: false })
-        .order("created_at", { ascending: false })
-        .limit(50),
-      supabase
-        .from("company_activities")
-        .select("*")
-        .eq("company_id", resolvedCompanyId)
-        .eq("org_id", orgId)
-        .order("occurred_at", { ascending: false, nullsFirst: false })
-        .limit(50),
-    ]);
-
-    if (!contactsResult.error)
-      setContacts((contactsResult.data ?? []) as unknown as LinkedContact[]);
-    if (!optionsResult.error) setContactOptions((optionsResult.data ?? []) as ContactOption[]);
-    if (!notesResult.error) setNotes((notesResult.data ?? []) as CompanyNote[]);
-    if (!activitiesResult.error) setActivities((activitiesResult.data ?? []) as CompanyActivity[]);
-
-    // Projects/Estimates/Invoices (Priority 6/7) — resolved via the direct
-    // contacts.company_id link (not company_contacts, and not free-text
-    // name matching). Also real deal_activities for this company's deals
-    // (deals.company_id is a real direct FK), merged into Activity below.
-    const [{ data: directContacts }, { data: companyDeals }] = await Promise.all([
-      supabase.from("contacts").select("id").eq("org_id", orgId).eq("company_id", resolvedCompanyId),
-      supabase.from("deals").select("id").eq("org_id", orgId).eq("company_id", resolvedCompanyId),
-    ]);
-    const directContactIds = (directContacts ?? []).map((c: any) => c.id as string);
-    const dealIds = (companyDeals ?? []).map((d: any) => d.id as string);
-
-    const [projectsResult, estimatesResult, invoicesResult, dealActivityResult] = await Promise.all([
-      directContactIds.length > 0
-        ? supabase.from("projects").select("id, name, status, completion_percentage").eq("org_id", orgId).in("client_id", directContactIds).order("created_at", { ascending: false })
-        : Promise.resolve({ data: [], error: null } as any),
-      directContactIds.length > 0
-        ? supabase.from("estimates").select("id, title, number, status, total, valid_until, created_at").eq("org_id", orgId).in("client_id", directContactIds).order("created_at", { ascending: false })
-        : Promise.resolve({ data: [], error: null } as any),
-      directContactIds.length > 0
-        ? supabase.from("invoices").select("id, invoice_number, status, total_amount, amount_paid, due_date").eq("org_id", orgId).in("client_id", directContactIds).order("issue_date", { ascending: false })
-        : Promise.resolve({ data: [], error: null } as any),
-      dealIds.length > 0
-        ? supabase.from("deal_activities").select("id, deal_id, activity_type, title, description, actor_name, occurred_at").eq("org_id", orgId).in("deal_id", dealIds).order("occurred_at", { ascending: false }).limit(50)
-        : Promise.resolve({ data: [], error: null } as any),
-    ]);
-
-    if (!projectsResult.error) setProjects((projectsResult.data ?? []) as RelatedProject[]);
-    if (!estimatesResult.error) setEstimates((estimatesResult.data ?? []) as RelatedEstimate[]);
-    if (!invoicesResult.error) setInvoices((invoicesResult.data ?? []) as RelatedInvoice[]);
-    if (!dealActivityResult.error) setDealActivities((dealActivityResult.data ?? []) as DealActivityRow[]);
-
-    // Appointment activities for this account (Phase 10.3 correction pass)
-    // — appointments.entity_type='company', entity_id=resolvedCompanyId.
-    // Bounded (limit 20) and org+entity-scoped, never an unbounded
-    // organization-wide appointment_activities scan.
-    const { data: apptActivityRows, error: apptActivityError } = await supabase
-      .from("appointment_activities")
-      .select("id, activity_type, actor_id, created_at, appointments!inner(title, service, contact_name, entity_type, entity_id, org_id)")
-      .eq("org_id", orgId)
-      .eq("appointments.entity_type", "company")
-      .eq("appointments.entity_id", resolvedCompanyId)
-      .order("created_at", { ascending: false })
-      .limit(20);
-    if (!apptActivityError) setAppointmentActivities((apptActivityRows ?? []) as unknown as AppointmentActivityRow[]);
-
+    setCompany(loadedCompanyFromStore as unknown as Company);
     setLoading(false);
   }, [accountSlug]);
 
   useEffect(() => {
     void loadAccount();
   }, [loadAccount]);
+
+  // S5B — keeps the header/detail fields in sync with the shared companies
+  // Query cache after the initial slug resolution above: a rename from
+  // this page's own Edit dialog (which writes through updateCompany(), see
+  // companies-store.ts) or from another tab both land here with no manual
+  // refresh — same "reconcile an open item against the live shared list"
+  // pattern Calendar's Task/Project drawers use (S4C/S4D). Compares
+  // updated_at (not object identity — a fresh query result is a new array/
+  // object every fetch even when nothing changed) and only reconciles once
+  // the shared list has actually loaded, so it never races the identity
+  // fetch above into a false "not found" while the list is still empty.
+  const allCompanies = useCompanies();
+  useEffect(() => {
+    if (!company || allCompanies.length === 0) return;
+    const fresh = allCompanies.find((c) => c.id === company.id);
+    if (fresh && fresh.updated_at !== company.updated_at) {
+      setCompany(fresh as unknown as Company);
+    }
+  }, [allCompanies, company]);
+
+  // Full org Contact list (contacts-store.ts, already shared/Query-backed)
+  // — used both as the "link existing contact" picker options (replacing
+  // the page's own duplicate `contacts` select) and to resolve display
+  // fields for the company_contacts association rows below, so Contact
+  // identity stays canonical in exactly one cache (Part 6).
+  const allContacts = useContacts();
+  const contactsById = useMemo(() => new Map(allContacts.map((c) => [c.id, c])), [allContacts]);
+  const contactOptions = useMemo<ContactOption[]>(
+    () => allContacts.map((c) => ({
+      id: c.id, full_name: c.name, email: c.email || null, phone: c.phone || null,
+      avatar_url: c.avatar_url, avatar_key: c.avatar_key,
+    })),
+    [allContacts],
+  );
+  // The canonical direct-affiliation link (contacts.company_id) — used for
+  // the contact-mediated Projects/Estimates/Invoices below, same ID-based
+  // resolution as before (never free-text name matching).
+  const directContactIds = useMemo(
+    () => (company ? allContacts.filter((c) => c.company_id === company.id).map((c) => c.id) : []),
+    [allContacts, company],
+  );
+
+  // S5B — company_contacts association rows, Query-backed
+  // (queryKeys.companyContacts). Bare association data only (no duplicated
+  // Contact rows) — joined against the shared Contacts list above to build
+  // the exact same LinkedContact[] shape the page always rendered.
+  const { data: companyContactRows = [] } = useCompanyContacts(orgId, company?.id);
+  const contacts = useMemo<LinkedContact[]>(
+    () => companyContactRows.map((row) => {
+      const c = contactsById.get(row.contactId);
+      return {
+        id: row.id,
+        contact_id: row.contactId,
+        relationship_title: row.relationshipTitle,
+        is_primary: row.isPrimary,
+        contact: c
+          ? { id: c.id, full_name: c.name, email: c.email || null, phone: c.phone || null, avatar_url: c.avatar_url, avatar_key: c.avatar_key }
+          : null,
+      };
+    }),
+    [companyContactRows, contactsById],
+  );
+
+  // S5B — company_notes / company_activities, Query-backed. Structurally
+  // identical row shape to this route's own CompanyNote/CompanyActivity
+  // types (see company-relations.ts), so every downstream render site
+  // (noteText(), ActivityList, NotesTab, mergedActivity below) needed zero
+  // changes.
+  const notes: CompanyNote[] = useCompanyNotes(orgId, company?.id).data ?? [];
+  const activities: CompanyActivity[] = useCompanyActivities(orgId, company?.id).data ?? [];
 
   const primaryContact = useMemo(
     () => contacts.find((item) => item.is_primary) ?? contacts[0] ?? null,
@@ -433,14 +426,78 @@ function AccountDetailsPage() {
   // derives status from the stage's own outcome column). Won/Lost never
   // count toward Open Opportunities or Pipeline Value.
   const allDeals = useDeals();
+  const companyDeals = useMemo(
+    () => allDeals.filter((d) => d.companyId === company?.id),
+    [allDeals, company?.id],
+  );
   const companyDealStats = useMemo(() => {
-    const companyDeals = allDeals.filter((d) => d.companyId === company?.id);
     const open = companyDeals.filter((d) => d.status === "open");
     return {
       openCount: open.length,
       openValue: open.reduce((sum, d) => sum + Number(d.value ?? 0), 0),
     };
-  }, [allDeals, company?.id]);
+  }, [companyDeals]);
+
+  // S5B — Projects panel now derives from the shared useProjects() list
+  // (Part 11) instead of a duplicate direct `projects` query. Same
+  // contact-mediated resolution (client_id in directContactIds), same
+  // shape, same order (the shared list is already server-ordered by
+  // created_at desc, and .filter() preserves relative order).
+  const { projects: allProjects } = useProjects();
+  const projects = useMemo<RelatedProject[]>(
+    () => allProjects
+      .filter((p) => directContactIds.includes(p.client_id))
+      .map((p) => ({ id: p.id, name: p.name, status: p.status, completion_percentage: p.completion_percentage })),
+    [allProjects, directContactIds],
+  );
+
+  // Estimates/Invoices (Financials-adjacent — out of S5A/S5B scope, left as
+  // direct reads, Part 12) + deal_activities/appointment_activities (no
+  // shared cache exists for either; targeted one-off reads, Part 2 class
+  // C) — same contact-mediated resolution as before, just now reactive to
+  // the shared Contacts/Deals lists instead of a fresh query per load.
+  useEffect(() => {
+    if (!company || !orgId) {
+      setEstimates([]);
+      setInvoices([]);
+      setDealActivities([]);
+      setAppointmentActivities([]);
+      return;
+    }
+    let cancelled = false;
+    const dealIds = companyDeals.map((d) => d.id);
+    (async () => {
+      const [estimatesResult, invoicesResult, dealActivityResult, apptActivityResult] = await Promise.all([
+        directContactIds.length > 0
+          ? supabase.from("estimates").select("id, title, number, status, total, valid_until, created_at").eq("org_id", orgId).in("client_id", directContactIds).order("created_at", { ascending: false })
+          : Promise.resolve({ data: [], error: null } as any),
+        directContactIds.length > 0
+          ? supabase.from("invoices").select("id, invoice_number, status, total_amount, amount_paid, due_date").eq("org_id", orgId).in("client_id", directContactIds).order("issue_date", { ascending: false })
+          : Promise.resolve({ data: [], error: null } as any),
+        dealIds.length > 0
+          ? supabase.from("deal_activities").select("id, deal_id, activity_type, title, description, actor_name, occurred_at").eq("org_id", orgId).in("deal_id", dealIds).order("occurred_at", { ascending: false }).limit(50)
+          : Promise.resolve({ data: [], error: null } as any),
+        // Appointment activities for this account (Phase 10.3 correction
+        // pass) — appointments.entity_type='company', entity_id=company.id.
+        // Bounded (limit 20) and org+entity-scoped, never an unbounded
+        // organization-wide appointment_activities scan.
+        supabase
+          .from("appointment_activities")
+          .select("id, activity_type, actor_id, created_at, appointments!inner(title, service, contact_name, entity_type, entity_id, org_id)")
+          .eq("org_id", orgId)
+          .eq("appointments.entity_type", "company")
+          .eq("appointments.entity_id", company.id)
+          .order("created_at", { ascending: false })
+          .limit(20),
+      ]);
+      if (cancelled) return;
+      if (!estimatesResult.error) setEstimates((estimatesResult.data ?? []) as RelatedEstimate[]);
+      if (!invoicesResult.error) setInvoices((invoicesResult.data ?? []) as RelatedInvoice[]);
+      if (!dealActivityResult.error) setDealActivities((dealActivityResult.data ?? []) as DealActivityRow[]);
+      if (!apptActivityResult.error) setAppointmentActivities((apptActivityResult.data ?? []) as unknown as AppointmentActivityRow[]);
+    })();
+    return () => { cancelled = true; };
+  }, [company, orgId, directContactIds, companyDeals]);
 
   // Active Projects — same "active" status set the Command Center's own
   // Active Projects KPI uses (src/routes/index.tsx), applied to this
@@ -563,7 +620,12 @@ function AccountDetailsPage() {
         .neq("company_id", company.id);
 
       toast.success(`${item.contact?.full_name ?? "Contact"} is now the primary contact.`);
-      await loadAccount();
+      // S5B — targeted refresh (Part 7/15): the relationship rows changed
+      // (companyContacts) and, whenever the affiliation moved, the
+      // Contact's own company_id (contacts) — never the whole loadAccount
+      // cascade for a primary-contact change.
+      invalidateCompanyContacts(company.org_id, company.id);
+      await refreshContacts();
     } catch (error) {
       console.error("[make-primary]", error);
       toast.error("Could not update the primary contact.");
@@ -594,7 +656,9 @@ function AccountDetailsPage() {
         .eq("company_id", company.id);
 
       toast.success("Contact removed from this account.");
-      await loadAccount();
+      // S5B — targeted refresh (Part 7/15): same reasoning as makePrimary.
+      invalidateCompanyContacts(company.org_id, company.id);
+      await refreshContacts();
     } catch (error) {
       console.error("[unlink-contact]", error);
       toast.error("Could not remove the contact.");
@@ -610,7 +674,9 @@ function AccountDetailsPage() {
         .eq("id", note.id)
         .eq("org_id", company.org_id);
       if (error) throw error;
-      await loadAccount();
+      // S5B — targeted refresh (Part 9/15): pin/unpin only ever touches
+      // companyNotes, never activities.
+      invalidateCompanyNotes(company.org_id, company.id);
     } catch (error) {
       console.error("[pin-note]", error);
       toast.error("Could not update the note.");
@@ -627,7 +693,8 @@ function AccountDetailsPage() {
         .eq("org_id", company.org_id);
       if (error) throw error;
       toast.success("Note deleted.");
-      await loadAccount();
+      // S5B — targeted refresh (Part 9/15).
+      invalidateCompanyNotes(company.org_id, company.id);
     } catch (error) {
       console.error("[delete-note]", error);
       toast.error("Could not delete the note.");
@@ -888,7 +955,11 @@ function AccountDetailsPage() {
         options={contactOptions}
         linkedContactIds={contacts.map((item) => item.contact_id)}
         onClose={() => setContactOpen(false)}
-        onSaved={loadAccount}
+        // S5B — the dialog now invalidates companyContacts/contacts itself
+        // (Part 7/15) right after its own write succeeds; loadAccount() no
+        // longer fetches those arrays, so re-running it here would be a
+        // no-op refresh of data this dialog doesn't own.
+        onSaved={async () => {}}
       />
       <NoteDialog
         open={noteOpen}
@@ -898,7 +969,9 @@ function AccountDetailsPage() {
           setNoteOpen(false);
           setEditingNote(null);
         }}
-        onSaved={loadAccount}
+        // S5B — same reasoning: NoteDialog invalidates companyNotes (and
+        // companyActivities on create) itself (Part 9/15).
+        onSaved={async () => {}}
       />
     </div>
   );
@@ -1908,6 +1981,13 @@ function AddContactDialog({
         toast.success("Contact linked to account.");
       }
 
+      // S5B — targeted refresh (Part 7/15): this write always changes the
+      // company_contacts association, and may also change contacts.company_id
+      // (new contact, or an existing contact's direct affiliation moving) —
+      // refresh both, never the whole loadAccount cascade.
+      invalidateCompanyContacts(company.org_id, company.id);
+      await refreshContacts();
+
       onClose();
       await onSaved();
     } catch (error) {
@@ -2075,6 +2155,11 @@ function NoteDialog({
         });
       }
       toast.success(note ? "Note updated." : "Note added.");
+      // S5B — targeted refresh (Part 9/10/15): every save touches the
+      // note itself; only a CREATE also inserted a company_activities row
+      // above, so activities is only invalidated in that branch.
+      invalidateCompanyNotes(company.org_id, company.id);
+      if (!note) invalidateCompanyActivities(company.org_id, company.id);
       onClose();
       await onSaved();
     } catch (error) {

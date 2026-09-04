@@ -49,6 +49,22 @@ export const queryKeys = {
   // read now warms/patches this same cache.
   companies: (orgId: string) => ["companies", orgId] as const,
 
+  // Platform State Sync Phase S5B — Account detail relationship data. Each
+  // is scoped by (orgId, companyId) — one Account detail page's worth of
+  // data, not the whole org — so opening a different Account never shares
+  // a cache entry with another one, but the leading ["<name>", orgId]
+  // prefix still lets the realtime bridge invalidate "every open Account
+  // detail's notes/activities/contacts" in one call without knowing which
+  // companyId is currently on screen in any tab (TanStack's default prefix
+  // matching). Full Contact rows are deliberately NOT duplicated into
+  // companyContacts — it holds only the company_contacts association
+  // (relationship_title/is_primary); the route joins it against the
+  // already-shared `queryKeys.contacts(orgId)` list. See
+  // src/lib/company-relations.ts.
+  companyContacts: (orgId: string, companyId: string) => ["companyContacts", orgId, companyId] as const,
+  companyNotes: (orgId: string, companyId: string) => ["companyNotes", orgId, companyId] as const,
+  companyActivities: (orgId: string, companyId: string) => ["companyActivities", orgId, companyId] as const,
+
   // Platform State Sync Phase S4A — Deals / Pipeline. ONE key per org whose
   // Query payload is the co-loaded bundle `{ deals, pipelines, stages }`
   // (deals-store.ts): a Deal can't be mapped without its stage, and every

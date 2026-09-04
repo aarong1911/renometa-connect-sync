@@ -116,13 +116,23 @@
 //                         link — e.g. convert_lead_to_deal — should still
 //                         nudge the contact surfaces), companies (any
 //                         association-derived count on the Accounts list).
-// The account DETAIL route (accounts_.$accountSlug.tsx) keeps its existing
-// instance-local load-by-slug model and its own contact/notes/activities
-// state — it is not driven by these queries, so a cross-tab edit refreshes
-// the Accounts LIST and every useCompanies() consumer, not that one
-// page's local copy (unchanged from before S5A; documented boundary).
 // Same DELETE-filter caveat as everything above (companies/company_contacts
 // DELETE events carry only the PK; the org_id filter is omitted on DELETE).
+//
+// S5B (Account detail synchronization) promotes the account DETAIL route
+// (accounts_.$accountSlug.tsx) off its instance-local contact/notes/
+// activities `useState` arrays onto three more Query keys (company-
+// relations.ts): `companyContacts(orgId, companyId)`, `companyNotes(orgId,
+// companyId)`, `companyActivities(orgId, companyId)`. The bridge doesn't
+// know which companyId (if any) is open in a given tab, so these three
+// invalidate by the (org) PREFIX only — `["companyContacts", orgId]`
+// matches every companyId's cached query underneath it via TanStack's
+// default prefix matching, so whichever Account detail tab happens to be
+// open picks up the change. `company_contacts` already had S5A coverage
+// (-> contacts, companies) — this extends that same handler to ALSO cover
+// the new prefix rather than adding a second subscription to the same
+// table. `company_notes`/`company_activities` are new subscriptions.
+// Same DELETE-filter caveat as everything above.
 //
 // Never logs row payloads (message bodies, contact PII) — every handler
 // below only ever logs the table name and event type, both safe.
@@ -213,6 +223,18 @@ export function RealtimeBridge(): null {
       // contact") should still nudge the contact + account lists.
       queryClient.invalidateQueries({ queryKey: queryKeys.contacts(orgId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.companies(orgId) });
+      // S5B: also refresh whichever Account detail tab's relationship
+      // panel (if any) is showing this association — prefix match, see the
+      // header comment above.
+      queryClient.invalidateQueries({ queryKey: ["companyContacts", orgId] });
+    };
+    const invalidateCompanyNotes = () => {
+      // S5B: Account detail Notes tab.
+      queryClient.invalidateQueries({ queryKey: ["companyNotes", orgId] });
+    };
+    const invalidateCompanyActivities = () => {
+      // S5B: Account detail Activity feed.
+      queryClient.invalidateQueries({ queryKey: ["companyActivities", orgId] });
     };
     const invalidatePipelinePulse = () => {
       // Prefix match (no `period` argument) — invalidates every cached
@@ -366,6 +388,36 @@ export function RealtimeBridge(): null {
         "postgres_changes",
         { event: "DELETE", schema: "public", table: "company_contacts" },
         () => invalidateCompanyContacts(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "company_notes", filter: `org_id=eq.${orgId}` },
+        () => invalidateCompanyNotes(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "company_notes", filter: `org_id=eq.${orgId}` },
+        () => invalidateCompanyNotes(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "company_notes" },
+        () => invalidateCompanyNotes(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "company_activities", filter: `org_id=eq.${orgId}` },
+        () => invalidateCompanyActivities(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "company_activities", filter: `org_id=eq.${orgId}` },
+        () => invalidateCompanyActivities(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "company_activities" },
+        () => invalidateCompanyActivities(),
       )
       .subscribe();
 
