@@ -313,13 +313,16 @@ export async function runAgentManually(
   agentDefinitionId: string,
   triggerData: Record<string, any> = {},
 ): Promise<{ success: boolean; error?: string; runId?: string }> {
-  const orgId = state.orgId;
-  if (!orgId) return { success: false, error: "Not authenticated" };
+  // AI-1: the server resolves the execution org itself from this session
+  // token — orgId is no longer sent in the body at all (the client can no
+  // longer choose the execution organization, even by accident).
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session) return { success: false, error: "Not authenticated" };
 
   const res = await fetch("/.netlify/functions/run-agent", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ agentDefinitionId, orgId, triggerData: { ...triggerData, manual: true } }),
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+    body: JSON.stringify({ agentDefinitionId, triggerData: { ...triggerData, manual: true } }),
   });
   const data = await res.json();
   if (!res.ok) return { success: false, error: data.error ?? "Agent failed" };
@@ -344,16 +347,15 @@ export async function runTool(
   toolDefinitionId: string,
   input: Record<string, string>,
 ): Promise<{ output: string; sections: Record<string, string>; error?: string }> {
-  const orgId = state.orgId;
-  if (!orgId) return { output: "", sections: {}, error: "Not authenticated" };
-
-  const { data: { user } } = await supabase.auth.getUser();
-  const userId = user?.id;
+  // AI-1: orgId/userId are resolved server-side from this session token —
+  // neither is sent in the body anymore.
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session) return { output: "", sections: {}, error: "Not authenticated" };
 
   const res = await fetch("/.netlify/functions/run-tool", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ toolDefinitionId, orgId, userId, input }),
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+    body: JSON.stringify({ toolDefinitionId, input }),
   });
   const data = await res.json();
   if (!res.ok) return { output: "", sections: {}, error: data.error ?? "Tool failed" };

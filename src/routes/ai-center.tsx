@@ -317,7 +317,13 @@ function AgentsPage() {
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60" />
               <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-success" />
             </span>
-            {loading ? "…" : `${stats.active} agent${stats.active === 1 ? "" : "s"} live`}
+            {/* AI-H1.1 badge-audit fix — this counts agent_instances.is_enabled
+                (Autonomous Agents only, via useAICenterAgents()); it never
+                included Voice Agents or Agentic Beta. The unscoped "agent(s)
+                live" wording read as an AI-Center-wide claim while only ever
+                reflecting one subsystem — label it explicitly instead of
+                fabricating a real cross-system total. */}
+            {loading ? "…" : `${stats.active} autonomous agent${stats.active === 1 ? "" : "s"} live`}
           </span>
         }
       />

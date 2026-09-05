@@ -17,6 +17,7 @@ import type { Handler, HandlerEvent } from '@netlify/functions';
 import nodeCrypto from 'crypto';
 import { createClient } from '@supabase/supabase-js';
 import { runPostCallAutomation } from './lib/post-call-automation';
+import { runAppointmentPostBookingLifecycle } from './lib/appointment-post-booking';
 
 // ─────────────────────────────────────────────
 // Supabase client — service role bypasses RLS
@@ -604,13 +605,7 @@ function mapCallStatus(vapiStatus: string, endedReason?: string): string {
 // ─────────────────────────────────────────────
 // Signature verification
 // ─────────────────────────────────────────────
-function verifySignature(rawBody: string, signature: string): boolean {
-  const secret = process.env.VAPI_WEBHOOK_SECRET;
-  if (!secret) {
-    console.warn('[vapi-webhook] VAPI_WEBHOOK_SECRET not set — skipping');
-    return true;
-  }
-
+function verifySignature(rawBody: string, signature: string, secret: string): boolean {
   const expected = nodeCrypto.createHmac('sha256', secret).update(rawBody).digest('hex');
 
   try {
@@ -1157,6 +1152,48 @@ async function handleEndOfCallReport(
       transcript: artifact.messages ?? artifact.transcript ?? null,
       callerNumber: call.customer?.number ?? null,
     }).catch((err: unknown) => logError('post-call', 'automation failed', err));
+
+    // AI-H1.2 — this is the ONE place Voice bookings trigger the shared
+    // post-booking lifecycle (confirmation email + owner notification).
+    // It deliberately runs here, in the separate end-of-call-report
+    // invocation, never from the live book_appointment tool-call
+    // invocation — see the comment in finalizeBookedAppointmentInBackground.
+    // runAppointmentPostBookingLifecycle() is itself idempotent
+    // (appointments.metadata flags), so this is safe even if Vapi
+    // redelivers this event.
+    (async () => {
+      const { data: appt, error } = await supabase
+        .from('appointments')
+        .select('id')
+        .eq('voice_call_id', callRowId)
+        .eq('org_id', tenantId)
+        .maybeSingle();
+
+      if (error) {
+        logError('end-of-call-report', 'appointment lookup failed', { callRowId });
+        return;
+      }
+      if (!appt) return;
+
+      await runAppointmentPostBookingLifecycle(supabase, { appointmentId: appt.id, orgId: tenantId }).catch((err) => {
+        logError('post-booking', 'lifecycle failed', { appointmentId: appt.id, message: err instanceof Error ? err.message : String(err) });
+      });
+    })();
+
+    // AI-H1.3 cleanup — the confirmed-slot fallback state
+    // (voice_call_booking_state) is short-lived, live-call-only state; it
+    // has no purpose once the call has ended, whether or not a booking
+    // happened. Deleted after the lifecycle lookup above so it can never
+    // race with that lookup (which reads `appointments`, not this table,
+    // so order doesn't actually matter for correctness — kept last for
+    // clarity). A call that never sends end-of-call-report (crashed/
+    // dropped) leaves an orphaned row; these are a handful of small text
+    // columns per call and are not cleaned up on a schedule today — worth
+    // a periodic sweep later if this ever matters, not needed yet.
+    (async () => {
+      const { error } = await supabase.from('voice_call_booking_state').delete().eq('vapi_call_id', call.id);
+      if (error) logError('end-of-call-report', 'booking state cleanup failed', { vapiCallId: call.id });
+    })();
   }
 }
 
@@ -1178,10 +1215,10 @@ async function handleToolCalls(
     try {
       args = typeof fn.arguments === 'string' ? JSON.parse(fn.arguments) : fn.arguments;
     } catch {
-      logError('tool-calls', 'parse args failed', fn.arguments);
+      logError('tool-calls', 'parse args failed', { argsType: typeof fn.arguments });
     }
 
-    log('tool-calls', 'args', args);
+    log('tool-calls', 'args received', { keys: Object.keys(args) });
 
     let result = 'Action completed successfully.';
     let errorMsg: string | undefined;
@@ -1249,7 +1286,7 @@ async function dispatchTool(
     case 'book_appointment':
       return toolBookAppointment(args, tenantId, call);
     case 'check_availability':
-      return toolCheckAvailability(args, tenantId);
+      return toolCheckAvailability(args, tenantId, call);
     case 'get_service_info':
       return toolGetServiceInfo(args, tenantId);
     default:
@@ -1275,7 +1312,7 @@ async function toolSaveLead(
   const timeline = String(args.timeline ?? '');
   const notes = String(args.notes ?? '');
 
-  log('save_lead', `name=${name} phone=${phone}`);
+  log('save_lead', `hasName=${!!name} hasPhone=${!!phone}`);
 
   if (!name && !phone) {
     return 'I need at least a name or phone number to save your details.';
@@ -1347,11 +1384,142 @@ async function toolSaveLead(
 }
 
 // ─────────────────────────────────────────────
+// Voice booking fallback state (AI-H1.3)
+//
+// Defense-in-depth for book_appointment being invoked with missing
+// date/time despite a correct tool schema and system prompt — see
+// supabase/migrations/20260910_voice_call_booking_state.sql for the full
+// rationale. Never derived from transcript text — only from a genuinely
+// successful check_availability result for this exact live call.
+// ─────────────────────────────────────────────
+const CONFIRMED_SLOT_TTL_MS = 30 * 60 * 1000;
+
+type ConfirmedSlotState = {
+  vapi_call_id: string;
+  org_id: string;
+  checked_date: string;
+  checked_time: string;
+  checked_timezone: string;
+  availability_status: string;
+  checked_at: string;
+  appointment_id: string | null;
+  consumed_at: string | null;
+};
+
+async function persistConfirmedSlotState(params: {
+  vapiCallId: string;
+  orgId: string;
+  checkedDate: string;
+  checkedTime: string;
+  checkedTimezone: string;
+}): Promise<void> {
+  const { vapiCallId, orgId, checkedDate, checkedTime, checkedTimezone } = params;
+  const { error } = await supabase.from('voice_call_booking_state').upsert(
+    {
+      vapi_call_id: vapiCallId,
+      org_id: orgId,
+      checked_date: checkedDate,
+      checked_time: checkedTime,
+      checked_timezone: checkedTimezone,
+      availability_status: 'available',
+      checked_at: new Date().toISOString(),
+      // A later successful check_availability supersedes any earlier
+      // one for the same call — including one that was already booked,
+      // which should not normally happen but must never be treated as
+      // "still consumed" against a brand new confirmed slot.
+      appointment_id: null,
+      consumed_at: null,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'vapi_call_id' }
+  );
+
+  if (error) {
+    logError('check_availability', 'failed to persist confirmed slot state', { vapiCallId, orgId });
+    return;
+  }
+  log('check_availability', 'confirmed slot state persisted', { vapiCallId, orgId });
+}
+
+async function getConfirmedSlotState(vapiCallId: string, orgId: string): Promise<ConfirmedSlotState | null> {
+  const { data, error } = await supabase
+    .from('voice_call_booking_state')
+    .select('*')
+    .eq('vapi_call_id', vapiCallId)
+    .eq('org_id', orgId)
+    .maybeSingle();
+
+  if (error) {
+    logError('book_appointment', 'confirmed slot state lookup failed', { vapiCallId, orgId });
+    return null;
+  }
+  return (data as ConfirmedSlotState | null) ?? null;
+}
+
+function isConfirmedSlotUsable(state: ConfirmedSlotState | null): boolean {
+  if (!state) return false;
+  if (state.consumed_at) return false;
+  if (state.availability_status !== 'available') return false;
+  if (!state.checked_date || !state.checked_time) return false;
+  const ageMs = Date.now() - new Date(state.checked_at).getTime();
+  return ageMs >= 0 && ageMs <= CONFIRMED_SLOT_TTL_MS;
+}
+
+async function markConfirmedSlotConsumed(vapiCallId: string, orgId: string, appointmentId: string): Promise<void> {
+  const { error } = await supabase
+    .from('voice_call_booking_state')
+    .update({ appointment_id: appointmentId, consumed_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+    .eq('vapi_call_id', vapiCallId)
+    .eq('org_id', orgId);
+
+  if (error) logError('book_appointment', 'failed to mark confirmed slot consumed', { vapiCallId, orgId });
+}
+
+// Cheap re-check that a specific hour is still free — same query pattern
+// check_availability itself uses. Used to revalidate a slot immediately
+// before INSERT (fallback path, and any path using a slot that wasn't
+// just freshly checked in this exact tool call) so a slot taken by
+// another booking between check_availability and book_appointment isn't
+// silently double-booked. appointments has no DB-level uniqueness
+// constraint on (org_id, scheduled_at) today — this app-level recheck is
+// the only collision guard that exists for Voice bookings; a real
+// constraint would need its own migration across every appointment
+// creation path, not just this one, so it's out of scope here.
+async function isHourStillFree(tenantId: string, targetDate: Date, hour: number, timezone: string): Promise<boolean> {
+  const dayStart = new Date(targetDate);
+  const dayEnd = new Date(targetDate);
+  dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
+
+  const { data: booked, error } = await supabase
+    .from('appointments')
+    .select('scheduled_at')
+    .eq('org_id', tenantId)
+    .neq('status', 'cancelled')
+    .gte('scheduled_at', dayStart.toISOString())
+    .lt('scheduled_at', dayEnd.toISOString());
+
+  if (error) {
+    logError('book_appointment', 'revalidation query failed', { tenantId });
+    return true; // fail open on a query error — the INSERT itself is still the source of truth
+  }
+
+  const bookedHours = (booked ?? []).map(b => {
+    const d = new Date(b.scheduled_at as string);
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: timezone, hour: 'numeric', hour12: false }).formatToParts(d);
+    const h = parseInt(parts.find(p => p.type === 'hour')?.value ?? '0', 10);
+    return h === 24 ? 0 : h;
+  });
+
+  return !bookedHours.includes(hour);
+}
+
+// ─────────────────────────────────────────────
 // check_availability
 // ─────────────────────────────────────────────
 async function toolCheckAvailability(
   args: Record<string, unknown>,
-  tenantId: string
+  tenantId: string,
+  call: VapiCall
 ): Promise<string> {
   const dateInput = String(args.date ?? '');
   const timeInput = String(args.time ?? '');
@@ -1420,6 +1588,13 @@ async function toolCheckAvailability(
     const reqHour = requestedTime.hours;
 
     if (!bookedHours.includes(reqHour) && allSlots.includes(reqHour)) {
+      await persistConfirmedSlotState({
+        vapiCallId: call.id,
+        orgId: tenantId,
+        checkedDate: dateInput,
+        checkedTime: timeInput,
+        checkedTimezone: avTz,
+      });
       return `${formatHour(reqHour)} on ${dayLabel} is available. Shall I book that for you?`;
     }
 
@@ -1503,6 +1678,9 @@ async function finalizeBookedAppointmentInBackground(params: {
     wallClock,
     orgTimezone,
   } = params;
+
+  const finalizeStartedAt = Date.now();
+  log('book_appointment', 'finalize start', { apptId });
 
   try {
     if (contactId) {
@@ -1590,6 +1768,22 @@ async function finalizeBookedAppointmentInBackground(params: {
   } catch (err) {
     logError('book_appointment', 'background finalize failed', err);
   }
+
+  log('book_appointment', 'finalize (calendar/CRM) done', { apptId, durationMs: Date.now() - finalizeStartedAt });
+
+  // AI-H1.2 correction — the confirmation email / owner notification
+  // lifecycle (netlify/functions/lib/appointment-post-booking.ts) must
+  // NEVER be started from any code path reachable from a live Vapi
+  // tool-call invocation, not even fire-and-forget. Even a `void` call
+  // still starts real outbound SMTP work (a socket/timer) inside this
+  // invocation's execution context, and under local netlify dev / lambda
+  // emulation that observably delayed the tool response reaching Vapi.
+  // Voice bookings now get this lifecycle from a separate, later
+  // invocation instead: handleEndOfCallReport() below, once Vapi's
+  // end-of-call-report event arrives after the live call has already
+  // ended — see that function for the appointment lookup by
+  // voice_call_id. Manual/Calendar/Workflow creation paths still call
+  // runAppointmentPostBookingLifecycle() directly at creation time.
 }
 
 // ─────────────────────────────────────────────
@@ -1611,19 +1805,92 @@ async function toolBookAppointment(
   const timeline = String(args.timeline ?? '');
   const notes = String(args.notes ?? '');
 
-  log('book_appointment', `date="${dateStr}" time="${timeStr}" name="${name}" phone="${phone}"`);
+  const bookStartedAt = Date.now();
+  log('book_appointment', 'received', { hasDate: !!dateStr, hasTime: !!timeStr, hasName: !!name, hasPhone: !!phone });
 
-  if (!dateStr || !timeStr) {
-    return `To book the appointment I need both a day and a time. What day and time works best?`;
+  // Idempotency guard — a model retry (e.g. it thinks the first call
+  // failed, or the corrective fallback message below caused it to call
+  // book_appointment again) must never create a second appointment for
+  // the same live call. Checked before anything else, regardless of
+  // whether this invocation's args are complete or empty.
+  const existingState = await getConfirmedSlotState(call.id, tenantId);
+  if (existingState?.consumed_at && existingState.appointment_id) {
+    log('book_appointment', 'duplicate call — already booked', { callId: call.id, appointmentId: existingState.appointment_id });
+    const parsedTime = parseTime(existingState.checked_time);
+    const displayTime = parsedTime
+      ? `${parsedTime.hours > 12 ? parsedTime.hours - 12 : parsedTime.hours}:${String(parsedTime.minutes).padStart(2, '0')}${parsedTime.hours >= 12 ? 'pm' : 'am'}`
+      : existingState.checked_time;
+    const parsedDate = parseNaturalDate(existingState.checked_date);
+    const displayDate = parsedDate?.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' }) ?? existingState.checked_date;
+    return `You're already all set — I've already booked your appointment for ${displayDate} at ${displayTime}. No need to book again.`;
   }
 
-  const scheduled = buildScheduledAt(dateStr, timeStr);
+  let effectiveDateStr = dateStr;
+  let effectiveTimeStr = timeStr;
+  let usedFallback = false;
+
+  if (!effectiveDateStr || !effectiveTimeStr) {
+    const fallbackUsable = isConfirmedSlotUsable(existingState);
+    log('book_appointment', 'missing args — checking confirmed-slot fallback', {
+      callId: call.id,
+      fallbackStateFound: !!existingState,
+      fallbackUsable,
+    });
+
+    if (fallbackUsable && existingState) {
+      effectiveDateStr = existingState.checked_date;
+      effectiveTimeStr = existingState.checked_time;
+      usedFallback = true;
+      log('book_appointment', 'using confirmed-slot fallback', {
+        callId: call.id,
+        orgId: tenantId,
+        stateAgeMs: Date.now() - new Date(existingState.checked_at).getTime(),
+      });
+    } else {
+      // Model-actionable, not caller-facing — this is a corrective
+      // instruction fed back into the same conversation as a tool result,
+      // not text meant to be spoken verbatim. No usable fallback exists
+      // (no prior successful check_availability for this call, or it's
+      // stale/already consumed), so the model must supply real values —
+      // guessing from transcript text is never acceptable here.
+      const missing = [!effectiveDateStr && 'date', !effectiveTimeStr && 'time'].filter(Boolean).join(' and ');
+      log('book_appointment', `missing required args, no usable fallback: ${missing}`);
+      return `Booking was not completed because ${missing} ${missing.includes('and') ? 'were' : 'was'} missing from this tool call. If the caller has already confirmed a specific date and time earlier in this call, call book_appointment again immediately with those exact values — do not ask the caller again. Only ask the caller if they have not yet stated a date and time.`;
+    }
+  } else if (isConfirmedSlotUsable(existingState) && existingState) {
+    // Both args were provided directly — observability only, never blocks
+    // the happy path on a raw-string mismatch (e.g. "today" vs an actual
+    // weekday name would differ here despite meaning the same slot). The
+    // isHourStillFree() revalidation right before INSERT is the real
+    // safety net regardless of which path supplied date/time.
+    if (existingState.checked_date !== effectiveDateStr || existingState.checked_time !== effectiveTimeStr) {
+      log('book_appointment', 'provided args differ from last confirmed availability check', { callId: call.id });
+    }
+  }
+
+  const scheduled = buildScheduledAt(effectiveDateStr, effectiveTimeStr);
   if (!scheduled) {
     return `I couldn't understand that date or time. Could you say it like Tuesday at 10 AM?`;
   }
 
-  const { wallClock } = scheduled;
+  // Revalidate immediately before INSERT — protects against another
+  // booking taking the same slot between check_availability and
+  // book_appointment (or between an earlier check and a late/fallback
+  // booking). appointments has no DB-level uniqueness constraint on
+  // (org_id, scheduled_at), so this app-level recheck is the only
+  // collision guard in place for Voice bookings.
   const orgTimezone = await getOrgTimezone(tenantId);
+  const revalidateDate = parseNaturalDate(effectiveDateStr);
+  const revalidateHour = parseTime(effectiveTimeStr)?.hours;
+  if (revalidateDate && revalidateHour !== undefined) {
+    const stillFree = await isHourStillFree(tenantId, revalidateDate, revalidateHour, orgTimezone);
+    if (!stillFree) {
+      log('book_appointment', 'revalidation failed — slot no longer free', { callId: call.id, usedFallback });
+      return `That time was just booked by someone else. Please call check_availability again for a new time before booking.`;
+    }
+  }
+
+  const { wallClock } = scheduled;
   const tzOffset = getUTCOffsetString(new Date(wallClock + 'Z'), orgTimezone);
   const dbScheduledAt = new Date(wallClock + tzOffset).toISOString();
 
@@ -1641,6 +1908,9 @@ async function toolBookAppointment(
     timeline && `Timeline: ${timeline}`,
     notes && notes,
   ].filter(Boolean);
+
+  const insertStartedAt = Date.now();
+  log('book_appointment', 'insert start');
 
   const { data: apptData, error: apptErr } = await supabase
     .from('appointments')
@@ -1664,8 +1934,18 @@ async function toolBookAppointment(
     .single();
 
   if (apptErr) {
-    logError('book_appointment', 'insert failed', apptErr);
+    logError('book_appointment', 'insert failed', {
+      code: apptErr.code,
+      message: apptErr.message,
+      durationMs: Date.now() - insertStartedAt,
+    });
     return `I saved your details, but I had trouble confirming the appointment. Our team will call you shortly to finalize it.`;
+  }
+
+  log('book_appointment', 'insert success', { appointmentId: apptData?.id, durationMs: Date.now() - insertStartedAt, usedFallback });
+
+  if (apptData?.id) {
+    await markConfirmedSlotConsumed(call.id, tenantId, apptData.id);
   }
 
   void finalizeBookedAppointmentInBackground({
@@ -1685,20 +1965,22 @@ async function toolBookAppointment(
     orgTimezone,
   });
 
-  const parsedTime = parseTime(timeStr);
+  const parsedTime = parseTime(effectiveTimeStr);
   const displayTime = parsedTime
     ? `${parsedTime.hours > 12 ? parsedTime.hours - 12 : parsedTime.hours}:${String(
         parsedTime.minutes
       ).padStart(2, '0')}${parsedTime.hours >= 12 ? 'pm' : 'am'}`
-    : timeStr;
+    : effectiveTimeStr;
 
-  const parsedDate = parseNaturalDate(dateStr);
+  const parsedDate = parseNaturalDate(effectiveDateStr);
   const displayDate =
     parsedDate?.toLocaleDateString('en-US', {
       weekday: 'long',
       month: 'long',
       day: 'numeric',
-    }) ?? dateStr;
+    }) ?? effectiveDateStr;
+
+  log('book_appointment', 'tool response ready', { totalDurationMs: Date.now() - bookStartedAt, usedFallback });
 
   return `You're all set. I booked your free on-site estimate for ${displayDate} at ${displayTime}. Our estimator will call before arriving.`;
 }
@@ -1846,7 +2128,6 @@ async function pushToGoogleCalendar(
   if (event.attendeeEmail) body.attendees = [{ email: event.attendeeEmail }];
 
   log('gcal', 'creating event', {
-    summary: event.summary,
     start: startDT,
     tz: event.timezone,
     offset,
@@ -1886,8 +2167,14 @@ export const handler: Handler = async (event: HandlerEvent) => {
   const rawBody = event.body ?? '';
   const signature = event.headers['x-vapi-signature'] ?? '';
 
-  if (signature && !verifySignature(rawBody, signature)) {
-    logError('handler', 'Invalid signature', {});
+  const webhookSecret = process.env.VAPI_WEBHOOK_SECRET;
+  if (!webhookSecret) {
+    logError('handler', 'VAPI_WEBHOOK_SECRET not configured', {});
+    return { statusCode: 503, body: 'Service unavailable' };
+  }
+
+  if (!signature || !verifySignature(rawBody, signature, webhookSecret)) {
+    logError('handler', 'Signature verification failed', {});
     return { statusCode: 401, body: 'Unauthorized' };
   }
 
@@ -1895,7 +2182,7 @@ export const handler: Handler = async (event: HandlerEvent) => {
   try {
     body = JSON.parse(rawBody);
   } catch {
-    logError('handler', 'Invalid JSON', rawBody.slice(0, 200));
+    logError('handler', 'Invalid JSON', { bodyLength: rawBody.length });
     return { statusCode: 400, body: 'Invalid JSON' };
   }
 
@@ -1919,8 +2206,8 @@ export const handler: Handler = async (event: HandlerEvent) => {
       cost: message.cost,
       costBreakdown: message.costBreakdown,
       durationSeconds: message.durationSeconds,
-      summary: message.summary?.slice?.(0, 80),
-      analysisSummary: message.analysis?.summary?.slice?.(0, 80),
+      summaryLength: message.summary?.length ?? 0,
+      analysisSummaryLength: message.analysis?.summary?.length ?? 0,
     });
   }
 
@@ -1940,19 +2227,13 @@ export const handler: Handler = async (event: HandlerEvent) => {
       rawMessage?.call?.phoneNumber?.id ??
       null;
 
-    const callerNumber = rawMessage?.customer?.number ?? rawMessage?.call?.customer?.number ?? null;
-
-    log('assistant-request', 'raw payload snapshot', {
+    log('assistant-request', 'payload snapshot', {
       topLevelKeys: Object.keys(rawMessage ?? {}),
       phoneNumberId,
-      callerNumber,
-      phoneNumber: rawMessage?.phoneNumber ?? null,
-      callPhoneNumberId: rawMessage?.call?.phoneNumberId ?? null,
-      callPhoneNumber: rawMessage?.call?.phoneNumber ?? null,
     });
 
     if (!phoneNumberId) {
-      logError('assistant-request', 'missing phoneNumberId', rawMessage);
+      logError('assistant-request', 'missing phoneNumberId', { topLevelKeys: Object.keys(rawMessage ?? {}) });
       return {
         statusCode: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -1985,7 +2266,14 @@ export const handler: Handler = async (event: HandlerEvent) => {
 
       if (mappedErr) logError('assistant-request', 'mapped agent lookup failed', mappedErr);
 
-      if (mappedAgent?.vapi_assistant_id) {
+      // AI-H1.1 Part 2 — a phone number's mapped agent_id can go stale
+      // relative to activation state (e.g. the mapped agent was later
+      // paused without this number being reassigned). Only honor the
+      // mapping while that agent is actually active; otherwise fall
+      // through to the active-agent lookup below so a paused agent can
+      // never keep receiving calls just because a number still points at
+      // its row.
+      if (mappedAgent?.vapi_assistant_id && mappedAgent.is_active) {
         log('assistant-request', 'returning mapped assistant', {
           crmAgentId: mappedAgent.id,
           agentName: mappedAgent.name,
@@ -1997,6 +2285,13 @@ export const handler: Handler = async (event: HandlerEvent) => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ assistantId: mappedAgent.vapi_assistant_id }),
         };
+      }
+
+      if (mappedAgent && !mappedAgent.is_active) {
+        log('assistant-request', 'mapped agent is paused, falling back to active agent', {
+          crmAgentId: mappedAgent.id,
+          agentName: mappedAgent.name,
+        });
       }
     }
 
@@ -2047,6 +2342,7 @@ export const handler: Handler = async (event: HandlerEvent) => {
 
   // ── tool-calls: must respond synchronously ──
   if (eventType === 'tool-calls' || eventType === 'tool.calls') {
+    const toolCallsStartedAt = Date.now();
     if (!call || !message.toolCallList?.length) {
       return { statusCode: 200, body: JSON.stringify({ results: [] }) };
     }
@@ -2066,6 +2362,7 @@ export const handler: Handler = async (event: HandlerEvent) => {
     }
 
     const results = await handleToolCalls(message.toolCallList, call, tenantInfo.tenantId);
+    log('handler', 'tool-calls response ready', { callId: call.id, durationMs: Date.now() - toolCallsStartedAt });
     return {
       statusCode: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -2135,7 +2432,7 @@ export const handler: Handler = async (event: HandlerEvent) => {
       if (mergedCall.endedReason === 'voicemail' || mergedCall.endedReason === 'customer-did-not-answer') {
         const callerNumber = mergedCall.customer?.number ?? null;
         if (tenantId && callerNumber) {
-          fetch(`${process.env.URL ?? 'http://localhost:8888'}/.netlify/functions/execute-workflow`, {
+          fetch(`${process.env.URL ?? 'http://localhost:9999'}/.netlify/functions/execute-workflow`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({

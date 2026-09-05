@@ -1,8 +1,12 @@
 import type { Handler, HandlerEvent } from '@netlify/functions';
 import { createClient } from '@supabase/supabase-js';
+import {
+  WEBHOOK_URL,
+  patchVapiPhoneNumberToWebhook,
+  fetchVapiPhoneNumber,
+} from './lib/vapi-phone-routing';
 
 const VAPI_BASE = 'https://api.vapi.ai';
-const WEBHOOK_URL = 'https://connect.renometa.com/.netlify/functions/vapi-webhook';
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -26,46 +30,6 @@ async function authenticate(
     .from('org_memberships').select('org_id').eq('member_id', user.id).single();
   if (!membership?.org_id) return null;
   return { userId: user.id, tenantId: membership.org_id };
-}
-
-async function patchVapiPhoneNumberToWebhook(phoneNumberId: string) {
-  const patchRes = await fetch(`${VAPI_BASE}/phone-number/${phoneNumberId}`, {
-    method: 'PATCH',
-    headers: {
-      Authorization: `Bearer ${process.env.VAPI_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      // Explicitly clear the hardcoded assistantId so Vapi uses serverUrl instead.
-      // If assistantId is left set, Vapi uses it directly and never fires assistant-request.
-      assistantId: null,
-      serverUrl: WEBHOOK_URL,
-    }),
-  });
-
-  const patchText = await patchRes.text();
-  if (!patchRes.ok) {
-    throw new Error(`Vapi PATCH failed: ${patchRes.status} ${patchText}`);
-  }
-
-  try { return JSON.parse(patchText); }
-  catch { return { raw: patchText }; }
-}
-
-async function fetchVapiPhoneNumber(phoneNumberId: string) {
-  const res = await fetch(`${VAPI_BASE}/phone-number/${phoneNumberId}`, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${process.env.VAPI_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-  });
-
-  const text = await res.text();
-  if (!res.ok) throw new Error(`Vapi GET failed: ${res.status} ${text}`);
-
-  try { return JSON.parse(text); }
-  catch { throw new Error(`Vapi GET returned invalid JSON: ${text}`); }
 }
 
 export const handler: Handler = async (event: HandlerEvent) => {
@@ -102,13 +66,25 @@ export const handler: Handler = async (event: HandlerEvent) => {
     return { statusCode: 404, body: JSON.stringify({ error: 'Phone number not found for this tenant' }) };
   }
 
-  // Verify agent belongs to this tenant
-  const { data: agentRow, error: agentErr } = await supabase
+  // Verify agent belongs to this tenant and is not archived. Falls back to
+  // an unfiltered lookup if archived_at doesn't exist yet in this
+  // environment (AI-H1.1 Part 3 migration proposed, not yet applied).
+  let { data: agentRow, error: agentErr } = await supabase
     .from('voice_agents')
     .select('id, tenant_id, vapi_assistant_id, name')
     .eq('id', agentId)
     .eq('tenant_id', tenantId)
+    .is('archived_at', null)
     .single();
+
+  if (agentErr?.code === '42703') {
+    ({ data: agentRow, error: agentErr } = await supabase
+      .from('voice_agents')
+      .select('id, tenant_id, vapi_assistant_id, name')
+      .eq('id', agentId)
+      .eq('tenant_id', tenantId)
+      .single());
+  }
 
   if (agentErr || !agentRow) {
     return { statusCode: 404, body: JSON.stringify({ error: 'Agent not found for this tenant' }) };

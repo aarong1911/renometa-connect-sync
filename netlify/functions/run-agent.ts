@@ -4,7 +4,20 @@
  * run-agent.ts
  * Netlify Function — executes an autonomous AI agent for an org.
  *
- * POST { agentDefinitionId, orgId, triggerData? }
+ * POST { agentDefinitionId, triggerData? }
+ * Authorization: Bearer <caller's Supabase session access token> — REQUIRED.
+ *
+ * AI-1 security fix: orgId is no longer accepted from the request body.
+ * Before this fix, the client sent its own orgId and this function (which
+ * uses the service-role client, bypassing RLS entirely) trusted it for
+ * every downstream read/write/action — a compromised or malicious browser
+ * could submit another organization's id and cause this function to read
+ * and act on that organization's leads/invoices/projects, and send SMS on
+ * its behalf. orgId is now resolved server-side from the verified bearer
+ * token via the same shared helper invite-member.ts/remove-member.ts/the
+ * SMTP endpoints already use (resolveOrgFromBearerToken, precedence:
+ * profiles.organization_id then org_memberships) — the client can no
+ * longer choose the execution organization.
  */
 
 import type { Handler } from "@netlify/functions";
@@ -12,6 +25,7 @@ import { createClient } from "@supabase/supabase-js";
 import { execFile } from "node:child_process";
 import { createServerTask } from "../lib/tasks";
 import { isInvoiceOverdue } from "../../src/lib/invoice-status";
+import { resolveOrgFromBearerToken } from "./lib/resolve-org";
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -35,16 +49,35 @@ export const handler: Handler = async (event) => {
     return { statusCode: 500, headers: HEADERS, body: JSON.stringify({ error: "ANTHROPIC_API_KEY is not configured" }) };
   }
 
-  let body: { agentDefinitionId: string; orgId: string; triggerData?: Record<string, unknown> };
+  // Verify the caller and resolve their org server-side — never trust a
+  // client-supplied orgId. Same failure shape (401) whether the header is
+  // missing or the token is invalid/expired, matching invite-member.ts/
+  // remove-member.ts's existing convention.
+  if (!event.headers.authorization) {
+    return { statusCode: 401, headers: HEADERS, body: JSON.stringify({ error: "Unauthorized" }) };
+  }
+  const resolved = await resolveOrgFromBearerToken(supabase, event.headers.authorization);
+  if (!resolved) {
+    return { statusCode: 401, headers: HEADERS, body: JSON.stringify({ error: "Invalid token" }) };
+  }
+  const { orgId } = resolved;
+
+  let body: { agentDefinitionId: string; triggerData?: Record<string, unknown> };
   try {
     body = JSON.parse(event.body ?? "{}");
   } catch {
     return { statusCode: 400, headers: HEADERS, body: JSON.stringify({ error: "Invalid JSON" }) };
   }
 
-  const { agentDefinitionId, orgId, triggerData = {} } = body;
-  if (!agentDefinitionId || !orgId)
-    return { statusCode: 400, headers: HEADERS, body: JSON.stringify({ error: "agentDefinitionId and orgId required" }) };
+  // agent_definitions rows are global/shared seed templates (no org_id
+  // column — seeded once for every org by seed-ai-center.ts, confirmed via
+  // the AI-1 audit), so any authenticated caller selecting a definition id
+  // is fine; no per-definition ownership check is needed. Any orgId the
+  // client still sends in the body (compatibility) is ignored below —
+  // `orgId` in scope is always the server-resolved value.
+  const { agentDefinitionId, triggerData = {} } = body;
+  if (!agentDefinitionId)
+    return { statusCode: 400, headers: HEADERS, body: JSON.stringify({ error: "agentDefinitionId required" }) };
 
   // 1. Load definition
   const { data: definition } = await supabase
@@ -183,9 +216,12 @@ async function fetchAgentData(
   for (const source of definition.data_sources ?? []) {
     switch (source.type) {
       case "lead": {
+        // AI-1: triggerData is client-controlled (this is the "manual"
+        // trigger path) — org-scoped so a caller can never point this
+        // agent at another organization's lead by id.
         const leadId = triggerData.lead_id as string | undefined;
         if (leadId) {
-          const { data } = await supabase.from("leads").select("*").eq("id", leadId).maybeSingle();
+          const { data } = await supabase.from("leads").select("*").eq("id", leadId).eq("org_id", orgId).maybeSingle();
           result.lead = data;
         }
         break;
@@ -320,36 +356,44 @@ async function fetchAgentData(
         break;
       }
       case "estimate": {
+        // AI-1: org-scoped — see the "lead" case above.
         const estimateId = triggerData.estimate_id as string | undefined;
         if (estimateId) {
           const { data } = await supabase
             .from("estimates")
             .select("*, estimate_items(*)")
             .eq("id", estimateId)
+            .eq("org_id", orgId)
             .maybeSingle();
           result.estimate = data;
         }
         break;
       }
       case "project": {
+        // AI-1: org-scoped — see the "lead" case above.
         const projectId = triggerData.project_id as string | undefined;
         if (projectId) {
           const { data } = await supabase
             .from("projects")
             .select("id, name, status, completion_percentage, contacts(full_name, phone, email)")
             .eq("id", projectId)
+            .eq("org_id", orgId)
             .maybeSingle();
           result.project = data;
         }
         break;
       }
       case "voice_call": {
+        // AI-1: org-scoped by tenant_id — voice_calls uses tenant_id as its
+        // org column (see CLAUDE.md's Vapi note: tenant_id = org_id), not
+        // org_id. Same client-controlled-triggerData risk as "lead" above.
         const callId = triggerData.call_id as string | undefined;
         if (callId) {
           const { data } = await supabase
             .from("voice_calls")
             .select("id, caller_phone, duration, transcript, started_at")
             .eq("id", callId)
+            .eq("tenant_id", orgId)
             .maybeSingle();
           result.call = data;
         } else {
@@ -362,13 +406,19 @@ async function fetchAgentData(
         break;
       }
       case "messages": {
+        // AI-1: project_notes has no direct org_id column — it's only
+        // scoped via project_id -> projects.org_id. This read had NO org
+        // filter at all before this fix (a genuine cross-org leak of every
+        // org's client messages into this agent's prompt), so it's
+        // org-scoped here through an inner join on the owning project.
         const { data } = await supabase
           .from("project_notes")
-          .select("id, body, author, client_email, is_client_message, created_at, project_id")
+          .select("id, body, author, client_email, is_client_message, created_at, project_id, projects!inner(org_id)")
           .eq("is_client_message", true)
+          .eq("projects.org_id", orgId)
           .order("created_at", { ascending: false })
           .limit(source.limit ?? 20);
-        result.messages = data ?? [];
+        result.messages = (data ?? []).map(({ projects: _projects, ...note }: any) => note);
         break;
       }
     }
@@ -463,10 +513,15 @@ async function executeActions(
     const score = parsed.score ?? null;
     const aiQuality = parsed.quality ?? null;
     if (score !== null) {
+      // AI-1: org-scoped write. realData.lead was already fetched
+      // org-scoped (see fetchAgentData's "lead" case), but the write
+      // itself is scoped too as defense in depth against a service-role
+      // update ever targeting another org's row.
       await supabase
         .from("leads")
         .update({ score, ai_quality: aiQuality, ai_notes: parsed.qualification_summary ?? null })
-        .eq("id", realData.lead.id);
+        .eq("id", realData.lead.id)
+        .eq("org_id", orgId);
       taken.push({ type: "lead_score_updated", score, quality: aiQuality });
     }
   }
@@ -474,11 +529,17 @@ async function executeActions(
   // ── update_lead_contacted ──────────────────────────────────────────────────
   if (has("update_lead_contacted") && realData.leads?.length) {
     const now = new Date().toISOString();
+    // AI-1: when `parsed` is present, these lead_id values come from the
+    // MODEL'S OWN OUTPUT, not directly from the org-scoped realData.leads
+    // list — nothing guarantees the model only ever echoes back ids it was
+    // given. `.eq("org_id", orgId)` on the write below is the actual
+    // safety boundary (a foreign-org id simply updates zero rows), not
+    // just the id match.
     const processedIds: string[] = Array.isArray(parsed)
       ? parsed.map((m: any) => m.lead_id).filter(Boolean)
       : (realData.leads as any[]).map((l) => l.id);
     for (const id of processedIds) {
-      await supabase.from("leads").update({ last_contacted_at: now }).eq("id", id);
+      await supabase.from("leads").update({ last_contacted_at: now }).eq("id", id).eq("org_id", orgId);
     }
     taken.push({ type: "leads_contacted_updated", count: processedIds.length });
   }

@@ -1,12 +1,26 @@
 /**
  * run-tool.mjs  —  Netlify Functions v2 (export default, zero npm imports)
  *
- * POST { toolDefinitionId, orgId, userId?, input }
+ * POST { toolDefinitionId, input }
+ * Authorization: Bearer <caller's Supabase session access token> — REQUIRED.
  * Returns { output, sections }
  *
  * Uses node:https for Claude API (bypasses bootstrap fetch polyfill that hangs
  * on api.anthropic.com inside lambda-local on Node 24 + Windows netlify dev).
  * Uses global fetch for Supabase REST (works fine).
+ *
+ * AI-1 security fix: orgId/userId are no longer accepted from the request
+ * body. Before this fix, the client sent its own orgId and this function
+ * (which uses the service-role key for every DB call, bypassing RLS
+ * entirely) trusted it for every downstream read/write — a compromised or
+ * malicious browser could submit another organization's id and cause this
+ * function to read that organization's CRM data. orgId/userId are now
+ * resolved server-side from the verified bearer token (same precedence as
+ * netlify/functions/lib/resolve-org.ts's resolveOrgFromBearerToken:
+ * profiles.organization_id then org_memberships — reimplemented here via
+ * this file's own sbSelect() REST helper rather than importing the .ts
+ * helper, to preserve this file's "zero npm imports" / pure-REST design).
+ * The client can no longer choose the execution organization.
  */
 
 import { execFile } from "node:child_process";
@@ -64,6 +78,34 @@ async function sbInsert(table, row) {
   return res.ok;
 }
 
+// ── Auth / org resolution (AI-1) ────────────────────────────────────────────
+// Never accepts an org id as an argument from the caller — the whole point
+// is that organization membership is always resolved server-side from the
+// verified bearer token, never trusted from client input. Same precedence
+// resolve-org.ts uses (profiles.organization_id first, org_memberships
+// fallback), reimplemented via this file's own REST helpers.
+
+async function resolveOrgFromBearerToken(authHeader) {
+  const token = authHeader?.slice(7);
+  if (!token) return null;
+
+  const userRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${token}` },
+  });
+  if (!userRes.ok) return null;
+  const user = await userRes.json();
+  if (!user?.id) return null;
+
+  const profiles = await sbSelect("profiles", { id: user.id }, "organization_id");
+  let orgId = profiles[0]?.organization_id ?? null;
+  if (!orgId) {
+    const memberships = await sbSelect("org_memberships", { member_id: user.id }, "org_id");
+    orgId = memberships[0]?.org_id ?? null;
+  }
+  if (!orgId) return null;
+  return { userId: user.id, orgId };
+}
+
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 export default async (req) => {
@@ -73,12 +115,27 @@ export default async (req) => {
   if (!ANTHROPIC_KEY) return json({ error: "ANTHROPIC_API_KEY is not configured" }, 500);
   if (!SUPABASE_URL || !SUPABASE_KEY) return json({ error: "Supabase env vars missing" }, 500);
 
+  // Verify the caller and resolve their org server-side — never trust a
+  // client-supplied orgId/userId. Same 401 shape whether the header is
+  // missing or the token is invalid/expired.
+  const authHeader = req.headers.get("authorization");
+  if (!authHeader) return json({ error: "Unauthorized" }, 401);
+  const resolved = await resolveOrgFromBearerToken(authHeader);
+  if (!resolved) return json({ error: "Invalid token" }, 401);
+  const { orgId, userId } = resolved;
+
   let body;
   try { body = await req.json(); }
   catch { return json({ error: "Invalid JSON" }, 400); }
 
-  const { toolDefinitionId, orgId, userId, input = {} } = body;
-  if (!toolDefinitionId || !orgId) return json({ error: "toolDefinitionId and orgId required" }, 400);
+  // tool_definitions rows are global/shared seed templates (no org_id
+  // column, confirmed via the AI-1 audit), so any authenticated caller
+  // selecting a tool id is fine; no per-definition ownership check is
+  // needed. Any orgId/userId the client still sends in the body
+  // (compatibility) is ignored — the values in scope here are always the
+  // server-resolved ones.
+  const { toolDefinitionId, input = {} } = body;
+  if (!toolDefinitionId) return json({ error: "toolDefinitionId required" }, 400);
 
   // 1. Load tool definition
   const tools = await sbSelect("tool_definitions", { id: toolDefinitionId });

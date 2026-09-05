@@ -35,8 +35,6 @@ import {
   ExternalLink,
   Phone as PhoneIcon,
   PhoneCall,
-  ArrowDownLeft,
-  ArrowUpRight,
   CheckCircle2,
   Circle,
   Pin,
@@ -3171,21 +3169,14 @@ function MessageBubble({ msg, onDelete }: { msg: LocalMessage; onDelete?: () => 
     );
   }
 
-  // Voice call
-  if (msg.channel === "voice") {
-    return (
-      <div className={`flex ${isOut ? "justify-end" : "justify-start"}`}>
-        <div className="flex max-w-[70%] items-center gap-3 rounded-lg border border-border bg-card px-3 py-2">
-          {isOut ? <ArrowUpRight className="h-4 w-4 text-emerald-500" /> : <ArrowDownLeft className="h-4 w-4 text-sky-500" />}
-          <div className="flex-1">
-            <div className="text-xs font-medium">{isOut ? "Outbound call" : "Inbound call"} · 4m 12s</div>
-            <div className="text-[10px] text-muted-foreground">Recording available · {fmtTime(msg.at)}</div>
-          </div>
-          <Button variant="ghost" size="sm" className="h-6 px-2 text-[10px]">Play</Button>
-        </div>
-      </div>
-    );
-  }
+  // Voice call — rendered as a real transcript-turn/summary text bubble
+  // below (voice-conversations.ts already composes msg.body as real
+  // transcript lines or the call summary; there is no per-call duration or
+  // recording-availability field at the message level, so it is NOT given
+  // a special-cased card here — doing so previously meant hardcoded
+  // placeholder values ("4m 12s", a fixed "Recording available" time) with
+  // no real data behind them. Voice recordings are played from Call Logs,
+  // where real per-call duration/recording data is available.
 
   // SMS / Email (+ scheduled variant)
   return (

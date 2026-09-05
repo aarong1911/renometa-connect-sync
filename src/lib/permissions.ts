@@ -18,6 +18,7 @@ const INBOX       = "/inbox";           // includes /inbox/templates
 const TEMPLATES   = "/inbox/templates";
 const MARKETING   = "/marketing";
 const AUTOMATION  = "/automation";
+const AI_CENTER   = "/ai-center";  // separate from /automation since the AI Center page moved out of that prefix; see permission-features.ts "ai_center" (owner/admin only)
 const ESTIMATES   = "/estimates";
 const INVOICES    = "/financials/invoices";
 const PAYMENTS    = "/financials/payments";
@@ -36,7 +37,8 @@ export const ROLE_ALLOWED_ROUTES: Record<Role, string[] | "*"> = {
     DASHBOARD, CONTACTS, COMPANIES, LEADS, PIPELINE,
     PROJECTS, TASKS, CALENDAR, FILES,
     INBOX, TEMPLATES, MARKETING,
-    AUTOMATION,           // covers /automation/workflows, /agents, /triggers
+    AUTOMATION,           // covers /automation/workflows, /call-logs, /triggers
+    AI_CENTER,            // AI Center moved to /ai-center — see permission-features.ts "ai_center"
     ESTIMATES, INVOICES, PAYMENTS,
     ANALYTICS, REPUTATION,
   ],

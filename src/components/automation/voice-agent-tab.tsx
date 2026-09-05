@@ -51,7 +51,7 @@ import {
   Clock,
   TrendingUp,
   Loader2,
-  Trash2,
+  Archive,
   Mic,
   MicOff,
 } from "lucide-react";
@@ -86,45 +86,17 @@ type VoiceAgent = {
   llm_model: string;
   end_call_phrases: string;
   crm_tools: CrmTools;
-  phone_numbers: { number: string; status: string; id: string }[];
+  phone_numbers: { number: string; status: string; id: string; vapi_number_id: string | null }[];
   total_calls: number;
   success_rate: number;
   hours_saved: number;
 };
 
-type VapiToolDefinition = {
-  type: "function";
-  function: {
-    name: string;
-    description: string;
-    parameters: {
-      type: "object";
-      properties: Record<string, { type: string; description?: string }>;
-      required: string[];
-    };
-  };
-};
-
-type VapiAssistantBody = {
-  name: string;
-  firstMessage: string;
-  serverUrl: string;
-  serverMessages: string[];
-  model: {
-    provider: "anthropic";
-    model: string;
-    systemPrompt: string;
-    tools: VapiToolDefinition[];
-  };
-  voice: {
-    provider: "11labs";
-    voiceId: string;
-  };
-  endCallPhrases: string[];
-  transcriber?: {
-    provider: "deepgram";
-    model: string;
-  };
+type OrgPhoneNumber = {
+  id: string;
+  vapi_number_id: string | null;
+  number: string;
+  agent_id: string | null;
 };
 
 const DEFAULT_CRM_TOOLS: CrmTools = {
@@ -135,6 +107,50 @@ const DEFAULT_CRM_TOOLS: CrmTools = {
 };
 
 const DEFAULT_END_CALL_PHRASES = "goodbye, bye, thank you bye";
+
+// AI-H1.1 model-currency pass — single source of truth for the model
+// dropdown and for every default/fallback in this file, so there is no
+// separate mapping to drift out of sync (the server-side payload builder,
+// netlify/functions/lib/vapi-assistant-body.ts, just forwards whatever
+// model id it's given — it holds no competing model list).
+//
+// Vapi flagged claude-sonnet-4-20250514 as deprecated (retiring 2026-06-15),
+// recommending claude-sonnet-4-6. New agents now default to it; existing
+// agents already saved on the deprecated id keep working and keep showing
+// accurately as "Claude Sonnet 4 (Legacy)" until a user explicitly opens
+// and re-saves them with a different model selected — no bulk migration.
+export const DEFAULT_LLM_MODEL = "claude-sonnet-4-6";
+
+// Legacy model — deliberately NOT a selectable option (product decision:
+// users must not be able to pick it again). It is not deleted in Vapi, and
+// existing agents already saved on it must keep loading/editing/calling —
+// see the isLegacyModel handling in VoiceAgentDetail below, which shows it
+// as a clearly-labeled unsupported current state instead of silently
+// mapping it to Sonnet 4.6 or letting the Select re-select it.
+export const LEGACY_LLM_MODEL_ID = "claude-sonnet-4-20250514";
+const LEGACY_LLM_MODEL_LABEL = "Claude Sonnet 4 (Legacy — unsupported)";
+
+const MODEL_OPTIONS: { label: string; value: string }[] = [
+  { label: "Claude Sonnet 4.6", value: "claude-sonnet-4-6" },
+  // Audited, not changed — no deprecation evidence found for either of
+  // these in this pass; see AI-H1.1 model-audit report.
+  { label: "Claude Haiku", value: "claude-haiku-4-5-20251001" },
+  { label: "GPT-4o", value: "gpt-4o" },
+];
+
+// ElevenLabs premade voice IDs, verified against ElevenLabs' own published
+// default-voice references (AI-H1.1 voice audit) — "Sarah" was corrected to
+// "Bella" below: EXAVITQu4vr4xnSDxMaL is ElevenLabs' "Bella" voice, not
+// "Sarah". The stored voice_id is unaffected either way — this only fixes
+// the human-readable label so it matches the actual voice a caller hears.
+const VOICE_OPTIONS: { label: string; value: string }[] = [
+  { label: "Rachel", value: "21m00Tcm4TlvDq8ikWAM" },
+  { label: "Bella", value: "EXAVITQu4vr4xnSDxMaL" },
+  { label: "Emily", value: "LcfcDJNUP1GQjkzn1xUU" },
+  { label: "Josh", value: "TxGEqnHWrfWFTfGW9XjX" },
+  { label: "Adam", value: "pNInz6obpgDQGcFmaJgB" },
+  { label: "Antoni", value: "ErXwobaYiN019PkySvjV" },
+];
 
 const STATUS_STYLE: Record<VoiceAgentStatus, string> = {
   active: "bg-success/15 text-success border-success/30",
@@ -169,166 +185,6 @@ async function getOrgId(): Promise<string | null> {
   return membership?.org_id ?? null;
 }
 
-function getVapiServerUrl(): string {
-  return (
-    import.meta.env.VITE_VAPI_SERVER_URL ||
-    "https://connect.renometa.com/.netlify/functions/vapi-webhook"
-  );
-}
-
-function buildVapiTools(crmTools: CrmTools): VapiToolDefinition[] {
-  const tools: VapiToolDefinition[] = [];
-
-  if (crmTools.saveLeads) {
-    tools.push({
-      type: "function",
-      function: {
-        name: "save_lead",
-        description:
-          "Save the caller's contact information and project details into the CRM when the caller provides lead information.",
-        parameters: {
-          type: "object",
-          properties: {
-            name: { type: "string", description: "Caller full name" },
-            phone: { type: "string", description: "Caller phone number" },
-            email: { type: "string", description: "Caller email address" },
-            address: { type: "string", description: "Project address" },
-            service: { type: "string", description: "Requested service or project type" },
-            budget: { type: "string", description: "Mentioned project budget" },
-            timeline: { type: "string", description: "Mentioned project timeline" },
-            notes: { type: "string", description: "Important call notes" },
-          },
-          required: [],
-        },
-      },
-    });
-  }
-
-  if (crmTools.checkAvailability) {
-    tools.push({
-      type: "function",
-      function: {
-        name: "check_availability",
-        description:
-          "Check appointment availability for a requested date and optional time before booking.",
-        parameters: {
-          type: "object",
-          properties: {
-            date: {
-              type: "string",
-              description: "Requested appointment date, like tomorrow or next Monday",
-            },
-            time: {
-              type: "string",
-              description: "Requested appointment time, like 10am",
-            },
-          },
-          required: ["date"],
-        },
-      },
-    });
-  }
-
-  if (crmTools.bookAppointment) {
-    tools.push({
-      type: "function",
-      function: {
-        name: "book_appointment",
-        description:
-          "Book a confirmed appointment after the caller agrees to a specific date and time.",
-        parameters: {
-          type: "object",
-          properties: {
-            date: { type: "string", description: "Confirmed appointment date" },
-            time: { type: "string", description: "Confirmed appointment time" },
-            name: { type: "string", description: "Caller full name" },
-            phone: { type: "string", description: "Caller phone number" },
-            email: { type: "string", description: "Caller email address" },
-            address: { type: "string", description: "Project address" },
-            service: { type: "string", description: "Requested service or project type" },
-            budget: { type: "string", description: "Mentioned project budget" },
-            timeline: { type: "string", description: "Mentioned project timeline" },
-            notes: { type: "string", description: "Important appointment notes" },
-          },
-          required: ["date", "time"],
-        },
-      },
-    });
-  }
-
-  if (crmTools.getServiceInfo) {
-    tools.push({
-      type: "function",
-      function: {
-        name: "get_service_info",
-        description:
-          "Answer basic questions about company services, project types, pricing process, or service availability.",
-        parameters: {
-          type: "object",
-          properties: {
-            service: { type: "string", description: "Service the caller is asking about" },
-          },
-          required: [],
-        },
-      },
-    });
-  }
-
-  return tools;
-}
-
-function buildVapiAssistantBody(params: {
-  name: string;
-  greeting: string;
-  llm: string;
-  systemPrompt: string;
-  voice: string;
-  endPhrases: string;
-  crmTools: CrmTools;
-  includeCreateOnlyFields?: boolean;
-}): VapiAssistantBody {
-  const {
-    name,
-    greeting,
-    llm,
-    systemPrompt,
-    voice,
-    endPhrases,
-    crmTools,
-    includeCreateOnlyFields = false,
-  } = params;
-
-  const body: VapiAssistantBody = {
-    name,
-    firstMessage: greeting,
-    serverUrl: getVapiServerUrl(),
-    serverMessages: ["status-update", "tool-calls", "end-of-call-report", "hang"],
-    model: {
-      provider: "anthropic",
-      model: llm,
-      systemPrompt,
-      tools: buildVapiTools(crmTools),
-    },
-    voice: {
-      provider: "11labs",
-      voiceId: voice,
-    },
-    endCallPhrases: endPhrases
-      .split(",")
-      .map((p) => p.trim())
-      .filter(Boolean),
-  };
-
-  if (includeCreateOnlyFields) {
-    body.transcriber = {
-      provider: "deepgram",
-      model: "nova-2",
-    };
-  }
-
-  return body;
-}
-
 // Vapi Web SDK singleton
 // Dynamic import keeps the SDK out of the initial bundle until user tests a call.
 declare global {
@@ -359,6 +215,7 @@ async function getVapiWeb(): Promise<any | null> {
 
 export function VoiceAgentTab() {
   const [agents, setAgents] = useState<VoiceAgent[]>([]);
+  const [allPhoneNumbers, setAllPhoneNumbers] = useState<OrgPhoneNumber[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
@@ -369,29 +226,45 @@ export function VoiceAgentTab() {
       const orgId = await getOrgId();
       if (!orgId) return;
 
-      const { data, error } = await supabase
+      // AI-H1.1 Part 3 — default list excludes archived agents. Falls back to
+      // an unfiltered query if the archived_at column doesn't exist yet in
+      // this environment (migration proposed, not yet applied — see
+      // supabase/migrations/20260905_voice_agents_archive.sql) so the tab
+      // keeps working either way; once the migration lands, filtering just
+      // starts working with no further code change.
+      let { data, error } = await supabase
         .from("voice_agents")
         .select("*")
         .eq("tenant_id", orgId)
+        .is("archived_at", null)
         .order("created_at", { ascending: true });
+
+      if (error?.code === "42703") {
+        ({ data, error } = await supabase
+          .from("voice_agents")
+          .select("*")
+          .eq("tenant_id", orgId)
+          .order("created_at", { ascending: true }));
+      }
 
       if (error) {
         console.error("Failed to load voice agents:", error);
         return;
       }
 
+      const { data: orgPhoneNumbers } = await supabase
+        .from("voice_phone_numbers")
+        .select("id, vapi_number_id, number, agent_id")
+        .eq("tenant_id", orgId);
+
+      setAllPhoneNumbers(orgPhoneNumbers ?? []);
+
       if (!data || data.length === 0) {
         setAgents([]);
         return;
       }
 
-      const agentIds = data.map((a: any) => a.id);
-
-      const { data: phoneNumbers } = await supabase
-        .from("voice_phone_numbers")
-        .select("*")
-        .eq("tenant_id", orgId)
-        .in("agent_id", agentIds);
+      const phoneNumbers = orgPhoneNumbers ?? [];
 
       const { data: callStats } = await supabase
         .from("voice_calls")
@@ -418,17 +291,23 @@ export function VoiceAgentTab() {
           system_prompt: a.system_prompt || "",
           first_message: a.first_message || "",
           voice_id: a.voice_id || "21m00Tcm4TlvDq8ikWAM",
-          llm_model: a.llm_model || "claude-sonnet-4-20250514",
+          llm_model: a.llm_model || DEFAULT_LLM_MODEL,
           end_call_phrases: DEFAULT_END_CALL_PHRASES,
-          crm_tools: DEFAULT_CRM_TOOLS,
+          // crm_tools is persisted server-side (voice_agents.crm_tools) — fall back to
+          // defaults only for agents saved before this column was read/written.
+          crm_tools: { ...DEFAULT_CRM_TOOLS, ...(a.crm_tools ?? {}) },
           phone_numbers: nums.map((pn: any) => ({
             id: pn.id,
+            vapi_number_id: pn.vapi_number_id ?? null,
             number: pn.number || "—",
             status: pn.agent_id ? "assigned" : "available",
           })),
           total_calls: totalCalls,
           success_rate: totalCalls > 0 ? Math.round((successCalls / totalCalls) * 100) : 0,
-          hours_saved: Math.round(totalCalls * 0.15 * 10) / 10,
+          // "Hours saved" has no real data source (no baseline for human-equivalent
+          // handling time exists) — always render "—" via the hours_saved > 0 checks
+          // in the card/drawer rather than fabricate a number from call count.
+          hours_saved: 0,
         };
       });
 
@@ -522,7 +401,7 @@ Thank them, confirm an estimator will call before arriving, end the call.
         first_message: defaultGreeting,
         voice_id: "21m00Tcm4TlvDq8ikWAM",
         voice_provider: "11labs",
-        llm_model: "claude-sonnet-4-20250514",
+        llm_model: DEFAULT_LLM_MODEL,
         is_active: false,
       } as any)
       .select()
@@ -544,24 +423,30 @@ Thank them, confirm an estimator will call before arriving, end the call.
 
     const newActive = agent.status !== "active";
 
-    if (newActive) {
-      const orgId = await getOrgId();
-      if (orgId) {
-        await supabase
-          .from("voice_agents")
-          .update({ is_active: false, updated_at: new Date().toISOString() })
-          .eq("tenant_id", orgId)
-          .neq("id", id);
-      }
+    // AI-H1.1 Part 2 — Activate/Pause go through a server-side endpoint that
+    // verifies Vapi phone-number routing before claiming success (Activate)
+    // and detaches any stale local number→agent mapping (Pause). No direct
+    // Vapi API calls happen from the browser.
+    const session = await supabase.auth.getSession();
+    const token = session.data.session?.access_token;
+
+    if (!token) {
+      toast.error("Could not verify your session");
+      return;
     }
 
-    const { error } = await supabase
-      .from("voice_agents")
-      .update({ is_active: newActive, updated_at: new Date().toISOString() })
-      .eq("id", id);
+    const res = await fetch("/.netlify/functions/voice-agent-set-status", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ agentId: id, active: newActive }),
+    });
 
-    if (error) {
-      toast.error("Failed to update status");
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      toast.error(data?.error || "Failed to update status");
       return;
     }
 
@@ -572,43 +457,74 @@ Thank them, confirm an estimator will call before arriving, end the call.
     await loadAgents();
   };
 
-  const handleDelete = async (id: string) => {
+  const handleArchive = async (id: string) => {
     const agent = agents.find((a) => a.id === id);
     if (!agent) return;
 
-    if (agent.vapi_assistant_id) {
-      try {
-        const session = await supabase.auth.getSession();
-        const token = session.data.session?.access_token;
+    // AI-H1.1 Part 3 — normal removal is Archive, not hard delete:
+    // voice_calls.agent_id needs a real row to resolve historical agent
+    // names against. voice-agent-archive.ts is provider-first (deletes the
+    // Vapi assistant before marking archived_at) and never touches the row
+    // itself, so historical Call Logs keep working.
+    const session = await supabase.auth.getSession();
+    const token = session.data.session?.access_token;
 
-        if (token) {
-          await fetch("/.netlify/functions/vapi-proxy", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${token}`,
-            },
-            body: JSON.stringify({
-              path: `/assistant/${agent.vapi_assistant_id}`,
-              method: "DELETE",
-            }),
-          });
-        }
-      } catch (err) {
-        console.warn("Vapi assistant delete failed (continuing)", err);
-      }
-    }
-
-    const { error } = await supabase.from("voice_agents").delete().eq("id", id);
-
-    if (error) {
-      toast.error("Failed to delete agent: " + error.message);
+    if (!token) {
+      toast.error("Could not verify your session — agent not archived.");
       return;
     }
 
-    toast.success(`${agent.name} deleted`);
+    const res = await fetch("/.netlify/functions/voice-agent-archive", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ agentId: id }),
+    });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      toast.error(data?.error || "Failed to archive agent");
+      return;
+    }
+
+    toast.success(`${agent.name} archived`);
     setSelectedId(null);
     await loadAgents();
+  };
+
+  const assignNumberToAgent = async (vapiNumberId: string, agentId: string) => {
+    try {
+      const session = await supabase.auth.getSession();
+      const token = session.data.session?.access_token;
+
+      if (!token) {
+        toast.error("Could not verify your session");
+        return;
+      }
+
+      const res = await fetch("/.netlify/functions/assign-voice-number", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ phoneNumberId: vapiNumberId, agentId, setActive: true }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        toast.error(data?.error || "Failed to assign phone number");
+        return;
+      }
+
+      toast.success("Phone number assigned");
+      await loadAgents();
+    } catch (err) {
+      console.error("Failed to assign phone number", err);
+      toast.error("Failed to assign phone number");
+    }
   };
 
   if (loading) {
@@ -661,7 +577,7 @@ Thank them, confirm an estimator will call before arriving, end the call.
               agent={agent}
               onOpen={() => setSelectedId(agent.id)}
               onToggle={() => toggleStatus(agent.id)}
-              onDelete={() => handleDelete(agent.id)}
+              onArchive={() => handleArchive(agent.id)}
             />
           ))}
         </div>
@@ -669,9 +585,11 @@ Thank them, confirm an estimator will call before arriving, end the call.
 
       <VoiceAgentDrawer
         agent={selected}
+        allPhoneNumbers={allPhoneNumbers}
         onOpenChange={(open) => !open && setSelectedId(null)}
         onToggle={() => selected && toggleStatus(selected.id)}
         onSaved={loadAgents}
+        onAssignNumber={assignNumberToAgent}
       />
     </div>
   );
@@ -685,14 +603,14 @@ function VoiceAgentCard({
   agent,
   onOpen,
   onToggle,
-  onDelete,
+  onArchive,
 }: {
   agent: VoiceAgent;
   onOpen: () => void;
   onToggle: () => void;
-  onDelete: () => void;
+  onArchive: () => void;
 }) {
-  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [archiveDialogOpen, setArchiveDialogOpen] = useState(false);
   const isLive = agent.status === "active";
   const phoneDisplay = agent.phone_numbers.length > 0 ? agent.phone_numbers[0].number : "—";
 
@@ -757,39 +675,48 @@ function VoiceAgentCard({
           {isLive ? "Pause" : "Activate"}
         </Button>
 
-        {confirmDelete ? (
-          <div className="flex items-center gap-1">
-            <Button
-              size="sm"
-              variant="destructive"
-              className="h-7 text-[11px]"
-              onClick={() => {
-                onDelete();
-                setConfirmDelete(false);
-              }}
-            >
-              Confirm
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              className="h-7 text-[11px]"
-              onClick={() => setConfirmDelete(false)}
-            >
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground"
+          onClick={() => setArchiveDialogOpen(true)}
+          title="Archive agent"
+        >
+          <Archive className="h-3.5 w-3.5" />
+        </Button>
+      </div>
+
+      <Dialog open={archiveDialogOpen} onOpenChange={setArchiveDialogOpen}>
+        <DialogContent
+          className="sm:max-w-sm"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <DialogHeader>
+            <DialogTitle className="text-sm">Archive {agent.name}?</DialogTitle>
+            <DialogDescription className="text-xs leading-relaxed">
+              This agent will be made inactive and hidden from your default Voice
+              Agent list. It won't answer calls anymore. Historical call records,
+              transcripts, and CRM activity tied to this agent stay intact and
+              remain visible in Call Logs. This is not a permanent delete.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex justify-end gap-2 pt-2">
+            <Button size="sm" variant="outline" onClick={() => setArchiveDialogOpen(false)}>
               Cancel
             </Button>
+            <Button
+              size="sm"
+              onClick={() => {
+                onArchive();
+                setArchiveDialogOpen(false);
+              }}
+            >
+              <Archive className="h-3.5 w-3.5" />
+              Archive agent
+            </Button>
           </div>
-        ) : (
-          <Button
-            size="sm"
-            variant="ghost"
-            className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive"
-            onClick={() => setConfirmDelete(true)}
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </Button>
-        )}
-      </div>
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 }
@@ -811,19 +738,31 @@ function SmallStat({ label, value }: { label: string; value: string }) {
 
 function VoiceAgentDrawer({
   agent,
+  allPhoneNumbers,
   onOpenChange,
   onToggle,
   onSaved,
+  onAssignNumber,
 }: {
   agent: VoiceAgent | null;
+  allPhoneNumbers: OrgPhoneNumber[];
   onOpenChange: (open: boolean) => void;
   onToggle: () => void;
   onSaved: () => void;
+  onAssignNumber: (vapiNumberId: string, agentId: string) => void;
 }) {
   return (
     <Sheet open={!!agent} onOpenChange={onOpenChange}>
       <SheetContent className="w-full overflow-y-auto sm:max-w-md">
-        {agent && <VoiceAgentDetail agent={agent} onToggle={onToggle} onSaved={onSaved} />}
+        {agent && (
+          <VoiceAgentDetail
+            agent={agent}
+            allPhoneNumbers={allPhoneNumbers}
+            onToggle={onToggle}
+            onSaved={onSaved}
+            onAssignNumber={onAssignNumber}
+          />
+        )}
       </SheetContent>
     </Sheet>
   );
@@ -835,12 +774,16 @@ function VoiceAgentDrawer({
 
 function VoiceAgentDetail({
   agent,
+  allPhoneNumbers,
   onToggle,
   onSaved,
+  onAssignNumber,
 }: {
   agent: VoiceAgent;
+  allPhoneNumbers: OrgPhoneNumber[];
   onToggle: () => void;
   onSaved: () => void;
+  onAssignNumber: (vapiNumberId: string, agentId: string) => void;
 }) {
   const isLive = agent.status === "active";
   const [saving, setSaving] = useState(false);
@@ -853,6 +796,7 @@ function VoiceAgentDetail({
   const [llm, setLlm] = useState(agent.llm_model);
   const [endPhrases, setEndPhrases] = useState(agent.end_call_phrases);
   const [crmTools, setCrmTools] = useState<CrmTools>(agent.crm_tools);
+  const isLegacyModel = llm === LEGACY_LLM_MODEL_ID;
 
   useEffect(() => {
     setName(agent.name);
@@ -868,102 +812,42 @@ function VoiceAgentDetail({
     setSaving(true);
 
     try {
-      const { error } = await supabase
-        .from("voice_agents")
-        .update({
-          name,
-          system_prompt: systemPrompt,
-          first_message: greeting,
-          voice_id: voice,
-          llm_model: llm,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", agent.id);
+      // AI-H1.1 correction — Save is provider-first end-to-end: this posts
+      // the raw form fields to voice-agent-save.ts, which PATCHes/POSTs Vapi
+      // BEFORE writing anything to voice_agents, and rolls back on a
+      // partial failure. Nothing is written locally from the browser here,
+      // so there is no path where RenoMeta shows the new config while Vapi
+      // is still running the old one (or vice versa).
+      const session = await supabase.auth.getSession();
+      const token = session.data.session?.access_token;
 
-      if (error) {
-        toast.error("Failed to save: " + error.message);
+      if (!token) {
+        toast.error("Could not verify your session — nothing was saved.");
         return;
       }
 
-      try {
-        const session = await supabase.auth.getSession();
-        const token = session.data.session?.access_token;
-
-        if (!token) {
-          toast.warning("Saved locally, but could not sync Vapi because the session token is missing.");
-          return;
-        }
-
-        const assistantBody = buildVapiAssistantBody({
+      const res = await fetch("/.netlify/functions/voice-agent-save", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          agentId: agent.id,
           name,
-          greeting,
-          llm,
           systemPrompt,
+          greeting,
           voice,
-          endPhrases,
+          llmModel: llm,
+          endCallPhrases: endPhrases,
           crmTools,
-          includeCreateOnlyFields: !agent.vapi_assistant_id,
-        });
+        }),
+      });
 
-        console.log("Vapi assistant serverUrl:", assistantBody.serverUrl);
-
-        if (agent.vapi_assistant_id) {
-          const updateRes = await fetch("/.netlify/functions/vapi-proxy", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${token}`,
-            },
-            body: JSON.stringify({
-              path: `/assistant/${agent.vapi_assistant_id}`,
-              method: "PATCH",
-              body: assistantBody,
-            }),
-          });
-
-          if (!updateRes.ok) {
-            const text = await updateRes.text();
-            console.error("Vapi assistant update failed:", text);
-            toast.warning("Agent saved locally, but Vapi sync failed. Check console.");
-          }
-        } else {
-          const createRes = await fetch("/.netlify/functions/vapi-proxy", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${token}`,
-            },
-            body: JSON.stringify({
-              path: "/assistant",
-              method: "POST",
-              body: assistantBody,
-            }),
-          });
-
-          if (!createRes.ok) {
-            const text = await createRes.text();
-            console.error("Vapi assistant create failed:", text);
-            toast.warning("Agent saved locally, but Vapi assistant creation failed. Check console.");
-          } else {
-            const vapiData = await createRes.json();
-            const newAssistantId = vapiData?.id || vapiData?.assistantId;
-
-            if (newAssistantId) {
-              await supabase
-                .from("voice_agents")
-                .update({
-                  vapi_assistant_id: newAssistantId,
-                  updated_at: new Date().toISOString(),
-                })
-                .eq("id", agent.id);
-            }
-
-            toast.success("Vapi assistant created and linked");
-          }
-        }
-      } catch (vapiErr) {
-        console.warn("Vapi sync failed, local save succeeded", vapiErr);
-        toast.warning("Agent saved locally, but Vapi sync failed. Check console.");
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        toast.error(data?.error || "Failed to save agent");
+        return;
       }
 
       toast.success("Agent saved");
@@ -1077,14 +961,7 @@ function VoiceAgentDetail({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {[
-                  { label: "Rachel", value: "21m00Tcm4TlvDq8ikWAM" },
-                  { label: "Sarah", value: "EXAVITQu4vr4xnSDxMaL" },
-                  { label: "Emily", value: "LcfcDJNUP1GQjkzn1xUU" },
-                  { label: "Josh", value: "TxGEqnHWrfWFTfGW9XjX" },
-                  { label: "Adam", value: "pNInz6obpgDQGcFmaJgB" },
-                  { label: "Antoni", value: "ErXwobaYiN019PkySvjV" },
-                ].map((v) => (
+                {VOICE_OPTIONS.map((v) => (
                   <SelectItem key={v.value} value={v.value} className="text-xs">
                     {v.label}
                   </SelectItem>
@@ -1095,22 +972,28 @@ function VoiceAgentDetail({
 
           <div className="space-y-1">
             <Label className="text-xs">LLM Model</Label>
-            <Select value={llm} onValueChange={setLlm}>
+            {/* Legacy model is not a selectable option (product decision) —
+                when the agent's current value isn't in MODEL_OPTIONS, show
+                the Select unselected (placeholder) rather than letting it
+                render an option that no longer exists. */}
+            <Select value={isLegacyModel ? "" : llm} onValueChange={setLlm}>
               <SelectTrigger className="h-8 text-xs">
-                <SelectValue />
+                <SelectValue placeholder="Select a model" />
               </SelectTrigger>
               <SelectContent>
-                {[
-                  { label: "Claude Sonnet 4", value: "claude-sonnet-4-20250514" },
-                  { label: "Claude Haiku", value: "claude-haiku-4-5-20251001" },
-                  { label: "GPT-4o", value: "gpt-4o" },
-                ].map((m) => (
+                {MODEL_OPTIONS.map((m) => (
                   <SelectItem key={m.value} value={m.value} className="text-xs">
                     {m.label}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
+            {isLegacyModel && (
+              <p className="text-[10px] leading-relaxed text-warning">
+                Current model: {LEGACY_LLM_MODEL_LABEL}. Select a supported
+                model above and save to update this agent.
+              </p>
+            )}
           </div>
         </div>
 
@@ -1200,17 +1083,42 @@ function VoiceAgentDetail({
           </Table>
         )}
 
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-7 text-xs"
-          onClick={() =>
-            toast.info("Phone number assignment requires a Vapi account with Twilio numbers configured.")
-          }
-        >
-          <Plus className="h-3 w-3" />
-          Assign Number
-        </Button>
+        {allPhoneNumbers.length === 0 ? (
+          <p className="text-[11px] text-muted-foreground">
+            No phone numbers are connected to your account yet. Contact support to add one.
+          </p>
+        ) : (
+          <div className="space-y-1">
+            <Label className="text-xs">Assign a number to this agent</Label>
+            <Select
+              value=""
+              disabled={!agent.vapi_assistant_id}
+              onValueChange={(vapiNumberId) => onAssignNumber(vapiNumberId, agent.id)}
+            >
+              <SelectTrigger className="h-8 text-xs">
+                <SelectValue
+                  placeholder={
+                    agent.vapi_assistant_id ? "Choose a number…" : "Save the agent first to assign a number"
+                  }
+                />
+              </SelectTrigger>
+              <SelectContent>
+                {allPhoneNumbers
+                  .filter((pn) => !!pn.vapi_number_id)
+                  .map((pn) => (
+                    <SelectItem key={pn.id} value={pn.vapi_number_id!} className="text-xs">
+                      {pn.number}
+                      {pn.agent_id === agent.id
+                        ? " (currently assigned)"
+                        : pn.agent_id
+                          ? " (reassign from another agent)"
+                          : " (unassigned)"}
+                    </SelectItem>
+                  ))}
+              </SelectContent>
+            </Select>
+          </div>
+        )}
       </div>
 
       <div className="sticky bottom-0 border-t border-border bg-background pt-3 pb-1">

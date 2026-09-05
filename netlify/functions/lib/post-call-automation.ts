@@ -16,6 +16,7 @@
  */
 
 import { createClient } from '@supabase/supabase-js';
+import { runAppointmentPostBookingLifecycle } from './appointment-post-booking';
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -513,7 +514,7 @@ export async function runPostCallAutomation(params: {
       .trim() || 'Consultation';
 
     if (!isNaN(scheduled.getTime()) && scheduled.getFullYear() >= 2025) {
-      const { error: apptErr } = await supabase
+      const { data: apptRow, error: apptErr } = await supabase
         .from('appointments')
         .insert({
           org_id: tenantId,
@@ -529,12 +530,24 @@ export async function runPostCallAutomation(params: {
           duration_min: 60,
           source: 'Voice AI',
           status: 'scheduled',
-        });
+        })
+        .select('id')
+        .single();
 
       if (apptErr) {
         logError('appointment insert failed', apptErr);
       } else {
         log('appointment created from post-call extraction');
+        // AI-H1.1 — this fallback path previously never triggered a
+        // confirmation email/notification at all (only the live
+        // book_appointment tool-call path did). Same shared lifecycle now.
+        if (apptRow?.id) {
+          try {
+            await runAppointmentPostBookingLifecycle(supabase, { appointmentId: apptRow.id as string, orgId: tenantId });
+          } catch (err) {
+            logError('post-booking lifecycle failed', err instanceof Error ? err.message : err);
+          }
+        }
       }
     } else {
       log(`could not parse appointment date: "${scheduledStr}" → ${scheduled}`);

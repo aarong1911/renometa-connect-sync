@@ -45,15 +45,22 @@ function normalizePhone(raw: string | null | undefined): string {
   return digits.length === 11 && digits[0] === "1" ? digits.slice(1) : digits;
 }
 
+// Vapi's raw artifact.messages array includes the system prompt (role:
+// "system") alongside real conversation turns — never show it in
+// customer-facing previews/threads. Allowlist the conversational roles
+// rather than blocklist "system", so any other non-conversational role
+// Vapi's artifact format adds is excluded too, not just this one.
+const CONVERSATION_ROLES = new Set(["assistant", "bot", "user", "human", "caller"]);
+const isConversationTurn = (m: any) => m?.role && m?.message && CONVERSATION_ROLES.has(String(m.role).toLowerCase());
+const isAssistantTurn = (m: any) => m.role === "assistant" || m.role === "bot";
+
 function formatTranscriptPreview(transcript: any): string {
   if (!transcript) return "Voice call — no transcript";
   if (typeof transcript === "string") return transcript.slice(0, 80) + "…";
   if (Array.isArray(transcript)) {
-    const lastMsg = [...transcript]
-      .reverse()
-      .find((m: any) => m.role && m.message);
+    const lastMsg = [...transcript].reverse().find(isConversationTurn);
     if (lastMsg) {
-      const role = lastMsg.role === "assistant" ? "Agent" : "Caller";
+      const role = isAssistantTurn(lastMsg) ? "Agent" : "Caller";
       return `${role}: ${lastMsg.message.slice(0, 70)}…`;
     }
   }
@@ -161,15 +168,17 @@ async function fetchVoiceConversations(orgId: string): Promise<{ conversations: 
           ? new Date(row.started_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
           : "";
 
-        if (Array.isArray(row.transcript) && row.transcript.length > 0) {
-          row.transcript
-            .filter((m: any) => m.role && m.message)
-            .forEach((m: any, i: number) => {
+        const conversationTurns = Array.isArray(row.transcript)
+          ? row.transcript.filter(isConversationTurn)
+          : [];
+
+        if (conversationTurns.length > 0) {
+          conversationTurns.forEach((m: any, i: number) => {
               msgs.push({
                 id: `voice-msg-${row.id}-${i}`,
                 conversationId: convId,
                 channel: "voice",
-                direction: m.role === "assistant" ? "out" : "in",
+                direction: isAssistantTurn(m) ? "out" : "in",
                 body: i === 0 && callLabel ? `[Call ${callLabel}] ${m.message}` : m.message,
                 at: row.started_at ?? new Date().toISOString(),
               });

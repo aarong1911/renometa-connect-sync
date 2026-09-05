@@ -9,6 +9,19 @@
  *   SUPABASE_URL
  *   SUPABASE_SERVICE_ROLE_KEY
  *
+ * Env vars required for assistant create/update (POST /assistant, PATCH /assistant/{id}):
+ *   VAPI_WEBHOOK_CREDENTIAL_ID  ← id of the pre-created Vapi Custom Credential
+ *                                 ("RenoMeta Production Webhook (HMAC)") that
+ *                                 holds the HMAC secret/algorithm/header config.
+ *                                 Every assistant create/update is wired to it via
+ *                                 server.credentialId so agents get working webhook
+ *                                 auth with no manual Vapi-dashboard step. REQUIRED —
+ *                                 if unset, assistant create/update is refused
+ *                                 (503) rather than silently creating an assistant
+ *                                 with no webhook authentication. Configure in the
+ *                                 Netlify site's environment variables (same place
+ *                                 as VAPI_API_KEY). See AI-H1.1 report.
+ *
  * Usage from the client:
  *   POST /.netlify/functions/vapi-proxy
  *   Body: { path: '/assistant', method: 'POST', body: { ... } }
@@ -24,12 +37,6 @@ const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
-
-console.log('[vapi-proxy] init:', {
-  url: process.env.SUPABASE_URL,
-  keyStart: process.env.SUPABASE_SERVICE_ROLE_KEY?.substring(0, 20),
-  keyLength: process.env.SUPABASE_SERVICE_ROLE_KEY?.length,
-});
 
 interface ProxyRequest {
   path: string;
@@ -310,6 +317,41 @@ export const handler: Handler = async (event: HandlerEvent) => {
     vapiUrl += `?${new URLSearchParams(query).toString()}`;
   }
 
+  // AI-H1.1 Part 1 — every assistant create/update from RenoMeta configures
+  // the RenoMeta webhook (serverUrl is always set by voice-agent-tab.tsx), so
+  // it MUST also attach RenoMeta's HMAC webhook credential — a customer must
+  // never end up with a Voice Agent that requires a later manual Vapi
+  // dashboard step to receive authenticated webhook traffic. This is now a
+  // hard requirement, not an opt-in: if VAPI_WEBHOOK_CREDENTIAL_ID is missing,
+  // the write is refused before any Vapi API call is made — never silently
+  // create/update an assistant with no working webhook auth.
+  const isAssistantWrite =
+    (path === '/assistant' && method === 'POST') ||
+    (/^\/assistant\/[a-zA-Z0-9-]+$/.test(path) && method === 'PATCH');
+
+  const credentialId = process.env.VAPI_WEBHOOK_CREDENTIAL_ID;
+
+  if (isAssistantWrite && !credentialId) {
+    console.error('[vapi-proxy] VAPI_WEBHOOK_CREDENTIAL_ID not configured — refusing assistant write');
+    return {
+      statusCode: 503,
+      body: JSON.stringify({
+        error: 'Voice Agent webhook credential is not configured on the server. Contact support.',
+      }),
+    };
+  }
+
+  const forwardBody: Record<string, unknown> | undefined =
+    isAssistantWrite && body
+      ? {
+          ...body,
+          server: {
+            url: (body as Record<string, unknown>).serverUrl,
+            credentialId,
+          },
+        }
+      : body;
+
   let vapiRes: Response;
   try {
     vapiRes = await fetch(vapiUrl, {
@@ -318,7 +360,7 @@ export const handler: Handler = async (event: HandlerEvent) => {
         Authorization: `Bearer ${process.env.VAPI_API_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: body ? JSON.stringify(body) : undefined,
+      body: forwardBody ? JSON.stringify(forwardBody) : undefined,
     });
   } catch (err) {
     console.error('[vapi-proxy] Vapi fetch error:', err);
