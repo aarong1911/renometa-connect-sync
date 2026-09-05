@@ -1,6 +1,60 @@
 // src/lib/organization.ts
-import { useSyncExternalStore } from "react";
+//
+// Platform State Sync Phase S5D — Organization / Team / Permissions.
+//
+// BEFORE: a module-level `org` object + `team` array + two listener Sets +
+// `emitOrg()`/`emitTeam()` + `useSyncExternalStore`, hydrated by a
+// top-level `loadOrgFromSupabase()` call at import time, plus its OWN
+// three realtime channels (`org_${orgId}`, `members_${orgId}`,
+// `invitations_${orgId}`) — the exact "duplicate subscription per module"
+// anti-pattern the central RealtimeBridge exists to eliminate.
+//
+// AFTER: two TanStack Query keys per org — `queryKeys.organization(orgId)`
+// (the organizations row) and `queryKeys.teamMembers(orgId)` (active
+// org_memberships, profile-joined) — plus a third,
+// `queryKeys.organizationInvitations(orgId)`, for the invitations table
+// that `useTeam()` merges in client-side (same merge rule the old
+// `reloadTeam()` used: active members first, then invited/roster members
+// whose email isn't already an active member). `useOrganization()` and
+// `useTeam()` keep their EXACT public shapes (`Organization` /
+// `TeamMember[]`) so none of this file's ~32 importers need to change.
+// The central RealtimeBridge now invalidates these on `organizations` /
+// `org_memberships` / `profiles` / `invitations` changes — see
+// realtime-bridge.tsx. No module-level realtime channels remain here.
+//
+// Org id resolution now uses the shared `useOrgId()` (src/lib/org-id.ts) —
+// the same hook every other Query-backed domain (S1–S5C) already uses —
+// instead of this file's own bespoke profiles→org_memberships lookup with
+// explicit SIGNED_IN/SIGNED_OUT/TOKEN_REFRESHED handling. `useOrgId()`'s
+// per-user memoization already invalidates correctly when a different
+// user signs in (keyed by auth user id), matching every already-migrated
+// domain's accepted session model. The one behavior worth preserving
+// explicitly: on SIGNED_OUT, the old code cleared the localStorage logo/
+// company-name cache so a different identity on the same machine never
+// sees a stale prior org's branding pre-fetch — kept below as a single
+// small, one-time auth listener (not a data cache, not a realtime
+// channel) that also drops this domain's Query cache entries.
+//
+// S5D.1 correction: `addMember`/`removeMember` are NOT local-only mocks —
+// a real, already-built trusted persistence path exists for both
+// (src/lib/team.ts's `inviteMember`/`removeMemberFromOrg`, calling
+// netlify/functions/invite-member.ts / remove-member.ts) and was already
+// wired into team-members-manager.tsx before S5D. The actual defect
+// (fixed in S5D.1) was ORDERING: the UI called these two functions to
+// patch local state BEFORE awaiting the real server call, so a failed
+// invite/remove still looked like it succeeded, and a successful one
+// never told the Query cache to reconcile with the authoritative row.
+// team-members-manager.tsx now calls the real endpoint FIRST and only
+// calls addMember()/removeMember() after confirmed success; these two
+// functions still don't touch Supabase themselves — they patch the Query
+// cache as an instant-feel placeholder and invalidate the correct real
+// key(s) so the next refetch replaces it with server truth.
+import { useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { supabase } from "./supabase";
+import { getQueryClient } from "@/lib/query-client";
+import { getOrgId, useOrgId } from "@/lib/org-id";
+import { queryKeys } from "@/lib/query-keys";
 
 export type Role =
   | "owner" | "admin" | "office_manager" | "estimator" | "sales"
@@ -117,183 +171,101 @@ const DEFAULT_ORG: Organization = {
   address: "", logoUrl: null, crmGoals: [], timezone: "America/Los_Angeles",
 };
 
-let org: Organization = { ...DEFAULT_ORG, logoUrl: readLogoCache(), companyName: readCompanyCache() };
-let team: TeamMember[] = [];
-let orgLoaded      = false;
-let orgSubscribed  = false;
-let currentOrgId: string | null = null;
-let isUpdating     = false;
+const qc = () => getQueryClient();
 
-const orgListeners  = new Set<() => void>();
-const teamListeners = new Set<() => void>();
-function emitOrg()  { for (const l of orgListeners)  l(); }
-function emitTeam() { for (const l of teamListeners) l(); }
-
-export async function reloadTeam(orgId: string) {
-  const [{ data: members }, { data: invites }] = await Promise.all([
-    supabase.from("org_memberships").select(`
-      member_id, role, name,
-      profiles!org_memberships_member_id_fkey(id, first_name, last_name, email, phone)
-    `).eq("org_id", orgId),
-    supabase.from("invitations").select("*")
-      .eq("organization_id", orgId)
-      .in("status", ["pending", "roster_only"])
-      .is("project_id", null),
-  ]);
-
-  const activeMembers: TeamMember[] = (members ?? []).map((m: any) => {
-    const profileName = `${m.profiles?.first_name || ""} ${m.profiles?.last_name || ""}`.trim();
-    return {
-      id:         m.member_id,
-      name:       profileName || m.name || m.profiles?.email || "",
-      email:      m.profiles?.email  || "",
-      phone:      m.profiles?.phone  || undefined,
-      role:       (m.role || "viewer") as Role,
-      workerType: "employee" as WorkerType,
-      status:     "active" as const,
-    };
+// ── One-time sign-out cleanup (NOT a data cache/realtime channel — see
+// file header) ─────────────────────────────────────────────────────────
+// Registered lazily on first hook use (never at import time). Preserves
+// the one behavior worth keeping from the old SIGNED_OUT handler: a
+// different identity on the same machine must never see a stale prior
+// org's cached branding before its own first fetch resolves.
+let signOutCleanupAttached = false;
+function ensureSignOutCleanup() {
+  if (signOutCleanupAttached) return;
+  signOutCleanupAttached = true;
+  supabase.auth.onAuthStateChange((event) => {
+    if (event !== "SIGNED_OUT") return;
+    writeLogoCache(null);
+    writeCompanyCache("");
+    qc().removeQueries({ queryKey: ["organization"] });
+    qc().removeQueries({ queryKey: ["teamMembers"] });
+    qc().removeQueries({ queryKey: ["organizationInvitations"] });
+    qc().removeQueries({ queryKey: ["memberPermissions"] });
   });
-
-  const invitedMembers: TeamMember[] = (invites ?? []).map((inv: any) => ({
-    id:        `inv-${inv.id}`,
-    name:      `${inv.first_name || ""} ${inv.last_name || ""}`.trim() || inv.email || "",
-    email:     inv.email || "",
-    phone:     inv.primary_phone || undefined,
-    role:      (inv.role || "viewer") as Role,
-    workerType: (inv.worker_type || "employee") as WorkerType,
-    status:    inv.status === "roster_only" ? "roster" as const : "invited" as const,
-    invitedAt: inv.created_at,
-  }));
-
-  const activeEmails = new Set(activeMembers.map(m => m.email));
-  const filteredInvited = invitedMembers.filter(m => !activeEmails.has(m.email));
-  team = [...activeMembers, ...filteredInvited];
-  emitTeam();
 }
 
-async function loadOrgFromSupabase() {
-  try {
-    const { data: { session } } = await supabase.auth.getSession();
-    if (!session?.user) return;
-    const user = session.user;
+// ── Organization profile ─────────────────────────────────────────────────
 
-    const { data: profile } = await supabase.from("profiles")
-      .select("organization_id").eq("id", user.id).maybeSingle();
-    let orgId = profile?.organization_id;
-
-    if (!orgId) {
-      const { data: membership } = await supabase.from("org_memberships")
-        .select("org_id").eq("member_id", user.id).maybeSingle();
-      orgId = membership?.org_id;
-    }
-    if (!orgId) return;
-
-    // If org changed (different account login), clear stale realtime channels
-    if (currentOrgId && currentOrgId !== orgId) {
-      supabase.removeAllChannels();
-      orgSubscribed = false;
-    }
-    currentOrgId = orgId;
-
-    const { data: orgData } = await supabase.from("organizations")
-      .select("*").eq("id", orgId).maybeSingle();
-
-    if (orgData) {
-      const rawLogo = orgData.logo_url || null;
-      const logoUrl = rawLogo?.startsWith("blob:") ? null : rawLogo;
-      org = {
-        companyName:  orgData.name  || orgData.public_name || "",
-        primaryPhone: orgData.phone || "",
-        website:      orgData.website || "",
-        industry:     orgData.industry || undefined,
-        address:      orgData.address  || orgData.business_address || "",
-        logoUrl:      logoUrl || readLogoCache(),
-        crmGoals:     orgData.crm_goals || [],
-        timezone:     orgData.timezone  || "America/Los_Angeles",
-      };
-      if (logoUrl) writeLogoCache(logoUrl);
-      writeCompanyCache(org.companyName);
-      orgLoaded = true;
-      emitOrg();
-    }
-
-    // Set orgSubscribed = true BEFORE subscribing to prevent the race condition
-    // where two concurrent calls both pass !orgSubscribed and try to add
-    // postgres_changes listeners to an already-subscribed channel.
-    if (!orgSubscribed) {
-      orgSubscribed = true;
-
-      supabase.channel(`org_${orgId}`)
-        .on("postgres_changes",
-          { event: "UPDATE", schema: "public", table: "organizations", filter: `id=eq.${orgId}` },
-          (payload) => {
-            const d  = payload.new as any;
-            const rl = (d.logo_url || null)?.startsWith("blob:") ? null : (d.logo_url || null);
-            org = { ...org,
-              companyName:  d.name  || d.public_name || org.companyName,
-              primaryPhone: d.phone || org.primaryPhone,
-              website:      d.website || org.website,
-              industry:     d.industry || org.industry,
-              address:      d.address  || d.business_address || org.address,
-              logoUrl:      rl ?? readLogoCache(),
-              crmGoals:     d.crm_goals || org.crmGoals,
-              timezone:     d.timezone  || org.timezone,
-            };
-            if (rl) writeLogoCache(rl);
-            emitOrg();
-          })
-        .subscribe();
-
-      supabase.channel(`members_${orgId}`)
-        .on("postgres_changes",
-          { event: "*", schema: "public", table: "org_memberships", filter: `org_id=eq.${orgId}` },
-          () => { if (!isUpdating) reloadTeam(orgId!); })
-        .subscribe();
-
-      supabase.channel(`invitations_${orgId}`)
-        .on("postgres_changes",
-          { event: "*", schema: "public", table: "invitations", filter: `organization_id=eq.${orgId}` },
-          () => { if (!isUpdating) reloadTeam(orgId!); })
-        .subscribe();
-    }
-
-    await reloadTeam(orgId);
-  } catch (err) {
-    console.error("[org] loadOrgFromSupabase failed:", err);
+async function fetchOrganizationForOrg(orgId: string): Promise<Organization> {
+  const { data: orgData, error } = await supabase.from("organizations").select("*").eq("id", orgId).maybeSingle();
+  if (error) {
+    console.error("[org] fetchOrganizationForOrg failed:", error);
+    throw error;
   }
+  if (!orgData) return { ...DEFAULT_ORG, logoUrl: readLogoCache(), companyName: readCompanyCache() };
+
+  const rawLogo = orgData.logo_url || null;
+  const logoUrl = rawLogo?.startsWith("blob:") ? null : rawLogo;
+  const resolved: Organization = {
+    companyName:  orgData.name  || orgData.public_name || "",
+    primaryPhone: orgData.phone || "",
+    website:      orgData.website || "",
+    industry:     orgData.industry || undefined,
+    address:      orgData.address  || orgData.business_address || "",
+    logoUrl:      logoUrl || readLogoCache(),
+    crmGoals:     orgData.crm_goals || [],
+    timezone:     orgData.timezone  || "America/Los_Angeles",
+  };
+  if (logoUrl) writeLogoCache(logoUrl);
+  writeCompanyCache(resolved.companyName);
+  return resolved;
 }
 
-loadOrgFromSupabase();
+function useOrganizationQuery() {
+  ensureSignOutCleanup();
+  const orgId = useOrgId();
+  return useQuery({
+    queryKey: orgId ? queryKeys.organization(orgId) : ["organization", "_pending"],
+    queryFn: () => fetchOrganizationForOrg(orgId as string),
+    enabled: !!orgId,
+    // Org profile changes rarely (name/logo/branding) — mutation
+    // invalidation + realtime + focus-refetch are the primary freshness
+    // path, this just caps redundant refetches.
+    staleTime: 90_000,
+    // Anti-flash (Part 23): seeds from the exact same localStorage cache
+    // the pre-S5D module default used, so the app shell/settings never
+    // show a blank name/logo before the first fetch resolves.
+    initialData: () => ({ ...DEFAULT_ORG, logoUrl: readLogoCache(), companyName: readCompanyCache() }),
+  });
+}
 
-supabase.auth.onAuthStateChange((event) => {
-  if (event === "SIGNED_IN" || event === "TOKEN_REFRESHED" || event === "INITIAL_SESSION") {
-    loadOrgFromSupabase();
-  } else if (event === "SIGNED_OUT") {
-    // Remove all realtime channels before resetting state
-    supabase.removeAllChannels();
-    writeLogoCache(null); writeCompanyCache("");
-    org = { ...DEFAULT_ORG }; team = [];
-    orgLoaded = false; orgSubscribed = false;
-    currentOrgId = null; isUpdating = false;
-    emitOrg(); emitTeam();
+export function useOrganization(): Organization {
+  return useOrganizationQuery().data ?? DEFAULT_ORG;
+}
+
+/** One-off cache reader for non-hook contexts (e.g. a draft-form's "Reset" button). */
+export function getOrganization(): Organization {
+  for (const [, data] of qc().getQueriesData<Organization>({ queryKey: ["organization"] })) {
+    if (data) return data;
   }
-});
+  return { ...DEFAULT_ORG, logoUrl: readLogoCache(), companyName: readCompanyCache() };
+}
 
-export function getOrganization(): Organization { return org; }
-
+/**
+ * Optimistic-first (preserved exactly — this was already the one domain
+ * in the app with an instant-feel update-before-persist contract, unlike
+ * the persist-first pattern every other S-phase store uses). Switching it
+ * to persist-first would add perceived latency to renaming the org or
+ * changing the logo that never existed before S5D.
+ */
 export function updateOrganization(patch: Partial<Organization>) {
-  org = { ...org, ...patch };
+  qc().setQueriesData<Organization>({ queryKey: ["organization"] }, (old) => ({ ...(old ?? DEFAULT_ORG), ...patch }));
   if (patch.logoUrl     !== undefined) writeLogoCache(patch.logoUrl);
   if (patch.companyName !== undefined) writeCompanyCache(patch.companyName);
-  emitOrg();
 
   (async () => {
     try {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session?.user) return;
-      const { data: p } = await supabase.from("profiles")
-        .select("organization_id").eq("id", session.user.id).maybeSingle();
-      const orgId = p?.organization_id;
+      const orgId = await getOrgId();
       if (!orgId) return;
       const u: Record<string, any> = {};
       if (patch.companyName  !== undefined) { u.name = patch.companyName; u.public_name = patch.companyName; }
@@ -307,49 +279,174 @@ export function updateOrganization(patch: Partial<Organization>) {
       if (Object.keys(u).length > 0) {
         const { error } = await supabase.from("organizations").update(u).eq("id", orgId);
         if (error) console.error("[org] updateOrganization failed:", error);
+        else void qc().invalidateQueries({ queryKey: ["organization"] });
       }
     } catch (err) { console.error("[org] updateOrganization sync failed:", err); }
   })();
 }
 
-export function useOrganization(): Organization {
-  return useSyncExternalStore(
-    cb => { orgListeners.add(cb); return () => orgListeners.delete(cb); },
-    () => org,
-    () => ({ ...DEFAULT_ORG, logoUrl: readLogoCache(), companyName: readCompanyCache() }),
-  );
+// ── Team roster + invitations ────────────────────────────────────────────
+//
+// Two separate Query keys (teamMembers = active org_memberships, profile-
+// joined; organizationInvitations = pending/roster-only team invites) so
+// inviting someone only ever invalidates the invitations key, never the
+// whole roster, and vice versa — see the S5D report's invalidation
+// matrix. `useTeam()` merges them client-side with the EXACT same rule
+// `reloadTeam()` always used (active members first, then any invited/
+// roster row whose email isn't already an active member), so its public
+// shape — one `TeamMember[]` — never changed for its ~15 callers.
+
+type OrgInvitationRow = TeamMember;
+
+async function fetchTeamMembersForOrg(orgId: string): Promise<TeamMember[]> {
+  const { data: members, error } = await supabase.from("org_memberships").select(`
+    member_id, role, name,
+    profiles!org_memberships_member_id_fkey(id, first_name, last_name, email, phone)
+  `).eq("org_id", orgId);
+  if (error) {
+    console.error("[org] fetchTeamMembersForOrg failed:", error);
+    throw error;
+  }
+  return (members ?? []).map((m: any) => {
+    const profileName = `${m.profiles?.first_name || ""} ${m.profiles?.last_name || ""}`.trim();
+    return {
+      id:         m.member_id,
+      name:       profileName || m.name || m.profiles?.email || "",
+      email:      m.profiles?.email  || "",
+      phone:      m.profiles?.phone  || undefined,
+      role:       (m.role || "viewer") as Role,
+      workerType: "employee" as WorkerType,
+      status:     "active" as const,
+    };
+  });
 }
 
-export function getTeam(): TeamMember[] { return team; }
+async function fetchOrganizationInvitationsForOrg(orgId: string): Promise<OrgInvitationRow[]> {
+  const { data: invites, error } = await supabase.from("invitations").select("*")
+    .eq("organization_id", orgId)
+    .in("status", ["pending", "roster_only"])
+    .is("project_id", null);
+  if (error) {
+    console.error("[org] fetchOrganizationInvitationsForOrg failed:", error);
+    throw error;
+  }
+  return (invites ?? []).map((inv: any) => ({
+    id:        `inv-${inv.id}`,
+    name:      `${inv.first_name || ""} ${inv.last_name || ""}`.trim() || inv.email || "",
+    email:     inv.email || "",
+    phone:     inv.primary_phone || undefined,
+    role:      (inv.role || "viewer") as Role,
+    workerType: (inv.worker_type || "employee") as WorkerType,
+    status:    inv.status === "roster_only" ? "roster" as const : "invited" as const,
+    invitedAt: inv.created_at,
+  }));
+}
+
+function mergeTeam(active: TeamMember[], invited: OrgInvitationRow[]): TeamMember[] {
+  const activeEmails = new Set(active.map((m) => m.email));
+  const filteredInvited = invited.filter((m) => !activeEmails.has(m.email));
+  return [...active, ...filteredInvited];
+}
+
+function useTeamMembersQuery() {
+  ensureSignOutCleanup();
+  const orgId = useOrgId();
+  return useQuery({
+    queryKey: orgId ? queryKeys.teamMembers(orgId) : ["teamMembers", "_pending"],
+    queryFn: () => fetchTeamMembersForOrg(orgId as string),
+    enabled: !!orgId,
+    staleTime: 60_000,
+  });
+}
+
+function useOrganizationInvitationsQuery() {
+  const orgId = useOrgId();
+  return useQuery({
+    queryKey: orgId ? queryKeys.organizationInvitations(orgId) : ["organizationInvitations", "_pending"],
+    queryFn: () => fetchOrganizationInvitationsForOrg(orgId as string),
+    enabled: !!orgId,
+    staleTime: 60_000,
+  });
+}
 
 export function useTeam(): TeamMember[] {
-  return useSyncExternalStore(
-    cb => { teamListeners.add(cb); return () => teamListeners.delete(cb); },
-    () => team,
-    () => [],
-  );
+  const active = useTeamMembersQuery().data ?? [];
+  const invited = useOrganizationInvitationsQuery().data ?? [];
+  // Stable reference unless either underlying Query actually changed —
+  // useCurrentUserRole() (permissions.ts) and every role-gated control
+  // reads this on every render; a fresh array every render would still be
+  // correct but would defeat memoized consumers downstream for no reason.
+  return useMemo(() => mergeTeam(active, invited), [active, invited]);
 }
 
+/** One-off cache reader for non-hook contexts (e.g. tasks-store.ts's assignee display resolution). */
+export function getTeam(): TeamMember[] {
+  let active: TeamMember[] = [];
+  let invited: OrgInvitationRow[] = [];
+  for (const [, data] of qc().getQueriesData<TeamMember[]>({ queryKey: ["teamMembers"] })) {
+    if (Array.isArray(data)) { active = data; break; }
+  }
+  for (const [, data] of qc().getQueriesData<OrgInvitationRow[]>({ queryKey: ["organizationInvitations"] })) {
+    if (Array.isArray(data)) { invited = data; break; }
+  }
+  return mergeTeam(active, invited);
+}
+
+/**
+ * S5D.1 correction — addMember() is now ONLY ever called by
+ * team-members-manager.tsx AFTER a real `inviteMember()` (src/lib/team.ts
+ * -> netlify/functions/invite-member.ts) call has confirmed persistence
+ * (invitation row insert + email send, or for a roster-only add, an
+ * immediate ghost profile + org_membership too). This function itself
+ * still does no Supabase call — its only job is the instant-feel local
+ * placeholder — but it now patches and invalidates the CORRECT real Query
+ * key(s) so the placeholder is reconciled with the authoritative server
+ * row within moments, instead of being the only representation of
+ * "success" indefinitely (the pre-S5D.1 defect).
+ *
+ * The one remaining local-only case: `status === "active"` happens when
+ * the caller explicitly turns off "Send invite now" without choosing
+ * roster-only — there is no existing backend endpoint for "add an
+ * already-active member with no invitation," so this one path stays a
+ * local-only placeholder exactly as before (see the S5D.1 report's
+ * "remaining gaps").
+ */
 export function addMember(member: Omit<TeamMember, "id">): TeamMember {
   const next: TeamMember = { ...member, id: `u${Date.now()}` };
-  team = [...team, next];
-  emitTeam();
+
+  if (member.status === "active") {
+    qc().setQueriesData<TeamMember[]>({ queryKey: ["teamMembers"] }, (old) => (Array.isArray(old) ? [...old, next] : old));
+    return next;
+  }
+
+  // "invited" or "roster" — a real invitation row (and, for roster, an
+  // immediate org_membership too) now exists server-side.
+  qc().setQueriesData<OrgInvitationRow[]>({ queryKey: ["organizationInvitations"] }, (old) => (Array.isArray(old) ? [...old, next] : old));
+  void qc().invalidateQueries({ queryKey: ["organizationInvitations"] });
+  if (member.status === "roster") void qc().invalidateQueries({ queryKey: ["teamMembers"] });
   return next;
 }
 
 export function updateMember(id: string, patch: Partial<TeamMember>) {
-  team = team.map(m => m.id === id ? { ...m, ...patch } : m);
-  emitTeam();
+  qc().setQueriesData<TeamMember[]>({ queryKey: ["teamMembers"] }, (old) =>
+    Array.isArray(old) ? old.map((m) => (m.id === id ? { ...m, ...patch } : m)) : old);
+  qc().setQueriesData<OrgInvitationRow[]>({ queryKey: ["organizationInvitations"] }, (old) =>
+    Array.isArray(old) ? old.map((m) => (m.id === id ? { ...m, ...patch } : m)) : old);
 
+  // Invitation rows are edited directly by the caller (team-members-
+  // manager.tsx's MemberInfoModal writes to `invitations` itself before
+  // calling this) — no real member profile to patch via the secure
+  // Netlify boundary below, matching the pre-S5D early return exactly.
   if (id.startsWith("inv-")) return;
 
   (async () => {
     try {
-      isUpdating = true;
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) return;
-      const member = team.find(m => m.id === id);
+      const member = getTeam().find((m) => m.id === id);
       const parts  = (patch.name ?? member?.name ?? "").trim().split(" ");
+      // Privileged write stays server-side, unchanged (Part 22) — never
+      // moved to a direct client-side profiles/org_memberships write.
       const res = await fetch("/.netlify/functions/update-user-by-id", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
@@ -362,19 +459,107 @@ export function updateMember(id: string, patch: Partial<TeamMember>) {
         }),
       });
       if (!res.ok) console.error("[org] update-user-by-id failed:", await res.text());
-      await new Promise(r => setTimeout(r, 500));
-      if (currentOrgId) await reloadTeam(currentOrgId);
+      // Same 500ms settle window the old reloadTeam() call waited out —
+      // the Netlify function's write needs a moment before reading it back.
+      await new Promise((r) => setTimeout(r, 500));
+      void qc().invalidateQueries({ queryKey: ["teamMembers"] });
+      // A role change can change this member's EFFECTIVE permissions
+      // (role defaults, see permission-features.ts) — nudge their
+      // permissions query too, in case their Permissions page is open.
+      // Prefix invalidation (no orgId in scope here) — cheap, matches the
+      // convention every other store in this codebase uses for this kind
+      // of "just in case it's open" nudge.
+      if (patch.role !== undefined) void qc().invalidateQueries({ queryKey: ["memberPermissions"] });
     } catch (err) {
       console.error("[org] updateMember failed:", err);
-    } finally {
-      isUpdating = false;
     }
   })();
 }
 
+/**
+ * S5D.1 correction — removeMember() is now ONLY ever called by
+ * team-members-manager.tsx AFTER a real `removeMemberFromOrg()`
+ * (src/lib/team.ts -> netlify/functions/remove-member.ts) call has
+ * confirmed persistence (org_membership delete + profiles.organization_id
+ * cleared + auth user deleted for an active member; invitation row delete
+ * + best-effort auth cleanup for a pending/roster row — see the S5D.1
+ * report for why the auth-account delete is intentional here, not a
+ * bug). Filters the placeholder out of both team caches immediately, then
+ * invalidates both plus this member's permission overrides (now moot)
+ * so a refetch confirms the removal against server truth.
+ */
 export function removeMember(id: string) {
-  team = team.filter(m => m.id !== id);
-  emitTeam();
+  qc().setQueriesData<TeamMember[]>({ queryKey: ["teamMembers"] }, (old) => (Array.isArray(old) ? old.filter((m) => m.id !== id) : old));
+  qc().setQueriesData<OrgInvitationRow[]>({ queryKey: ["organizationInvitations"] }, (old) => (Array.isArray(old) ? old.filter((m) => m.id !== id) : old));
+  void qc().invalidateQueries({ queryKey: ["teamMembers"] });
+  void qc().invalidateQueries({ queryKey: ["organizationInvitations"] });
+  void qc().invalidateQueries({ queryKey: ["memberPermissions"] });
+}
+
+// ── Member permission overrides ──────────────────────────────────────────
+//
+// Scoped per (org, member) — the Permissions settings page only ever
+// needs the currently-selected member's override rows, never every
+// member's at once (Part 8). Role DEFAULTS live in permission-features.ts
+// (getRoleDefaultPermission) — unchanged, not duplicated here; this only
+// covers the persisted per-member override rows themselves.
+
+export type MemberPermissionOverride = { feature: string; action: string; granted: boolean };
+
+async function fetchMemberPermissions(orgId: string, memberId: string): Promise<MemberPermissionOverride[]> {
+  const { data, error } = await supabase.from("member_permissions")
+    .select("feature, action, granted")
+    .eq("org_id", orgId)
+    .eq("member_id", memberId);
+  if (error) {
+    console.error("[org] fetchMemberPermissions failed:", error);
+    throw error;
+  }
+  return (data ?? []) as MemberPermissionOverride[];
+}
+
+export function useMemberPermissions(orgId: string | null | undefined, memberId: string | null | undefined) {
+  const enabled = !!orgId && !!memberId;
+  return useQuery({
+    queryKey: enabled ? queryKeys.memberPermissions(orgId as string, memberId as string) : ["memberPermissions", "_pending"],
+    queryFn: () => fetchMemberPermissions(orgId as string, memberId as string),
+    enabled,
+    staleTime: 30_000,
+  });
+}
+
+export type SetMemberPermissionResult = { ok: true } | { ok: false; error: string };
+
+export async function setMemberPermissionOverride(
+  orgId: string, memberId: string, feature: string, action: string, granted: boolean,
+): Promise<SetMemberPermissionResult> {
+  const { error } = await supabase.from("member_permissions").upsert(
+    { org_id: orgId, member_id: memberId, feature, action, granted, updated_at: new Date().toISOString() },
+    { onConflict: "org_id,member_id,feature,action" },
+  );
+  if (error) { console.error("[org] setMemberPermissionOverride failed:", error); return { ok: false, error: error.message }; }
+  void qc().invalidateQueries({ queryKey: queryKeys.memberPermissions(orgId, memberId) });
+  return { ok: true };
+}
+
+/** Clears a single override, reverting that one feature/action back to the role default. */
+export async function clearMemberPermissionOverride(
+  orgId: string, memberId: string, feature: string, action: string,
+): Promise<SetMemberPermissionResult> {
+  const { error } = await supabase.from("member_permissions").delete()
+    .eq("org_id", orgId).eq("member_id", memberId).eq("feature", feature).eq("action", action);
+  if (error) { console.error("[org] clearMemberPermissionOverride failed:", error); return { ok: false, error: error.message }; }
+  void qc().invalidateQueries({ queryKey: queryKeys.memberPermissions(orgId, memberId) });
+  return { ok: true };
+}
+
+/** Clears every override for a member, reverting them entirely to their role's default permissions. */
+export async function resetMemberPermissions(orgId: string, memberId: string): Promise<SetMemberPermissionResult> {
+  const { error } = await supabase.from("member_permissions").delete()
+    .eq("org_id", orgId).eq("member_id", memberId);
+  if (error) { console.error("[org] resetMemberPermissions failed:", error); return { ok: false, error: error.message }; }
+  void qc().invalidateQueries({ queryKey: queryKeys.memberPermissions(orgId, memberId) });
+  return { ok: true };
 }
 
 export function memberInitials(name: string): string {

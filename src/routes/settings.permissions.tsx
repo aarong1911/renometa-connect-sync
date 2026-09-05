@@ -1,14 +1,25 @@
 // src/routes/settings.permissions.tsx
+//
+// Platform State Sync Phase S5D — member_permissions overrides are now
+// Query-backed (queryKeys.memberPermissions(orgId, memberId), see
+// organization.ts) instead of this page's own local useState + useEffect
+// fetch. Scoped per selected member, so switching members never mixes
+// cached results (Part 19) — a different memberId is simply a different
+// Query cache entry. orgId now comes from the shared useOrgId() instead
+// of a duplicate ad hoc profiles.organization_id lookup.
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Loader2, RotateCcw } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { supabase } from "@/lib/supabase";
-import { useTeam, memberInitials, ROLE_LABELS, type Role, type TeamMember } from "@/lib/organization";
+import { useOrgId } from "@/lib/org-id";
+import {
+  useTeam, useMemberPermissions, setMemberPermissionOverride, clearMemberPermissionOverride, resetMemberPermissions,
+  memberInitials, ROLE_LABELS, type Role, type TeamMember,
+} from "@/lib/organization";
 import {
   PERMISSION_ACTIONS as ACTIONS, PERMISSION_SECTIONS as SECTIONS, getRoleDefaultPermission as getRoleDefault,
   type PermissionAction as Action,
@@ -55,20 +66,9 @@ function Toggle({ on, inherited, onChange }: {
 
 function PermissionsPage() {
   const team = useTeam();
-  const [orgId, setOrgId]               = useState<string | null>(null);
+  const orgId = useOrgId();
   const [selected, setSelected]         = useState<TeamMember | null>(null);
-  const [overrides, setOverrides]       = useState<OverrideMap>(new Map());
-  const [loading, setLoading]           = useState(false);
   const [saving, setSaving]             = useState<string | null>(null);
-
-  // Get org ID
-  useEffect(() => {
-    supabase.auth.getUser().then(({ data: { user } }) => {
-      if (!user) return;
-      supabase.from("profiles").select("organization_id").eq("id", user.id).maybeSingle()
-        .then(({ data }) => setOrgId(data?.organization_id ?? null));
-    });
-  }, []);
 
   // Select first non-owner member by default
   useEffect(() => {
@@ -78,21 +78,16 @@ function PermissionsPage() {
     }
   }, [team]);
 
-  // Load overrides when member changes
-  useEffect(() => {
-    if (!selected || !orgId) return;
-    setLoading(true);
-    supabase.from("member_permissions")
-      .select("feature, action, granted")
-      .eq("org_id", orgId)
-      .eq("member_id", selected.id)
-      .then(({ data }) => {
-        const map = new Map<string, boolean>();
-        for (const row of data ?? []) map.set(overrideKey(row.feature, row.action as Action), row.granted);
-        setOverrides(map);
-        setLoading(false);
-      });
-  }, [selected?.id, orgId]);
+  // Query-backed (S5D) — scoped per (orgId, selected member), so switching
+  // members never mixes cached results; a different memberId is simply a
+  // different cache entry.
+  const overridesQuery = useMemberPermissions(orgId, selected?.id);
+  const loading = overridesQuery.isLoading;
+  const overrides: OverrideMap = useMemo(() => {
+    const map = new Map<string, boolean>();
+    for (const row of overridesQuery.data ?? []) map.set(overrideKey(row.feature, row.action as Action), row.granted);
+    return map;
+  }, [overridesQuery.data]);
 
   const handleToggle = async (featureId: string, action: Action, newValue: boolean) => {
     if (!selected || !orgId) return;
@@ -101,30 +96,19 @@ function PermissionsPage() {
     setSaving(key);
 
     // If toggling back to role default → delete the override
-    if (newValue === roleDefault) {
-      await supabase.from("member_permissions")
-        .delete()
-        .eq("org_id", orgId).eq("member_id", selected.id)
-        .eq("feature", featureId).eq("action", action);
-      setOverrides(prev => { const m = new Map(prev); m.delete(key); return m; });
-    } else {
-      // Upsert the override
-      await supabase.from("member_permissions").upsert({
-        org_id: orgId, member_id: selected.id,
-        feature: featureId, action, granted: newValue,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: "org_id,member_id,feature,action" });
-      setOverrides(prev => new Map(prev).set(key, newValue));
-    }
+    const result = newValue === roleDefault
+      ? await clearMemberPermissionOverride(orgId, selected.id, featureId, action)
+      : await setMemberPermissionOverride(orgId, selected.id, featureId, action, newValue);
+
+    if (!result.ok) toast.error("Could not update the permission.");
     setSaving(null);
   };
 
   const handleReset = async () => {
     if (!selected || !orgId) return;
-    await supabase.from("member_permissions")
-      .delete().eq("org_id", orgId).eq("member_id", selected.id);
-    setOverrides(new Map());
-    toast.success("Reset to role defaults");
+    const result = await resetMemberPermissions(orgId, selected.id);
+    if (result.ok) toast.success("Reset to role defaults");
+    else toast.error("Could not reset permissions.");
   };
 
   const overrideCount = overrides.size;

@@ -26,6 +26,9 @@
 // domain split rather than inventing a new one.
 
 export const queryKeys = {
+  // Platform State Sync Phase S5D — Organization profile (organizations
+  // table: name/logo/branding/settings). Declared since S0 as the agreed
+  // future shape; actually Query-backed as of S5D — see organization.ts.
   organization: (orgId: string) => ["organization", orgId] as const,
 
   // NOT YET migrated to Query in S1 — contacts-store.ts/leads-store.ts stay
@@ -76,6 +79,21 @@ export const queryKeys = {
   // would be speculative. Client-side filter/search/sort over this one
   // list, same as before.
   files: (orgId: string) => ["files", orgId] as const,
+
+  // Platform State Sync Phase S5D — Organization / Team / Permissions.
+  // Team roster (org_memberships + profiles join, active members only) and
+  // organization invitations (pending/roster-only, team invites — never
+  // portal invites, which carry a project_id) are TWO separate keys/
+  // fetches even though `useTeam()` still returns ONE merged array (its
+  // pre-S5D public shape, preserved) — kept apart so inviting someone only
+  // invalidates `organizationInvitations`, not the whole team roster, and
+  // vice versa (see organization.ts / the S5D report's invalidation
+  // matrix). `memberPermissions` is scoped per (org, member) — the
+  // Permissions settings page only ever needs the one currently-selected
+  // member's overrides, never every member's rows at once.
+  teamMembers: (orgId: string) => ["teamMembers", orgId] as const,
+  organizationInvitations: (orgId: string) => ["organizationInvitations", orgId] as const,
+  memberPermissions: (orgId: string, memberId: string) => ["memberPermissions", orgId, memberId] as const,
 
   // Platform State Sync Phase S4A — Deals / Pipeline. ONE key per org whose
   // Query payload is the co-loaded bundle `{ deals, pipelines, stages }`

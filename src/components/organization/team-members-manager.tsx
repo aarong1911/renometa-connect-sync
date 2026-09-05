@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, type CSSProperties } from "react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { StatusBadge, type BadgeTone } from "@/components/ui/status-badge";
@@ -70,15 +70,33 @@ type FullProfile = {
 
 // ── Sensitive input ───────────────────────────────────────────────────────────
 
+// `type="password"` + `autoComplete="new-password"` is exactly the signal
+// Chrome/Google Password Manager uses to recognize a "create a new
+// password" field, which is why it was offering to generate/save a
+// password for the SSN/EIN fields below. Fixed by staying on
+// `type="text"` always (never `type="password"`) and masking the
+// rendered characters with the `-webkit-text-security` CSS property
+// instead — the DOM/autofill heuristics only ever see a normal text
+// input, while the on-screen value still renders as dots when hidden.
+// The real value in state/onChange is unchanged either way, so existing
+// formatting (fmtSSN/fmtEIN), validation, and submit/storage logic are
+// untouched — only the visual masking mechanism changed.
+const MASKED_TEXT_STYLE = { WebkitTextSecurity: "disc" } as CSSProperties;
+
 function SensitiveInput({ value, onChange, placeholder }: {
   value: string; onChange: (v: string) => void; placeholder: string;
 }) {
   const [show, setShow] = useState(false);
   return (
     <div className="relative">
-      <Input className="h-9 pr-9" type={show ? "text" : "password"}
+      <Input
+        className="h-9 pr-9" type="text"
+        style={show ? undefined : MASKED_TEXT_STYLE}
         value={value} onChange={e => onChange(e.target.value)}
-        placeholder={placeholder} autoComplete="new-password" />
+        placeholder={placeholder}
+        autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
+        data-lpignore="true" data-1p-ignore="true"
+      />
       <button type="button" onClick={() => setShow(s => !s)}
         className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
         {show ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
@@ -462,13 +480,19 @@ export function TeamMembersManager({
     if (!confirmId) return;
     const m = confirmMember;
     setConfirmId(null);
-    onRemove(confirmId);
+    // Persist FIRST (S5D.1) — the member must stay visible until the real
+    // remove-member call confirms; onRemove() (organization.ts's
+    // removeMember) only runs after confirmed persistence, so a failure
+    // (e.g. "Cannot remove the owner") never optimistically disappears a
+    // row the server refused to remove.
     const result = await removeMemberFromOrg(
       m?.status === "invited" || m?.status === "roster"
         ? { invitationId: confirmId }
         : { memberId: confirmId }
     );
-    if (!result.success) toast.error(result.error);
+    if (!result.success) { toast.error(result.error); return; }
+    onRemove(confirmId);
+    toast.success("Member removed");
   };
 
   return (
@@ -626,14 +650,18 @@ function MemberDialog({ mode, initial, inviteDefault, onSave, trigger }: {
     if (!email.trim()) return;
     const shouldInvite = mode === "add" && (inviteDefault || sendNow) && !rosterOnly;
     const status: TeamMember["status"] = rosterOnly ? "roster" : shouldInvite ? "invited" : initial?.status ?? "active";
-
-    onSave({
+    const member: Omit<TeamMember, "id"> = {
       name: name.trim(), email: email.trim().toLowerCase(),
       phone: phone.trim() || undefined, role, workerType, status,
       invitedAt: status !== "active" ? new Date().toISOString() : initial?.invitedAt,
-    });
-    setOpen(false);
+    };
 
+    // Persist FIRST (S5D.1) — no fake row shown before the real
+    // invite-member call actually succeeds. onSave() (organization.ts's
+    // addMember) only runs after confirmed persistence, and now
+    // invalidates the real Query keys so the placeholder it patches in
+    // gets reconciled with server truth on the next refetch, instead of
+    // being the only representation of "success".
     if (shouldInvite || rosterOnly) {
       setSending(true);
       const result = await inviteMember({
@@ -651,9 +679,19 @@ function MemberDialog({ mode, initial, inviteDefault, onSave, trigger }: {
         companyName:  isSub  ? (companyName.trim() || undefined) : undefined,
       });
       setSending(false);
-      if (result.success) toast.success(rosterOnly ? `${name || email} added to roster` : `Invitation sent to ${email.trim()}`);
-      else toast.error(`Failed: ${result.error}`);
+      if (!result.success) { toast.error(`Failed: ${result.error}`); return; }
+      onSave(member);
+      setOpen(false);
+      toast.success(rosterOnly ? `${name || email} added to roster` : `Invitation sent to ${email.trim()}`);
+      return;
     }
+
+    // No server-backed path for this case today (mode !== "add", or an
+    // "add" with "Send invite now" explicitly turned off and not
+    // roster-only) — preserved exactly as before (local-only), see the
+    // S5D.1 report's "remaining gaps".
+    onSave(member);
+    setOpen(false);
   };
 
   return (

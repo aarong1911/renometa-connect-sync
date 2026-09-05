@@ -7,34 +7,25 @@ import {
   updateMember,
   useTeam,
 } from "@/lib/organization";
-import { toast } from "sonner";
 
 export const Route = createFileRoute("/settings/team")({
   component: TeamSettings,
 });
 
+// S5D.1 — addMember/updateMember/removeMember are now only ever called
+// AFTER team-members-manager.tsx has confirmed the real persisted write
+// (inviteMember/removeMemberFromOrg/update-user-by-id) succeeded, and that
+// component already shows the one success/error toast for each action —
+// this route no longer duplicates it.
 function TeamSettings() {
   const team = useTeam();
   return (
     <Card className="overflow-hidden p-0">
       <TeamMembersManager
         members={team}
-        onAdd={(m) => {
-          addMember(m);
-          toast.success(
-            m.status === "invited"
-              ? `Invitation sent to ${m.email}`
-              : `${m.name || m.email} added`,
-          );
-        }}
-        onUpdate={(id, patch) => {
-          updateMember(id, patch);
-          toast.success("Member updated");
-        }}
-        onRemove={(id) => {
-          removeMember(id);
-          toast.success("Member removed");
-        }}
+        onAdd={(m) => addMember(m)}
+        onUpdate={(id, patch) => updateMember(id, patch)}
+        onRemove={(id) => removeMember(id)}
       />
     </Card>
   );

@@ -147,6 +147,30 @@
 // list via this same handler (it's a real project_files row either way).
 // Same DELETE-filter caveat as everything above.
 //
+// S5D (Organization / Team / Permissions) adds `organizations`,
+// `org_memberships`, `profiles` (org-scoped), `invitations` (org-scoped —
+// covers both team AND portal invites; a portal-invite event harmlessly
+// over-invalidates the team invitations list, same trade-off as other
+// broad-but-simple fan-outs in this bridge), and `member_permissions`.
+// organization.ts's three own module-level channels (`org_${orgId}`,
+// `members_${orgId}`, `invitations_${orgId}`) are REMOVED — this is the
+// only domain that had component/module-level realtime outside this
+// bridge before S5D. Fan-out:
+//   organizations UPDATE       -> organization(orgId)
+//   org_memberships INSERT/UPDATE/DELETE -> teamMembers(orgId)
+//   profiles UPDATE (org-scoped) -> teamMembers(orgId) (profile fields —
+//                                   name/email/phone — are joined into
+//                                   team rows; a member editing their own
+//                                   name/phone elsewhere must still show
+//                                   up on the Team page with no refresh)
+//   invitations INSERT/UPDATE/DELETE (org-scoped) -> organizationInvitations(orgId)
+//   member_permissions INSERT/UPDATE/DELETE (org-scoped) -> the matching
+//                                   memberPermissions(orgId, memberId)
+//                                   prefix (member_id is in the row, so
+//                                   this can invalidate precisely rather
+//                                   than every member's permissions)
+// Same DELETE-filter caveat as everything above.
+//
 // Never logs row payloads (message bodies, contact PII) — every handler
 // below only ever logs the table name and event type, both safe.
 
@@ -248,6 +272,33 @@ export function RealtimeBridge(): null {
     const invalidateCompanyActivities = () => {
       // S5B: Account detail Activity feed.
       queryClient.invalidateQueries({ queryKey: ["companyActivities", orgId] });
+    };
+    const invalidateOrganization = () => {
+      // S5D: Organization profile is Query-backed (organization.ts).
+      queryClient.invalidateQueries({ queryKey: queryKeys.organization(orgId) });
+    };
+    const invalidateTeamMembers = () => {
+      // S5D: Team roster is Query-backed (organization.ts). Fires on
+      // org_memberships changes AND on org-scoped profile edits (name/
+      // email/phone are joined into team rows).
+      queryClient.invalidateQueries({ queryKey: queryKeys.teamMembers(orgId) });
+    };
+    const invalidateOrganizationInvitations = () => {
+      // S5D: Organization invitations is Query-backed (organization.ts).
+      queryClient.invalidateQueries({ queryKey: queryKeys.organizationInvitations(orgId) });
+    };
+    const invalidateMemberPermissions = (memberId?: string | null) => {
+      // S5D: member_permissions is Query-backed, scoped per (org, member).
+      // INSERT/UPDATE carry the row (member_id available) so this
+      // invalidates precisely; DELETE has no org filter/payload (see the
+      // caveat above) and falls back to the whole memberPermissions
+      // prefix for this org — still cheap, only refetches whichever
+      // member's Permissions panel happens to be open.
+      if (memberId) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.memberPermissions(orgId, memberId) });
+      } else {
+        queryClient.invalidateQueries({ queryKey: ["memberPermissions", orgId] });
+      }
     };
     const invalidateFiles = () => {
       // S5C: Files is Query-backed (files-store.ts). No denormalized file
@@ -451,6 +502,61 @@ export function RealtimeBridge(): null {
         "postgres_changes",
         { event: "DELETE", schema: "public", table: "project_files" },
         () => invalidateFiles(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "organizations", filter: `id=eq.${orgId}` },
+        () => invalidateOrganization(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "org_memberships", filter: `org_id=eq.${orgId}` },
+        () => invalidateTeamMembers(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "org_memberships", filter: `org_id=eq.${orgId}` },
+        () => invalidateTeamMembers(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "org_memberships" },
+        () => invalidateTeamMembers(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "profiles", filter: `organization_id=eq.${orgId}` },
+        () => invalidateTeamMembers(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "invitations", filter: `organization_id=eq.${orgId}` },
+        () => invalidateOrganizationInvitations(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "invitations", filter: `organization_id=eq.${orgId}` },
+        () => invalidateOrganizationInvitations(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "invitations" },
+        () => invalidateOrganizationInvitations(),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "member_permissions", filter: `org_id=eq.${orgId}` },
+        (payload) => invalidateMemberPermissions((payload.new as any)?.member_id),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "member_permissions", filter: `org_id=eq.${orgId}` },
+        (payload) => invalidateMemberPermissions((payload.new as any)?.member_id),
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "member_permissions" },
+        () => invalidateMemberPermissions(),
       )
       .subscribe();
 
