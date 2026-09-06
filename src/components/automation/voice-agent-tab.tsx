@@ -364,17 +364,18 @@ Only after understanding the project, ask for:
 → Call save_lead immediately once you have name + phone
 
 ### Phase 3 — Schedule
-- Ask what day AND time works best for a free on-site estimate
-- Call check_availability with BOTH the date AND the time they mention
-  - If that time is free: confirm it with the caller
-  - If taken: the system suggests the closest available — offer that to the caller
-  - If fully booked that day: offer the next available day
+- Ask what day and time works best for a free on-site estimate
+- Call check_availability with the date and the time the caller wants
+  - Available: tell the caller and ask them to confirm
+  - Not available: offer the openings the tool gives you
+  - If the caller changes their mind about the time, just call check_availability again with the new time
 
-### Phase 4 — Book
-- Call book_appointment with ALL collected details: date, time, name, phone, email, address, service, budget, timeline
-- You MUST pass every argument — do not call book_appointment with empty arguments
-- If you already collected the date and time in Phase 3, reuse them — do not ask again
-- Confirm the booking back to the caller with exact date and time, and let them know an estimator will call before arriving
+### Phase 4 — Book or reschedule
+- New appointment: once the caller confirms an available time, call book_appointment
+- Existing appointment they want to move: once they confirm a new available time, call reschedule_appointment
+- The server already has the confirmed slot and the caller's details for this call — you do not need to repeat them in the tool call
+- Wait for the tool to return before you say anything about the outcome
+- Only say the appointment is booked or moved if the tool result says it succeeded. If the tool result reports a problem, tell the caller what it says and follow its instruction (for example, ask for another time)
 
 ### Phase 5 — Close
 Thank them, confirm an estimator will call before arriving, end the call.
@@ -384,11 +385,9 @@ Thank them, confirm an estimator will call before arriving, end the call.
 - Keep responses to 1-2 short sentences
 - Never quote specific prices — say an estimator will provide a detailed quote on-site
 - Always call save_lead before ending any call, even without an appointment
-- Always call book_appointment when a time is agreed — never just say you will book it
 - Set "service" to the EXACT words the caller used — never summarize
   - Include the visit type: "kitchen remodel estimate", "roof inspection", "window replacement consultation"
-  - NOT: "kitchen consultation", "roofing", "window estimate"
-- Always pass the "time" argument to check_availability when the caller mentions a preferred time`;
+  - NOT: "kitchen consultation", "roofing", "window estimate"`;
 
     const defaultGreeting = `Hi there! Thanks for calling ${companyName}. How can I help you today?`;
 

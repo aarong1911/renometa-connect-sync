@@ -99,12 +99,12 @@ function buildVapiTools(crmTools: CrmTools): VapiToolDefinition[] {
       function: {
         name: 'check_availability',
         description:
-          'Check appointment availability for a requested date and optional time before booking.',
+          'Check whether a specific date and time is open. Call this whenever the caller names or changes a desired day/time, before book_appointment or reschedule_appointment. The newest successful check is the one that gets booked.',
         parameters: {
           type: 'object',
           properties: {
-            date: { type: 'string', description: 'Requested appointment date, like tomorrow or next Monday' },
-            time: { type: 'string', description: 'Requested appointment time, like 10am' },
+            date: { type: 'string', description: 'Requested date, e.g. "tomorrow", "next Monday", "April 15"' },
+            time: { type: 'string', description: 'Requested time, e.g. "10am", "2:30pm"' },
           },
           required: ['date'],
         },
@@ -117,22 +117,41 @@ function buildVapiTools(crmTools: CrmTools): VapiToolDefinition[] {
       type: 'function',
       function: {
         name: 'book_appointment',
-        description: 'Book a confirmed appointment after the caller agrees to a specific date and time.',
+        description:
+          'Confirm the appointment after check_availability returned "available" for the slot the caller agreed to. The server already holds the confirmed slot and the caller details for this call, so calling with an empty object {} is valid; any fields you do pass are used as-is. Safe to call more than once — repeat calls return the same booking.',
         parameters: {
           type: 'object',
           properties: {
-            date: { type: 'string', description: 'Confirmed appointment date' },
-            time: { type: 'string', description: 'Confirmed appointment time' },
-            name: { type: 'string', description: 'Caller full name' },
-            phone: { type: 'string', description: 'Caller phone number' },
-            email: { type: 'string', description: 'Caller email address' },
-            address: { type: 'string', description: 'Project address' },
-            service: { type: 'string', description: 'Requested service or project type' },
-            budget: { type: 'string', description: 'Mentioned project budget' },
-            timeline: { type: 'string', description: 'Mentioned project timeline' },
-            notes: { type: 'string', description: 'Important appointment notes' },
+            date: { type: 'string', description: 'Confirmed date (optional — omit to use the last checked slot)' },
+            time: { type: 'string', description: 'Confirmed time (optional — omit to use the last checked slot)' },
+            name: { type: 'string', description: 'Caller full name (optional)' },
+            phone: { type: 'string', description: 'Caller phone number (optional)' },
+            email: { type: 'string', description: 'Caller email address (optional)' },
+            address: { type: 'string', description: 'Project address (optional)' },
+            service: { type: 'string', description: 'Service or project type in the caller\'s own words (optional)' },
+            budget: { type: 'string', description: 'Mentioned budget (optional)' },
+            timeline: { type: 'string', description: 'Mentioned timeline (optional)' },
+            notes: { type: 'string', description: 'Important notes (optional)' },
           },
-          required: ['date', 'time'],
+          required: [],
+        },
+      },
+    });
+
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'reschedule_appointment',
+        description:
+          'Move this caller\'s existing appointment to a new time. First call check_availability for the new slot. The server finds the existing appointment from the caller\'s record — pass current_date only if the server asks you to disambiguate between several upcoming appointments. Safe to call more than once.',
+        parameters: {
+          type: 'object',
+          properties: {
+            new_date: { type: 'string', description: 'New date (optional — omit to use the last checked slot)' },
+            new_time: { type: 'string', description: 'New time (optional — omit to use the last checked slot)' },
+            current_date: { type: 'string', description: 'The existing appointment\'s current date — only when disambiguating between multiple upcoming appointments' },
+          },
+          required: [],
         },
       },
     });
