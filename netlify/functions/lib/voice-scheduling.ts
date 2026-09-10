@@ -367,6 +367,40 @@ async function claimBooking(
   return won ? 'won' : 'lost';
 }
 
+/**
+ * A claim older than this with no resulting appointment is treated as
+ * abandoned — the invocation that made it timed out / was frozen before it
+ * could insert. A retry may safely take it over.
+ */
+const STALE_CLAIM_MS = 20_000;
+
+/**
+ * Re-take a stale, never-completed claim so a retry can finish the booking
+ * instead of looping on "one moment". Only matches rows whose claim is
+ * older than STALE_CLAIM_MS AND that still have no appointment recorded, so
+ * a genuine in-flight concurrent booking is never disturbed.
+ */
+async function reclaimStaleBooking(deps: SchedulingDeps, vapiCallId: string, orgId: string): Promise<boolean> {
+  const nowMs = clock(deps).getTime();
+  const cutoffIso = new Date(nowMs - STALE_CLAIM_MS).toISOString();
+  const nowIso = new Date(nowMs).toISOString();
+  const { data, error } = await deps.supabase
+    .from(STATE_TABLE)
+    .update({ consumed_at: nowIso, updated_at: nowIso })
+    .eq('vapi_call_id', vapiCallId)
+    .eq('org_id', orgId)
+    .is('resulting_appointment_id', null)
+    .lt('consumed_at', cutoffIso)
+    .select('vapi_call_id');
+  if (error) {
+    slogError('claim', 'stale reclaim failed', { vapiCallId, orgId });
+    return false;
+  }
+  const ok = (data?.length ?? 0) > 0;
+  if (ok) slog('claim', 'stale claim reclaimed — prior invocation timed out', { vapiCallId, orgId });
+  return ok;
+}
+
 /** Release a claim after a failed DB write so a retry can proceed. */
 async function releaseBooking(deps: SchedulingDeps, vapiCallId: string, orgId: string): Promise<void> {
   const nowIso = clock(deps).toISOString();
@@ -473,6 +507,41 @@ async function isSlotFree(
     }
   }
   return true;
+}
+
+/**
+ * Find an appointment THIS Voice booking flow already created for this exact
+ * confirmed slot — the case where an earlier invocation inserted the
+ * appointment but crashed before markResult wrote resulting_appointment_id.
+ *
+ * Matched by the authoritative tuple (org_id, contact_id, scheduled_at,
+ * source='Voice AI', not cancelled). scheduled_at is the verbatim
+ * selected_slot_at instant, so this is an exact match, not an hour bucket.
+ * Requires a contact_id: without one, a Voice appointment at the same slot
+ * cannot be safely distinguished from a different caller's booking, so we
+ * do NOT adopt it (the caller-facing "slot taken" path handles that).
+ */
+async function findExistingVoiceBooking(
+  deps: SchedulingDeps,
+  params: { orgId: string; contactId: string | null; slotIso: string },
+): Promise<string | null> {
+  if (!params.contactId) return null;
+
+  const { data, error } = await deps.supabase
+    .from('appointments')
+    .select('id')
+    .eq('org_id', params.orgId)
+    .eq('contact_id', params.contactId)
+    .eq('scheduled_at', params.slotIso)
+    .eq('source', 'Voice AI')
+    .neq('status', 'cancelled')
+    .limit(1)
+    .maybeSingle();
+  if (error) {
+    slogError('book_appointment', 'existing-booking lookup failed', { orgId: params.orgId });
+    return null;
+  }
+  return (data?.id as string | undefined) ?? null;
 }
 
 // ─────────────────────────────────────────────
@@ -712,28 +781,15 @@ export async function handleBookAppointment(
     };
   }
 
-  // ── Redelivery safety: an appointment already exists for this call ─────
-  const voiceCallRowIdEarly = await resolveVoiceCallRowId(deps, vapiCallId);
-  if (voiceCallRowIdEarly) {
-    const { data: existingAppt } = await deps.supabase
-      .from('appointments')
-      .select('id, scheduled_at')
-      .eq('org_id', orgId)
-      .eq('voice_call_id', voiceCallRowIdEarly)
-      .neq('status', 'cancelled')
-      .limit(1)
-      .maybeSingle();
-    if (existingAppt?.id) {
-      await markResult(deps, vapiCallId, orgId, existingAppt.id as string);
-      slog('book_appointment', 'idempotent hit — appointment row already present', {
-        vapiCallId, appointmentId: existingAppt.id,
-      });
-      return {
-        ok: true, outcome: 'already_booked', appointmentId: existingAppt.id as string,
-        speech: `You're all set — this appointment is already booked. Nothing more is needed.`,
-      };
-    }
-  }
+  // NOTE: the live path is kept deliberately short (state lookup ->
+  // revalidate -> claim -> insert -> mark). It does NOT resolve the
+  // internal voice_calls.id, look up existing appointments by voice_call_id,
+  // resolve the org timezone (the confirmed slot is already an absolute
+  // instant on the state row), or write voice_calls.contact_id. Those are
+  // handled off the hot path (handleToolCalls audit / end-of-call linkage)
+  // so book_appointment always returns to Vapi well within its tool
+  // timeout. Idempotency is the state row's job (consumed_at +
+  // resulting_appointment_id), checked above.
 
   // ── Resolve the slot to write ─────────────────────────────────────────
   let slotIso: string | null = null;
@@ -790,6 +846,20 @@ export async function handleBookAppointment(
   const stillFree = await isSlotFree(deps, orgId, slotIso!, tz);
   slog('book_appointment', 'revalidation', { vapiCallId, slotAt: slotIso, stillFree });
   if (!stillFree) {
+    // The slot might be occupied by THIS call's own earlier booking (a
+    // prior invocation inserted it but crashed before markResult). If so,
+    // that's "already booked", not a conflict — repair the state row.
+    const ownPrior = await findExistingVoiceBooking(deps, {
+      orgId, contactId: state?.contact_id ?? null, slotIso: slotIso!,
+    });
+    if (ownPrior) {
+      await markResult(deps, vapiCallId, orgId, ownPrior);
+      slog('book_appointment', 'slot taken by this call\'s own prior insert — adopting', { vapiCallId, appointmentId: ownPrior });
+      return {
+        ok: true, outcome: 'already_booked', appointmentId: ownPrior,
+        speech: `You're all set — this appointment is already booked. Nothing more is needed.`,
+      };
+    }
     await writeState(deps, vapiCallId, orgId, { availability_status: 'unavailable', selected_slot_at: null });
     return {
       ok: false, outcome: 'slot_taken',
@@ -827,20 +897,46 @@ export async function handleBookAppointment(
   }
   if (claim === 'lost') {
     const fresh = await loadState(deps, vapiCallId, orgId);
-    if (fresh?.resulting_appointment_id) {
+    let priorId = fresh?.resulting_appointment_id ?? null;
+
+    // The claim owner may have inserted the appointment but crashed before
+    // markResult (so resulting_appointment_id is still null). Look for it by
+    // the authoritative (org, contact, slot, source) key BEFORE reclaiming,
+    // so a stale-claim retry can never insert a second appointment for a
+    // slot this call already booked.
+    if (!priorId) {
+      priorId = await findExistingVoiceBooking(deps, { orgId, contactId, slotIso: slotIso! });
+      if (priorId) {
+        await markResult(deps, vapiCallId, orgId, priorId); // repair the state row
+        slog('book_appointment', 'stale claim — appointment already exists, adopting', { vapiCallId, appointmentId: priorId });
+      }
+    }
+
+    if (priorId) {
       return {
-        ok: true, outcome: 'already_booked', appointmentId: fresh.resulting_appointment_id,
+        ok: true, outcome: 'already_booked', appointmentId: priorId,
         speech: `You're all set — this appointment is already booked. Nothing more is needed.`,
       };
     }
-    return {
-      ok: false, outcome: 'book_in_progress',
-      speech: `I'm still confirming that booking — give me one moment, then ask me to confirm.`,
-    };
+
+    // consumed_at is set, no appointment exists anywhere — the invocation
+    // that first claimed it timed out / was frozen BEFORE its insert.
+    // Reclaim a STALE claim so this retry finishes the booking instead of
+    // looping forever on "one moment".
+    const reclaimed = await reclaimStaleBooking(deps, vapiCallId, orgId);
+    if (!reclaimed) {
+      return {
+        ok: false, outcome: 'book_in_progress',
+        speech:
+          `That booking is still being finalized by another request. Wait a few seconds, ` +
+          `then call book_appointment one more time.`,
+      };
+    }
+    slog('book_appointment', 'proceeding after reclaiming a stale claim', { vapiCallId });
   }
 
   // ── DB write ─────────────────────────────────────────────────────────
-  const voiceCallRowId = voiceCallRowIdEarly ?? (await resolveVoiceCallRowId(deps, vapiCallId));
+  // voice_call_id is linked off the hot path (end-of-call) — see note above.
   const endsAt = new Date(new Date(slotIso!).getTime() + DEFAULT_DURATION_MIN * 60 * 1000).toISOString();
   const service = String(args.service ?? 'Consultation') || 'Consultation';
   const noteParts = [
@@ -869,7 +965,7 @@ export async function handleBookAppointment(
       time_zone: tz,
       source: 'Voice AI',
       status: 'scheduled',
-      voice_call_id: voiceCallRowId,
+      voice_call_id: null,
     })
     .select('id')
     .single();
@@ -886,9 +982,6 @@ export async function handleBookAppointment(
   }
 
   await markResult(deps, vapiCallId, orgId, appt.id as string);
-  if (contactId && voiceCallRowId) {
-    await deps.supabase.from('voice_calls').update({ contact_id: contactId }).eq('id', voiceCallRowId);
-  }
   slog('book_appointment', 'db write success', { vapiCallId, appointmentId: appt.id, consumed: true });
 
   return {

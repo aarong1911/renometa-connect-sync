@@ -17,6 +17,7 @@
 
 import { createClient } from '@supabase/supabase-js';
 import { runAppointmentPostBookingLifecycle } from './appointment-post-booking';
+import { normalizeServiceTitle } from './voice-crm';
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -460,11 +461,16 @@ export async function runPostCallAutomation(params: {
   if (extracted.service || extracted.budget || extracted.timeline) {
     const leadStatus = (extracted.budget || extracted.timeline) ? 'qualified' : 'new';
 
+    // Same clean CRM label the live save_lead path uses — the Leads PROJECT
+    // column reads leads.custom_fields.service, so this must be normalized
+    // here too (no trailing "estimate"/"appointment"/"consultation").
+    const serviceLabel = normalizeServiceTitle(extracted.service);
+
     const leadId = await upsertLead({
       tenantId,
       contactId,
       name,
-      service: extracted.service,
+      service: serviceLabel,
       budget: extracted.budget,
       timeline: extracted.timeline,
       notes: extracted.summary,
@@ -482,14 +488,10 @@ export async function runPostCallAutomation(params: {
         tenantId,
         contactId,
         leadId,
-        title: capitalizeService(
-          (extracted.service || '')
-            .replace(/\b(estimate|consultation|inspection)\b/gi, '')
-            .trim()
-        ) || 'Inbound Call Lead',
+        title: serviceLabel || 'Inbound Call Lead',
         value: dealValue,
         notes: extracted.summary,
-        service: extracted.service || 'General',
+        service: serviceLabel || 'General',
         isAppointment: extracted.appointmentRequested,
         stagePosition: extracted.appointmentRequested ? 1 : 0,
       });

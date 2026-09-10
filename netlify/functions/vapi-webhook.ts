@@ -30,10 +30,11 @@ import {
 import {
   resolveVoiceCallId,
   recordToolInvocations,
-  backfillCallContact,
+  reconcileCallContactIdentity,
   resolveAuthoritativeOutcome,
   type ToolAuditEntry,
 } from './lib/voice-call-audit';
+import { normalizeServiceTitle } from './lib/voice-crm';
 
 // ─────────────────────────────────────────────
 // Supabase client — service role bypasses RLS
@@ -42,6 +43,22 @@ const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
+
+// ─────────────────────────────────────────────
+// Post-booking side effects — OFF by default
+// ─────────────────────────────────────────────
+// The synchronous booking path (book_appointment tool call) is deliberately
+// minimal: load persisted slot -> revalidate -> insert appointment -> mark
+// state -> return. It NEVER sends email/SMTP, calls the post-booking
+// lifecycle, sets reminders, syncs Google Calendar, or triggers post-call
+// automation — those helpers do not exist on that path at all.
+//
+// The remaining post-call extras (confirmation email, owner notification,
+// Google Calendar sync, delayed transcript automation, CRM enrichment) live
+// only in the SEPARATE end-of-call-report webhook. They are gated here so
+// booking reliability can be proven in isolation first. Re-enable later with
+// VOICE_POST_BOOKING_ENABLED=true.
+const POST_BOOKING_SIDE_EFFECTS_ENABLED = process.env.VOICE_POST_BOOKING_ENABLED === 'true';
 
 // ─────────────────────────────────────────────
 // Types
@@ -173,11 +190,6 @@ function parseBudget(raw: string): number | null {
 
   const n = parseFloat(cleaned);
   return Number.isNaN(n) ? null : n;
-}
-
-function capitalizeService(s: string): string {
-  if (!s) return s;
-  return s.replace(/\b\w/g, c => c.toUpperCase());
 }
 
 // ─────────────────────────────────────────────
@@ -1062,55 +1074,141 @@ async function handleEndOfCallReport(
   }
 
   if (callRowId) {
-    runPostCallAutomation({
-      callId: callRowId,
-      vapiCallId: call.id,
-      tenantId,
-      transcript: artifact.messages ?? artifact.transcript ?? null,
-      callerNumber: call.customer?.number ?? null,
-    }).catch((err: unknown) => logError('post-call', 'automation failed', err));
+    // ── AWAITED finalization — must complete before this webhook returns,
+    // or Netlify freezes the container and the writes are lost. Ordered so
+    // the appointment↔call link and the contact-identity reconciliation
+    // happen BEFORE any gated post-call automation (so runPostCallAutomation
+    // sees the reconciled voice_calls.contact_id and early-returns) and
+    // BEFORE the scheduling-state row is deleted.
+    const { data: st } = await supabase
+      .from('voice_call_scheduling_state')
+      .select('resulting_appointment_id, contact_id')
+      .eq('vapi_call_id', call.id)
+      .eq('org_id', tenantId)
+      .maybeSingle();
 
-    // The ONE place Voice bookings/reschedules run their post-call
-    // lifecycle — CRM finalize (lead + pipeline deal), Google Calendar
-    // push, then the shared confirmation-email / owner-notification
-    // lifecycle. Deliberately here in the separate end-of-call-report
-    // invocation, NEVER on the live book_appointment / reschedule_appointment
-    // tool-call path (that path is state lookup -> recheck -> DB write ->
-    // consume -> response, nothing else). Both finalizeVoiceBookedAppointment
-    // (metadata.voice_crm_finalized) and runAppointmentPostBookingLifecycle
-    // (metadata flags) are idempotent, so Vapi redelivery is safe.
-    (async () => {
-      const { data: appt, error } = await supabase
+    log('end-of-call-report', 'finalize start', {
+      callRowId,
+      hadCallRow: !!existing,
+      stResultingAppt: st?.resulting_appointment_id ?? null,
+      stContact: st?.contact_id ?? null,
+    });
+
+    // Resolve THE appointment for this call — from the scheduling-state
+    // result, else the most recent Voice appointment for the authoritative
+    // contact (covers a booking whose linkage did not land).
+    let apptForCall = (st?.resulting_appointment_id as string | undefined) ?? null;
+    if (!apptForCall && st?.contact_id) {
+      const { data: recentAppt } = await supabase
         .from('appointments')
         .select('id')
-        .eq('voice_call_id', callRowId)
+        .eq('org_id', tenantId)
+        .eq('contact_id', st.contact_id)
+        .eq('source', 'Voice AI')
+        .neq('status', 'cancelled')
+        .gte('created_at', new Date(Date.now() - 6 * 3600 * 1000).toISOString())
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      apptForCall = (recentAppt?.id as string | undefined) ?? null;
+    }
+    if (apptForCall) {
+      const { error: linkErr } = await supabase
+        .from('appointments')
+        .update({ voice_call_id: callRowId })
+        .eq('id', apptForCall)
+        .eq('org_id', tenantId)
+        .is('voice_call_id', null);
+      if (linkErr) logError('end-of-call-report', 'voice_call_id backfill failed', { appointmentId: apptForCall });
+
+      // Clean the appointment's service/title label. handleBookAppointment
+      // stores the raw model string (e.g. "roof replacement estimate"); we
+      // normalize it POST-creation here, without touching the booking
+      // transaction. The appointment TYPE (appointment_type) is untouched —
+      // only the display NAME is cleaned ("Roof replacement").
+      const { data: aRow } = await supabase
+        .from('appointments')
+        .select('service, title')
+        .eq('id', apptForCall)
         .eq('org_id', tenantId)
         .maybeSingle();
-
-      if (error) {
-        logError('end-of-call-report', 'appointment lookup failed', { callRowId });
-        return;
+      if (aRow) {
+        const cleanService = normalizeServiceTitle(aRow.service as string | null);
+        const cleanTitle = normalizeServiceTitle(aRow.title as string | null);
+        const labelPatch: Record<string, unknown> = {};
+        if (cleanService && cleanService !== aRow.service) labelPatch.service = cleanService;
+        if (cleanTitle && cleanTitle !== aRow.title) labelPatch.title = cleanTitle;
+        if (Object.keys(labelPatch).length > 0) {
+          const { error: nErr } = await supabase
+            .from('appointments')
+            .update(labelPatch)
+            .eq('id', apptForCall)
+            .eq('org_id', tenantId);
+          if (nErr) logError('end-of-call-report', 'appointment label normalize failed', { appointmentId: apptForCall });
+          else log('end-of-call-report', 'appointment label normalized', { appointmentId: apptForCall });
+        }
       }
-      if (!appt) return;
+    }
 
-      await finalizeVoiceBookedAppointment(tenantId, appt.id as string).catch((err) => {
-        logError('voice-finalize', 'failed', { appointmentId: appt.id, message: err instanceof Error ? err.message : String(err) });
-      });
+    // Point voice_calls.contact_id (and any voice conversation_states row)
+    // at the save_lead-resolved contact instead of the provisional caller ID.
+    // NOTE: the Voice lifecycle ends at Contact → Lead → Deal → Appointment;
+    // a Project is created later only via the existing manual conversion flow.
+    await reconcileCallContactIdentity(
+      { supabase },
+      { vapiCallId: call.id, voiceCallId: callRowId, tenantId, callerNumber: call.customer?.number ?? null },
+    );
 
-      await runAppointmentPostBookingLifecycle(supabase, { appointmentId: appt.id, orgId: tenantId }).catch((err) => {
-        logError('post-booking', 'lifecycle failed', { appointmentId: appt.id, message: err instanceof Error ? err.message : String(err) });
-      });
-    })();
+    // Finalize the outcome from authoritative state now that the links are set.
+    const finalOutcome = await resolveAuthoritativeOutcome(
+      { supabase },
+      {
+        voiceCallId: callRowId,
+        vapiCallId: call.id,
+        tenantId,
+        summaryOutcome: classifyOutcome(summary),
+        contactId: (st?.contact_id as string | undefined) ?? null,
+      },
+    );
+    if (finalOutcome !== outcome) {
+      const { error: oErr } = await supabase.from('voice_calls').update({ outcome: finalOutcome }).eq('id', callRowId);
+      if (oErr) logError('end-of-call-report', 'outcome finalize failed', { callRowId });
+      else log('end-of-call-report', 'outcome finalized', { callRowId, from: outcome, to: finalOutcome });
+    }
 
-    // Per-call scheduling state is short-lived live-call state — no purpose
-    // once the call has ended, booking or not. Deleted last; it is never
-    // read for reporting (voice_call_tools is the audit trail). A call that
-    // never sends end-of-call-report leaves an orphan row (a handful of
-    // small columns) — worth a periodic sweep later, not needed yet.
-    (async () => {
-      const { error } = await supabase.from('voice_call_scheduling_state').delete().eq('vapi_call_id', call.id).eq('org_id', tenantId);
-      if (error) logError('end-of-call-report', 'scheduling state cleanup failed', { vapiCallId: call.id });
-    })();
+    // ── Gated post-booking side effects (email / lifecycle / gcal / post-call
+    // automation). Now run AFTER reconciliation, so runPostCallAutomation
+    // sees the reconciled contact_id and skips its transcript-extraction
+    // rebuild. Fire-and-forget by design when enabled.
+    if (POST_BOOKING_SIDE_EFFECTS_ENABLED) {
+      runPostCallAutomation({
+        callId: callRowId,
+        vapiCallId: call.id,
+        tenantId,
+        transcript: artifact.messages ?? artifact.transcript ?? null,
+        callerNumber: call.customer?.number ?? null,
+      }).catch((err: unknown) => logError('post-call', 'automation failed', err));
+
+      (async () => {
+        if (!apptForCall) return;
+        await finalizeVoiceBookedAppointment(tenantId, apptForCall).catch((err) => {
+          logError('voice-finalize', 'failed', { appointmentId: apptForCall, message: err instanceof Error ? err.message : String(err) });
+        });
+        await runAppointmentPostBookingLifecycle(supabase, { appointmentId: apptForCall, orgId: tenantId }).catch((err) => {
+          logError('post-booking', 'lifecycle failed', { appointmentId: apptForCall, message: err instanceof Error ? err.message : String(err) });
+        });
+      })();
+    } else {
+      log('end-of-call-report', 'post-booking side effects disabled (VOICE_POST_BOOKING_ENABLED!=true) — skipping email / lifecycle / gcal / post-call automation');
+    }
+
+    // ── AWAITED — remove the short-lived scheduling-state row LAST.
+    const { error: delErr } = await supabase
+      .from('voice_call_scheduling_state')
+      .delete()
+      .eq('vapi_call_id', call.id)
+      .eq('org_id', tenantId);
+    if (delErr) logError('end-of-call-report', 'scheduling state cleanup failed', { vapiCallId: call.id });
   }
 }
 
@@ -1124,7 +1222,6 @@ async function handleToolCalls(
 ): Promise<Array<{ toolCallId: string; result: string }>> {
   const results: Array<{ toolCallId: string; result: string }> = [];
   const auditEntries: ToolAuditEntry[] = [];
-  let sawSaveLead = false;
 
   // Resolve the internal voice_calls.id ONCE, synchronously, up front — the
   // call-started webhook has normally already written this row, but create a
@@ -1166,7 +1263,6 @@ async function handleToolCalls(
     log('tool-calls', `result: ${result}`);
     results.push({ toolCallId, result });
     auditEntries.push({ toolName: fn.name, args, resultText: result, errorMsg: errorMsg ?? null });
-    if (fn.name === 'save_lead') sawSaveLead = true;
 
     fireMakeWebhook(process.env.MAKE_TOOL_CALL_WEBHOOK, {
       event: 'tool_call',
@@ -1178,14 +1274,24 @@ async function handleToolCalls(
     });
   }
 
-  // AWAITED bookkeeping — previously a fire-and-forget IIFE that Netlify
-  // froze on response, which is why recent calls had no voice_call_tools
-  // rows. recordToolInvocations / backfillCallContact never throw and never
-  // affect `results`; a failure is only logged (success rule §8).
-  await recordToolInvocations({ supabase }, { voiceCallId, tenantId, entries: auditEntries });
-  if (sawSaveLead) {
-    await backfillCallContact({ supabase }, { vapiCallId: call.id, voiceCallId, tenantId });
-  }
+  // Identity reconciliation is correctness-critical and cheap (a few indexed
+  // round-trips) — ALWAYS fully awaited. It runs on every tool batch (not
+  // just the one containing save_lead) so a later webhook still heals the
+  // identity if save_lead's own batch did not. Never throws; only logs.
+  await reconcileCallContactIdentity(
+    { supabase },
+    { vapiCallId: call.id, voiceCallId, tenantId, callerNumber: call.customer?.number ?? null },
+  ).catch((err) => logError('tool-calls', 'reconcile failed', err));
+
+  // Audit write — capped so a slow voice_call_tools insert can never delay
+  // the tool response (Vapi's tool timeout is what causes the "one moment"
+  // loop). Continues best-effort if the cap is hit.
+  const audit = recordToolInvocations({ supabase }, { voiceCallId, tenantId, entries: auditEntries })
+    .catch((err) => {
+      logError('tool-calls', 'audit failed', err);
+      return { written: 0 };
+    });
+  await Promise.race([audit, new Promise((resolve) => setTimeout(resolve, 3000))]);
 
   return results;
 }
@@ -1228,7 +1334,11 @@ async function toolSaveLead(
   const phone = String(args.phone ?? call.customer?.number ?? '');
   const email = String(args.email ?? '');
   const address = String(args.address ?? '');
-  const service = String(args.service ?? '');
+  // Clean the service/project label at the source so every downstream CRM
+  // record (lead custom_fields, deal title, Project name) gets the same
+  // normalized value — no "estimate"/"appointment" scheduling suffix, clean
+  // casing. The raw model text is not stored anywhere else.
+  const service = normalizeServiceTitle(String(args.service ?? ''));
   const budget = String(args.budget ?? '');
   const timeline = String(args.timeline ?? '');
   const notes = String(args.notes ?? '');
@@ -1246,7 +1356,17 @@ async function toolSaveLead(
     return "I had trouble saving your information, but I'll make a note for our team.";
   }
 
-  await supabase.from('voice_calls').update({ contact_id: contactId }).eq('vapi_call_id', call.id);
+  {
+    const { data: vcUpd, error: vcErr } = await supabase
+      .from('voice_calls')
+      .update({ contact_id: contactId })
+      .eq('vapi_call_id', call.id)
+      .select('id');
+    log('save_lead', 'voice_calls.contact_id write', {
+      matched: vcUpd?.length ?? 0,
+      err: vcErr?.code ?? null,
+    });
+  }
 
   const leadStatus = classifyLeadStatus(timeline, budget);
   log('save_lead', `leadStatus=${leadStatus} timeline="${timeline}" budget="${budget}"`);
@@ -1303,7 +1423,10 @@ async function toolSaveLead(
       tenantId,
       contactId,
       leadId,
-      title: capitalizeService(service) || 'New Lead',
+      // `service` is already normalized (normalizeServiceTitle above) —
+      // do NOT re-title-case it; the CRM display value is "Full house
+      // renovation", not "Full House Renovation".
+      title: service || 'New Lead',
       value: dealValue,
       notes: noteParts.join(' | ') || null,
       service: service || 'General',
@@ -1431,10 +1554,10 @@ async function finalizeVoiceBookedAppointment(tenantId: string, apptId: string):
           tenantId,
           contactId: appt.contact_id as string,
           leadId,
-          title: capitalizeService(service) || 'Consultation',
+          title: normalizeServiceTitle(service) || 'Consultation',
           value: dealValue,
           notes: budget ? `Budget: ${budget}` : null,
-          service,
+          service: normalizeServiceTitle(service) || 'Consultation',
           isAppointment: true,
           stagePosition: 1,
         });
