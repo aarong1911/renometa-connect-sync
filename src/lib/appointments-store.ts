@@ -268,11 +268,22 @@ function useAppointmentsQuery() {
   });
 }
 
+// Stable fallback reference — `query.data ?? []` would otherwise hand back
+// a brand-new array every render for as long as the query has no data
+// (pending org resolution, or a persistently failing fetch), which breaks
+// any consumer that reasonably depends on `appointments` for effect
+// identity (e.g. calendar.tsx's "last refreshed" effect): a new array
+// every render → effect deps look changed every render → setState every
+// render → React's own runaway-render guard trips with "Maximum update
+// depth exceeded". Every other caller of `useAppointments()` is unaffected
+// by reusing one constant for the empty case.
+const EMPTY_APPOINTMENTS: Appointment[] = [];
+
 /** THE shared Appointments hook (S4D). One org-wide list; every Calendar view + entity panel filters it client-side. `reload()` forces a refetch of the shared query for every observer and resolves when it settles (so a "Refresh" button can await it). */
 export function useAppointments(): { appointments: Appointment[]; loading: boolean; reload: () => Promise<void> } {
   const query = useAppointmentsQuery();
   return {
-    appointments: query.data ?? [],
+    appointments: query.data ?? EMPTY_APPOINTMENTS,
     loading: query.isLoading,
     reload: () => query.refetch().then(() => undefined),
   };
@@ -411,7 +422,28 @@ export async function createAppointment(input: CreateAppointmentInput): Promise<
   const appointment = mapRow(data);
   patchAppointmentsCache((list) => [appointment, ...list.filter((a) => a.id !== appointment.id)]);
   invalidateAppointmentsWithDashboard();
+
+  // AI-H1.1 — platform-wide post-booking lifecycle (confirmation email +
+  // owner/assignee notification), same one every appointment source uses.
+  // Fire-and-forget: the appointment itself is already created and
+  // returned to the caller successfully regardless of what happens here.
+  void triggerPostBookingLifecycle(appointment.id);
+
   return { ok: true, appointment };
+}
+
+async function triggerPostBookingLifecycle(appointmentId: string): Promise<void> {
+  try {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    await fetch("/.netlify/functions/appointment-post-booking", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+      body: JSON.stringify({ appointmentId }),
+    });
+  } catch (err) {
+    console.error("[appointments-store] post-booking lifecycle trigger failed:", err);
+  }
 }
 
 export type UpdateAppointmentInput = Partial<Omit<CreateAppointmentInput, "scheduledAt" | "endsAt">> & {
@@ -458,12 +490,14 @@ export async function updateAppointment(id: string, patch: UpdateAppointmentInpu
     update.ends_at = patch.endsAt;
   }
 
+  let justCompleted = false;
   if (patch.status !== undefined) {
     const { data: current } = await supabase.from("appointments").select("completed_at, cancelled_at").eq("id", id).maybeSingle();
     const resolved = getAppointmentStatusPatch(patch.status, { completedAt: current?.completed_at ?? null, cancelledAt: current?.cancelled_at ?? null });
     update.status = resolved.status;
     update.completed_at = resolved.completedAt;
     update.cancelled_at = resolved.cancelledAt;
+    justCompleted = resolved.status === "completed" && !current?.completed_at;
   }
 
   const { data, error } = await supabase
@@ -480,7 +514,62 @@ export async function updateAppointment(id: string, patch: UpdateAppointmentInpu
   const appointment = mapRow(data);
   patchAppointmentsCache((list) => list.map((a) => (a.id === id ? appointment : a)));
   invalidateAppointmentsWithDashboard();
+
+  // AI-H1.1 Part 8 — real "prepare estimate" task, created only on the
+  // actual transition into "completed" (never at booking time), using the
+  // existing generic tasks.entity_type/entity_id linkage (Phase 10.1) —
+  // no new task system, no schema change. Best-effort: the appointment
+  // update itself already succeeded, so a failure here is logged, not
+  // surfaced as an appointment-update failure.
+  if (justCompleted) {
+    void createEstimatePrepTaskOnce(data).catch((err) => {
+      console.error("[appointments-store] estimate-prep task creation failed:", err);
+    });
+  }
+
   return { ok: true, appointment };
+}
+
+async function createEstimatePrepTaskOnce(apptRow: any): Promise<void> {
+  const orgId = apptRow.org_id as string | undefined;
+  if (!orgId) return;
+
+  // Link the task to the appointment's own CRM entity (lead/deal/project/
+  // contact) when one exists — that's the actual object the estimate is
+  // being prepared for — falling back to the linked contact_id.
+  const entityType = (apptRow.entity_type as string | null) ?? (apptRow.contact_id ? "contact" : null);
+  const entityId = (apptRow.entity_type ? apptRow.entity_id : apptRow.contact_id) as string | null;
+
+  const label = apptRow.contact_name || apptRow.title || apptRow.service || "this appointment";
+  const title = `Prepare estimate for ${label}`;
+
+  // Idempotent: don't duplicate if an open estimate-prep task already
+  // exists for this same entity.
+  if (entityType && entityId) {
+    const { data: existing } = await supabase
+      .from("tasks")
+      .select("id")
+      .eq("org_id", orgId)
+      .eq("entity_type", entityType)
+      .eq("entity_id", entityId)
+      .eq("title", title)
+      .neq("status", "completed")
+      .maybeSingle();
+    if (existing) return;
+  }
+
+  const { error } = await supabase.from("tasks").insert({
+    org_id: orgId,
+    entity_type: entityType,
+    entity_id: entityId,
+    title,
+    status: "not_started",
+    priority: "medium",
+    stage: "planning",
+    stage_position: 0,
+  });
+
+  if (error) console.error("[appointments-store] failed to insert estimate-prep task:", error);
 }
 
 export async function deleteAppointment(id: string): Promise<{ ok: true } | { ok: false; error: string }> {

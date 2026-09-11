@@ -29,6 +29,7 @@
 // gets its activity history for free, with no risk of a duplicate event.
 
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { runAppointmentPostBookingLifecycle } from "../functions/lib/appointment-post-booking";
 
 export type ServerAppointmentStatus = "scheduled" | "confirmed" | "in_progress" | "completed" | "cancelled" | "no_show";
 export type ServerAppointmentType = "consultation" | "estimate" | "site_visit" | "service" | "follow_up" | "internal" | "other";
@@ -174,6 +175,17 @@ export async function createServerAppointment(
     .single();
 
   if (error || !data) throw new Error(`Could not create the appointment: ${error?.message ?? "no row returned"}`);
+
+  // AI-H1.1 — same shared post-booking lifecycle every appointment source
+  // uses (confirmation email + owner/assignee notification). Best-effort:
+  // the appointment itself is already created successfully regardless of
+  // what happens here.
+  try {
+    await runAppointmentPostBookingLifecycle(supabase, { appointmentId: data.id as string, orgId: input.orgId });
+  } catch (err) {
+    console.error("[appointments] post-booking lifecycle failed:", err instanceof Error ? err.message : err);
+  }
+
   return { appointmentId: data.id as string };
 }
 

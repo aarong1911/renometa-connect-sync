@@ -40,6 +40,7 @@ import { Route as SettingsFavoritesRouteImport } from './routes/settings.favorit
 import { Route as SettingsCustomFieldsRouteImport } from './routes/settings.custom-fields'
 import { Route as SettingsBrandingRouteImport } from './routes/settings.branding'
 import { Route as SettingsBillingRouteImport } from './routes/settings.billing'
+import { Route as SettingsAppointmentsRouteImport } from './routes/settings.appointments'
 import { Route as SettingsApiKeysRouteImport } from './routes/settings.api-keys'
 import { Route as SalesPipelineRouteImport } from './routes/sales.pipeline'
 import { Route as ProposalTokenRouteImport } from './routes/proposal.$token'
@@ -221,6 +222,11 @@ const SettingsBillingRoute = SettingsBillingRouteImport.update({
   path: '/billing',
   getParentRoute: () => SettingsRoute,
 } as any)
+const SettingsAppointmentsRoute = SettingsAppointmentsRouteImport.update({
+  id: '/appointments',
+  path: '/appointments',
+  getParentRoute: () => SettingsRoute,
+} as any)
 const SettingsApiKeysRoute = SettingsApiKeysRouteImport.update({
   id: '/api-keys',
   path: '/api-keys',
@@ -392,6 +398,7 @@ export interface FileRoutesByFullPath {
   '/proposal/$token': typeof ProposalTokenRoute
   '/sales/pipeline': typeof SalesPipelineRoute
   '/settings/api-keys': typeof SettingsApiKeysRoute
+  '/settings/appointments': typeof SettingsAppointmentsRoute
   '/settings/billing': typeof SettingsBillingRoute
   '/settings/branding': typeof SettingsBrandingRoute
   '/settings/custom-fields': typeof SettingsCustomFieldsRoute
@@ -449,6 +456,7 @@ export interface FileRoutesByTo {
   '/proposal/$token': typeof ProposalTokenRoute
   '/sales/pipeline': typeof SalesPipelineRoute
   '/settings/api-keys': typeof SettingsApiKeysRoute
+  '/settings/appointments': typeof SettingsAppointmentsRoute
   '/settings/billing': typeof SettingsBillingRoute
   '/settings/branding': typeof SettingsBrandingRoute
   '/settings/custom-fields': typeof SettingsCustomFieldsRoute
@@ -508,6 +516,7 @@ export interface FileRoutesById {
   '/proposal/$token': typeof ProposalTokenRoute
   '/sales/pipeline': typeof SalesPipelineRoute
   '/settings/api-keys': typeof SettingsApiKeysRoute
+  '/settings/appointments': typeof SettingsAppointmentsRoute
   '/settings/billing': typeof SettingsBillingRoute
   '/settings/branding': typeof SettingsBrandingRoute
   '/settings/custom-fields': typeof SettingsCustomFieldsRoute
@@ -568,6 +577,7 @@ export interface FileRouteTypes {
     | '/proposal/$token'
     | '/sales/pipeline'
     | '/settings/api-keys'
+    | '/settings/appointments'
     | '/settings/billing'
     | '/settings/branding'
     | '/settings/custom-fields'
@@ -625,6 +635,7 @@ export interface FileRouteTypes {
     | '/proposal/$token'
     | '/sales/pipeline'
     | '/settings/api-keys'
+    | '/settings/appointments'
     | '/settings/billing'
     | '/settings/branding'
     | '/settings/custom-fields'
@@ -683,6 +694,7 @@ export interface FileRouteTypes {
     | '/proposal/$token'
     | '/sales/pipeline'
     | '/settings/api-keys'
+    | '/settings/appointments'
     | '/settings/billing'
     | '/settings/branding'
     | '/settings/custom-fields'
@@ -955,6 +967,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsBillingRouteImport
       parentRoute: typeof SettingsRoute
     }
+    '/settings/appointments': {
+      id: '/settings/appointments'
+      path: '/appointments'
+      fullPath: '/settings/appointments'
+      preLoaderRoute: typeof SettingsAppointmentsRouteImport
+      parentRoute: typeof SettingsRoute
+    }
     '/settings/api-keys': {
       id: '/settings/api-keys'
       path: '/api-keys'
@@ -1171,6 +1190,7 @@ const InboxRouteWithChildren = InboxRoute._addFileChildren(InboxRouteChildren)
 
 interface SettingsRouteChildren {
   SettingsApiKeysRoute: typeof SettingsApiKeysRoute
+  SettingsAppointmentsRoute: typeof SettingsAppointmentsRoute
   SettingsBillingRoute: typeof SettingsBillingRoute
   SettingsBrandingRoute: typeof SettingsBrandingRoute
   SettingsCustomFieldsRoute: typeof SettingsCustomFieldsRoute
@@ -1185,6 +1205,7 @@ interface SettingsRouteChildren {
 
 const SettingsRouteChildren: SettingsRouteChildren = {
   SettingsApiKeysRoute: SettingsApiKeysRoute,
+  SettingsAppointmentsRoute: SettingsAppointmentsRoute,
   SettingsBillingRoute: SettingsBillingRoute,
   SettingsBrandingRoute: SettingsBrandingRoute,
   SettingsCustomFieldsRoute: SettingsCustomFieldsRoute,

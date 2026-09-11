@@ -17,6 +17,12 @@
 [functions."marketing-campaign-process-queue"]
   schedule = "*/5 * * * *"
 
+# AI-H1.1 — sends the 1-hour appointment SMS reminder. See
+# netlify/functions/appointment-reminder-sms.ts for eligibility window and
+# idempotency design.
+[functions."appointment-reminder-sms"]
+  schedule = "*/5 * * * *"
+
 [[redirects]]
   from = "/*"
   to = "/index.html"
