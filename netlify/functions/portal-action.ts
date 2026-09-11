@@ -3,6 +3,7 @@
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import Stripe from "stripe";
+import { getAppConfig } from "./lib/app-config-store";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -162,7 +163,7 @@ export const handler: Handler = async (event) => {
     if (balance <= 0)
       return { statusCode: 400, headers, body: JSON.stringify({ error: "Payment is temporarily unavailable while an adjustment is being processed." }) };
 
-    const stripeKey = process.env.STRIPE_SECRET_KEY;
+    const stripeKey = await getAppConfig(supabaseAdmin, "STRIPE_SECRET_KEY");
     if (!stripeKey) {
       await supabaseAdmin.from("project_notes").insert({
         project_id:        invoice.project_id,

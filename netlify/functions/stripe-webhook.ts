@@ -40,6 +40,7 @@ import Stripe from "stripe";
 import { postInvoicePaymentSucceeded, postInvoicePaymentRefundSucceeded } from "../lib/accounting";
 import { mintPublicInvoiceToken, revokePublicInvoiceTokenByRawToken } from "../lib/invoice-tokens";
 import { sendPaymentReceipt } from "../lib/payment-receipt";
+import { getAppConfigs } from "./lib/app-config-store";
 
 const admin = createClient(
   process.env.SUPABASE_URL!,
@@ -72,8 +73,10 @@ function mapPaymentMethod(stripeTypes: string[] | undefined): string {
 export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResponse> => {
   if (event.httpMethod !== "POST") return json(405, { error: "Method Not Allowed" });
 
-  const stripeKey = process.env.STRIPE_SECRET_KEY;
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  const { STRIPE_SECRET_KEY: stripeKey, STRIPE_WEBHOOK_SECRET: webhookSecret } = await getAppConfigs(admin, [
+    "STRIPE_SECRET_KEY",
+    "STRIPE_WEBHOOK_SECRET",
+  ]);
   if (!stripeKey || !webhookSecret) {
     console.error("[stripe-webhook] STRIPE_SECRET_KEY or STRIPE_WEBHOOK_SECRET not configured");
     return json(500, { error: "Webhook not configured" });

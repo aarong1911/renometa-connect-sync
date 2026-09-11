@@ -32,6 +32,7 @@ import { createClient } from "@supabase/supabase-js";
 import Stripe from "stripe";
 import { resolveOrgFromBearerToken } from "./lib/resolve-org";
 import { postInvoicePaymentRefundSucceeded } from "../lib/accounting";
+import { getAppConfig } from "./lib/app-config-store";
 
 const admin = createClient(
   process.env.SUPABASE_URL!,
@@ -142,7 +143,7 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
     });
   }
 
-  const stripeKey = process.env.STRIPE_SECRET_KEY;
+  const stripeKey = await getAppConfig(admin, "STRIPE_SECRET_KEY");
   if (!stripeKey) return json(501, { error: "Stripe is not configured." });
   if (!providerPaymentId) return json(409, { error: "This payment has no Stripe reference and cannot be refunded." });
 

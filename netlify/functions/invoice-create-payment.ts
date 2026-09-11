@@ -32,6 +32,7 @@ import type { Handler, HandlerEvent, HandlerResponse } from "@netlify/functions"
 import { createClient } from "@supabase/supabase-js";
 import Stripe from "stripe";
 import { resolvePublicInvoiceToken } from "../lib/invoice-tokens";
+import { getAppConfig } from "./lib/app-config-store";
 
 const admin = createClient(
   process.env.SUPABASE_URL!,
@@ -99,7 +100,7 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
   const balanceCents = Math.round((Number(invoice.total_amount ?? 0) - Number(invoice.amount_paid ?? 0)) * 100) - reservedCreditsCents;
   if (balanceCents <= 0) return json(409, { error: "Payment is temporarily unavailable while an adjustment is being processed." });
 
-  const stripeKey = process.env.STRIPE_SECRET_KEY;
+  const stripeKey = await getAppConfig(admin, "STRIPE_SECRET_KEY");
   if (!stripeKey) return json(501, { error: "Online payment isn't configured yet. Please contact your contractor to pay this invoice." });
 
   const stripe = new Stripe(stripeKey);
