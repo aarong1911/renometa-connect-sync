@@ -3582,11 +3582,11 @@ function ProjectsPage() {
           </div>
         } />
 
-      <div className="mb-4 flex gap-4 shrink-0">
-        <MetricCard icon={TrendingUp} label="Active Project Value" value={formatMoney(kpis.pipelineValue)} sub={`across ${counts.active} active ${counts.active === 1 ? "project" : "projects"}`} tone="info" className="flex-1 min-w-0" />
-        <MetricCard icon={DollarSign} label="Average Project Value" value={formatMoney(kpis.avgValue)}      sub="per active project"                    tone="success" className="flex-1 min-w-0" />
-        <MetricCard icon={Clock}      label="Average Cycle Time"    value={kpis.avgCycle > 0 ? `${kpis.avgCycle}d` : "—"} sub="from start to completion" tone="violet" className="flex-1 min-w-0" />
-        <MetricCard icon={PauseCircle} label="On Hold"              value={String(kpis.onHold)}             sub="projects paused"                       tone="warning" className="flex-1 min-w-0" />
+      <div className="mb-4 grid grid-cols-2 gap-3 shrink-0 md:grid-cols-4 md:gap-4">
+        <MetricCard icon={TrendingUp} label="Active Project Value" value={formatMoney(kpis.pipelineValue)} sub={`across ${counts.active} active ${counts.active === 1 ? "project" : "projects"}`} tone="info" className="min-w-0" />
+        <MetricCard icon={DollarSign} label="Average Project Value" value={formatMoney(kpis.avgValue)}      sub="per active project"                    tone="success" className="min-w-0" />
+        <MetricCard icon={Clock}      label="Average Cycle Time"    value={kpis.avgCycle > 0 ? `${kpis.avgCycle}d` : "—"} sub="from start to completion" tone="violet" className="min-w-0" />
+        <MetricCard icon={PauseCircle} label="On Hold"              value={String(kpis.onHold)}             sub="projects paused"                       tone="warning" className="min-w-0" />
       </div>
 
       <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-b border-border pb-3">

@@ -94,6 +94,7 @@ import {
   PRIORITIES, type Priority,
 } from "@/components/tasks/task-detail-drawer";
 import { projectDetailLink } from "@/lib/routes";
+import { useIsMobile } from "@/hooks/use-mobile";
 
 export const Route = createFileRoute("/tasks")({
   component: TasksPage,
@@ -208,6 +209,22 @@ function groupSummary(groupTasks: Task[]) {
 }
 
 function TasksPage() {
+  // @hello-pangea/dnd's touch sensor permanently attaches a window-level,
+  // non-passive, no-op `touchmove` listener the whole time a
+  // DragDropContext is mounted (an old iOS-Safari "wake up touchmove
+  // events" workaround baked into the library). On several Android Chrome
+  // builds, a non-passive touchmove listener at the window level defeats
+  // the browser's fast-path/optimistic scrolling for the ENTIRE page, not
+  // just inside the board — which is why Board mode, and anything else
+  // rendered while `view === "board"`, stopped scrolling on a real Android
+  // phone even though every element's own overflow/height was already
+  // correct. Since Board defaults to mounted (`view` starts as "board"),
+  // this hits on first load regardless of which sub-view the user actually
+  // looks at. Below `md`, we skip DragDropContext entirely and render
+  // plain (non-draggable) columns instead — same horizontal swipe, same
+  // tap-to-open, no drag — so this listener is simply never registered on
+  // phones. Full drag/drop is unchanged at md+.
+  const isMobile = useIsMobile();
   const { projects } = useProjects();
   const tasks = useTasks();
   const allTeamMembers = useTeam();
@@ -445,14 +462,14 @@ function TasksPage() {
           : { title: "No tasks yet.", hint: "Create a task to get started." };
 
   return (
-    // Bounded to the app shell's <main> content box (h-full/min-h-0 inherit
-    // its already-viewport-constrained height) so only the task-content
-    // region below scrolls — everything else here is flex-none. Without
-    // this, header/tabs/KPI/filters + an unbounded Kanban/grouped list all
-    // stack naturally and overflow <main>'s own overflow-y-auto, producing
-    // a page-level scrollbar that also scrolls the title/tabs/filters out
-    // of view (the regression this fixes).
-    <div className="mobile-tasks flex h-full min-h-0 flex-col overflow-hidden">
+    // Desktop (md+): bounded to the app shell's <main> content box
+    // (h-full/min-h-0 inherit its already-viewport-constrained height) so
+    // only the task-content region below scrolls internally — everything
+    // else here is flex-none. Below md, none of that height-bounding
+    // applies: the route grows to its natural content height and
+    // AppShell's own <main overflow-y-auto> becomes the one real scroll
+    // owner, matching the architecture already used for Pipeline/Calendar.
+    <div className="flex flex-col overflow-visible md:h-full md:min-h-0 md:overflow-hidden">
       <div className="flex-none">
         <PageHeader
           icon={CheckSquare}
@@ -616,9 +633,9 @@ function TasksPage() {
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-hidden">
+      <div className="overflow-visible flex-none md:min-h-0 md:flex-1 md:overflow-hidden">
       {contentIsEmpty ? (
-        <Card className="flex h-full min-h-40 flex-col items-center justify-center gap-1 border-dashed p-8 text-center">
+        <Card className="flex min-h-40 flex-col items-center justify-center gap-1 border-dashed p-8 text-center md:h-full">
           <p className="text-sm font-medium text-foreground">{emptyStateCopy.title}</p>
           {emptyStateCopy.hint && <p className="text-xs text-muted-foreground">{emptyStateCopy.hint}</p>}
           {hasActiveFilters && (
@@ -626,7 +643,7 @@ function TasksPage() {
           )}
         </Card>
       ) : showProjectGroups ? (
-        <div className="h-full min-h-0 space-y-2 overflow-y-auto overscroll-contain pb-1 pr-1">
+        <div className="space-y-2 overflow-visible pb-1 md:h-full md:min-h-0 md:overflow-y-auto md:overscroll-contain md:pr-1">
           {projectGroups.map(({ projectId, tasks: groupTasks }) => {
             const key = `proj:${projectId}`;
             const summary = groupSummary(groupTasks);
@@ -724,6 +741,81 @@ function TasksPage() {
           })}
         </div>
       ) : view === "board" ? (
+        isMobile ? (
+          // Plain (non-draggable) columns — see the isMobile comment above
+          // TasksPage for why DragDropContext itself can't mount here.
+          // Horizontal swipe and tap-to-open are unaffected; only the
+          // press-and-drag reorder gesture is unavailable below md.
+          <div className="min-w-0 overflow-visible">
+            {/* overflow-x-auto alone would implicitly force overflow-y to
+                'auto' too (CSS's overflow-x/y coupling rule kicks in
+                whenever one axis is non-visible and the other is left at
+                the visible default) — explicit overflow-y-hidden avoids
+                that ambiguity; touch-pan-x tells the browser this element
+                only owns horizontal gestures so vertical drags pass
+                straight through to AppShell's <main>. */}
+            <div className="grid w-full max-w-full auto-cols-[minmax(240px,1fr)] grid-flow-col gap-3 overflow-x-auto overflow-y-hidden touch-pan-x pb-1">
+              {TASK_STATUS_ORDER.map((statusId) => {
+                const allItems = grouped.get(statusId) ?? [];
+                const limit = getColumnLimit(statusId);
+                const items = allItems.slice(0, limit);
+                const remaining = allItems.length - items.length;
+                const Icon = TASK_STATUS_ICONS[statusId];
+                const tint = TASK_STATUS_TINT[statusId];
+
+                return (
+                  <div key={statusId} className={cn("flex min-w-0 flex-col rounded-lg border bg-card", tint.border)}>
+                    <div className={cn("flex shrink-0 items-center gap-2 border-b px-3 py-2", tint.headerBg, tint.border)}>
+                      <div className={cn("flex h-6 w-6 shrink-0 items-center justify-center rounded", tint.iconBg)}>
+                        <Icon className={cn("h-3.5 w-3.5", tint.icon)} />
+                      </div>
+                      <h2 className="text-[13px] font-semibold text-foreground">{TASK_STATUS_LABELS[statusId]}</h2>
+                      <Badge variant="secondary" className="ml-auto h-4.5 rounded px-1.5 text-[10px] font-medium">
+                        {allItems.length}
+                      </Badge>
+                    </div>
+
+                    <div className="space-y-2 overflow-visible p-2">
+                      {items.map((task) => (
+                        <TaskCard
+                          key={task.id}
+                          task={task}
+                          dragging={false}
+                          draggable={false}
+                          hideProject={singleProjectContext}
+                          assigneesById={assigneesById}
+                          onView={() => setViewing(task)}
+                          onEdit={() => setEditing(task)}
+                          onDelete={() => {
+                            void deleteTask(task.id);
+                            toast.success("Task deleted");
+                          }}
+                        />
+                      ))}
+
+                      {items.length === 0 && (
+                        <div className="flex min-h-20 flex-col items-center justify-center gap-1 rounded-md border border-dashed border-border text-center text-[11px] text-muted-foreground">
+                          <p>No tasks</p>
+                        </div>
+                      )}
+
+                      {remaining > 0 && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 w-full text-[11px]"
+                          onClick={() => showMoreInColumn(statusId)}
+                        >
+                          Show {Math.min(remaining, COLUMN_LIMIT_STEP)} more {TASK_STATUS_LABELS[statusId]} tasks (showing {items.length} of {allItems.length})
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : (
         <DragDropContext onDragEnd={onDragEnd}>
           <div className="h-full min-h-0 min-w-0 overflow-hidden">
             <div
@@ -814,6 +906,7 @@ function TasksPage() {
             </div>
           </div>
         </DragDropContext>
+        )
       ) : (
         <>
           {/* Mobile: card rows instead of the desktop <Table> — a table
@@ -822,7 +915,7 @@ function TasksPage() {
               same TaskCard used on the board (title, related-to, assignee,
               status/priority badges, due date) with the status badge turned
               on since there's no column header to imply it here. */}
-          <div className="h-full min-h-0 space-y-2 overflow-y-auto overscroll-contain pb-1 md:hidden">
+          <div className="space-y-2 overflow-visible pb-1 md:hidden">
             {filtered.map((task) => (
               <TaskCard
                 key={task.id}

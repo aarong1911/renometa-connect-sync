@@ -404,5 +404,4 @@
   .mobile-calendar { height: auto; min-height: 100%; overflow: visible; }
   .mobile-calendar .calendar-content { min-height: 360px; }
   .mobile-pipeline { height: auto; min-height: 100%; overflow: visible; margin-bottom: 0; }
-  .mobile-tasks { height: auto; min-height: 100%; overflow: visible; }
 }
