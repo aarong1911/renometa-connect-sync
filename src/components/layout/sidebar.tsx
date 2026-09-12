@@ -20,7 +20,7 @@ import { useConversationArchiveStates, conversationMapKey } from "@/lib/conversa
 import { ContactAvatar } from "@/components/ui/contact-avatar";
 import { signOut } from "@/lib/auth";
 import { supabase } from "@/lib/supabase";
-import { getOrgId } from "@/lib/org-id";
+import { useOrgId } from "@/lib/org-id";
 import { useAuthSession } from "@/lib/auth-session";
 
 const LOGO_KEY = "rm_org_logo";
@@ -58,6 +58,7 @@ export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle:
   const pathname  = location.pathname;
   const navigate  = useNavigate();
   const role      = useCurrentUserRole();
+  const orgId     = useOrgId();
   const org       = useOrganization();
   const { conversations } = useSmsMetaConversations();
   const { archivedMap } = useConversationArchiveStates();
@@ -68,7 +69,12 @@ export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle:
   const [user, setUser] = useState<{ email: string; firstName: string; lastName: string } | null>(null);
 
   // Real org logo — same fetch/realtime pattern the topbar used to own.
+  // Keyed on the reactive useOrgId() above (not a one-shot getOrgId()
+  // call) so this re-runs the moment orgId actually resolves after
+  // sign-in, instead of possibly capturing a stale pre-login null and
+  // never retrying — same boot-race class as the useOrgId() fix itself.
   useEffect(() => {
+    if (!orgId) return;
     let realtimeChannel: ReturnType<typeof supabase.channel> | null = null;
     function applyLogo(raw: string | null | undefined, fromDB = false) {
       const url = raw && !raw.startsWith("blob:") ? raw : null;
@@ -84,8 +90,6 @@ export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle:
       }
     }
     async function load() {
-      const orgId = await getOrgId();
-      if (!orgId) return;
       const { data, error } = await supabase.from("organizations").select("logo_url").eq("id", orgId).maybeSingle();
       if (!error && data !== undefined) applyLogo(data?.logo_url, true);
       if (realtimeChannel) return;
@@ -102,7 +106,7 @@ export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle:
       window.removeEventListener("org-updated", onOrgUpdated);
       if (realtimeChannel) supabase.removeChannel(realtimeChannel);
     };
-  }, []);
+  }, [orgId]);
 
   // Real session user — reads the shared session cache (auth-session.ts)
   // instead of independently calling getSession(); see that file's header

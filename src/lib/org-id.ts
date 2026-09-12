@@ -27,7 +27,7 @@
 
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
-import { resolveAuthUserId } from "@/lib/auth-session";
+import { resolveAuthUserId, useAuthUserId } from "@/lib/auth-session";
 
 let cachedOrgId: string | null = null;
 let cachedForUserId: string | null = null;
@@ -66,24 +66,56 @@ export async function getOrgId(): Promise<string | null> {
 
 /**
  * React hook wrapper around getOrgId() — Platform State Sync Phase S0/S1.
- * Resolves once (getOrgId() is already memoized per user above, so a
- * second component mounting this hook does not re-fire the network
- * request), returns null until resolved. Used as the enabling condition +
- * query-key input for every Query-backed Conversations hook
- * (sms-meta-conversations.ts/gmail-conversations.ts/voice-conversations.ts)
- * and by the central realtime bridge (realtime-bridge.tsx) — one shared
- * implementation instead of each of those re-deriving org id its own way.
+ * Used as the enabling condition + query-key input for every Query-backed
+ * Conversations hook (sms-meta-conversations.ts/gmail-conversations.ts/
+ * voice-conversations.ts), organization.ts (org branding/team roster),
+ * deals-store.ts (Pipeline), Dashboard (index.tsx), and the central
+ * realtime bridge (realtime-bridge.tsx) — one shared implementation
+ * instead of each of those re-deriving org id its own way.
+ *
+ * Re-resolves whenever the shared auth session's user id changes
+ * (useAuthUserId(), from auth-session.ts), rather than only once at
+ * mount. Boot-race fix: this hook used to resolve org id via a one-shot
+ * effect with an empty dependency array, calling getOrgId() exactly once
+ * and never again. getOrgId() -> resolveAuthUserId() ->
+ * resolveAuthSession() returns auth-session.ts's cached session
+ * IMMEDIATELY once it has been resolved even once (by design, to avoid
+ * hitting supabase-js's auth-storage lock repeatedly). On sign-in,
+ * signin.tsx calls navigate({ to: "/" }) itself right after
+ * signInWithEmail() resolves — BEFORE supabase's own SIGNED_IN
+ * onAuthStateChange notification is guaranteed to have reached
+ * auth-session.ts's listener and updated its cache. Every component that
+ * freshly mounted because of that navigation (Dashboard, Sidebar/Topbar
+ * org branding, Pipeline/deals, Conversations, RealtimeBridge) could call
+ * this hook in that narrow window, capture the STILL-STALE pre-login
+ * `null` user id, resolve orgId to null, and — because the effect never
+ * re-ran — stay stuck at null indefinitely, even after the real session
+ * landed a moment later. A full page reload "fixed" it only because that
+ * wipes auth-session.ts's module-level cache entirely, forcing a fresh,
+ * correct resolution. Depending on the reactive useAuthUserId() (which
+ * IS correctly subscribed to auth-session.ts's live updates) instead of
+ * an empty dependency array means this hook now re-resolves org id the
+ * moment the real session becomes available, with no reload needed.
  */
 export function useOrgId(): string | null {
-  const [orgId, setOrgId] = useState<string | null>(cachedOrgId);
+  const userId = useAuthUserId();
+  const [orgId, setOrgId] = useState<string | null>(
+    userId && cachedForUserId === userId ? cachedOrgId : null,
+  );
+
   useEffect(() => {
     let cancelled = false;
+    if (!userId) {
+      setOrgId(null);
+      return;
+    }
     getOrgId().then((id) => {
       if (!cancelled) setOrgId(id);
     });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [userId]);
+
   return orgId;
 }

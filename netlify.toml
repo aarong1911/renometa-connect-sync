@@ -23,6 +23,51 @@
 [functions."appointment-reminder-sms"]
   schedule = "*/5 * * * *"
 
+# Vite dev-server-only paths must reach the proxied Vite target
+# (netlify dev's [dev] targetPort) untouched, never fall through to the
+# SPA catch-all below. Without these, netlify dev's redirect matching
+# rewrites requests like /@vite/client and /src/main.tsx to /index.html
+# before proxying — Vite's own dev server never sees the real request,
+# the caller gets back HTML instead of a JS module, and Vite's
+# import-analysis transform then fails trying to parse that HTML as
+# JavaScript ("Failed to parse source for import analysis... File:
+# index.html"). Netlify matches redirects top-to-bottom, first match
+# wins, so these narrower "rewrite to itself" rules must stay ABOVE the
+# catch-all to intercept dev-only requests first. None of these paths are
+# ever requested against the production `dist` build (Vite's dev-only
+# virtual modules don't exist there — production references hashed
+# /assets/*.js files instead), so these rules are no-ops in production
+# and the SPA fallback below is completely unchanged.
+[[redirects]]
+  from = "/@vite/*"
+  to = "/@vite/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/@react-refresh"
+  to = "/@react-refresh"
+  status = 200
+
+[[redirects]]
+  from = "/@id/*"
+  to = "/@id/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/@fs/*"
+  to = "/@fs/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/src/*"
+  to = "/src/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/node_modules/*"
+  to = "/node_modules/:splat"
+  status = 200
+
 [[redirects]]
   from = "/*"
   to = "/index.html"
