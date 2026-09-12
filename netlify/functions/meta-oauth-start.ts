@@ -2,6 +2,7 @@
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
+import { getAppConfigs } from "./lib/app-config-store";
 
 // ─────────────────────────────────────────────────────────────────────────
 // meta-oauth-start.ts
@@ -73,8 +74,9 @@ export const handler: Handler = async (event) => {
     return { statusCode: 400, body: "Missing userId" };
   }
 
-  const stateSecret = process.env.META_OAUTH_STATE_SECRET || process.env.ENCRYPTION_KEY;
-  const appId = process.env.META_APP_ID;
+  const metaConfig = await getAppConfigs(supabaseAdmin, ["META_OAUTH_STATE_SECRET", "META_APP_ID"]);
+  const stateSecret = metaConfig.META_OAUTH_STATE_SECRET || process.env.ENCRYPTION_KEY;
+  const appId = metaConfig.META_APP_ID;
   if (!stateSecret || !appId) {
     return { statusCode: 500, body: "Meta OAuth is not configured (missing META_APP_ID or META_OAUTH_STATE_SECRET)" };
   }

@@ -23,6 +23,8 @@ import { useConversationArchiveStates, conversationMapKey } from "@/lib/conversa
 import { ContactAvatar } from "@/components/ui/contact-avatar";
 import { signOut } from "@/lib/auth";
 import { supabase } from "@/lib/supabase";
+import { getOrgId } from "@/lib/org-id";
+import { useAuthSession } from "@/lib/auth-session";
 
 const LOGO_KEY = "rm_org_logo";
 
@@ -54,20 +56,11 @@ const NAV: NavItem[] = [
   { to: "/settings/integrations", label: "Integrations",    icon: Plug },
 ];
 
-async function getOrgId(): Promise<string | null> {
-  const { data: { session } } = await supabase.auth.getSession();
-  if (!session?.user) return null;
-  const uid = session.user.id;
-  const { data: p } = await supabase.from("profiles").select("organization_id").eq("id", uid).maybeSingle();
-  if (p?.organization_id) return p.organization_id;
-  const { data: m } = await supabase.from("org_memberships").select("org_id").eq("member_id", uid).maybeSingle();
-  return m?.org_id ?? null;
-}
-
 export function Sidebar({ collapsed: desktopCollapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
   const isMobile = useIsMobile();
   const collapsed = !isMobile && desktopCollapsed;
   const [moreOpen, setMoreOpen] = useState(false);
+
   const location  = useLocation();
   const pathname  = location.pathname;
   useEffect(() => { setMoreOpen(false); }, [pathname]);
@@ -119,18 +112,19 @@ export function Sidebar({ collapsed: desktopCollapsed, onToggle }: { collapsed: 
     };
   }, []);
 
-  // Real session user — same as the topbar used to own.
+  // Real session user — reads the shared session cache (auth-session.ts)
+  // instead of independently calling getSession(); see that file's header
+  // for why (prod lock-contention incident, worst on /inbox).
+  const { session } = useAuthSession();
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (!session?.user) return;
-      const meta = session.user.user_metadata ?? {};
-      setUser({
-        email: session.user.email ?? "",
-        firstName: meta.first_name ?? meta.firstName ?? "",
-        lastName: meta.last_name ?? meta.lastName ?? "",
-      });
+    if (!session?.user) return;
+    const meta = session.user.user_metadata ?? {};
+    setUser({
+      email: session.user.email ?? "",
+      firstName: meta.first_name ?? meta.firstName ?? "",
+      lastName: meta.last_name ?? meta.lastName ?? "",
     });
-  }, []);
+  }, [session]);
 
   const items = role === null ? [] : filterNavGroups([{ label: "", items: NAV }], role)[0]?.items ?? [];
   const showSettings = role === null ? false : canAccessSettings(role);

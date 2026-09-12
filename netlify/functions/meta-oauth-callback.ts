@@ -4,6 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
 import { ensureMetaLeadgenSubscription } from "./lib/meta-lead-ads";
 import { ensureMetaMessengerSubscription, ensureMetaInstagramSubscription } from "./lib/meta-messaging";
+import { getAppConfigs } from "./lib/app-config-store";
 
 // ─────────────────────────────────────────────────────────────────────────
 // meta-oauth-callback.ts
@@ -145,9 +146,10 @@ export const handler: Handler = async (event) => {
     return popupResponse(false, "Missing code or state from Facebook redirect");
   }
 
-  const stateSecret = process.env.META_OAUTH_STATE_SECRET || process.env.ENCRYPTION_KEY;
-  const appId = process.env.META_APP_ID;
-  const appSecret = process.env.META_APP_SECRET;
+  const metaConfig = await getAppConfigs(supabaseAdmin, ["META_OAUTH_STATE_SECRET", "META_APP_ID", "META_APP_SECRET"]);
+  const stateSecret = metaConfig.META_OAUTH_STATE_SECRET || process.env.ENCRYPTION_KEY;
+  const appId = metaConfig.META_APP_ID;
+  const appSecret = metaConfig.META_APP_SECRET;
   if (!stateSecret || !appId || !appSecret) {
     return popupResponse(false, "Meta OAuth is not configured on the server");
   }

@@ -1,7 +1,6 @@
 // src/lib/permissions.ts
-import { useEffect, useState } from "react";
-import { supabase } from "./supabase";
 import { useTeam, type Role } from "./organization";
+import { useAuthUserId } from "./auth-session";
 
 // ── Route definitions (must match sidebar nav `to` values exactly) ────────────
 
@@ -150,18 +149,17 @@ export function canAccessSettings(role: Role | null): boolean {
 }
 
 // ── Hook: current logged-in user's role ───────────────────────────────────────
+//
+// User id now comes from auth-session.ts's shared session cache instead
+// of this hook independently calling supabase.auth.getUser() and
+// registering its own onAuthStateChange subscription — this hook is
+// mounted twice at once on every route (RoleGuard in __root.tsx AND
+// Sidebar), which meant two redundant listeners/lookups on every page
+// load; see auth-session.ts's header for the full incident writeup.
 
 export function useCurrentUserRole(): Role | null {
   const team = useTeam();
-  const [userId, setUserId] = useState<string | null>(null);
-
-  useEffect(() => {
-    supabase.auth.getUser().then(({ data: { user } }) => setUserId(user?.id ?? null));
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, session) => {
-      setUserId(session?.user?.id ?? null);
-    });
-    return () => subscription.unsubscribe();
-  }, []);
+  const userId = useAuthUserId();
 
   if (!userId) return null;
   const member = team.find(m => m.id === userId);

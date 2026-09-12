@@ -5,6 +5,7 @@ import { createHmac, timingSafeEqual } from "crypto";
 import { isMetaLeadgenChange, extractMetaLeadgenEvent, processMetaLeadgenEvent } from "./lib/meta-lead-ads";
 import { resolveMessengerContactAndLead } from "./lib/meta-messenger-crm";
 import { resolveInstagramContactAndLead } from "./lib/meta-instagram-crm";
+import { getAppConfig } from "./lib/app-config-store";
 
 // Writes inbound messages to sms_meta_messages — see
 // supabase/migrations/005_sms_meta_messages.sql for the real schema.
@@ -64,7 +65,8 @@ export const handler: Handler = async (event) => {
     const token     = p["hub.verify_token"];
     const challenge = p["hub.challenge"] ?? "";
 
-    if (mode === "subscribe" && token === process.env.META_VERIFY_TOKEN) {
+    const verifyToken = await getAppConfig(supabaseAdmin, "META_VERIFY_TOKEN");
+    if (mode === "subscribe" && token === verifyToken) {
       return { statusCode: 200, headers: { "Content-Type": "text/plain" }, body: challenge };
     }
     return { statusCode: 403, headers: CORS, body: JSON.stringify({ error: "Forbidden" }) };
@@ -79,7 +81,7 @@ export const handler: Handler = async (event) => {
   }
 
   // ── POST — incoming WhatsApp/Messenger/Instagram event ─────────────────────
-  const appSecret = process.env.META_APP_SECRET;
+  const appSecret = await getAppConfig(supabaseAdmin, "META_APP_SECRET");
   if (!appSecret) {
     console.error("[meta-webhook] META_APP_SECRET not configured — refusing to process webhook");
     return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: "Webhook not configured" }) };
