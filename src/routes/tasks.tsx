@@ -26,6 +26,7 @@ import {
   RotateCcw,
   ChevronDown,
   ChevronRight,
+  ChevronLeft,
   AlertCircle,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -248,6 +249,12 @@ function TasksPage() {
   }, []);
 
   const [view, setView] = useState<View>("board");
+  // Mobile-only: which single status column is showing. Below md the
+  // Kanban board renders one stage at a time (see the isMobile branch
+  // further down) instead of a horizontally-scrolling row of columns, so
+  // there's never a horizontal-overflow surface for Android's gesture
+  // arbitration to claim a vertical drag against.
+  const [mobileStage, setMobileStage] = useState<TaskStatus>(TASK_STATUS_ORDER[0]);
   const [topView, setTopView] = useState<TopView>("my");
   const [groupBy, setGroupBy] = useState<GroupBy>("project");
   const [query, setQuery] = useState("");
@@ -742,84 +749,107 @@ function TasksPage() {
         </div>
       ) : view === "board" ? (
         isMobile ? (
-          // Plain (non-draggable) columns — see the isMobile comment above
-          // TasksPage for why DragDropContext itself can't mount here.
-          // Horizontal swipe and tap-to-open are unaffected; only the
-          // press-and-drag reorder gesture is unavailable below md.
-          <div className="min-w-0 overflow-visible">
-            {/* overflow-x-auto alone would implicitly force overflow-y to
-                'auto' too (CSS's overflow-x/y coupling rule kicks in
-                whenever one axis is non-visible and the other is left at
-                the visible default) — explicit overflow-y-hidden avoids
-                that ambiguity. No explicit `touch-action` here: leaving it
-                at the native default lets the browser direction-lock each
-                gesture itself (horizontal → this board scrolls, vertical →
-                it falls through to the ancestor main.app-main). Adding
-                `touch-pan-x` would restrict this element to horizontal
-                panning only, which stops it from ever handing a
-                vertical-starting gesture up to main — the opposite of
-                what's needed here. */}
-            <div className="grid w-full max-w-full auto-cols-[minmax(240px,1fr)] grid-flow-col gap-3 overflow-x-auto overflow-y-hidden pb-1">
-              {TASK_STATUS_ORDER.map((statusId) => {
-                const allItems = grouped.get(statusId) ?? [];
-                const limit = getColumnLimit(statusId);
-                const items = allItems.slice(0, limit);
-                const remaining = allItems.length - items.length;
-                const Icon = TASK_STATUS_ICONS[statusId];
-                const tint = TASK_STATUS_TINT[statusId];
+          // One stage at a time — no horizontally-scrolling board and no
+          // overflow-x/overflow-y wrapper of any kind around the card
+          // list. The previous mobile board still wrapped every column in
+          // an `overflow-x-auto` grid; even with no touch-action override,
+          // Android Chrome's gesture arbitration could still claim a
+          // vertical drag that *started* inside that horizontal-scroll
+          // surface before handing it to main.app-main. Removing the
+          // horizontal-overflow element entirely (rather than tuning its
+          // touch-action) sidesteps that arbitration altogether: the
+          // stage's task list here is a plain block list with no overflow
+          // rule at all, so main.app-main is the only element in this
+          // subtree that can ever claim a scroll gesture. Switching stages
+          // uses the ‹ label count › navigator below instead of a swipe on
+          // the card body, for the same reason.
+          (() => {
+            const stageIndex = TASK_STATUS_ORDER.indexOf(mobileStage);
+            const allItems = grouped.get(mobileStage) ?? [];
+            const limit = getColumnLimit(mobileStage);
+            const items = allItems.slice(0, limit);
+            const remaining = allItems.length - items.length;
+            const Icon = TASK_STATUS_ICONS[mobileStage];
+            const tint = TASK_STATUS_TINT[mobileStage];
+            const goToStage = (index: number) => {
+              const clamped = Math.max(0, Math.min(TASK_STATUS_ORDER.length - 1, index));
+              setMobileStage(TASK_STATUS_ORDER[clamped]);
+            };
 
-                return (
-                  <div key={statusId} className={cn("flex min-w-0 flex-col rounded-lg border bg-card", tint.border)}>
-                    <div className={cn("flex shrink-0 items-center gap-2 border-b px-3 py-2", tint.headerBg, tint.border)}>
-                      <div className={cn("flex h-6 w-6 shrink-0 items-center justify-center rounded", tint.iconBg)}>
-                        <Icon className={cn("h-3.5 w-3.5", tint.icon)} />
-                      </div>
-                      <h2 className="text-[13px] font-semibold text-foreground">{TASK_STATUS_LABELS[statusId]}</h2>
-                      <Badge variant="secondary" className="ml-auto h-4.5 rounded px-1.5 text-[10px] font-medium">
-                        {allItems.length}
-                      </Badge>
+            return (
+              <div className="w-full">
+                <div className={cn("mb-3 flex items-center gap-1 rounded-lg border px-1.5 py-1.5", tint.border, tint.headerBg)}>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 shrink-0"
+                    onClick={() => goToStage(stageIndex - 1)}
+                    disabled={stageIndex === 0}
+                    aria-label="Previous stage"
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+
+                  <div className="flex min-w-0 flex-1 items-center justify-center gap-2 px-1">
+                    <div className={cn("flex h-6 w-6 shrink-0 items-center justify-center rounded", tint.iconBg)}>
+                      <Icon className={cn("h-3.5 w-3.5", tint.icon)} />
                     </div>
-
-                    <div className="space-y-2 overflow-visible p-2">
-                      {items.map((task) => (
-                        <TaskCard
-                          key={task.id}
-                          task={task}
-                          dragging={false}
-                          draggable={false}
-                          hideProject={singleProjectContext}
-                          assigneesById={assigneesById}
-                          onView={() => setViewing(task)}
-                          onEdit={() => setEditing(task)}
-                          onDelete={() => {
-                            void deleteTask(task.id);
-                            toast.success("Task deleted");
-                          }}
-                        />
-                      ))}
-
-                      {items.length === 0 && (
-                        <div className="flex min-h-20 flex-col items-center justify-center gap-1 rounded-md border border-dashed border-border text-center text-[11px] text-muted-foreground">
-                          <p>No tasks</p>
-                        </div>
-                      )}
-
-                      {remaining > 0 && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="h-7 w-full text-[11px]"
-                          onClick={() => showMoreInColumn(statusId)}
-                        >
-                          Show {Math.min(remaining, COLUMN_LIMIT_STEP)} more {TASK_STATUS_LABELS[statusId]} tasks (showing {items.length} of {allItems.length})
-                        </Button>
-                      )}
-                    </div>
+                    <h2 className="truncate text-[13px] font-semibold text-foreground">{TASK_STATUS_LABELS[mobileStage]}</h2>
+                    <Badge variant="secondary" className="h-4.5 shrink-0 rounded px-1.5 text-[10px] font-medium">
+                      {allItems.length}
+                    </Badge>
                   </div>
-                );
-              })}
-            </div>
-          </div>
+
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 shrink-0"
+                    onClick={() => goToStage(stageIndex + 1)}
+                    disabled={stageIndex === TASK_STATUS_ORDER.length - 1}
+                    aria-label="Next stage"
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
+
+                <div className="space-y-2">
+                  {items.map((task) => (
+                    <TaskCard
+                      key={task.id}
+                      task={task}
+                      dragging={false}
+                      draggable={false}
+                      hideProject={singleProjectContext}
+                      assigneesById={assigneesById}
+                      onView={() => setViewing(task)}
+                      onEdit={() => setEditing(task)}
+                      onDelete={() => {
+                        void deleteTask(task.id);
+                        toast.success("Task deleted");
+                      }}
+                    />
+                  ))}
+
+                  {items.length === 0 && (
+                    <div className="flex min-h-20 flex-col items-center justify-center gap-1 rounded-md border border-dashed border-border text-center text-[11px] text-muted-foreground">
+                      <p>No tasks</p>
+                    </div>
+                  )}
+
+                  {remaining > 0 && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 w-full text-[11px]"
+                      onClick={() => showMoreInColumn(mobileStage)}
+                    >
+                      Show {Math.min(remaining, COLUMN_LIMIT_STEP)} more {TASK_STATUS_LABELS[mobileStage]} tasks (showing {items.length} of {allItems.length})
+                    </Button>
+                  )}
+                </div>
+              </div>
+            );
+          })()
         ) : (
         <DragDropContext onDragEnd={onDragEnd}>
           <div className="h-full min-h-0 min-w-0 overflow-hidden">
