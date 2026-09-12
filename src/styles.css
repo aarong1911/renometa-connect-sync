@@ -292,9 +292,20 @@
   /* Toggled by AppShell (src/components/layout/app-shell.tsx) only while it
      is mounted — see the comment there for why. Never applied to portal/
      proposal/change-order/auth pages, which don't mount AppShell and keep
-     relying on natural document scrolling. */
-  html.app-shell-scroll-lock {
-    overflow: hidden;
+     relying on natural document scrolling.
+     Desktop-only (md+): the fractional-zoom double-scrollbar this guards
+     against is a desktop-browser-zoom concern, and locking html/body here
+     is also what silently defeated Android Chrome's native pull-to-refresh
+     — Chrome's PTR is tied to the actual document/root scroller reaching
+     its own top; with html/body forced non-scrollable, there is no root
+     scroller for that gesture to ever reach, no matter what
+     overscroll-behavior is set on the nested main.app-main scroller (see
+     the mobile block below, where main stops being its own scroll
+     container so the document can be the one real mobile scroller instead). */
+  @media (min-width: 768px) {
+    html.app-shell-scroll-lock {
+      overflow: hidden;
+    }
   }
 
   body {
@@ -369,23 +380,38 @@
 
 /* Phone app shell. Desktop geometry remains controlled by its existing utilities. */
 @media (max-width: 767px) {
+  /* The shell no longer clips its own box on mobile: height becomes a
+     floor (min-height), not a ceiling, so it can grow past one viewport
+     of content and let the document itself scroll — see the
+     app-shell-scroll-lock comment above for why. overflow:visible here
+     overrides the shell's own `overflow-hidden` Tailwind class (this
+     unlayered rule already outranks that layered utility, same
+     precedence trick used by .mobile-pipeline/.mobile-calendar/etc.
+     elsewhere in this file). The safe-area/bottom-nav padding is
+     unchanged — it still reserves the same trailing space at the end of
+     the document's content, just as part of a naturally-tall box instead
+     of a fixed-height one. */
   .mobile-app-shell {
-    height: var(--mobile-viewport-height, 100dvh);
+    min-height: var(--mobile-viewport-height, 100dvh);
+    height: auto;
+    overflow: visible;
     padding-top: env(safe-area-inset-top);
     padding-bottom: calc(64px + env(safe-area-inset-bottom));
     padding-left: env(safe-area-inset-left);
     padding-right: env(safe-area-inset-right);
   }
+  /* main.app-main stops being its own scroll container on mobile — it
+     was the nested scroller that could never hand a top-of-page
+     overscroll to Chrome for native pull-to-refresh, no matter what
+     overscroll-behavior it carried, because html/body (the actual root
+     scroller PTR watches) were locked non-scrollable. With this and the
+     scroll-lock change above, the document is the one real mobile
+     scroller; Topbar's existing `sticky top-0` and the bottom nav's
+     existing `fixed` positioning are both already anchored correctly
+     for that (sticky needs a scrolling ancestor, which is now the
+     document; fixed is always viewport-relative regardless). */
+  .app-main { overflow: visible; }
   .mobile-bottom-nav { padding-bottom: env(safe-area-inset-bottom); }
-  /* No overscroll-behavior override here (mobile-only default is
-     `auto`, same as this rule's desktop side, which never had an
-     override to begin with) — `contain` previously blocked scroll
-     chaining at the top of main.app-main, which also stops Chrome from
-     ever seeing the rubber-band overscroll it needs to trigger native
-     pull-to-refresh. `auto` still keeps `main` as the one real scroll
-     container (that comes from `overflow-y-auto` + the scroll-lock on
-     `html`/`body`, untouched here) — it only stops swallowing the
-     overscroll signal once main hits its own top/bottom. */
   .mobile-page-header h1 { font-size: 20px; }
   .mobile-page-header > div { min-width: 0; }
   .mobile-page-header > div:last-child { flex-wrap: wrap; }
