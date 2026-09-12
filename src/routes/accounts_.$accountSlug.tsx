@@ -2220,28 +2220,23 @@ function AccountContactAvatar({
   className?: string;
 }) {
   const name = contact?.full_name || "Contact";
-  const sizeClasses = {
-    sm: "h-8 w-8",
-    md: "h-10 w-10",
-    lg: "h-16 w-16",
-  } as const;
 
-  if (contact?.avatar_url) {
-    return (
-      <Avatar className={`${sizeClasses[size]} shrink-0 ${className ?? ""}`}>
-        <AvatarImage src={contact.avatar_url} alt={name} className="object-cover" />
-        <AvatarFallback>{initials(name)}</AvatarFallback>
-      </Avatar>
-    );
-  }
-
+  // Delegates to the shared ContactAvatar for both the has-a-URL and
+  // no-URL cases (previously this had its own raw <AvatarImage> branch
+  // with no error handling when a URL was present — a Meta/Instagram
+  // profile picture URL that expires with a 403 had nothing to fall back
+  // to but bare initials, unlike every other contact avatar surface).
+  // "lg" here (h-16 w-16) predates and is larger than ContactAvatar's own
+  // "lg" (h-12 w-12) — preserved via a className override so this
+  // component's existing sizing doesn't change.
   return (
     <ContactAvatar
       id={contact?.id}
       name={name}
       avatarKey={contact?.avatar_key}
+      avatarUrl={contact?.avatar_url}
       size={size === "lg" ? "lg" : size}
-      className={className}
+      className={cn(size === "lg" && "h-16 w-16", className)}
     />
   );
 }
