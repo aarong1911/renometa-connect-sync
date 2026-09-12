@@ -315,19 +315,24 @@ export function RealtimeBridge(): null {
     };
 
     // ONE channel for this org, covering every table this bridge watches —
-    // not one channel per table, and never one per component.
+    // not one channel per table, and never one per component. EXCEPT
+    // sms_meta_messages — see the dedicated `realtime-sms-${orgId}`
+    // channel below, created and torn down alongside this one. A
+    // controlled runtime test proved sms_meta_messages INSERT events
+    // reliably reach a small, dedicated channel but never reach this
+    // shared channel, even with the exact same unfiltered binding shape
+    // and the same org guard in the callback. This channel currently
+    // carries ~48 postgres_changes bindings across ~19 tables — the
+    // likely explanation is Supabase Realtime's own documented
+    // reliability/scaling limits for a single channel carrying a very
+    // large number of bindings, though the exact internal mechanism
+    // wasn't provable from this codebase alone. Rather than keep
+    // debugging that internal behavior, sms_meta_messages now gets its
+    // own small, dedicated channel — the topology already confirmed to
+    // work — while every other table stays on this shared channel
+    // unchanged.
     const channel = supabase
       .channel(`realtime-bridge-${orgId}`)
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "sms_meta_messages", filter: `org_id=eq.${orgId}` },
-        () => invalidateSms(),
-      )
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "sms_meta_messages", filter: `org_id=eq.${orgId}` },
-        () => invalidateSms(),
-      )
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "conversation_states", filter: `org_id=eq.${orgId}` },
@@ -558,10 +563,50 @@ export function RealtimeBridge(): null {
         { event: "DELETE", schema: "public", table: "member_permissions" },
         () => invalidateMemberPermissions(),
       )
-      .subscribe();
+      .subscribe((status, err) => {
+        // A CHANNEL_ERROR/TIMED_OUT/CLOSED subscribe failure would
+        // otherwise be completely silent (the channel object still
+        // "existed" locally, but no postgres_changes event would ever
+        // arrive) — surface it instead of silently doing nothing.
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          console.error("[realtime-bridge] subscribe failed", { orgId, status, message: err?.message });
+        }
+      });
+
+    // Dedicated channel for sms_meta_messages only — see the comment
+    // above `channel`'s own declaration for why this table isn't on the
+    // shared channel. No `filter` (Realtime's per-change filter
+    // evaluation proved unreliable for this table's RLS policy — see
+    // the same comment); org scoping is enforced client-side below
+    // instead, exactly as the shared channel's other org-scoped
+    // handlers already do via their `filter` option.
+    const smsChannel = supabase
+      .channel(`realtime-sms-${orgId}`)
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "sms_meta_messages" },
+        (payload) => {
+          if ((payload.new as any)?.org_id !== orgId) return;
+          invalidateSms();
+        },
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "sms_meta_messages" },
+        (payload) => {
+          if ((payload.new as any)?.org_id !== orgId) return;
+          invalidateSms();
+        },
+      )
+      .subscribe((status, err) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          console.error("[realtime-sms] subscribe failed", { orgId, status, message: err?.message });
+        }
+      });
 
     return () => {
       supabase.removeChannel(channel);
+      supabase.removeChannel(smsChannel);
     };
   }, [orgId, queryClient]);
 
