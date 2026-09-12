@@ -21,6 +21,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { metaGraphRequest, MetaGraphApiError } from "./meta-graph-api";
 import { getMetaPageAccessToken } from "./meta-page-access";
 import { decryptMetaAccessToken } from "./meta-token-crypto";
+import { cacheMetaAvatar, isMetaCdnAvatarUrl } from "./meta-avatar-cache";
 
 const FALLBACK_CONTACT_NAME = "Instagram Contact";
 
@@ -115,12 +116,19 @@ export async function resolveInstagramContactAndLead(
   let contactAvatarUrl: string | null = existingContact?.avatar_url ?? null;
   let contactSource: string | null = existingContact?.source ?? null;
 
-  // Best-effort profile enrichment — ONLY attempted while the contact still
-  // has no real name (a brand-new contact, or one still holding the
-  // "Instagram Contact" placeholder). Never re-fetched on every message once
-  // a real name is set, and never overwrites a human-edited name.
+  // Best-effort profile enrichment — attempted while EITHER the contact
+  // still has no real name (a brand-new contact, or one still holding the
+  // "Instagram Contact" placeholder) OR its stored avatar_url is still a
+  // raw, expiring Meta CDN URL from before meta-avatar-cache.ts existed
+  // (self-heal path: repairs a stale avatar even for an already-named
+  // contact, without a bulk backfill). Never re-fetched on every message
+  // once BOTH a real name AND a non-Meta-CDN avatar are in place — at that
+  // point neither condition holds, so this block is skipped entirely on
+  // every subsequent inbound message. Never overwrites a human-edited name
+  // — see the patch logic below, which still gates `full_name` on
+  // isPlaceholderName independently of why enrichment ran.
   let metaProfile: InstagramSenderProfile | null = null;
-  if (isPlaceholderName(contactFullName)) {
+  if (isPlaceholderName(contactFullName) || isMetaCdnAvatarUrl(contactAvatarUrl)) {
     try {
       const userAccessToken = decryptMetaAccessToken(connectionAccessTokenEncrypted);
       const pageAccessToken = await getMetaPageAccessToken(userAccessToken, pageId);
@@ -144,6 +152,19 @@ export async function resolveInstagramContactAndLead(
           : null)
     : null;
 
+  // Never persist Meta's raw CDN profile_pic URL directly — it expires
+  // and later 403s (see meta-avatar-cache.ts). Cache it server-side into
+  // Supabase Storage first and store that stable URL instead; on any
+  // caching failure this resolves to null, same as "no picture found"
+  // (contact creation) or "leave the existing avatar untouched" (patch
+  // below, gated on the avatar still being missing/a raw Meta CDN URL) —
+  // never a dead link.
+  const cachedAvatarUrl = metaProfile?.profilePic
+    ? await cacheMetaAvatar(supabaseAdmin, {
+        orgId, channel: "instagram", providerSenderId: senderId, remoteUrl: metaProfile.profilePic,
+      })
+    : null;
+
   if (!contactId) {
     const { data: created, error: createErr } = await supabaseAdmin
       .from("contacts")
@@ -152,7 +173,7 @@ export async function resolveInstagramContactAndLead(
         instagram_igsid: senderId,
         full_name: metaFullName || FALLBACK_CONTACT_NAME,
         source: "instagram",
-        avatar_url: metaProfile?.profilePic ?? null,
+        avatar_url: cachedAvatarUrl,
       })
       .select("id, full_name, avatar_url, source")
       .maybeSingle();
@@ -183,20 +204,28 @@ export async function resolveInstagramContactAndLead(
       contactSource = created?.source ?? null;
     }
   } else {
-    // Existing contact — two INDEPENDENT, additive-only enrichments, never
-    // gated on each other (mirrors Messenger's exact rule):
-    //   1. Name/avatar: only while the name is still a placeholder — never
+    // Existing contact — three INDEPENDENT, additive-only enrichments,
+    // never gated on each other (mirrors Messenger's exact rule):
+    //   1. Name: only while the name is still a placeholder — never
     //      overwrites a human-edited or already-enriched name.
-    //   2. Source backfill: independent of name state — a Contact that
-    //      already has a real name but was created before this backfill
-    //      existed (contacts.source still null) still gets backfilled.
-    //      NEVER overwrites a meaningful existing source (google_ads,
-    //      meta_ads, website, phone, sms, etc.) — only fires when the
-    //      stored value is null/empty.
+    //   2. Avatar: whenever a fresh cached avatar was produced above AND
+    //      the currently-stored avatar is either missing or still a raw
+    //      Meta CDN URL (self-heal) — independent of the name-placeholder
+    //      state, so an already-named contact's stale CDN avatar still
+    //      gets repaired. Never overwrites an avatar that's already a
+    //      stable (non-Meta-CDN) URL.
+    //   3. Source backfill: independent of both of the above — a Contact
+    //      that already has a real name but was created before this
+    //      backfill existed (contacts.source still null) still gets
+    //      backfilled. NEVER overwrites a meaningful existing source
+    //      (google_ads, meta_ads, website, phone, sms, etc.) — only fires
+    //      when the stored value is null/empty.
     const patch: Record<string, unknown> = {};
     if (metaFullName && isPlaceholderName(contactFullName)) {
       patch.full_name = metaFullName;
-      if (!contactAvatarUrl && metaProfile?.profilePic) patch.avatar_url = metaProfile.profilePic;
+    }
+    if (cachedAvatarUrl && (!contactAvatarUrl || isMetaCdnAvatarUrl(contactAvatarUrl))) {
+      patch.avatar_url = cachedAvatarUrl;
     }
     if (!contactSource || contactSource.trim() === "") {
       patch.source = "instagram";
