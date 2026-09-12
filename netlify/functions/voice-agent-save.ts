@@ -38,6 +38,7 @@ import type { Handler, HandlerEvent } from '@netlify/functions';
 import { createClient } from '@supabase/supabase-js';
 import { resolveOrgFromBearerToken } from './lib/resolve-org';
 import { buildVapiAssistantBody, DEFAULT_CRM_TOOLS, type CrmTools } from './lib/vapi-assistant-body';
+import { getAppConfig } from './lib/app-config-store';
 
 const VAPI_BASE = 'https://api.vapi.ai';
 
@@ -57,11 +58,11 @@ interface SaveRequestBody {
   crmTools?: CrmTools;
 }
 
-async function vapiFetch(path: string, method: string, body: unknown) {
+async function vapiFetch(path: string, method: string, body: unknown, vapiApiKey: string) {
   const res = await fetch(`${VAPI_BASE}${path}`, {
     method,
     headers: {
-      Authorization: `Bearer ${process.env.VAPI_API_KEY}`,
+      Authorization: `Bearer ${vapiApiKey}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
@@ -104,6 +105,11 @@ export const handler: Handler = async (event: HandlerEvent) => {
     };
   }
 
+  const vapiApiKey = await getAppConfig(supabase, 'VAPI_API_KEY');
+  if (!vapiApiKey) {
+    return { statusCode: 503, body: JSON.stringify({ error: 'Voice provider is not configured on the server.' }) };
+  }
+
   const { data: currentRow, error: loadErr } = await supabase
     .from('voice_agents')
     .select('id, tenant_id, name, system_prompt, first_message, voice_id, llm_model, end_call_phrases, crm_tools, vapi_assistant_id')
@@ -144,8 +150,8 @@ export const handler: Handler = async (event: HandlerEvent) => {
 
   // 1. Provider first.
   const providerRes = isCreate
-    ? await vapiFetch('/assistant', 'POST', newVapiBody)
-    : await vapiFetch(`/assistant/${currentRow.vapi_assistant_id}`, 'PATCH', newVapiBody);
+    ? await vapiFetch('/assistant', 'POST', newVapiBody, vapiApiKey)
+    : await vapiFetch(`/assistant/${currentRow.vapi_assistant_id}`, 'PATCH', newVapiBody, vapiApiKey);
 
   if (!providerRes.ok) {
     console.error('[voice-agent-save] Vapi write failed', { agentId, isCreate, status: providerRes.status });
@@ -207,7 +213,7 @@ export const handler: Handler = async (event: HandlerEvent) => {
   if (isCreate) {
     // Nothing local ever learned this assistant existed — delete it so no
     // orphan is left in Vapi.
-    const cleanup = await vapiFetch(`/assistant/${newAssistantId}`, 'DELETE', undefined);
+    const cleanup = await vapiFetch(`/assistant/${newAssistantId}`, 'DELETE', undefined, vapiApiKey);
     if (cleanup.ok || cleanup.status === 404) {
       return {
         statusCode: 500,
@@ -245,7 +251,7 @@ export const handler: Handler = async (event: HandlerEvent) => {
     credentialId,
   });
 
-  const rollback = await vapiFetch(`/assistant/${currentRow.vapi_assistant_id}`, 'PATCH', oldVapiBody);
+  const rollback = await vapiFetch(`/assistant/${currentRow.vapi_assistant_id}`, 'PATCH', oldVapiBody, vapiApiKey);
 
   if (rollback.ok) {
     return {

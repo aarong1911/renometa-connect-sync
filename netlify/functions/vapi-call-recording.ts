@@ -33,6 +33,7 @@
 import type { Handler, HandlerEvent } from '@netlify/functions';
 import { createClient } from '@supabase/supabase-js';
 import { resolveOrgFromBearerToken } from './lib/resolve-org';
+import { getAppConfig } from './lib/app-config-store';
 
 const VAPI_BASE = 'https://api.vapi.ai';
 
@@ -89,13 +90,18 @@ export const handler: Handler = async (event: HandlerEvent) => {
     return { statusCode: 404, body: JSON.stringify({ error: 'No recording available for this call' }) };
   }
 
+  const vapiApiKey = await getAppConfig(supabase, 'VAPI_API_KEY');
+  if (!vapiApiKey) {
+    return { statusCode: 503, body: JSON.stringify({ error: 'Voice provider is not configured on the server.' }) };
+  }
+
   try {
     const vapiRes = await fetch(
       `${VAPI_BASE}/call/${callRow.vapi_call_id}/${TRACK_ENDPOINTS[track]}`,
       {
         method: 'GET',
         redirect: 'manual',
-        headers: { Authorization: `Bearer ${process.env.VAPI_API_KEY}` },
+        headers: { Authorization: `Bearer ${vapiApiKey}` },
       }
     );
 

@@ -11,11 +11,11 @@ const WEBHOOK_URL = 'https://connect.renometa.com/.netlify/functions/vapi-webhoo
 
 export { WEBHOOK_URL };
 
-export async function patchVapiPhoneNumberToWebhook(phoneNumberId: string) {
+export async function patchVapiPhoneNumberToWebhook(phoneNumberId: string, vapiApiKey: string) {
   const patchRes = await fetch(`${VAPI_BASE}/phone-number/${phoneNumberId}`, {
     method: 'PATCH',
     headers: {
-      Authorization: `Bearer ${process.env.VAPI_API_KEY}`,
+      Authorization: `Bearer ${vapiApiKey}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -35,11 +35,11 @@ export async function patchVapiPhoneNumberToWebhook(phoneNumberId: string) {
   catch { return { raw: patchText }; }
 }
 
-export async function fetchVapiPhoneNumber(phoneNumberId: string) {
+export async function fetchVapiPhoneNumber(phoneNumberId: string, vapiApiKey: string) {
   const res = await fetch(`${VAPI_BASE}/phone-number/${phoneNumberId}`, {
     method: 'GET',
     headers: {
-      Authorization: `Bearer ${process.env.VAPI_API_KEY}`,
+      Authorization: `Bearer ${vapiApiKey}`,
       'Content-Type': 'application/json',
     },
   });
@@ -57,9 +57,9 @@ export async function fetchVapiPhoneNumber(phoneNumberId: string) {
  * and verifying the result. Throws if Vapi's state can't be confirmed —
  * callers must not report success to the UI if this throws.
  */
-export async function verifyPhoneNumberInWebhookMode(vapiPhoneNumberId: string): Promise<void> {
-  const patchPayload = await patchVapiPhoneNumberToWebhook(vapiPhoneNumberId);
-  const verifiedPhone = await fetchVapiPhoneNumber(vapiPhoneNumberId);
+export async function verifyPhoneNumberInWebhookMode(vapiPhoneNumberId: string, vapiApiKey: string): Promise<void> {
+  const patchPayload = await patchVapiPhoneNumberToWebhook(vapiPhoneNumberId, vapiApiKey);
+  const verifiedPhone = await fetchVapiPhoneNumber(vapiPhoneNumberId, vapiApiKey);
 
   const verifiedServerUrl = verifiedPhone?.serverUrl ?? patchPayload?.serverUrl ?? null;
   let verifiedAssistantId = verifiedPhone?.assistantId ?? patchPayload?.assistantId ?? null;
@@ -75,13 +75,13 @@ export async function verifyPhoneNumberInWebhookMode(vapiPhoneNumberId: string):
     await fetch(`${VAPI_BASE}/phone-number/${vapiPhoneNumberId}`, {
       method: 'PATCH',
       headers: {
-        Authorization: `Bearer ${process.env.VAPI_API_KEY}`,
+        Authorization: `Bearer ${vapiApiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ assistantId: null }),
     }).catch(() => {});
 
-    const reverified = await fetchVapiPhoneNumber(vapiPhoneNumberId);
+    const reverified = await fetchVapiPhoneNumber(vapiPhoneNumberId, vapiApiKey);
     verifiedAssistantId = reverified?.assistantId ?? null;
 
     if (verifiedAssistantId) {

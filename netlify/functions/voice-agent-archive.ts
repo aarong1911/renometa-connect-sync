@@ -46,6 +46,7 @@ import type { Handler, HandlerEvent } from '@netlify/functions';
 import { createClient } from '@supabase/supabase-js';
 import { resolveOrgFromBearerToken } from './lib/resolve-org';
 import { buildVapiAssistantBody, DEFAULT_CRM_TOOLS, type CrmTools } from './lib/vapi-assistant-body';
+import { getAppConfig } from './lib/app-config-store';
 
 const VAPI_BASE = 'https://api.vapi.ai';
 
@@ -100,6 +101,11 @@ export const handler: Handler = async (event: HandlerEvent) => {
     return { statusCode: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ success: true, alreadyArchived: true }) };
   }
 
+  const vapiApiKey = await getAppConfig(supabase, 'VAPI_API_KEY');
+  if (!vapiApiKey) {
+    return { statusCode: 503, body: JSON.stringify({ error: 'Voice provider is not configured on the server.' }) };
+  }
+
   // 2. Provider first: delete the Vapi assistant. No local mutation happens
   // before this succeeds (or is confirmed already gone).
   let assistantAlreadyGone = false;
@@ -107,7 +113,7 @@ export const handler: Handler = async (event: HandlerEvent) => {
     try {
       const res = await fetch(`${VAPI_BASE}/assistant/${agentRow.vapi_assistant_id}`, {
         method: 'DELETE',
-        headers: { Authorization: `Bearer ${process.env.VAPI_API_KEY}` },
+        headers: { Authorization: `Bearer ${vapiApiKey}` },
       });
 
       if (!res.ok) {
@@ -201,7 +207,7 @@ export const handler: Handler = async (event: HandlerEvent) => {
         const recreateRes = await fetch(`${VAPI_BASE}/assistant`, {
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${process.env.VAPI_API_KEY}`,
+            Authorization: `Bearer ${vapiApiKey}`,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify(recreateBody),

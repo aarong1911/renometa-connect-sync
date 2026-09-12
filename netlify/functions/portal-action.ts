@@ -3,7 +3,7 @@
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import Stripe from "stripe";
-import { getAppConfig } from "./lib/app-config-store";
+import { getAppConfig, getAppConfigs } from "./lib/app-config-store";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -68,10 +68,16 @@ export const handler: Handler = async (event) => {
     if (error) return { statusCode: 500, headers, body: JSON.stringify({ error: error.message }) };
 
     // SMS notification via Twilio
-    const twilioSid  = process.env.TWILIO_ACCOUNT_SID;
-    const twilioAuth = process.env.TWILIO_AUTH_TOKEN;
-    const twilioFrom = process.env.TWILIO_PHONE_NUMBER;
-    const twilioTo   = process.env.NOTIFY_PHONE_NUMBER;
+    const twilioConfig = await getAppConfigs(supabaseAdmin, [
+      "TWILIO_ACCOUNT_SID",
+      "TWILIO_AUTH_TOKEN",
+      "TWILIO_PHONE_NUMBER",
+      "NOTIFY_PHONE_NUMBER",
+    ]);
+    const twilioSid  = twilioConfig.TWILIO_ACCOUNT_SID;
+    const twilioAuth = twilioConfig.TWILIO_AUTH_TOKEN;
+    const twilioFrom = twilioConfig.TWILIO_PHONE_NUMBER;
+    const twilioTo   = twilioConfig.NOTIFY_PHONE_NUMBER;
 
     if (twilioSid && twilioAuth && twilioFrom && twilioTo) {
       const smsBody = `New portal message from ${clientName}:\n"${clientMessage.trim()}"`;

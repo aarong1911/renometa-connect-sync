@@ -35,6 +35,7 @@ import {
   type ToolAuditEntry,
 } from './lib/voice-call-audit';
 import { normalizeServiceTitle } from './lib/voice-crm';
+import { getAppConfig } from './lib/app-config-store';
 
 // ─────────────────────────────────────────────
 // Supabase client — service role bypasses RLS
@@ -1794,7 +1795,7 @@ export const handler: Handler = async (event: HandlerEvent) => {
   const rawBody = event.body ?? '';
   const signature = event.headers['x-vapi-signature'] ?? '';
 
-  const webhookSecret = process.env.VAPI_WEBHOOK_SECRET;
+  const webhookSecret = await getAppConfig(supabase, 'VAPI_WEBHOOK_SECRET');
   if (!webhookSecret) {
     logError('handler', 'VAPI_WEBHOOK_SECRET not configured', {});
     return { statusCode: 503, body: 'Service unavailable' };

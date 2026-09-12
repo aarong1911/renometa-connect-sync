@@ -4,6 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 import nodemailer from "nodemailer";
 import { createServerTask, type ServerTaskPriority } from "../lib/tasks";
 import { createServerAppointment, type ServerAppointmentType } from "../lib/appointments";
+import { getAppConfigs } from "./lib/app-config-store";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -458,10 +459,11 @@ async function finishRun(runId: string, failedAtNodeId: string | null, status: s
 // ── Integrations ──────────────────────────────────────────────────────────────
 
 async function sendTwilioSms(to: string, body: string) {
-  const sid  = process.env.TWILIO_ACCOUNT_SID;
-  const auth = process.env.TWILIO_AUTH_TOKEN;
-  const from = process.env.TWILIO_PHONE_NUMBER;
-  if (!sid || !auth || !from) { console.warn("[execute-workflow] Twilio env vars not set"); return; }
+  const config = await getAppConfigs(supabaseAdmin, ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER"]);
+  const sid  = config.TWILIO_ACCOUNT_SID;
+  const auth = config.TWILIO_AUTH_TOKEN;
+  const from = config.TWILIO_PHONE_NUMBER;
+  if (!sid || !auth || !from) { console.warn("[execute-workflow] Twilio config not set"); return; }
 
   const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
     method: "POST",

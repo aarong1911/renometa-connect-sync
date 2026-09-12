@@ -26,6 +26,7 @@ import { execFile } from "node:child_process";
 import { createServerTask } from "../lib/tasks";
 import { isInvoiceOverdue } from "../../src/lib/invoice-status";
 import { resolveOrgFromBearerToken } from "./lib/resolve-org";
+import { getAppConfigs } from "./lib/app-config-store";
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -657,9 +658,10 @@ async function executeActions(
 }
 
 async function sendSms(to: string, body: string) {
-  const sid = process.env.TWILIO_ACCOUNT_SID;
-  const auth = process.env.TWILIO_AUTH_TOKEN;
-  const from = process.env.TWILIO_PHONE_NUMBER;
+  const config = await getAppConfigs(supabase, ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER"]);
+  const sid = config.TWILIO_ACCOUNT_SID;
+  const auth = config.TWILIO_AUTH_TOKEN;
+  const from = config.TWILIO_PHONE_NUMBER;
   if (!sid || !auth || !from) return;
 
   await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {

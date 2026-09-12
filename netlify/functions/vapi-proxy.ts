@@ -30,6 +30,7 @@
 
 import type { Handler, HandlerEvent } from '@netlify/functions';
 import { createClient } from '@supabase/supabase-js';
+import { getAppConfig } from './lib/app-config-store';
 
 const VAPI_BASE = 'https://api.vapi.ai';
 
@@ -352,12 +353,17 @@ export const handler: Handler = async (event: HandlerEvent) => {
         }
       : body;
 
+  const vapiApiKey = await getAppConfig(supabase, 'VAPI_API_KEY');
+  if (!vapiApiKey) {
+    return { statusCode: 503, body: JSON.stringify({ error: 'Voice provider is not configured on the server.' }) };
+  }
+
   let vapiRes: Response;
   try {
     vapiRes = await fetch(vapiUrl, {
       method,
       headers: {
-        Authorization: `Bearer ${process.env.VAPI_API_KEY}`,
+        Authorization: `Bearer ${vapiApiKey}`,
         'Content-Type': 'application/json',
       },
       body: forwardBody ? JSON.stringify(forwardBody) : undefined,

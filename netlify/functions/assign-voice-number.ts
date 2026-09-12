@@ -5,6 +5,7 @@ import {
   patchVapiPhoneNumberToWebhook,
   fetchVapiPhoneNumber,
 } from './lib/vapi-phone-routing';
+import { getAppConfig } from './lib/app-config-store';
 
 const VAPI_BASE = 'https://api.vapi.ai';
 
@@ -94,13 +95,18 @@ export const handler: Handler = async (event: HandlerEvent) => {
     return { statusCode: 400, body: JSON.stringify({ error: 'Selected agent has no Vapi assistant ID' }) };
   }
 
+  const vapiApiKey = await getAppConfig(supabase, 'VAPI_API_KEY');
+  if (!vapiApiKey) {
+    return { statusCode: 503, body: JSON.stringify({ error: 'Voice provider is not configured on the server.' }) };
+  }
+
   // Patch Vapi: clear assistantId, set serverUrl
   let patchPayload: any;
   let verifiedPhone: any;
 
   try {
-    patchPayload = await patchVapiPhoneNumberToWebhook(phoneNumberId);
-    verifiedPhone = await fetchVapiPhoneNumber(phoneNumberId);
+    patchPayload = await patchVapiPhoneNumberToWebhook(phoneNumberId, vapiApiKey);
+    verifiedPhone = await fetchVapiPhoneNumber(phoneNumberId, vapiApiKey);
   } catch (err) {
     console.error('[assign-voice-number] Vapi update failed:', err);
     return {
@@ -144,7 +150,7 @@ export const handler: Handler = async (event: HandlerEvent) => {
       await fetch(`${VAPI_BASE}/phone-number/${phoneNumberId}`, {
         method: 'PATCH',
         headers: {
-          Authorization: `Bearer ${process.env.VAPI_API_KEY}`,
+          Authorization: `Bearer ${vapiApiKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ assistantId: null }),

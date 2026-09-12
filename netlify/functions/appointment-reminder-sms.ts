@@ -63,6 +63,7 @@
 
 import type { Handler } from '@netlify/functions';
 import { createClient } from '@supabase/supabase-js';
+import { getAppConfigs } from './lib/app-config-store';
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -81,9 +82,10 @@ function logError(msg: string, fields?: Record<string, unknown>) {
 }
 
 async function sendSms(to: string, body: string): Promise<boolean> {
-  const sid = process.env.TWILIO_ACCOUNT_SID;
-  const auth = process.env.TWILIO_AUTH_TOKEN;
-  const from = process.env.TWILIO_PHONE_NUMBER;
+  const config = await getAppConfigs(supabase, ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE_NUMBER']);
+  const sid = config.TWILIO_ACCOUNT_SID;
+  const auth = config.TWILIO_AUTH_TOKEN;
+  const from = config.TWILIO_PHONE_NUMBER;
   if (!sid || !auth || !from) {
     logError('Twilio not configured');
     return false;

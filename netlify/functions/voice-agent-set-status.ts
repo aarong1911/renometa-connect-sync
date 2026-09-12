@@ -41,6 +41,7 @@ import type { Handler, HandlerEvent } from '@netlify/functions';
 import { createClient } from '@supabase/supabase-js';
 import { resolveOrgFromBearerToken } from './lib/resolve-org';
 import { verifyPhoneNumberInWebhookMode } from './lib/vapi-phone-routing';
+import { getAppConfig } from './lib/app-config-store';
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -122,9 +123,14 @@ export const handler: Handler = async (event: HandlerEvent) => {
     // Provider-first: verify EVERY number that needs repointing before any
     // local write — a partial repoint (some numbers verified, others not)
     // must not be reported as success.
+    const vapiApiKey = numbersToRepoint.length > 0 ? await getAppConfig(supabase, 'VAPI_API_KEY') : null;
+    if (numbersToRepoint.length > 0 && !vapiApiKey) {
+      return { statusCode: 503, body: JSON.stringify({ error: 'Voice provider is not configured on the server.' }) };
+    }
+
     for (const pn of numbersToRepoint) {
       try {
-        await verifyPhoneNumberInWebhookMode(pn.vapi_number_id!);
+        await verifyPhoneNumberInWebhookMode(pn.vapi_number_id!, vapiApiKey!);
       } catch (err) {
         console.error('[voice-agent-set-status] Vapi verification failed during activate', {
           message: err instanceof Error ? err.message : String(err),
