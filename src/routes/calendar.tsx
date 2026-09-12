@@ -195,7 +195,7 @@ function CalendarPage() {
 
   const today = useMemo(() => { const now = new Date(); return new Date(now.getFullYear(), now.getMonth(), now.getDate()); }, []);
   const [cursor, setCursor] = useState(new Date(today.getFullYear(), today.getMonth(), 1));
-  const [view, setView] = useState<ViewMode>("week");
+  const [view, setView] = useState<ViewMode>(() => typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches ? "agenda" : "week");
   const [selectedDay, setSelectedDay] = useState<string>(() => ymd(new Date()));
   const [nowTick, setNowTick] = useState<Date | null>(null);
 
@@ -507,7 +507,7 @@ function CalendarPage() {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-2.5 overflow-hidden">
+    <div className="mobile-calendar flex h-full min-h-0 flex-col gap-2.5 overflow-hidden">
       <div className="flex-none">
         <PageHeader
           title="Calendar"
@@ -655,7 +655,7 @@ function CalendarPage() {
       </div>
 
       {/* Main grid */}
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-[1fr_320px]">
+      <div className="calendar-content grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-[1fr_320px]">
         {view === "month" && (
           <Card className="flex flex-col overflow-hidden p-0">
             <div className="grid flex-shrink-0 grid-cols-7 border-b border-border bg-secondary/40">

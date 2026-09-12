@@ -1007,7 +1007,24 @@ function ContactsPage() {
       </Card>
 
       <Card className="overflow-hidden p-0">
-        <div className="overflow-x-auto">
+        <div className="divide-y divide-border md:hidden">
+          {paginated.length === 0 && <p className="p-8 text-center text-sm text-muted-foreground">No contacts match your filters.</p>}
+          {paginated.map(c => <article key={c.id} className="space-y-3 p-4">
+            <div className="flex items-center gap-3">
+              <input type="checkbox" aria-label={`Select ${c.name}`} checked={selectedIds.has(c.id)} onChange={() => toggleContactSelection(c.id)} className="h-5 w-5 shrink-0 accent-primary" />
+              <button type="button" onClick={() => navigate({ search: { contactId: c.id }, replace: true })} className="flex min-w-0 flex-1 items-center gap-3 text-left">
+                <ContactAvatar id={c.id} name={c.name} avatarUrl={c.avatar_url} avatarKey={c.avatar_key} size="sm" />
+                <span className="min-w-0"><span className="block truncate text-sm font-semibold">{c.name}</span><span className="block truncate text-xs text-muted-foreground">{c.companyName || c.company || c.email || displayPhone(c.phone)}</span></span>
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-1">{effectiveTags(c).map(tag => <span key={tag} className={`rounded border px-2 py-1 text-[10px] ${colorForTag(tagComparisonKey(tag)).chip}`}>{tag}</span>)}</div>
+            <div className="flex gap-2">
+              {c.phone && <a href={`tel:${c.phone}`} className="flex min-h-11 flex-1 items-center justify-center rounded-lg border text-sm">Call</a>}
+              <button type="button" onClick={() => navigate({ search: { contactId: c.id }, replace: true })} className="min-h-11 flex-1 rounded-lg bg-gold-soft text-sm font-medium">View contact</button>
+            </div>
+          </article>)}
+        </div>
+        <div className="hidden overflow-x-auto md:block">
           <table className="w-full text-sm">
             <thead className="sticky top-0 z-10 bg-secondary/60 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
               <tr className="border-b border-border">

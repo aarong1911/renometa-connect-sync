@@ -1646,7 +1646,7 @@ function DashboardPage() {
       />
 
       {/* KPI row — 5 tiles + Quick Actions, one 6-col grid, matching Lovable exactly */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3">
+      <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3">
         {KPIS.map((k) => <KpiCard key={k.label} k={k} />)}
         <QuickActions
           navigate={navigate}
@@ -1663,8 +1663,8 @@ function DashboardPage() {
           (Needs Attention 4 / Live Pipeline 5 / Upcoming 3, etc. at 2xl)
           while degrading gracefully: 2 columns at lg, supporting cards
           wrapping to a second row at xl, single column below lg. */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-start 2xl:items-stretch">
-        <div className="col-span-1 lg:col-span-6 2xl:col-span-4 h-full">
+      <div className="mobile-dashboard-cards grid grid-cols-1 lg:grid-cols-12 gap-3 items-start 2xl:items-stretch">
+        <div data-mobile-order="1" className="col-span-1 lg:col-span-6 2xl:col-span-4 h-full">
           <SectionCard title="Needs Attention" icon={AlertTriangle} tint="orange" count={attentionItemsAll.length} action={<CardAction to="/tasks">View all</CardAction>} className="h-full 2xl:min-h-[198px]">
             {/* Card body = ONLY the category grid (3 cols x 2 rows for the
                 six categories). No inline detail list, no flex-1 panel, no
@@ -1747,7 +1747,7 @@ function DashboardPage() {
           </SectionCard>
         </div>
 
-        <div className="col-span-1 lg:col-span-6 2xl:col-span-5 h-full">
+        <div data-mobile-order="5" className="col-span-1 lg:col-span-6 2xl:col-span-5 h-full">
           <SectionCard title="Live Pipeline" icon={TrendingUp} tint="blue" action={<CardAction to={ROUTES.PIPELINE}>View pipeline</CardAction>} className="h-full 2xl:min-h-[198px]">
             {pipelineDistribution.pieSlices.length === 0 ? (
               <p className="py-6 text-center text-sm text-muted-foreground">No open deals yet.</p>
@@ -1808,7 +1808,7 @@ function DashboardPage() {
           </SectionCard>
         </div>
 
-        <div className="col-span-1 lg:col-span-12 2xl:col-span-3 h-full">
+        <div data-mobile-order="3" className="col-span-1 lg:col-span-12 2xl:col-span-3 h-full">
           <SectionCard title="Today's Tasks" icon={CheckSquare} tint="amber" action={<CardAction to="/tasks">View tasks</CardAction>} className="h-full 2xl:min-h-[198px]">
             <div className="grid grid-cols-2 gap-1.5">
               <div className="rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-100 dark:border-red-900/50 px-1 py-1 text-center">
@@ -1867,7 +1867,7 @@ function DashboardPage() {
             row (wrong: an appointment is not a task). Added as a new grid
             item rather than resized into the existing row above, so no
             other card's width/column-span changes. */}
-        <div className="col-span-1 lg:col-span-12 2xl:col-span-3 h-full">
+        <div data-mobile-order="2" className="col-span-1 lg:col-span-12 2xl:col-span-3 h-full">
           <SectionCard title="Next Booking" icon={CalendarClock} tint="blue" action={<CardAction to={ROUTES.CALENDAR}>View calendar</CardAction>} className="h-full 2xl:min-h-[198px]">
             {nextBooking ? (
               <Link to={ROUTES.CALENDAR} className="flex h-full flex-col gap-1.5 group">
@@ -2007,7 +2007,7 @@ function DashboardPage() {
           </SectionCard>
         </div>
 
-        <div className="col-span-1 lg:col-span-6 2xl:col-span-5 h-full">
+        <div data-mobile-order="4" className="col-span-1 lg:col-span-6 2xl:col-span-5 h-full">
           <SectionCard title="Recent Conversations" icon={Mail} tint="blue" action={<CardAction to="/inbox">View conversations</CardAction>} className="h-full 2xl:min-h-[200px]">
             <div className="flex items-center gap-3 text-[12.5px] border-b border-border/70 pb-1.5 -mx-3.5 px-3.5 mb-1">
               <button

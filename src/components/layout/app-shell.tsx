@@ -44,6 +44,38 @@ export function AppShell({ children }: { children: ReactNode }) {
     return () => document.documentElement.classList.remove("app-shell-scroll-lock");
   }, [isAuthRoute]);
 
+  useEffect(() => {
+    if (isAuthRoute) return;
+    const viewport = window.visualViewport;
+    const root = document.documentElement;
+    const updateViewport = () => {
+      // Pinch zoom must keep its native behavior; only follow the keyboard viewport.
+      if (viewport && viewport.scale !== 1) return;
+      const height = viewport?.height ?? window.innerHeight;
+      root.style.setProperty("--mobile-viewport-height", `${height}px`);
+      const editing = document.activeElement?.matches("input, textarea, [contenteditable=true]");
+      root.classList.toggle("mobile-keyboard-open", !!editing && window.innerHeight - height > 120);
+    };
+    updateViewport();
+    viewport?.addEventListener("resize", updateViewport);
+    window.addEventListener("resize", updateViewport);
+    document.addEventListener("focusout", updateViewport);
+    return () => {
+      viewport?.removeEventListener("resize", updateViewport);
+      window.removeEventListener("resize", updateViewport);
+      document.removeEventListener("focusout", updateViewport);
+      root.style.removeProperty("--mobile-viewport-height");
+      root.classList.remove("mobile-keyboard-open");
+    };
+  }, [isAuthRoute]);
+
+  // Must be a stable object — a new literal here every render would
+  // re-render every useTopbarAction() consumer on every AppShell render
+  // (context value identity, not just props, drives context re-renders),
+  // which recreates their action node, which re-fires their effect, which
+  // calls setAction again, which re-renders AppShell: an infinite loop.
+  const topbarActionCtx = useMemo(() => ({ setAction: setPrimaryAction }), []);
+
   if (isAuthRoute) {
     return <>{children}</>;
   }
@@ -58,20 +90,13 @@ export function AppShell({ children }: { children: ReactNode }) {
     });
   };
 
-  // Must be a stable object — a new literal here every render would
-  // re-render every useTopbarAction() consumer on every AppShell render
-  // (context value identity, not just props, drives context re-renders),
-  // which recreates their action node, which re-fires their effect, which
-  // calls setAction again, which re-renders AppShell: an infinite loop.
-  const topbarActionCtx = useMemo(() => ({ setAction: setPrimaryAction }), []);
-
   return (
     <TopbarActionContext.Provider value={topbarActionCtx}>
-      <div className="flex h-dvh overflow-hidden bg-canvas">
+      <div className="mobile-app-shell flex h-dvh overflow-hidden bg-canvas">
         <Sidebar collapsed={collapsed} onToggle={toggleCollapsed} />
-        <div className={cn("flex min-w-0 flex-1 flex-col transition-[margin] duration-200", collapsed ? "ml-16" : "ml-60")}>
+        <div className={cn("flex min-w-0 flex-1 flex-col transition-[margin] duration-200", collapsed ? "md:ml-16" : "md:ml-60")}>
           <Topbar primaryAction={primaryAction} />
-          <main className="min-h-0 min-w-0 flex-1 overflow-y-auto p-6 space-y-4">{children}</main>
+          <main className="app-main min-h-0 min-w-0 flex-1 overflow-y-auto p-3 md:p-6 space-y-4">{children}</main>
         </div>
       </div>
     </TopbarActionContext.Provider>
@@ -98,7 +123,7 @@ export function PageHeader({
 }) {
   if (Icon) {
     return (
-      <div className="mb-6 flex items-start justify-between gap-4">
+      <div className="mobile-page-header mb-4 md:mb-6 flex flex-wrap md:flex-nowrap items-start justify-between gap-3 md:gap-4">
         <div className="flex items-start gap-3">
           <div className={cn("grid h-11 w-11 shrink-0 place-items-center rounded-xl ring-1 ring-black/5", iconBg)}>
             <Icon className={cn("h-5 w-5", iconColor)} />
@@ -115,7 +140,7 @@ export function PageHeader({
               </div>
             )}
             <h1 className="text-[22px] font-semibold leading-tight tracking-tight text-foreground">{title}</h1>
-            {subtitle && <p className="mt-0.5 text-[13px] text-muted-foreground">{subtitle}</p>}
+            {subtitle && <p className="hidden md:block mt-0.5 text-[13px] text-muted-foreground">{subtitle}</p>}
           </div>
         </div>
         {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
@@ -124,7 +149,7 @@ export function PageHeader({
   }
 
   return (
-    <div className="mb-6 flex items-start justify-between gap-4">
+    <div className="mobile-page-header mb-4 md:mb-6 flex flex-wrap md:flex-nowrap items-start justify-between gap-3 md:gap-4">
       <div>
         {breadcrumb && breadcrumb.length > 0 && (
           <div className="mb-1 flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -137,7 +162,7 @@ export function PageHeader({
           </div>
         )}
         <h1 className="text-2xl font-semibold tracking-tight text-foreground">{title}</h1>
-        {subtitle && <p className="mt-0.5 text-sm text-muted-foreground">{subtitle}</p>}
+        {subtitle && <p className="hidden md:block mt-0.5 text-sm text-muted-foreground">{subtitle}</p>}
       </div>
       {actions && <div className="flex items-center gap-2">{actions}</div>}
     </div>

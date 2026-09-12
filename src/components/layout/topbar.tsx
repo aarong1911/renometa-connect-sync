@@ -264,8 +264,9 @@ export function Topbar({ primaryAction }: { primaryAction?: ReactNode }) {
   }, {});
 
   return (
-    <header className="sticky top-0 z-30 grid h-16 grid-cols-[1fr_auto_1fr] items-center border-b border-border bg-background/80 px-6 backdrop-blur">
+    <header className="mobile-topbar sticky top-0 z-30 grid shrink-0 h-14 md:h-16 grid-cols-[auto_1fr_auto] md:grid-cols-[1fr_auto_1fr] items-center border-b border-border bg-background/80 px-3 md:px-6 backdrop-blur">
       <div className="justify-self-start">
+        <span className="block max-w-28 truncate text-sm font-semibold md:hidden">{organization.companyName || "Connect"}</span>
         <div
           className="hidden h-10 w-auto items-center gap-3 whitespace-nowrap rounded-lg border border-slate-400/70 bg-secondary/30 px-3 xl:inline-flex"
           title={`Company timezone: ${companyClock.timeZone}`}
@@ -283,20 +284,21 @@ export function Topbar({ primaryAction }: { primaryAction?: ReactNode }) {
         </div>
       </div>
 
-      <div className="w-[420px] max-w-[42vw]">
+      <div className="ml-auto mr-2 w-11 md:mx-0 md:w-[420px] md:max-w-[42vw]">
         <button
           onClick={() => setOpen(true)}
+          aria-label="Search contacts, deals and projects"
           className="flex h-10 w-full items-center gap-2 rounded-lg border border-slate-400/70 bg-secondary/45 px-3 text-sm text-muted-foreground transition-colors hover:bg-secondary/70"
         >
           <Search className="h-4 w-4 shrink-0" />
-          <span className="min-w-0 flex-1 truncate text-left">
+          <span className="hidden md:block min-w-0 flex-1 truncate text-left">
             Search contacts, deals, projects, tasks...
           </span>
         </button>
       </div>
 
       <div className="relative flex min-w-0 items-center justify-end">
-        <div className="flex shrink-0 items-center gap-1">
+        <div className="hidden md:flex shrink-0 items-center gap-1">
         <Button
           variant="ghost"
           size="icon"
@@ -327,7 +329,7 @@ export function Topbar({ primaryAction }: { primaryAction?: ReactNode }) {
         </Button>
       </div>
 
-        {primaryAction && <div className="ml-2 flex shrink-0 items-center">{primaryAction}</div>}
+        {primaryAction && <div className="md:ml-2 flex shrink-0 items-center">{primaryAction}</div>}
       </div>
 
       <Dialog

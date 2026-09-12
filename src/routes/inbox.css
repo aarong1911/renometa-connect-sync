@@ -169,3 +169,37 @@
     right: 0;
   }
 }
+@media (max-width: 767px) {
+  .conversations-page {
+    margin: -12px;
+    height: calc(100% + 24px);
+  }
+  .conversations-page-header { min-height: 0; padding: 12px; }
+  .conversations-grid { display: flex; flex-direction: column; }
+  .conversation-channel-tabs {
+    position: static; height: auto; min-height: 52px; flex-shrink: 0;
+    width: 100%; padding: 6px 8px;
+  }
+  .conversation-channel-tab { min-height: 40px; }
+  .conversation-list-pane, .conversation-thread-pane {
+    padding-top: 0; flex: 1; min-width: 0; overflow: hidden;
+  }
+  .conversation-thread-pane { display: none; }
+  [data-mobile-thread="true"] .conversation-list-pane,
+  [data-mobile-thread="true"] .conversation-channel-tabs,
+  [data-mobile-thread="true"] .conversations-page-header { display: none; }
+  [data-mobile-thread="true"] .conversation-thread-pane { display: flex; }
+  .conversation-thread-pane > div:first-of-type { padding: 8px 12px; flex-wrap: wrap; gap: 8px; }
+  .conversation-thread-body { padding: 16px 12px; }
+  .conversation-composer-wrap { padding: 8px; flex-shrink: 0; max-height: 55%; overflow-y: auto; }
+  .conversation-composer { min-height: 0; padding: 8px; }
+  .conversation-composer textarea { min-height: 52px !important; }
+  .conversation-compose-tabs { max-width: 100%; overflow-x: auto; }
+  .conversation-compose-tab { min-height: 40px; flex-shrink: 0; }
+  .conversation-composer-bottom { margin-top: 8px; padding-top: 8px; gap: 8px; }
+  .conversation-composer-bottom > div:last-child { margin-left: auto; }
+}
+@media (max-width: 767px) {
+  .conversation-channel-tabs { flex-wrap: wrap; }
+  .conversation-channel-tabs > div { max-width: 100%; }
+}

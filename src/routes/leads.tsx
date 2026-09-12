@@ -1166,7 +1166,7 @@ function LeadsPage() {
       />
       <ImportHistoryDialog open={historyOpen} onOpenChange={setHistoryOpen} entityType="lead" />
 
-      <div className="mb-6 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
         <LeadMetricCard label="Total Leads" value={stats.total} icon={Users} tone="blue" series={dailySeries} />
         <LeadMetricCard label="New Leads" value={stats.newCount} icon={Plus} tone="violet" series={dailySeries} />
         <LeadMetricCard label="Hot Leads" value={stats.hot} icon={Flame} tone="red" series={dailySeries} />
@@ -1351,7 +1351,26 @@ function LeadsPage() {
           </Popover>
         </div>
 
-        <div className="overflow-x-auto">
+        <div className="divide-y divide-border md:hidden">
+          {filtered.length === 0 && <p className="p-8 text-center text-sm text-muted-foreground">No leads match your filters.</p>}
+          {filtered.map(lead => <article key={lead.id} className="space-y-3 p-4">
+            <div className="flex items-center gap-3">
+              <input type="checkbox" aria-label={`Select ${lead.name}`} checked={selectedIds.has(lead.id)} onChange={() => toggleLeadSelection(lead.id)} className="h-5 w-5 shrink-0 accent-primary" />
+              <button type="button" onClick={() => openLead(lead)} className="flex min-w-0 flex-1 items-center gap-3 text-left">
+                <ContactAvatar id={lead.contactId ?? undefined} name={lead.name} avatarUrl={lead.contactAvatarUrl} avatarKey={lead.contactAvatarKey} size="sm" />
+                <span className="min-w-0"><span className="block truncate text-sm font-semibold">{lead.name || "Unknown"}</span><span className="block truncate text-xs text-muted-foreground">{lead.projectType || leadSourceLabel(lead.source)}</span></span>
+              </button>
+              <Badge variant={leadStatusBadgeVariant(lead.rawStatus ?? lead.status)} className="text-[10px]">{leadStatusLabel(lead.rawStatus ?? lead.status)}</Badge>
+            </div>
+            <div className="flex items-center justify-between text-xs text-muted-foreground"><span>{leadSourceLabel(lead.source)}</span><span className="font-semibold text-foreground">{formatMoney(lead.estimatedBudget)}</span></div>
+            <div className="flex gap-2">
+              {lead.phone && <a href={`tel:${lead.phone}`} className="flex min-h-11 flex-1 items-center justify-center rounded-lg border text-sm">Call</a>}
+              <button type="button" onClick={() => openLead(lead)} className="min-h-11 flex-1 rounded-lg bg-gold-soft text-sm font-medium">View lead</button>
+              <button type="button" onClick={() => handleEditLead(lead)} className="min-h-11 rounded-lg border px-4 text-sm">Edit</button>
+            </div>
+          </article>)}
+        </div>
+        <div className="hidden overflow-x-auto md:block">
           <table className="w-full min-w-[1040px] text-sm">
             <thead>
               <tr className="border-b border-[#E5E7EB] bg-[#F8FAFC] text-left text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">

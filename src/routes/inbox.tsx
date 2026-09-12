@@ -1,3 +1,4 @@
+import { ArrowLeft } from "lucide-react";
 // src/routes/inbox.tsx
 import { createFileRoute, Link, Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -212,6 +213,7 @@ function InboxPage() {
   const contactsLoading = useContactsLoading();
   const [folder, setFolder] = useState<FolderId>("all");
   const [channelFilter, setChannelFilter] = useState<ChannelFilter>("all");
+  const [mobileThreadOpen, setMobileThreadOpen] = useState(false);
   const [activeId, setActiveId] = useState<string | undefined>(undefined);
   // Records which conversation id the user genuinely, explicitly navigated
   // to (a row click, a deep-link "Message" action, or picking a contact in
@@ -228,6 +230,7 @@ function InboxPage() {
   const selectConversation = useCallback((id: string) => {
     explicitSelectionRef.current = id;
     setActiveId(id);
+    setMobileThreadOpen(true);
   }, []);
   const [draft, setDraft] = useState("");
   const [subject, setSubject] = useState("");
@@ -1458,7 +1461,7 @@ function InboxPage() {
 
   return (
     <>
-    <div className="conversations-page -m-6 flex h-[calc(100vh-3.5rem)] flex-col overflow-hidden">
+    <div data-mobile-thread={mobileThreadOpen} className="conversations-page -m-6 flex h-[calc(100vh-3.5rem)] flex-col overflow-hidden">
       <div className="conversations-page-header shrink-0 border-b border-border bg-background px-6 py-5">
         <PageHeader
           icon={MessageSquare}
@@ -1585,6 +1588,9 @@ function InboxPage() {
 
         {/* PANE 2 — Conversation list */}
         <section className="conversation-list-pane flex min-h-0 flex-col border-r border-border">
+          <div className="flex shrink-0 gap-2 overflow-x-auto border-b p-2 lg:hidden" aria-label="Conversation folders">
+            {folders.map(f => <button type="button" key={f.id} onClick={() => { setFolder(f.id); setSelectedTag(null); }} className={`min-h-11 shrink-0 rounded-lg px-3 text-xs font-medium ${folder === f.id ? "bg-gold-soft text-gold-hover" : "bg-secondary text-muted-foreground"}`}>{f.label}</button>)}
+          </div>
           <div className="conversation-channel-tabs flex items-center justify-between gap-2 border-b border-border bg-background px-4 py-3">
             <div className="flex items-center gap-2 overflow-x-auto">
               {channelTabs.map((t) => {
@@ -1712,6 +1718,7 @@ function InboxPage() {
 
         {/* PANE 3 — Thread */}
         <section className="conversation-thread-pane flex min-h-0 flex-col bg-background">
+          <button type="button" onClick={() => setMobileThreadOpen(false)} className="mobile-thread-back flex min-h-11 shrink-0 items-center gap-2 border-b px-3 text-sm font-medium md:hidden"><ArrowLeft className="h-5 w-5" /> All conversations</button>
           {active && contact ? (
             <>
               <div className="flex items-center justify-between border-b border-border bg-background px-5 py-4">

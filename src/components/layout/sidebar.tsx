@@ -1,3 +1,6 @@
+import { useIsMobile } from "@/hooks/use-mobile";
+import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
+import { Menu } from "lucide-react";
 // src/components/layout/sidebar.tsx
 import { Link, useLocation, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
@@ -61,9 +64,13 @@ async function getOrgId(): Promise<string | null> {
   return m?.org_id ?? null;
 }
 
-export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
+export function Sidebar({ collapsed: desktopCollapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
+  const isMobile = useIsMobile();
+  const collapsed = !isMobile && desktopCollapsed;
+  const [moreOpen, setMoreOpen] = useState(false);
   const location  = useLocation();
   const pathname  = location.pathname;
+  useEffect(() => { setMoreOpen(false); }, [pathname]);
   const navigate  = useNavigate();
   const role      = useCurrentUserRole();
   const org       = useOrganization();
@@ -171,10 +178,11 @@ export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle:
   const companyName = org.companyName;
   const displayName = [user?.firstName, user?.lastName].filter(Boolean).join(" ") || user?.email?.split("@")[0] || "Account";
 
-  return (
+  const sidebar = (
     <TooltipProvider delayDuration={0}>
       <aside className={cn(
-        "fixed left-0 top-0 bottom-0 z-40 flex flex-col border-r border-border bg-card transition-[width] duration-200",
+        "flex flex-col border-r border-border bg-card transition-[width] duration-200",
+        isMobile ? "relative h-full !w-full" : "fixed left-0 top-0 bottom-0 z-40",
         collapsed ? "w-16" : "w-60",
       )}>
         {/* Brand — tenant-only. Expanded state shows the org's own full
@@ -214,7 +222,7 @@ export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle:
         </div>
 
         {/* Collapse control */}
-        <div className={cn("shrink-0 pt-2", collapsed ? "px-2" : "px-3")}>
+        <div className={cn("hidden md:block shrink-0 pt-2", collapsed ? "px-2" : "px-3")}>
           <button
             onClick={onToggle}
             title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
@@ -275,6 +283,31 @@ export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle:
       </aside>
     </TooltipProvider>
   );
+  if (!isMobile) return <div className="hidden md:block">{sidebar}</div>;
+  const primaryPaths = ["/", "/leads", "/inbox", "/calendar"];
+  const primary = items.filter(item => primaryPaths.includes(item.to));
+  return <>
+    <nav aria-label="Main navigation" className="mobile-bottom-nav fixed inset-x-0 bottom-0 z-40 flex border-t border-border bg-card/95 px-2 backdrop-blur">
+      {primary.map(item => {
+        const Icon = item.icon;
+        const active = isNavActive(item.to);
+        const label = item.to === "/" ? "Home" : item.to === "/inbox" ? "Inbox" : item.label;
+        return <Link key={item.to} to={item.to} aria-current={active ? "page" : undefined} className={cn("relative flex min-h-16 min-w-0 flex-1 flex-col items-center justify-center gap-1 rounded-xl text-[11px] font-medium", active ? "text-gold-hover" : "text-muted-foreground")}>
+          <span className={cn("relative rounded-xl px-4 py-1", active && "bg-gold-soft")}><Icon className="h-5 w-5" />
+          {item.badgeKey && unreadCount > 0 && <span aria-label={`${unreadCount} unread messages`} className="absolute -right-1 -top-1 rounded-full bg-primary px-1.5 text-[10px] text-primary-foreground">{unreadCount > 99 ? "99+" : unreadCount}</span>}</span>
+          {label}
+        </Link>;
+      })}
+      <button type="button" onClick={() => setMoreOpen(true)} aria-expanded={moreOpen} aria-label="More navigation and account" className={cn("flex min-h-16 flex-1 flex-col items-center justify-center gap-1 text-[11px] font-medium", !primary.some(item => isNavActive(item.to)) ? "text-gold-hover" : "text-muted-foreground")}><Menu className="h-5 w-5" />More</button>
+    </nav>
+    <Sheet open={moreOpen} onOpenChange={setMoreOpen}>
+      <SheetContent side="bottom" className="h-[85dvh] overflow-hidden rounded-t-2xl p-0 pb-[env(safe-area-inset-bottom)]" aria-describedby={undefined}>
+        <SheetTitle className="sr-only">Navigation and account</SheetTitle>
+        <div className="h-full" onClick={event => { if ((event.target as HTMLElement).closest("a")) setMoreOpen(false); }}>{sidebar}</div>
+      </SheetContent>
+    </Sheet>
+  </>;
+
 }
 
 function NavLinkRow({ item, active, collapsed, badgeCount }: { item: NavItem; active: boolean; collapsed: boolean; badgeCount?: number }) {
@@ -282,7 +315,7 @@ function NavLinkRow({ item, active, collapsed, badgeCount }: { item: NavItem; ac
   const content = (
     <Link to={item.to} className={cn(
       "group relative flex items-center rounded-lg text-sm font-medium transition-colors",
-      collapsed ? "justify-center h-9 w-full" : "justify-between gap-3 px-3 py-2",
+      collapsed ? "justify-center h-9 w-full" : "justify-between gap-3 px-3 py-3 md:py-2",
       active ? "bg-gold-soft text-gold-hover ring-1 ring-gold-soft" : "text-foreground/70 hover:bg-secondary hover:text-foreground",
     )}>
       <span className={cn("flex items-center", collapsed ? "" : "gap-3")}>

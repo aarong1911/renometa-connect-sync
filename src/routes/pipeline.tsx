@@ -1,6 +1,6 @@
 // src/routes/pipeline.tsx
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   DragDropContext,
@@ -694,7 +694,7 @@ function PipelinePage() {
   }
 
   return (
-    <div className="-mb-6 flex h-[calc(100vh-88px)] flex-col overflow-hidden">
+    <div className="mobile-pipeline -mb-6 flex h-[calc(100vh-88px)] flex-col overflow-hidden">
       <PageHeader
         icon={GitBranch}
         iconBg="bg-violet-soft"
@@ -1049,8 +1049,15 @@ function PipelineBoard({
   onDragEnd: (result: DropResult) => void;
   onDealOpen: (dealId: string) => void;
 }) {
+  const boardRef = useRef<HTMLDivElement>(null);
   return (
     <DragDropContext onDragEnd={onDragEnd}>
+      <div className="flex shrink-0 gap-2 overflow-x-auto pb-2 md:hidden" aria-label="Pipeline stages">
+        {stages.map(stage => <button type="button" key={stage.id} onClick={() => {
+          const column = boardRef.current?.querySelector<HTMLElement>(`[data-stage-id="${stage.id}"]`);
+          if (column && boardRef.current) boardRef.current.scrollTo({ left: column.offsetLeft, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" });
+        }} className="min-h-11 shrink-0 rounded-xl border border-border bg-card px-3 text-xs font-medium">{stage.name} <span className="text-muted-foreground">{deals.filter(deal => deal.resolvedStageId === stage.id).length}</span></button>)}
+      </div>
       {/* Board viewport — owns horizontal scroll only below the wide-desktop
           breakpoint (2xl); at 2xl+ the six stages share the available width
           via minmax(0,1fr) columns and this container never scrolls
@@ -1058,7 +1065,8 @@ function PipelineBoard({
           list below, never to this viewport. */}
       <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
         <div
-          className="grid h-full min-h-0 min-w-0 w-full max-w-full auto-cols-[minmax(260px,1fr)]
+          ref={boardRef}
+          className="relative grid h-full min-h-0 min-w-0 w-full max-w-full auto-cols-[90%] snap-x snap-mandatory md:auto-cols-[minmax(260px,1fr)]
             grid-flow-col gap-2 overflow-x-auto pb-1
             2xl:grid-flow-row 2xl:auto-cols-auto 2xl:grid-cols-[repeat(6,minmax(0,1fr))] 2xl:overflow-x-hidden"
         >
@@ -1074,7 +1082,8 @@ function PipelineBoard({
             return (
               <section
                 key={stage.id}
-                className="flex min-h-0 min-w-0 w-full max-w-full flex-col overflow-hidden"
+                data-stage-id={stage.id}
+                className="snap-start flex min-h-0 min-w-0 w-full max-w-full flex-col overflow-hidden"
               >
                 <div className="shrink-0">
                   <StageColumnHeader
