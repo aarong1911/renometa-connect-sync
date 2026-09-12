@@ -751,10 +751,15 @@ function TasksPage() {
                 'auto' too (CSS's overflow-x/y coupling rule kicks in
                 whenever one axis is non-visible and the other is left at
                 the visible default) — explicit overflow-y-hidden avoids
-                that ambiguity; touch-pan-x tells the browser this element
-                only owns horizontal gestures so vertical drags pass
-                straight through to AppShell's <main>. */}
-            <div className="grid w-full max-w-full auto-cols-[minmax(240px,1fr)] grid-flow-col gap-3 overflow-x-auto overflow-y-hidden touch-pan-x pb-1">
+                that ambiguity. No explicit `touch-action` here: leaving it
+                at the native default lets the browser direction-lock each
+                gesture itself (horizontal → this board scrolls, vertical →
+                it falls through to the ancestor main.app-main). Adding
+                `touch-pan-x` would restrict this element to horizontal
+                panning only, which stops it from ever handing a
+                vertical-starting gesture up to main — the opposite of
+                what's needed here. */}
+            <div className="grid w-full max-w-full auto-cols-[minmax(240px,1fr)] grid-flow-col gap-3 overflow-x-auto overflow-y-hidden pb-1">
               {TASK_STATUS_ORDER.map((statusId) => {
                 const allItems = grouped.get(statusId) ?? [];
                 const limit = getColumnLimit(statusId);
