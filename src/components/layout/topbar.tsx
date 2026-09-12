@@ -22,6 +22,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { supabase } from "@/lib/supabase";
 import { ROUTES } from "@/lib/routes";
 import { useOrganization } from "@/lib/organization";
+import { getOrgId } from "@/lib/org-id";
 
 type SearchResult = {
   id: string;
@@ -30,32 +31,6 @@ type SearchResult = {
   group: "contacts" | "deals" | "projects";
   href: string;
 };
-
-async function getOrgId(): Promise<string | null> {
-  const {
-    data: { session },
-  } = await supabase.auth.getSession();
-
-  if (!session?.user) return null;
-
-  const uid = session.user.id;
-
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("organization_id")
-    .eq("id", uid)
-    .maybeSingle();
-
-  if (profile?.organization_id) return profile.organization_id;
-
-  const { data: membership } = await supabase
-    .from("org_memberships")
-    .select("org_id")
-    .eq("member_id", uid)
-    .maybeSingle();
-
-  return membership?.org_id ?? null;
-}
 
 async function globalSearch(query: string): Promise<SearchResult[]> {
   const orgId = await getOrgId();

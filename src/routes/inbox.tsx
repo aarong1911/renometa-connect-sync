@@ -94,6 +94,7 @@ import {
 import { FileText } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
+import { resolveAuthSession, useAuthSession } from "@/lib/auth-session";
 import { useVoiceConversations } from "@/lib/voice-conversations";
 import { useSmsMetaConversations } from "@/lib/sms-meta-conversations";
 import { analyzeSmsLength } from "@/lib/sms-segments";
@@ -397,7 +398,11 @@ function InboxPage() {
   const [smtpConfigured, setSmtpConfigured] = useState<boolean | null>(null);
   useEffect(() => {
     (async () => {
-      const { data: { session } } = await supabase.auth.getSession();
+      // Shared, deduplicated session cache (auth-session.ts) instead of
+      // an independent getSession() call — /inbox mounts enough of these
+      // at once to cause auth-storage lock contention in production; see
+      // that file's header.
+      const session = await resolveAuthSession();
       if (!session) return;
       try {
         const res = await fetch("/.netlify/functions/smtp-config-status", {
@@ -474,15 +479,17 @@ function InboxPage() {
   // until at least one real communication record exists for it.
   const org = useOrganization();
   const [currentUserName, setCurrentUserName] = useState("");
+  // Shared session cache (auth-session.ts) instead of an independent
+  // getUser() call — see that file's header for why.
+  const { session: currentSession } = useAuthSession();
   useEffect(() => {
-    supabase.auth.getUser().then(({ data: { user } }) => {
-      if (!user) return;
-      supabase.from("profiles").select("first_name, last_name").eq("id", user.id).maybeSingle()
-        .then(({ data }) => {
-          if (data) setCurrentUserName(`${data.first_name ?? ""} ${data.last_name ?? ""}`.trim());
-        });
-    });
-  }, []);
+    const userId = currentSession?.user?.id;
+    if (!userId) return;
+    supabase.from("profiles").select("first_name, last_name").eq("id", userId).maybeSingle()
+      .then(({ data }) => {
+        if (data) setCurrentUserName(`${data.first_name ?? ""} ${data.last_name ?? ""}`.trim());
+      });
+  }, [currentSession]);
  
 
   // CRM relevance filter — only SMS/WhatsApp/Messenger/Instagram/Voice are

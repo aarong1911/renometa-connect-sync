@@ -1,13 +1,13 @@
 // src/routes/__root.tsx
 import { Outlet, Link, createRootRouteWithContext, useRouterState, useNavigate } from "@tanstack/react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { Loader2 } from "lucide-react";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppShell } from "@/components/layout/app-shell";
 import { RealtimeBridge } from "@/lib/realtime-bridge";
-import { supabase } from "@/lib/supabase";
+import { useAuthSession } from "@/lib/auth-session";
 import type { Session } from "@supabase/supabase-js";
 import {
   useCurrentUserRole, canAccessRoute, ROLE_DEFAULT_ROUTE, ROLE_EXTERNAL_REDIRECT,
@@ -45,18 +45,14 @@ function RootComponent() {
   const navigate  = useNavigate();
   const routerState = useRouterState();
   const pathname  = routerState.location.pathname;
-  const [session, setSession] = useState<Session | null | undefined>(undefined);
-  const [checked, setChecked] = useState(false);
+  // Auth state — shared, deduplicated cache (auth-session.ts) instead of
+  // this component independently calling getSession()/onAuthStateChange;
+  // see that file's header for why (prod lock-contention incident,
+  // worst on /inbox).
+  const { session, checked } = useAuthSession();
 
   const isPublicRoute = PUBLIC_ROUTES.some(r => pathname.startsWith(r));
   const isPortalRoute = PORTAL_ROUTES.some(r => pathname.startsWith(r));
-
-  // Auth state
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session: s } }) => { setSession(s); setChecked(true); });
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, s) => { setSession(s); setChecked(true); });
-    return () => subscription.unsubscribe();
-  }, []);
 
   // Redirect unauthenticated users
   useEffect(() => {
