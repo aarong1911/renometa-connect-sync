@@ -166,9 +166,16 @@ function writeCompanyCache(name: string) {
   try { name ? localStorage.setItem(COMPANY_KEY, name) : localStorage.removeItem(COMPANY_KEY); } catch {}
 }
 
-const DEFAULT_ORG: Organization = {
+// Exported so callers that need an empty starting Organization object
+// (onboarding.tsx, specifically) reuse this single default instead of
+// re-declaring their own duplicate literal with its own hardcoded
+// timezone — see DEFAULT_ORG_TIMEZONE below for the one place that
+// value is defined.
+export const DEFAULT_ORG_TIMEZONE = "America/New_York";
+
+export const DEFAULT_ORG: Organization = {
   companyName: "", primaryPhone: "", website: "", industry: undefined,
-  address: "", logoUrl: null, crmGoals: [], timezone: "America/Los_Angeles",
+  address: "", logoUrl: null, crmGoals: [], timezone: DEFAULT_ORG_TIMEZONE,
 };
 
 const qc = () => getQueryClient();
@@ -214,7 +221,11 @@ async function fetchOrganizationForOrg(orgId: string): Promise<Organization> {
     address:      orgData.address  || orgData.business_address || "",
     logoUrl:      logoUrl || readLogoCache(),
     crmGoals:     orgData.crm_goals || [],
-    timezone:     orgData.timezone  || "America/Los_Angeles",
+    // Only a null/empty stored value falls through to the default — an
+    // organization with an explicitly saved timezone (including one a
+    // user previously set to America/Los_Angeles on purpose) is never
+    // overwritten by this read-time fallback.
+    timezone:     orgData.timezone  || DEFAULT_ORG_TIMEZONE,
   };
   if (logoUrl) writeLogoCache(logoUrl);
   writeCompanyCache(resolved.companyName);

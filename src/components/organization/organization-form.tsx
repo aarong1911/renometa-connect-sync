@@ -4,6 +4,7 @@ import { useState } from "react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
+import { AddressAutocomplete } from "@/components/ui/address-autocomplete";
 import { supabase } from "@/lib/supabase";
 import { toast } from "sonner";
 import {
@@ -108,14 +109,18 @@ export function OrganizationForm({
         </Field>
 
         <Field label="Primary business address" className="md:col-span-2">
-          <Input
+          <AddressAutocomplete
             value={value.address}
-            onChange={(e) => {
-              const addr = e.target.value;
+            onChange={(addr) => {
               set("address", addr);
               const tz = guessTimezoneFromAddress(addr);
               if (tz && tz !== value.timezone) set("timezone", tz);
             }}
+            // The Organization model stores one combined address string
+            // (no separate street/city/state/zip fields to populate), so
+            // the split parts Google returns here aren't needed — onChange
+            // above already receives the full selected formatted_address.
+            onSelect={() => {}}
             placeholder="Street, City, State"
           />
         </Field>
