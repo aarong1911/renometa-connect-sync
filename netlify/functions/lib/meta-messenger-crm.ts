@@ -16,6 +16,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { metaGraphRequest, MetaGraphApiError } from "./meta-graph-api";
 import { getMetaPageAccessToken } from "./meta-page-access";
 import { decryptMetaAccessToken } from "./meta-token-crypto";
+import { shouldRefreshMetaAvatar } from "./meta-avatar-url";
 
 const FALLBACK_CONTACT_NAME = "Messenger Contact";
 
@@ -106,14 +107,23 @@ export async function resolveMessengerContactAndLead(
   let contactAvatarUrl: string | null = existingContact?.avatar_url ?? null;
   let contactSource: string | null = existingContact?.source ?? null;
 
-  // Best-effort profile enrichment — ONLY attempted while the contact still
-  // has no real name (a brand-new contact, or one still holding the
-  // "Messenger Contact" placeholder from before this feature existed).
-  // Never re-fetched on every message once a real name is set (Part 2: "on
-  // the FIRST inbound message"), and never overwrites a human-edited name
-  // (Part 5/6).
+  // Best-effort profile enrichment — attempted while EITHER the contact
+  // still has no real name (a brand-new contact, or one still holding the
+  // "Messenger Contact" placeholder from before this feature existed) OR
+  // its stored avatar_url is a Meta CDN URL that is already expired or
+  // close to it (self-heal: repairs a stale avatar for an already-named
+  // contact on its next inbound message, with no bulk backfill needed —
+  // see meta-avatar-url.ts's shouldRefreshMetaAvatar). This is NOT "is the
+  // avatar Meta-hosted" — a freshly Meta-issued URL is still Meta-hosted
+  // but has a far-future expiry, so it correctly does NOT re-trigger this
+  // block on the very next message; only a URL nearing/past its own oe
+  // expiry does. Never re-fetched at all once BOTH a real name AND a
+  // fresh (or non-Meta) avatar are already in place. Never overwrites a
+  // human-edited name (Part 5/6) — see the patch logic below, which still
+  // gates `full_name` on isPlaceholderName independently of why
+  // enrichment ran.
   let metaProfile: MessengerSenderProfile | null = null;
-  if (isPlaceholderName(contactFullName)) {
+  if (isPlaceholderName(contactFullName) || shouldRefreshMetaAvatar(contactAvatarUrl)) {
     try {
       const userAccessToken = decryptMetaAccessToken(connectionAccessTokenEncrypted);
       const pageAccessToken = await getMetaPageAccessToken(userAccessToken, pageId);
@@ -171,22 +181,32 @@ export async function resolveMessengerContactAndLead(
       contactSource = created?.source ?? null;
     }
   } else {
-    // Existing contact — two INDEPENDENT, additive-only enrichments, never
-    // gated on each other:
-    //   1. Name/avatar: only while the name is still a placeholder (Part 5/6
-    //      — never overwrites a human-edited or already-Meta-enriched name),
-    //      which is also what gates whether a profile Graph call was even
-    //      attempted above.
-    //   2. Source backfill (Part 1/2): independent of name state — a
-    //      Contact that already has a real name from an earlier message but
-    //      was created before this backfill existed (contacts.source still
-    //      null) still gets backfilled on this message. NEVER overwrites a
-    //      meaningful existing source (google_ads, meta_ads, website, phone,
-    //      sms, etc.) — only fires when the stored value is null/empty.
+    // Existing contact — three INDEPENDENT, additive-only enrichments,
+    // never gated on each other:
+    //   1. Name: only while the name is still a placeholder (Part 5/6 —
+    //      never overwrites a human-edited or already-Meta-enriched name).
+    //   2. Avatar: whenever a fresh metaProfile.profilePic was returned
+    //      above AND the currently-stored avatar is either missing or a
+    //      Meta CDN URL that was actually expired/near-expiry
+    //      (shouldRefreshMetaAvatar) — independent of the name-placeholder
+    //      state, so an already-named contact's stale CDN avatar still
+    //      gets repaired. Never overwrites an avatar that's already a
+    //      real, non-Meta-CDN URL, and never overwrites a still-valid Meta
+    //      CDN URL just because it's Meta-hosted. A failed/empty profile
+    //      lookup leaves the current avatar_url untouched — never cleared.
+    //   3. Source backfill (Part 1/2): independent of both of the above —
+    //      a Contact that already has a real name from an earlier message
+    //      but was created before this backfill existed (contacts.source
+    //      still null) still gets backfilled on this message. NEVER
+    //      overwrites a meaningful existing source (google_ads, meta_ads,
+    //      website, phone, sms, etc.) — only fires when the stored value
+    //      is null/empty.
     const patch: Record<string, unknown> = {};
     if (metaFullName && isPlaceholderName(contactFullName)) {
       patch.full_name = metaFullName;
-      if (!contactAvatarUrl && metaProfile?.profilePic) patch.avatar_url = metaProfile.profilePic;
+    }
+    if (metaProfile?.profilePic && (!contactAvatarUrl || shouldRefreshMetaAvatar(contactAvatarUrl))) {
+      patch.avatar_url = metaProfile.profilePic;
     }
     if (!contactSource || contactSource.trim() === "") {
       patch.source = "messenger";
