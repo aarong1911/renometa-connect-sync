@@ -1,5 +1,5 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   DragDropContext,
   Droppable,
@@ -26,7 +26,6 @@ import {
   RotateCcw,
   ChevronDown,
   ChevronRight,
-  ChevronLeft,
   AlertCircle,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -255,6 +254,17 @@ function TasksPage() {
   // there's never a horizontal-overflow surface for Android's gesture
   // arbitration to claim a vertical drag against.
   const [mobileStage, setMobileStage] = useState<TaskStatus>(TASK_STATUS_ORDER[0]);
+  const activeStageTabRef = useRef<HTMLButtonElement>(null);
+  // Keep the selected stage tab in view within its own horizontally-
+  // scrolling row — inline-only, so this never touches the page's
+  // vertical scroll position (main.app-main).
+  useEffect(() => {
+    activeStageTabRef.current?.scrollIntoView({
+      inline: "center",
+      block: "nearest",
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth",
+    });
+  }, [mobileStage]);
   const [topView, setTopView] = useState<TopView>("my");
   const [groupBy, setGroupBy] = useState<GroupBy>("project");
   const [query, setQuery] = useState("");
@@ -761,55 +771,42 @@ function TasksPage() {
           // stage's task list here is a plain block list with no overflow
           // rule at all, so main.app-main is the only element in this
           // subtree that can ever claim a scroll gesture. Switching stages
-          // uses the ‹ label count › navigator below instead of a swipe on
-          // the card body, for the same reason.
+          // uses the Pipeline-style stage-tab row below (same chip shape
+          // as the mobile Pipeline stage row in pipeline.tsx) instead of a
+          // swipe on the card body, for the same reason — the horizontal
+          // overflow lives only on that tab row, never around the cards.
           (() => {
-            const stageIndex = TASK_STATUS_ORDER.indexOf(mobileStage);
             const allItems = grouped.get(mobileStage) ?? [];
             const limit = getColumnLimit(mobileStage);
             const items = allItems.slice(0, limit);
             const remaining = allItems.length - items.length;
-            const Icon = TASK_STATUS_ICONS[mobileStage];
-            const tint = TASK_STATUS_TINT[mobileStage];
-            const goToStage = (index: number) => {
-              const clamped = Math.max(0, Math.min(TASK_STATUS_ORDER.length - 1, index));
-              setMobileStage(TASK_STATUS_ORDER[clamped]);
-            };
 
             return (
               <div className="w-full">
-                <div className={cn("mb-3 flex items-center gap-1 rounded-lg border px-1.5 py-1.5", tint.border, tint.headerBg)}>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 shrink-0"
-                    onClick={() => goToStage(stageIndex - 1)}
-                    disabled={stageIndex === 0}
-                    aria-label="Previous stage"
-                  >
-                    <ChevronLeft className="h-4 w-4" />
-                  </Button>
-
-                  <div className="flex min-w-0 flex-1 items-center justify-center gap-2 px-1">
-                    <div className={cn("flex h-6 w-6 shrink-0 items-center justify-center rounded", tint.iconBg)}>
-                      <Icon className={cn("h-3.5 w-3.5", tint.icon)} />
-                    </div>
-                    <h2 className="truncate text-[13px] font-semibold text-foreground">{TASK_STATUS_LABELS[mobileStage]}</h2>
-                    <Badge variant="secondary" className="h-4.5 shrink-0 rounded px-1.5 text-[10px] font-medium">
-                      {allItems.length}
-                    </Badge>
-                  </div>
-
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 shrink-0"
-                    onClick={() => goToStage(stageIndex + 1)}
-                    disabled={stageIndex === TASK_STATUS_ORDER.length - 1}
-                    aria-label="Next stage"
-                  >
-                    <ChevronRight className="h-4 w-4" />
-                  </Button>
+                <div className="mb-3 flex gap-2 overflow-x-auto pb-1" aria-label="Task stages">
+                  {TASK_STATUS_ORDER.map((statusId) => {
+                    const count = (grouped.get(statusId) ?? []).length;
+                    const StatusIcon = TASK_STATUS_ICONS[statusId];
+                    const stageTint = TASK_STATUS_TINT[statusId];
+                    const active = statusId === mobileStage;
+                    return (
+                      <button
+                        type="button"
+                        key={statusId}
+                        ref={active ? activeStageTabRef : undefined}
+                        onClick={() => setMobileStage(statusId)}
+                        aria-pressed={active}
+                        className={cn(
+                          "flex min-h-11 shrink-0 items-center gap-1.5 rounded-xl border px-3 text-xs font-medium transition-colors",
+                          active ? cn(stageTint.border, stageTint.headerBg) : "border-border bg-card hover:bg-muted/40",
+                        )}
+                      >
+                        <StatusIcon className={cn("h-3.5 w-3.5", active ? stageTint.icon : "text-muted-foreground")} />
+                        {TASK_STATUS_LABELS[statusId]}
+                        <span className={active ? stageTint.icon : "text-muted-foreground"}>{count}</span>
+                      </button>
+                    );
+                  })}
                 </div>
 
                 <div className="space-y-2">
