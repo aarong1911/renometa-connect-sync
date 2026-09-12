@@ -377,7 +377,15 @@
     padding-right: env(safe-area-inset-right);
   }
   .mobile-bottom-nav { padding-bottom: env(safe-area-inset-bottom); }
-  .app-main { overscroll-behavior-y: contain; }
+  /* No overscroll-behavior override here (mobile-only default is
+     `auto`, same as this rule's desktop side, which never had an
+     override to begin with) — `contain` previously blocked scroll
+     chaining at the top of main.app-main, which also stops Chrome from
+     ever seeing the rubber-band overscroll it needs to trigger native
+     pull-to-refresh. `auto` still keeps `main` as the one real scroll
+     container (that comes from `overflow-y-auto` + the scroll-lock on
+     `html`/`body`, untouched here) — it only stops swallowing the
+     overscroll signal once main hits its own top/bottom. */
   .mobile-page-header h1 { font-size: 20px; }
   .mobile-page-header > div { min-width: 0; }
   .mobile-page-header > div:last-child { flex-wrap: wrap; }
