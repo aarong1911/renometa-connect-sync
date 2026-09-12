@@ -26,7 +26,6 @@ import {
   XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { StatusBadge, type BadgeTone } from "@/components/ui/status-badge";
 import { Button } from "@/components/ui/button";
@@ -2798,33 +2797,19 @@ function PersonAvatar({
   avatarUrl?: string | null;
   size?: "sm" | "md";
 }) {
-  if (!avatarUrl) {
-    return (
-      <ContactAvatar
-        id={id}
-        name={name}
-        avatarKey={avatarKey}
-        size={size}
-      />
-    );
-  }
-
-  const sizeClass = size === "md" ? "h-10 w-10" : "h-8 w-8";
-  const initials = name
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0])
-    .join("")
-    .toUpperCase();
-
+  // Delegates entirely to the shared ContactAvatar (previously this had
+  // its own raw <AvatarImage> branch with no error handling when a URL
+  // was present — a Meta/Instagram profile picture URL that expires with
+  // a 403 had nothing to fall back to but bare initials, unlike every
+  // other contact avatar surface).
   return (
-    <Avatar className={`${sizeClass} shrink-0 ring-1 ring-black/5`}>
-      <AvatarImage src={avatarUrl} alt={name} />
-      <AvatarFallback className="bg-[#FAF3E4] text-xs font-semibold">
-        {initials || "?"}
-      </AvatarFallback>
-    </Avatar>
+    <ContactAvatar
+      id={id}
+      name={name}
+      avatarKey={avatarKey}
+      avatarUrl={avatarUrl}
+      size={size}
+    />
   );
 }
 

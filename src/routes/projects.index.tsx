@@ -42,7 +42,6 @@ import {
 } from "@/lib/projects-store";
 import { useContacts, getOrgId } from "@/lib/contacts-store";
 import { ContactAvatar } from "@/components/ui/contact-avatar";
-import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
 import { useCompanies, resolvePrimaryContactForCompany } from "@/lib/companies-store";
 import { useTeam } from "@/lib/organization";
 import { composeAddress } from "@/lib/address";
@@ -2668,14 +2667,13 @@ function EditProjectDialog({
                 <PopoverTrigger asChild>
                   {selectedContact ? (
                     <button type="button" className="flex w-full items-center gap-2.5 rounded-md border border-border bg-secondary/30 px-3 py-2 text-left hover:bg-secondary/50">
-                      {selectedContact.avatar_url ? (
-                        <Avatar className="h-8 w-8 shrink-0 ring-1 ring-black/5">
-                          <AvatarImage src={selectedContact.avatar_url} alt={selectedContact.name} className="object-cover" />
-                          <AvatarFallback className="bg-primary-soft text-[10px] font-semibold text-primary">{getInitials(selectedContact.name)}</AvatarFallback>
-                        </Avatar>
-                      ) : (
-                        <ContactAvatar id={selectedContact.id} name={selectedContact.name} avatarKey={selectedContact.avatar_key} size="sm" />
-                      )}
+                      <ContactAvatar
+                        id={selectedContact.id}
+                        name={selectedContact.name}
+                        avatarKey={selectedContact.avatar_key}
+                        avatarUrl={selectedContact.avatar_url}
+                        size="sm"
+                      />
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-sm font-medium">{selectedContact.name}</p>
                         <p className="truncate text-[11px] text-muted-foreground">
