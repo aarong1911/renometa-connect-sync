@@ -452,7 +452,7 @@ function TasksPage() {
     // stack naturally and overflow <main>'s own overflow-y-auto, producing
     // a page-level scrollbar that also scrolls the title/tabs/filters out
     // of view (the regression this fixes).
-    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+    <div className="mobile-tasks flex h-full min-h-0 flex-col overflow-hidden">
       <div className="flex-none">
         <PageHeader
           icon={CheckSquare}
@@ -815,7 +815,31 @@ function TasksPage() {
           </div>
         </DragDropContext>
       ) : (
-        <Card className="flex h-full min-h-0 flex-col overflow-hidden p-0">
+        <>
+          {/* Mobile: card rows instead of the desktop <Table> — a table
+              forces its own min-content width and won't reflow at phone
+              widths, so it stays a md:hidden alternative that reuses the
+              same TaskCard used on the board (title, related-to, assignee,
+              status/priority badges, due date) with the status badge turned
+              on since there's no column header to imply it here. */}
+          <div className="h-full min-h-0 space-y-2 overflow-y-auto overscroll-contain pb-1 md:hidden">
+            {filtered.map((task) => (
+              <TaskCard
+                key={task.id}
+                task={task}
+                dragging={false}
+                draggable={false}
+                showStatusBadge
+                hideProject={singleProjectContext}
+                assigneesById={assigneesById}
+                onView={() => setViewing(task)}
+                onEdit={() => setEditing(task)}
+                onDelete={() => { void deleteTask(task.id); toast.success("Task deleted"); }}
+              />
+            ))}
+          </div>
+
+          <Card className="hidden h-full min-h-0 flex-col overflow-hidden p-0 md:flex">
           <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
           <Table>
             <TableHeader className="sticky top-0 z-10">
@@ -893,6 +917,7 @@ function TasksPage() {
           </Table>
           </div>
         </Card>
+        </>
       )}
       </div>
 
@@ -963,6 +988,8 @@ function TaskCard({
   onDelete,
   hideProject = false,
   assigneesById,
+  showStatusBadge = false,
+  draggable = true,
 }: {
   task: Task;
   dragging: boolean;
@@ -971,6 +998,13 @@ function TaskCard({
   onDelete: () => void;
   hideProject?: boolean;
   assigneesById: Map<string, TeamMember>;
+  /** Board columns already imply status via their header, so the badge is
+      opt-in — only the mobile List view (which has no column context) needs
+      it spelled out on the card itself. */
+  showStatusBadge?: boolean;
+  /** Kanban cards are dnd handles (grab cursor); the mobile List view
+      reuses this same card purely as a tappable row, not a drag source. */
+  draggable?: boolean;
 }) {
   const overdue = isOverdue(task.dueDateRaw, task.status);
   const dueToday = isDueToday(task.dueDateRaw) && isActiveStatus(task.status) && !overdue;
@@ -978,11 +1012,14 @@ function TaskCard({
   const isCancelled = task.status === "cancelled";
   const assigneeName = resolveAssigneeName(task, assigneesById);
   const assigneeDisplay = getTaskAssigneeDisplay(task, assigneesById);
+  const tint = TASK_STATUS_TINT[task.status];
+  const StatusIcon = TASK_STATUS_ICONS[task.status];
 
   return (
     <Card
       className={cn(
-        "w-full min-w-0 max-w-full cursor-grab p-2.5 transition-shadow hover:shadow-md active:cursor-grabbing",
+        "w-full min-w-0 max-w-full p-2.5 transition-shadow hover:shadow-md",
+        draggable ? "cursor-grab active:cursor-grabbing" : "cursor-pointer",
         dragging && "shadow-lg ring-1 ring-primary/40",
         isCompleted && "border-emerald-200/70 bg-emerald-50/30 dark:border-emerald-900/30 dark:bg-emerald-500/5",
         isCancelled && "opacity-70",
@@ -1048,6 +1085,11 @@ function TaskCard({
       </div>
 
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        {showStatusBadge && (
+          <Badge variant="outline" className={cn("h-4.5 gap-1 shrink-0 rounded px-1.5 text-[9.5px]", tint.badge)}>
+            <StatusIcon className="h-3 w-3" /> {TASK_STATUS_LABELS[task.status]}
+          </Badge>
+        )}
         <Badge variant="outline" className={cn("h-4.5 shrink-0 rounded px-1.5 text-[9.5px]", priorityClass(task.priority))}>
           {PRIORITIES.find((priority) => priority.id === task.priority)?.label}
         </Badge>

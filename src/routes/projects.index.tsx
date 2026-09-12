@@ -903,7 +903,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
             <span>Projects</span><ChevronRight className="h-3 w-3" />
             <span className="text-foreground font-medium">{project.name}</span>
           </div>
-          <div className="flex items-start justify-between gap-3">
+          <div className="flex flex-wrap md:flex-nowrap items-start justify-between gap-3">
             <div className="min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <h2 className="text-lg font-semibold leading-tight">{project.name}</h2>
@@ -926,10 +926,21 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
                 onClick={() => setPortalInviteOpen(true)}>
                 <ExternalLink className="h-3.5 w-3.5" />Client Portal
               </Button>
-              <Button variant="outline" size="sm" className="h-8 gap-1.5 text-xs"
-                onClick={() => setEditOpen(true)}>
-                <Pencil className="h-3.5 w-3.5" />Edit
-              </Button>
+              {/* Close/Edit are kept as one non-wrapping unit so they always
+                  land beside each other — the mobile Sheet has no visible
+                  overlay to tap-to-dismiss (it's full-width there) and the
+                  built-in Radix X is intentionally off (showCloseButton=
+                  false), so this is the only way to dismiss on a phone. */}
+              <div className="flex shrink-0 items-center gap-2">
+                <Button variant="outline" size="sm" className="h-8 gap-1.5 text-xs md:hidden"
+                  onClick={onClose}>
+                  Close
+                </Button>
+                <Button variant="outline" size="sm" className="h-8 gap-1.5 text-xs"
+                  onClick={() => setEditOpen(true)}>
+                  <Pencil className="h-3.5 w-3.5" />Edit
+                </Button>
+              </div>
             </div>
           </div>
         </div>
@@ -1047,7 +1058,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
                   than the drawer. */}
               <Card className="flex flex-col lg:col-start-1 lg:row-start-1 lg:h-full lg:min-h-0 lg:overflow-hidden">
                 <CardHeader className="shrink-0 border-b border-[#E5E7EB] bg-gold-soft/50 px-5 py-3"><CardTitle className="text-sm font-semibold leading-5">Scope & Details</CardTitle></CardHeader>
-                <CardContent className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-5 pt-4">
+                <CardContent className="flex-1 overflow-visible px-5 pb-5 pt-4 lg:min-h-0 lg:overflow-y-auto lg:overscroll-contain">
                     <dl className="grid grid-cols-1 gap-x-5 gap-y-3 text-sm sm:grid-cols-2 xl:grid-cols-3">
                       <div className="sm:col-span-2 xl:col-span-3">
                         <dt className="text-[11px] text-muted-foreground font-medium uppercase tracking-wide">Address</dt>
@@ -1089,7 +1100,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
                 </Card>
                 <Card className="flex flex-col lg:col-start-2 lg:row-start-1 lg:h-full lg:min-h-0 lg:overflow-hidden">
                   <CardHeader className="shrink-0 border-b border-[#E5E7EB] bg-gold-soft/50 px-5 py-3"><CardTitle className="text-sm font-semibold leading-5">Primary Contact</CardTitle></CardHeader>
-                  <CardContent className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-5 pt-4">
+                  <CardContent className="flex-1 overflow-visible px-5 pb-5 pt-4 lg:min-h-0 lg:overflow-y-auto lg:overscroll-contain">
                     {contact ? (
                       <div className="space-y-4">
                         <div className="flex items-center gap-3">
@@ -1147,7 +1158,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
                 </Card>
                 <Card className="flex flex-col lg:col-start-2 lg:row-start-2 lg:h-full lg:min-h-0 lg:overflow-hidden">
                   <CardHeader className="shrink-0 border-b border-[#E5E7EB] bg-gold-soft/50 px-5 py-3"><CardTitle className="text-sm font-semibold leading-5">Budget Snapshot</CardTitle></CardHeader>
-                  <CardContent className="min-h-0 flex-1 space-y-3.5 overflow-y-auto overscroll-contain px-5 pb-5 pt-4">
+                  <CardContent className="flex-1 space-y-3.5 overflow-visible px-5 pb-5 pt-4 lg:min-h-0 lg:overflow-y-auto lg:overscroll-contain">
                     {[
                       { label: "Total Budget", val: formatMoneyFull(project.budget_total), cls: "" },
                       { label: "Spent",        val: formatMoneyFull(project.actual_cost),  cls: "text-amber-600" },
@@ -1169,7 +1180,7 @@ export function ProjectDetailSheet({ project, open, onClose, onReload, onProject
                 </Card>
                 <Card className="flex flex-col lg:col-start-1 lg:row-start-2 lg:h-full lg:min-h-0 lg:overflow-hidden">
                   <CardHeader className="shrink-0 border-b border-[#E5E7EB] bg-gold-soft/50 px-5 py-3"><CardTitle className="text-sm font-semibold leading-5">Recent Activity</CardTitle></CardHeader>
-                  <CardContent className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-5 pt-4">
+                  <CardContent className="flex-1 overflow-visible px-5 pb-5 pt-4 lg:min-h-0 lg:overflow-y-auto lg:overscroll-contain">
                     {(() => {
                       type Entry = { id: string; icon: React.ReactNode; tone: string; title: string; sub?: string; at: Date };
                       const entries: Entry[] = [
