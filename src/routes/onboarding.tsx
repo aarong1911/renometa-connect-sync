@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { OrganizationForm } from "@/components/organization/organization-form";
 import { TeamMembersManager } from "@/components/organization/team-members-manager";
 import {
+  DEFAULT_ORG,
   type Organization,
   type TeamMember,
 } from "@/lib/organization";
@@ -33,16 +34,9 @@ export const Route = createFileRoute("/onboarding")({
   component: OnboardingPage,
 });
 
-const EMPTY_ORG: Organization = {
-  companyName: "",
-  primaryPhone: "",
-  website: "",
-  industry: undefined,
-  address: "",
-  logoUrl: null,
-  crmGoals: [],
-  timezone: "America/Los_Angeles",
-};
+// Reuses the shared default from organization.ts (same shape, one
+// definition of the default timezone) instead of a second hardcoded copy.
+const EMPTY_ORG: Organization = { ...DEFAULT_ORG };
 
 function OnboardingPage() {
   const navigate = useNavigate();
