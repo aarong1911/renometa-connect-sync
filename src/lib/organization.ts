@@ -246,7 +246,28 @@ function useOrganizationQuery() {
     // Anti-flash (Part 23): seeds from the exact same localStorage cache
     // the pre-S5D module default used, so the app shell/settings never
     // show a blank name/logo before the first fetch resolves.
-    initialData: () => ({ ...DEFAULT_ORG, logoUrl: readLogoCache(), companyName: readCompanyCache() }),
+    //
+    // `placeholderData`, NOT `initialData` — this was the actual bug
+    // (post-refresh Organization Settings regression): `initialData`
+    // writes straight into the query's own cached state and, with no
+    // `initialDataUpdatedAt` given, is treated as freshly fetched RIGHT
+    // NOW — combined with `staleTime: 90_000` above, that made the real
+    // fetchOrganizationForOrg() call never fire at all for 90 seconds
+    // after every fresh page load (the query already "had fresh data"
+    // as far as staleness checks were concerned). Every field with no
+    // separate cache of its own (phone/website/industry/address/
+    // crmGoals) stayed on this placeholder's plain defaults the whole
+    // time — logoUrl/companyName only *looked* correct because they're
+    // separately restored from localStorage right here, and timezone
+    // only looked correct by coincidence when DEFAULT_ORG_TIMEZONE
+    // happened to match this org's real saved value. `placeholderData`
+    // shows the exact same seed value immediately (no blank flash) but
+    // is a per-observer overlay only — it never marks the query
+    // "fresh," so the real fetch still fires immediately regardless of
+    // staleTime, and every consumer (useOrganization() here, and
+    // OrganizationSettings' own draft-sync effect) swaps over to the
+    // real row the moment it arrives, exactly as already designed.
+    placeholderData: () => ({ ...DEFAULT_ORG, logoUrl: readLogoCache(), companyName: readCompanyCache() }),
   });
 }
 
