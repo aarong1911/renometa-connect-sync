@@ -217,10 +217,21 @@ function useProjectsQuery() {
   });
 }
 
+// Stable fallback reference — `query.data ?? []` would otherwise hand back
+// a brand-new array every render for as long as the query has no data
+// (pending org resolution, or a persistently failing fetch), which breaks
+// any consumer that reasonably depends on `projects` for effect identity
+// (e.g. projects.index.tsx's approved-change-order-totals and
+// contract-baseline effects): a new array every render → effect deps look
+// changed every render → setState every render → React's own runaway-render
+// guard trips with "Maximum update depth exceeded". Same fix already applied
+// to useAppointments() in appointments-store.ts for the identical bug.
+const EMPTY_PROJECTS: Project[] = [];
+
 export function useProjects(): { projects: Project[]; loading: boolean; reload: () => void } {
   const query = useProjectsQuery();
   return {
-    projects: query.data ?? [],
+    projects: query.data ?? EMPTY_PROJECTS,
     loading: query.isLoading,
     reload: () => { void query.refetch(); },
   };
