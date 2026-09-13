@@ -54,10 +54,22 @@ type RunContextPresence = {
   recentMessageCount?: number;
 };
 
+/** AI-1K addition — the backend persists only this compact audit record
+ * (fromAgent/toAgent/reason), never knownFacts/openQuestions/raw model
+ * output (see orchestrator.ts's AIHandoffSummary). Kept optional and
+ * validated field-by-field below rather than cast, since this is still
+ * jsonb read back from the database, not a value this file produced. */
+type RunHandoffSummary = {
+  fromAgent: string;
+  toAgent: string;
+  reason: string;
+};
+
 type RunInputSummary = {
   channel?: string;
   route?: RunRouteSummary;
   context?: RunContextPresence;
+  handoff?: unknown;
 };
 
 type RunOutputSummary = {
@@ -66,6 +78,19 @@ type RunOutputSummary = {
 
 function asRunInputSummary(value: unknown): RunInputSummary {
   return value && typeof value === "object" ? (value as RunInputSummary) : {};
+}
+
+/** Validates that `handoff` is genuinely `{fromAgent, toAgent, reason}`
+ * with all three as non-empty strings — never a blind cast. Any other
+ * shape (missing field, wrong type, or not an object at all) is treated
+ * as "no handoff to show," never a crash. */
+function getValidHandoff(value: unknown): RunHandoffSummary | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const v = value as Record<string, unknown>;
+  if (typeof v.fromAgent !== "string" || !v.fromAgent) return undefined;
+  if (typeof v.toAgent !== "string" || !v.toAgent) return undefined;
+  if (typeof v.reason !== "string" || !v.reason) return undefined;
+  return { fromAgent: v.fromAgent, toAgent: v.toAgent, reason: v.reason };
 }
 
 function asRunOutputSummary(value: unknown): RunOutputSummary {
@@ -318,6 +343,7 @@ function ExecutionDetail({ row, usage }: { row: ExecutionRow; usage?: UsageInfo 
   const output = asRunOutputSummary(row.output_summary);
   const route = input.route;
   const context = input.context;
+  const handoff = getValidHandoff(input.handoff);
 
   return (
     <Card className="space-y-4 p-4">
@@ -356,6 +382,16 @@ function ExecutionDetail({ row, usage }: { row: ExecutionRow; usage?: UsageInfo 
             <Field label="Confidence" value={typeof route.confidence === "number" ? route.confidence.toFixed(2) : "—"} />
           </div>
           <p className="text-[11px] leading-snug text-muted-foreground">{route.reason ?? "—"}</p>
+        </div>
+      )}
+
+      {handoff && (
+        <div className="space-y-1.5">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Handoff</div>
+          <p className="text-xs font-medium capitalize">
+            {formatAgentKey(handoff.fromAgent)} <span className="text-muted-foreground">→</span> {formatAgentKey(handoff.toAgent)}
+          </p>
+          <p className="text-[11px] leading-snug text-muted-foreground">{handoff.reason}</p>
         </div>
       )}
 

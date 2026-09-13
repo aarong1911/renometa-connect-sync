@@ -51,6 +51,7 @@ import { recordUsageEvent } from "../../../../src/lib/agentic/usage";
 import { buildAIContext } from "./context-builder";
 import { routeAIEvent } from "./router";
 import type {
+  AIAgentHandoff,
   AIAgentKey,
   AIChannel,
   AIChannelEvent,
@@ -73,6 +74,12 @@ import {
   summarizeToolSuccess,
   type LeadQualificationToolDecision,
 } from "./agents/lead-qualification";
+import {
+  GENERIC_FALLBACK_RESPONSE as RECEPTION_GENERIC_FALLBACK_RESPONSE,
+  RECEPTION_HANDOFF_ALLOWLIST,
+  buildReceptionDecisionRequest,
+  parseReceptionDecision,
+} from "./agents/reception";
 
 // ── OBSERVABILITY SCOPE (why no agent_execution_steps / agent_events) ───
 //
@@ -144,6 +151,23 @@ import {
 // makes tool selection safe (strict schema, per-agent allowlist, and
 // trusted-only argument binding — the model can choose a tool name and
 // add_internal_note's note text, and NOTHING else).
+//
+// AI-1K ADDENDUM (first agent-to-agent handoff): Reception now gets its
+// own structured-decision call too (see runReceptionTurn() below), and
+// may hand off to Lead Qualification exactly once per run. A handoff
+// stays inside the SAME agent_executions row created at the top of
+// orchestrateAI() — there is no second execution row, no child-run table,
+// and no new handoff-execution table. runLeadQualificationTurn() (still
+// the one and only place this file calls executeAITool()) is reused
+// as-is for the post-handoff turn, extended with two new optional
+// parameters (`handoff`, `seedUsage`) rather than duplicated into a
+// second function — see its own updated doc comment. Loop prevention is
+// structural, not a runtime counter: agents/reception.ts's decision
+// schema has no "tool" variant (Reception can't call a tool) and
+// agents/lead-qualification.ts's decision schema has no "handoff" variant
+// (Lead Qualification can't hand off again, including back to
+// Reception) — a second hop is not merely disallowed by convention, there
+// is no JSON shape either agent could produce that would parse into one.
 
 /**
  * Placeholder value written to agent_executions.agent_key at INSERT time.
@@ -294,6 +318,19 @@ type AIToolingSummary = {
   skippedReason?: string;
 };
 
+/** AI-1K addition: a compact, audit-only record that a handoff happened —
+ * never the full knownFacts/openQuestions (which may contain customer
+ * content the task explicitly says not to persist here) and never the
+ * raw model JSON. The full validated AIAgentHandoff still reaches the
+ * caller via AIRunResult.handoff (see runReceptionTurn()) — this is only
+ * what gets written into agent_executions.input_summary for the Run
+ * Inspector. */
+type AIHandoffSummary = {
+  fromAgent: AIAgentKey;
+  toAgent: AIAgentKey;
+  reason: string;
+};
+
 /** Full shape written to agent_executions.input_summary. `route`/`context`
  * are omitted (not merely empty) when execution failed before routing/
  * context-building completed — an absent key means "never computed,"
@@ -303,6 +340,7 @@ type AIExecutionInputSummary = {
   route?: AIRouteSummary;
   context?: AIContextPresenceSummary;
   tooling?: AIToolingSummary;
+  handoff?: AIHandoffSummary;
 };
 
 export type OrchestrateAIParams = {
@@ -380,11 +418,21 @@ export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunR
     }
 
     // AI-1J: Lead Qualification ONLY gets the tool-enabled, two-model-call
-    // flow. Every other agent (currently: Reception) falls through to the
-    // exact same plain-response flow AI-1F established below — unchanged.
+    // flow.
     if (route.agentKey === "lead_qualification") {
       return await runLeadQualificationTurn({
-        supabase, trustedContext, event, context, route, modelProvider, executionId, agentConfig, inputSummary,
+        supabase, trustedContext, event, context, activeAgentKey: route.agentKey, modelProvider, executionId, agentConfig, inputSummary,
+      });
+    }
+
+    // AI-1K: Reception gets its own structured-decision flow (may hand off
+    // to Lead Qualification exactly once — see runReceptionTurn()). Any
+    // OTHER future SYSTEM_AGENTS entry (none exist today besides these
+    // two) falls through to the original AI-1F plain-response flow below,
+    // unchanged.
+    if (route.agentKey === "reception") {
+      return await runReceptionTurn({
+        supabase, trustedContext, event, context, modelProvider, executionId, agentConfig, inputSummary,
       });
     }
 
@@ -458,37 +506,65 @@ export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunR
   }
 }
 
-// ── Lead Qualification tool-enabled turn (AI-1J) ─────────────────────────
+// ── Lead Qualification tool-enabled turn (AI-1J, extended AI-1K) ─────────
 //
 // The only path in this file that ever calls executeAITool(). Sequence:
 //
-//   model call #1 (structured decision)
+//   model call (structured decision)
 //     -> "respond"            -> finalize, done (no tool)
 //     -> "tool" + no leadId   -> finalize, done (no tool — see ENTITY
 //                                BINDING below; the agent still answers
 //                                normally, it just can't use the tool)
 //     -> "tool" (bound input) -> executeAITool()
-//          -> completed         -> model call #2 (response only) -> finalize
+//          -> completed         -> one more model call (response only) -> finalize
 //          -> approval_required -> finalize as "awaiting_approval", done
 //          -> denied/failed     -> finalize as "failed", done
 //
-// At most one tool call, at most two model calls, no loops — the function
-// has no path that could ask for a second decision or a second tool.
+// At most one tool call, at most two of ITS OWN model calls, no loops —
+// the function has no path that could ask for a second decision or a
+// second tool. (AI-1K: when reached via a Reception handoff, one
+// additional model call already happened in runReceptionTurn() before
+// this function was even called — see `seedUsage` below, which folds
+// that prior call's usage into this function's own running totals so the
+// execution row's totals cover the whole run, not just this function's
+// share of it.)
+//
+// AI-1K reuse, not duplication: this same function now serves both entry
+// points — routed directly (activeAgentKey passed as the router's own
+// pick, no `handoff`/`seedUsage`) and reached via a Reception handoff
+// (activeAgentKey is always "lead_qualification" in that case, `handoff`
+// carries the validated AIAgentHandoff for prompt continuity, `seedUsage`
+// carries Reception's own decision-call usage so far). No second
+// "runLeadQualificationFromHandoff()" implementation exists.
 async function runLeadQualificationTurn(params: {
   supabase: SupabaseClient;
   trustedContext: AITrustedContext;
   event: AIChannelEvent;
   context: AIResolvedContext;
-  route: AIRouteDecision;
+  /** Who is actually driving this turn — NOT necessarily who the router
+   * originally picked. Always "lead_qualification" when `handoff` is set. */
+  activeAgentKey: AIAgentKey;
   modelProvider: ModelProvider;
   executionId: string;
   agentConfig: SystemAgentConfig;
   inputSummary: AIExecutionInputSummary;
+  /** Set only when this turn was reached via a Reception handoff — passed
+   * straight through to both Lead Qualification prompt builders for
+   * continuity (see agents/lead-qualification.ts's HANDOFF_CONTINUITY_
+   * INSTRUCTION) and attached to the returned AIRunResult by the caller
+   * (runReceptionTurn()), not by this function itself. */
+  handoff?: AIAgentHandoff;
+  /** Usage already incurred by a prior model call before this function was
+   * invoked (Reception's own decision call, when reached via handoff).
+   * Folded into this function's own running totals so
+   * agent_executions.input_tokens/output_tokens/cost_usd_estimated always
+   * reflect the ENTIRE execution — never just this function's share. */
+  seedUsage?: { inputTokens: number; outputTokens: number; costUsd: number };
 }): Promise<AIRunResult> {
-  const { supabase, trustedContext, event, context, route, modelProvider, executionId, agentConfig, inputSummary } = params;
+  const { supabase, trustedContext, event, context, activeAgentKey, modelProvider, executionId, agentConfig, inputSummary, handoff, seedUsage } = params;
 
-  // ── Model call #1: structured decision ──────────────────────────────
-  const decisionRequest = buildLeadQualificationDecisionRequest(agentConfig.instructions, context, event);
+  // ── Model call: structured decision ──────────────────────────────────
+  const decisionRequest = buildLeadQualificationDecisionRequest(agentConfig.instructions, context, event, handoff);
 
   let decisionResponse;
   try {
@@ -496,25 +572,29 @@ async function runLeadQualificationTurn(params: {
   } catch (err) {
     console.error(`[ai/orchestrator] lead_qualification decision call failed (execution ${executionId}):`, err);
     const message = "The AI model could not generate a response.";
-    await finalizeExecution(supabase, executionId, { agentKey: route.agentKey, status: "failed", error: message, inputSummary });
-    return { executionId, status: "failed", agentKey: route.agentKey, error: message };
+    await finalizeExecution(supabase, executionId, { agentKey: activeAgentKey, status: "failed", error: message, inputSummary });
+    return { executionId, status: "failed", agentKey: activeAgentKey, error: message };
   }
 
-  // Running totals across both possible model calls — agent_executions
-  // must reflect the ENTIRE run, never just the last call (see this
-  // file's AI-1J usage-accounting notes). Both numbers here are the
-  // direct return values of the model provider / usage recorder — no
-  // token or price math is performed by this file.
-  let totalInputTokens = decisionResponse.usage.inputTokens;
-  let totalOutputTokens = decisionResponse.usage.outputTokens;
-  let totalCostUsd = await recordUsageEvent(supabase, {
-    orgId: trustedContext.orgId,
-    executionId,
-    provider: decisionResponse.provider,
-    model: decisionResponse.model,
-    inputTokens: decisionResponse.usage.inputTokens,
-    outputTokens: decisionResponse.usage.outputTokens,
-  });
+  // Running totals across every model call THIS EXECUTION makes —
+  // agent_executions must reflect the entire run, never just one
+  // function's share of it. Seeded from a prior Reception call when
+  // reached via handoff (see `seedUsage` above); every number here is
+  // either a direct ModelResponse.usage value or a direct
+  // recordUsageEvent() return value — no token/price math is performed by
+  // this file.
+  let totalInputTokens = (seedUsage?.inputTokens ?? 0) + decisionResponse.usage.inputTokens;
+  let totalOutputTokens = (seedUsage?.outputTokens ?? 0) + decisionResponse.usage.outputTokens;
+  let totalCostUsd =
+    (seedUsage?.costUsd ?? 0) +
+    (await recordUsageEvent(supabase, {
+      orgId: trustedContext.orgId,
+      executionId,
+      provider: decisionResponse.provider,
+      model: decisionResponse.model,
+      inputTokens: decisionResponse.usage.inputTokens,
+      outputTokens: decisionResponse.usage.outputTokens,
+    }));
 
   const parsed = parseLeadQualificationDecision(decisionResponse.text);
 
@@ -522,7 +602,7 @@ async function runLeadQualificationTurn(params: {
   // See agents/lead-qualification.ts's parseLeadQualificationDecision()
   // for why this is a plain response rather than any kind of retry.
   if (parsed.kind === "fallback") {
-    return await finalizeLeadQualificationRun(supabase, executionId, route, {
+    return await finalizeLeadQualificationRun(supabase, executionId, activeAgentKey, {
       status: "succeeded",
       responseText: parsed.responseText,
       inputTokens: totalInputTokens,
@@ -535,7 +615,7 @@ async function runLeadQualificationTurn(params: {
   const decision = parsed.decision;
 
   if (decision.type === "respond") {
-    return await finalizeLeadQualificationRun(supabase, executionId, route, {
+    return await finalizeLeadQualificationRun(supabase, executionId, activeAgentKey, {
       status: "succeeded",
       responseText: decision.response,
       inputTokens: totalInputTokens,
@@ -554,7 +634,7 @@ async function runLeadQualificationTurn(params: {
   // calling executeAITool(). Should be unreachable given the schema, but
   // never trusted to be unreachable.
   if (!LEAD_QUALIFICATION_TOOL_ALLOWLIST.has(decision.tool)) {
-    return await finalizeLeadQualificationRun(supabase, executionId, route, {
+    return await finalizeLeadQualificationRun(supabase, executionId, activeAgentKey, {
       status: "succeeded",
       responseText: GENERIC_FALLBACK_RESPONSE_LOCAL,
       inputTokens: totalInputTokens,
@@ -573,7 +653,7 @@ async function runLeadQualificationTurn(params: {
   if (!trustedContext.leadId) {
     const message =
       "I don't have a specific lead on file for this conversation yet, so I can't pull up or update any records — could you tell me a bit more about the project in the meantime?";
-    return await finalizeLeadQualificationRun(supabase, executionId, route, {
+    return await finalizeLeadQualificationRun(supabase, executionId, activeAgentKey, {
       status: "succeeded",
       responseText: message,
       inputTokens: totalInputTokens,
@@ -615,7 +695,7 @@ async function runLeadQualificationTurn(params: {
     // status invented.
     const message = "I've prepared that for a teammate to review before it's added — I haven't made any changes yet.";
     await finalizeExecution(supabase, executionId, {
-      agentKey: route.agentKey,
+      agentKey: activeAgentKey,
       status: "awaiting_approval",
       outputSummary: { responseText: message },
       inputTokens: totalInputTokens,
@@ -623,7 +703,7 @@ async function runLeadQualificationTurn(params: {
       costUsd: totalCostUsd,
       inputSummary: { ...inputSummary, tooling: toolingSummary },
     });
-    return { executionId, status: "awaiting_approval", agentKey: route.agentKey, responseText: message, toolResults: [toolResult] };
+    return { executionId, status: "awaiting_approval", agentKey: activeAgentKey, responseText: message, toolResults: [toolResult] };
   }
 
   if (toolResult.status === "denied" || toolResult.status === "failed") {
@@ -635,7 +715,7 @@ async function runLeadQualificationTurn(params: {
     // is already sanitized by the Tool Registry (see tools/registry.ts's
     // sanitizeError()) — never a raw DB error.
     const message = "I wasn't able to complete that just now — let's continue, and a teammate can follow up on the details.";
-    return await finalizeLeadQualificationRun(supabase, executionId, route, {
+    return await finalizeLeadQualificationRun(supabase, executionId, activeAgentKey, {
       status: "failed",
       responseText: undefined,
       errorMessage: message,
@@ -655,6 +735,7 @@ async function runLeadQualificationTurn(params: {
     context,
     event,
     summarizeToolSuccess(decision.tool),
+    handoff,
   );
 
   let finalResponse;
@@ -668,7 +749,7 @@ async function runLeadQualificationTurn(params: {
     // failed, with the real tool outcome still attached via toolResults
     // so this isn't mistaken for "nothing happened."
     const message = "The AI model could not generate a final response.";
-    return await finalizeLeadQualificationRun(supabase, executionId, route, {
+    return await finalizeLeadQualificationRun(supabase, executionId, activeAgentKey, {
       status: "failed",
       responseText: undefined,
       errorMessage: message,
@@ -691,7 +772,7 @@ async function runLeadQualificationTurn(params: {
     outputTokens: finalResponse.usage.outputTokens,
   });
 
-  return await finalizeLeadQualificationRun(supabase, executionId, route, {
+  return await finalizeLeadQualificationRun(supabase, executionId, activeAgentKey, {
     status: "succeeded",
     responseText: finalResponse.text,
     inputTokens: totalInputTokens,
@@ -721,7 +802,7 @@ const GENERIC_FALLBACK_RESPONSE_LOCAL =
 async function finalizeLeadQualificationRun(
   supabase: SupabaseClient,
   executionId: string,
-  route: AIRouteDecision,
+  agentKey: AIAgentKey,
   params: {
     status: "succeeded" | "failed";
     responseText?: string;
@@ -734,7 +815,7 @@ async function finalizeLeadQualificationRun(
   },
 ): Promise<AIRunResult> {
   const finalized = await finalizeExecution(supabase, executionId, {
-    agentKey: route.agentKey,
+    agentKey,
     status: params.status,
     error: params.errorMessage,
     outputSummary: params.responseText !== undefined ? { responseText: params.responseText } : undefined,
@@ -750,11 +831,206 @@ async function finalizeLeadQualificationRun(
   return {
     executionId,
     status: params.status === "succeeded" ? "completed" : "failed",
-    agentKey: route.agentKey,
+    agentKey,
     responseText: params.responseText,
     error: params.errorMessage,
     toolResults: params.toolResults,
   };
+}
+
+// ── Reception turn (AI-1K) ────────────────────────────────────────────────
+//
+// One structured-decision model call. Sequence:
+//
+//   model call (structured decision)
+//     -> "respond"                          -> finalize, done
+//     -> "handoff" (disallowed destination) -> finalize as a plain
+//                                               response, done (defense
+//                                               in depth — see below;
+//                                               should be unreachable)
+//     -> "handoff" to lead_qualification     -> build AIAgentHandoff
+//                                               -> runLeadQualificationTurn()
+//                                               (SAME execution row,
+//                                               SAME trustedContext,
+//                                               unmodified)
+//
+// Reception has NO tool access and NO path to hand off more than once —
+// see agents/reception.ts's header for why that's structural, not just
+// conventional. This function never calls executeAITool() itself; if a
+// handoff happens, the tool call (if any) happens entirely inside the
+// reused runLeadQualificationTurn().
+async function runReceptionTurn(params: {
+  supabase: SupabaseClient;
+  trustedContext: AITrustedContext;
+  event: AIChannelEvent;
+  context: AIResolvedContext;
+  modelProvider: ModelProvider;
+  executionId: string;
+  agentConfig: SystemAgentConfig;
+  inputSummary: AIExecutionInputSummary;
+}): Promise<AIRunResult> {
+  const { supabase, trustedContext, event, context, modelProvider, executionId, agentConfig, inputSummary } = params;
+
+  const decisionRequest = buildReceptionDecisionRequest(agentConfig.instructions, context, event);
+
+  let decisionResponse;
+  try {
+    decisionResponse = await modelProvider.run(decisionRequest);
+  } catch (err) {
+    console.error(`[ai/orchestrator] reception decision call failed (execution ${executionId}):`, err);
+    const message = "The AI model could not generate a response.";
+    await finalizeExecution(supabase, executionId, { agentKey: "reception", status: "failed", error: message, inputSummary });
+    return { executionId, status: "failed", agentKey: "reception", error: message };
+  }
+
+  const receptionInputTokens = decisionResponse.usage.inputTokens;
+  const receptionOutputTokens = decisionResponse.usage.outputTokens;
+  const receptionCostUsd = await recordUsageEvent(supabase, {
+    orgId: trustedContext.orgId,
+    executionId,
+    provider: decisionResponse.provider,
+    model: decisionResponse.model,
+    inputTokens: decisionResponse.usage.inputTokens,
+    outputTokens: decisionResponse.usage.outputTokens,
+  });
+
+  const parsed = parseReceptionDecision(decisionResponse.text);
+
+  // Parse/validation failed — respond safely, no handoff ever considered.
+  // Same reasoning as Lead Qualification's own fallback handling.
+  if (parsed.kind === "fallback") {
+    return await finalizeReceptionRun(supabase, executionId, {
+      responseText: parsed.responseText,
+      inputTokens: receptionInputTokens,
+      outputTokens: receptionOutputTokens,
+      costUsd: receptionCostUsd,
+      inputSummary,
+    });
+  }
+
+  const decision = parsed.decision;
+
+  if (decision.type === "respond") {
+    return await finalizeReceptionRun(supabase, executionId, {
+      responseText: decision.response,
+      inputTokens: receptionInputTokens,
+      outputTokens: receptionOutputTokens,
+      costUsd: receptionCostUsd,
+      inputSummary,
+    });
+  }
+
+  // decision.type === "handoff" from here on.
+
+  // Defense in depth, per this task's explicit instruction: even though
+  // the Zod schema already restricts `toAgent` to the single literal
+  // "lead_qualification", this file applies a SECOND, explicit allowlist
+  // check before ever building an AIAgentHandoff or calling Lead
+  // Qualification. Should be unreachable given the schema, but never
+  // trusted to be unreachable — same pattern as
+  // LEAD_QUALIFICATION_TOOL_ALLOWLIST one layer down.
+  if (!RECEPTION_HANDOFF_ALLOWLIST.has(decision.toAgent)) {
+    return await finalizeReceptionRun(supabase, executionId, {
+      responseText: RECEPTION_GENERIC_FALLBACK_RESPONSE,
+      inputTokens: receptionInputTokens,
+      outputTokens: receptionOutputTokens,
+      costUsd: receptionCostUsd,
+      inputSummary,
+    });
+  }
+
+  // The handoff is a CONTENT decision only — it never touches trust. No
+  // field below can come from trustedContext, and nothing downstream
+  // reads orgId/actor/autonomyLevel/executionId/contactId/leadId/
+  // projectId from it (see this file's AI-1K header addendum and
+  // agents/reception.ts's own trust-boundary note).
+  const handoff: AIAgentHandoff = {
+    fromAgent: "reception",
+    toAgent: decision.toAgent,
+    reason: decision.reason,
+    summary: decision.summary,
+    knownFacts: decision.knownFacts,
+    openQuestions: decision.openQuestions,
+  };
+  const handoffSummary: AIHandoffSummary = { fromAgent: "reception", toAgent: decision.toAgent, reason: decision.reason };
+
+  const leadQualificationConfig = SYSTEM_AGENTS.lead_qualification;
+  if (!leadQualificationConfig) {
+    // Defensive only — both agents are defined together above; this
+    // should never actually happen.
+    const message = "Lead Qualification is not available right now.";
+    await finalizeExecution(supabase, executionId, {
+      agentKey: "reception",
+      status: "failed",
+      error: message,
+      inputTokens: receptionInputTokens,
+      outputTokens: receptionOutputTokens,
+      costUsd: receptionCostUsd,
+      inputSummary: { ...inputSummary, handoff: handoffSummary },
+    });
+    return { executionId, status: "failed", agentKey: "reception", error: message, handoff };
+  }
+
+  // Reuse the existing tool-enabled Lead Qualification turn — SAME
+  // execution row (`executionId` passed straight through, never a new
+  // insert), SAME trustedContext (passed straight through, completely
+  // unmodified — a handoff cannot widen what Lead Qualification is
+  // allowed to do). Reception's own usage is folded in via `seedUsage` so
+  // the execution's totals cover this entire run, not just Lead
+  // Qualification's share of it.
+  const result = await runLeadQualificationTurn({
+    supabase,
+    trustedContext,
+    event,
+    context,
+    activeAgentKey: "lead_qualification",
+    modelProvider,
+    executionId,
+    agentConfig: leadQualificationConfig,
+    inputSummary: { ...inputSummary, handoff: handoffSummary },
+    handoff,
+    seedUsage: { inputTokens: receptionInputTokens, outputTokens: receptionOutputTokens, costUsd: receptionCostUsd },
+  });
+
+  // Attach the full validated handoff to the result regardless of how
+  // runLeadQualificationTurn's own turn concluded (completed, failed, or
+  // awaiting_approval) — per this task's explicit instruction: "Do not
+  // lose the fact that a handoff occurred if a later stage fails."
+  return { ...result, handoff };
+}
+
+/** Shared finalize+return helper for every Reception exit path that
+ * simply responds (no handoff) — mirrors
+ * finalizeLeadQualificationRun()'s role for Lead Qualification. Always
+ * "succeeded"/"completed": every path that reaches this helper already
+ * has a safe response to give (a real decision, or a fallback), so there
+ * is nothing else to report as failed here — a genuine Reception model
+ * failure is handled earlier, before this helper is ever called. */
+async function finalizeReceptionRun(
+  supabase: SupabaseClient,
+  executionId: string,
+  params: {
+    responseText: string;
+    inputTokens: number;
+    outputTokens: number;
+    costUsd: number;
+    inputSummary: AIExecutionInputSummary;
+  },
+): Promise<AIRunResult> {
+  const finalized = await finalizeExecution(supabase, executionId, {
+    agentKey: "reception",
+    status: "succeeded",
+    outputSummary: { responseText: params.responseText },
+    inputTokens: params.inputTokens,
+    outputTokens: params.outputTokens,
+    costUsd: params.costUsd,
+    inputSummary: params.inputSummary,
+  });
+  if (!finalized) {
+    console.error(`[ai/orchestrator] reception execution ${executionId} succeeded but could not be finalized in the database.`);
+  }
+
+  return { executionId, status: "completed", agentKey: "reception", responseText: params.responseText };
 }
 
 // ── agent_executions lifecycle ──────────────────────────────────────────

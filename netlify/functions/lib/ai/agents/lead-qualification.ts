@@ -38,9 +38,40 @@
 // for more than one action in a single decision.
 
 import { z } from "zod";
-import type { AIChannelEvent, AIResolvedContext } from "../types";
+import type { AIAgentHandoff, AIChannelEvent, AIResolvedContext } from "../types";
 import type { ModelRequest } from "../providers/model-provider";
 import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines } from "../prompting";
+
+// ── AI-1K: optional handoff continuity (see orchestrator.ts's "Reception
+// turn") ─────────────────────────────────────────────────────────────────
+//
+// When Reception hands off, Lead Qualification's prompts get this
+// addendum plus a compact block built from the validated AIAgentHandoff.
+// Per this task's explicit instruction: the customer-facing experience
+// must read as ONE business conversation — never "I am the Lead
+// Qualification Agent" or "Reception transferred you." Also per this
+// task: handoff facts are context only — trusted CRM context (already
+// injected above this block by buildContextLines()) remains authoritative
+// if the two ever conflict; this is why the block below is explicitly
+// labeled as such rather than presented as equally-trusted data.
+const HANDOFF_CONTINUITY_INSTRUCTION =
+  "Reception has handed this conversation to you. Continue naturally as the same business conversation — do not introduce yourself as a separate AI agent, and do not tell the customer they were transferred or handed off, unless the customer explicitly asks how this works.";
+
+function buildHandoffContextBlock(handoff: AIAgentHandoff): string {
+  const lines: string[] = [
+    `Notes from Reception (context only — the CRM data above is authoritative if anything here conflicts): ${handoff.summary}`,
+  ];
+  if (handoff.knownFacts && Object.keys(handoff.knownFacts).length > 0) {
+    const facts = Object.entries(handoff.knownFacts)
+      .map(([label, value]) => `${label}: ${String(value)}`)
+      .join("; ");
+    lines.push(`Reception noted: ${facts}`);
+  }
+  if (handoff.openQuestions && handoff.openQuestions.length > 0) {
+    lines.push(`Still open per Reception: ${handoff.openQuestions.join("; ")}`);
+  }
+  return lines.join("\n");
+}
 
 // ── Per-agent tool allowlist (AI-1J) ─────────────────────────────────────
 //
@@ -216,21 +247,24 @@ export function buildLeadQualificationDecisionRequest(
   agentInstructions: string,
   context: AIResolvedContext,
   event: AIChannelEvent,
+  handoff?: AIAgentHandoff,
 ): ModelRequest {
-  const system = buildDecisionSystemInstructions(agentInstructions, context.organization.name);
+  const baseSystem = buildDecisionSystemInstructions(agentInstructions, context.organization.name);
+  const system = handoff ? `${baseSystem}\n\n${HANDOFF_CONTINUITY_INSTRUCTION}` : baseSystem;
   const contextLines = buildContextLines(context);
   const inboundText = event.content.text?.trim() || "(no message text provided)";
 
-  const userMessage = [
+  const userMessageParts = [
     `Current inbound event:\n${inboundText}`,
     contextLines.length > 0 ? `Known CRM context:\n${contextLines.join("\n")}` : "Known CRM context: none available.",
-    "Decide your response now, following the JSON contract exactly.",
-  ].join("\n\n");
+  ];
+  if (handoff) userMessageParts.push(buildHandoffContextBlock(handoff));
+  userMessageParts.push("Decide your response now, following the JSON contract exactly.");
 
   return {
     model: AI_CENTER_DEFAULT_MODEL,
     system,
-    messages: [{ role: "user", content: userMessage }],
+    messages: [{ role: "user", content: userMessageParts.join("\n\n") }],
     maxTokens: AI_CENTER_MAX_TOKENS,
   };
 }
@@ -243,28 +277,34 @@ export function buildLeadQualificationFinalRequest(
   context: AIResolvedContext,
   event: AIChannelEvent,
   toolResultSummary: string,
+  handoff?: AIAgentHandoff,
 ): ModelRequest {
-  const system = [
+  const systemParts = [
     agentInstructions,
     "",
     "You just completed an internal action. Do not mention internal tools, notes, or CRM systems to the customer — respond naturally based on what you now know.",
     `Organization: ${context.organization.name}.`,
-  ].join("\n");
+  ];
+  if (handoff) systemParts.push("", HANDOFF_CONTINUITY_INSTRUCTION);
+  const system = systemParts.join("\n");
 
   const contextLines = buildContextLines(context);
   const inboundText = event.content.text?.trim() || "(no message text provided)";
 
-  const userMessage = [
+  const userMessageParts = [
     `Current inbound event:\n${inboundText}`,
     contextLines.length > 0 ? `Known CRM context:\n${contextLines.join("\n")}` : "Known CRM context: none available.",
+  ];
+  if (handoff) userMessageParts.push(buildHandoffContextBlock(handoff));
+  userMessageParts.push(
     `Internal result: ${toolResultSummary}`,
     "Respond to the customer now, in natural language only. Do not request another tool.",
-  ].join("\n\n");
+  );
 
   return {
     model: AI_CENTER_DEFAULT_MODEL,
     system,
-    messages: [{ role: "user", content: userMessage }],
+    messages: [{ role: "user", content: userMessageParts.join("\n\n") }],
     maxTokens: AI_CENTER_MAX_TOKENS,
   };
 }
