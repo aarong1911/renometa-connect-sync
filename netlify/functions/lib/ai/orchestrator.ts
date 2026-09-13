@@ -61,6 +61,18 @@ import type {
 } from "./types";
 import { createAnthropicProvider } from "./providers/anthropic";
 import type { ModelProvider, ModelRequest } from "./providers/model-provider";
+import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines } from "./prompting";
+import { executeAITool } from "./tools/registry";
+import type { AIToolExecutionResult } from "./tools/types";
+import {
+  LEAD_QUALIFICATION_TOOL_ALLOWLIST,
+  buildLeadQualificationDecisionRequest,
+  buildLeadQualificationFinalRequest,
+  buildTrustedToolInput,
+  parseLeadQualificationDecision,
+  summarizeToolSuccess,
+  type LeadQualificationToolDecision,
+} from "./agents/lead-qualification";
 
 // ── OBSERVABILITY SCOPE (why no agent_execution_steps / agent_events) ───
 //
@@ -108,6 +120,30 @@ import type { ModelProvider, ModelRequest } from "./providers/model-provider";
 // input_tokens/output_tokens/cost_usd_estimated columns. Adding
 // lifecycle-event production now would be observability beyond what this
 // task's GOAL actually requires — deferred, not ruled out for later.
+//
+// AI-1J ADDENDUM (first tool-enabled flow): Lead Qualification (and ONLY
+// Lead Qualification — Reception's flow below is byte-for-byte unchanged
+// from AI-1F) may now request at most ONE of two allowlisted Gen-2
+// actions per run: get_lead_context (read) and add_internal_note (low
+// risk, no approval). The actual tool call always goes through the
+// existing path this architecture requires:
+//
+//   this file -> executeAITool() (tools/registry.ts, AI-1B)
+//             -> getActionDefinition()/executeStep() (src/lib/agentic/
+//                action-registry.ts + action-executor.ts, Gen-2,
+//                UNMODIFIED) -> handler
+//
+// This file never calls a handler or the action registry directly, and
+// never writes any table other than agent_executions itself — the tool
+// call's own agent_execution_steps row (and, if it ever needs one, an
+// agent_approval_requests row) is created by executeStep(), not by this
+// file, exactly as it already is for every other executeStep() caller
+// (agent-execute.ts). See runLeadQualificationTurn() below for the full
+// two-model-call, one-tool-maximum flow, and
+// agents/lead-qualification.ts for the structured-decision contract that
+// makes tool selection safe (strict schema, per-agent allowlist, and
+// trusted-only argument binding — the model can choose a tool name and
+// add_internal_note's note text, and NOTHING else).
 
 /**
  * Placeholder value written to agent_executions.agent_key at INSERT time.
@@ -123,22 +159,12 @@ import type { ModelProvider, ModelRequest } from "./providers/model-provider";
  */
 const UNROUTED_AGENT_KEY: AIAgentKey = "unrouted";
 
-/**
- * Temporary default model for AI-1F. This is the exact alias already
- * smoke-tested against the real Anthropic API in AI-1A/AI-1B
- * ("claude-haiku-4-5", confirmed to resolve server-side to
- * claude-haiku-4-5-20251001 — see anthropic.ts / the AI-1A smoke test).
- * Model choice belongs to agent versioning/configuration once that exists
- * (see the ai-center skill's "Model Provider Architecture" section: "do
- * not hard-code model IDs throughout agent implementations") — this is
- * the ONE named constant standing in for that until then, not a pattern
- * to repeat elsewhere in this file.
- */
-const AI_CENTER_DEFAULT_MODEL = "claude-haiku-4-5";
-
-/** Bounded reply length for AI-1F's conversational responses — an
- * AI-1F-specific default, not an architectural constant. */
-const AI_CENTER_MAX_TOKENS = 400;
+// AI_CENTER_DEFAULT_MODEL / AI_CENTER_MAX_TOKENS moved to ./prompting.ts
+// in AI-1J so agents/lead-qualification.ts's prompt builders can share
+// them without importing this file (which would create a circular
+// dependency — this file imports the lead-qualification flow to run it).
+// Still exactly the same values/meaning as AI-1F: the one smoke-tested
+// model alias, and one bounded reply-length default.
 
 // ── Temporary AI-1 system-agent configuration ───────────────────────────
 //
@@ -175,8 +201,31 @@ const SYSTEM_AGENTS: Partial<Record<AIAgentKey, SystemAgentConfig>> = {
     agentKey: "lead_qualification",
     instructions: [
       "You are Lead Qualification, responsible for understanding a sales lead's project needs for a home improvement contractor.",
+      // Behavior correction (live-test finding): the model asked "Are you
+      // looking to work with a specific contractor, or are you exploring
+      // options?" — treating itself as a neutral third party rather than
+      // this business's own sales representative. The two sentences below
+      // are the fix; everything else in this instruction set is
+      // unchanged.
+      "The business using RenoMeta Connect is the contractor/service provider the lead is contacting — you represent THAT business, not a marketplace, referral service, or neutral third party. Assume the customer is considering hiring this business for the project. Do not ask whether the customer is looking for another contractor, comparing contractors, already has a contractor, or needs help finding one, unless the customer explicitly brings that up first.",
+      "Your goal is to move this opportunity forward for this business — choose whichever single most useful next question fits what's already known, focusing on whichever of these is not already known: project scope, location/service area, timeline, approximate budget, property/job details, decision-maker readiness, or a next step such as a consultation, estimate, or scheduling.",
+      // Follow-up correction (live-test finding): a test lead had a known
+      // $50,000 estimated budget, and the agent still asked "what's your
+      // approximate budget range for this project?" The two sentences
+      // below are the fix — everything else in this instruction set is
+      // unchanged.
+      "Use known CRM context before asking qualification questions — do not ask the customer for information (such as budget, project type, location, or timeline) that is already present in the lead, contact, project, or recent conversation context provided below, unless the value is ambiguous, stale, contradicted, or explicit confirmation is genuinely needed. You may acknowledge a known value naturally instead of asking about it again — for example, \"A $50,000 budget gives us a good starting point,\" not \"What is your budget?\"",
+      "When the customer's first name is known from the trusted CRM context below (a \"Contact:\" or \"Lead name:\" line), use it naturally where it fits, especially in a greeting or acknowledgment — but do not repeat it in every sentence. If only a full name is given, use just its first word as the first name. Never guess a name from an email address, phone number, or username, and if no name is provided below, respond normally without one.",
       "Use ONLY the lead/contact/conversation context provided below — never invent job details, budget, or timeline.",
-      "Ask one or two concise qualification questions when key information (project type, timeline, budget range) is missing.",
+      // Follow-up correction (live-test finding): the prior wording here
+      // ("ask one or two concise qualification questions") directly
+      // conflicted with the "choose the single most useful next question"
+      // rule above, and produced a response bundling two questions into
+      // one turn ("What's the address of the property, and roughly which
+      // kitchen elements are you prioritizing..."). Replaced with a rule
+      // that resolves the conflict in favor of one question at a time —
+      // everything else in this instruction set is unchanged.
+      "Ask only ONE primary qualification question per response — choose the single most useful missing piece of information based on the CRM context and conversation, and never bundle multiple unrelated questions into the same turn (e.g. do not ask for the address, the timeline, and which kitchen elements are being replaced all at once). A small clarification within that same topic is fine — e.g. \"What area is the property located in — just the city or ZIP code is fine\" is still one question with one objective — but the response must not have more than one primary qualification objective.",
       "You have not updated any CRM record and cannot book an appointment right now — never claim otherwise.",
       "Respond briefly and naturally, as if speaking directly to the customer.",
     ].join(" "),
@@ -233,6 +282,18 @@ function summarizeRoute(route: AIRouteDecision): AIRouteSummary {
   return { agentKey: route.agentKey, source: route.source, reason: route.reason, confidence: route.confidence };
 }
 
+/** AI-1J addition: whether a tool was attempted for this run, and which
+ * one — never the note body, customer text, or raw model decision (see
+ * this file's AI-1J header addendum). `attempted: false` with a
+ * `skippedReason` records that the model asked for a tool but a trust
+ * safeguard (e.g. no trusted leadId) blocked it before executeAITool()
+ * was ever called. */
+type AIToolingSummary = {
+  attempted: boolean;
+  toolName: string;
+  skippedReason?: string;
+};
+
 /** Full shape written to agent_executions.input_summary. `route`/`context`
  * are omitted (not merely empty) when execution failed before routing/
  * context-building completed — an absent key means "never computed,"
@@ -241,6 +302,7 @@ type AIExecutionInputSummary = {
   channel: AIChannel;
   route?: AIRouteSummary;
   context?: AIContextPresenceSummary;
+  tooling?: AIToolingSummary;
 };
 
 export type OrchestrateAIParams = {
@@ -317,6 +379,15 @@ export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunR
       return { executionId, status: "failed", agentKey: route.agentKey, error: message };
     }
 
+    // AI-1J: Lead Qualification ONLY gets the tool-enabled, two-model-call
+    // flow. Every other agent (currently: Reception) falls through to the
+    // exact same plain-response flow AI-1F established below — unchanged.
+    if (route.agentKey === "lead_qualification") {
+      return await runLeadQualificationTurn({
+        supabase, trustedContext, event, context, route, modelProvider, executionId, agentConfig, inputSummary,
+      });
+    }
+
     const modelRequest = buildModelRequest(agentConfig, context, event);
 
     let modelResponse;
@@ -387,6 +458,305 @@ export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunR
   }
 }
 
+// ── Lead Qualification tool-enabled turn (AI-1J) ─────────────────────────
+//
+// The only path in this file that ever calls executeAITool(). Sequence:
+//
+//   model call #1 (structured decision)
+//     -> "respond"            -> finalize, done (no tool)
+//     -> "tool" + no leadId   -> finalize, done (no tool — see ENTITY
+//                                BINDING below; the agent still answers
+//                                normally, it just can't use the tool)
+//     -> "tool" (bound input) -> executeAITool()
+//          -> completed         -> model call #2 (response only) -> finalize
+//          -> approval_required -> finalize as "awaiting_approval", done
+//          -> denied/failed     -> finalize as "failed", done
+//
+// At most one tool call, at most two model calls, no loops — the function
+// has no path that could ask for a second decision or a second tool.
+async function runLeadQualificationTurn(params: {
+  supabase: SupabaseClient;
+  trustedContext: AITrustedContext;
+  event: AIChannelEvent;
+  context: AIResolvedContext;
+  route: AIRouteDecision;
+  modelProvider: ModelProvider;
+  executionId: string;
+  agentConfig: SystemAgentConfig;
+  inputSummary: AIExecutionInputSummary;
+}): Promise<AIRunResult> {
+  const { supabase, trustedContext, event, context, route, modelProvider, executionId, agentConfig, inputSummary } = params;
+
+  // ── Model call #1: structured decision ──────────────────────────────
+  const decisionRequest = buildLeadQualificationDecisionRequest(agentConfig.instructions, context, event);
+
+  let decisionResponse;
+  try {
+    decisionResponse = await modelProvider.run(decisionRequest);
+  } catch (err) {
+    console.error(`[ai/orchestrator] lead_qualification decision call failed (execution ${executionId}):`, err);
+    const message = "The AI model could not generate a response.";
+    await finalizeExecution(supabase, executionId, { agentKey: route.agentKey, status: "failed", error: message, inputSummary });
+    return { executionId, status: "failed", agentKey: route.agentKey, error: message };
+  }
+
+  // Running totals across both possible model calls — agent_executions
+  // must reflect the ENTIRE run, never just the last call (see this
+  // file's AI-1J usage-accounting notes). Both numbers here are the
+  // direct return values of the model provider / usage recorder — no
+  // token or price math is performed by this file.
+  let totalInputTokens = decisionResponse.usage.inputTokens;
+  let totalOutputTokens = decisionResponse.usage.outputTokens;
+  let totalCostUsd = await recordUsageEvent(supabase, {
+    orgId: trustedContext.orgId,
+    executionId,
+    provider: decisionResponse.provider,
+    model: decisionResponse.model,
+    inputTokens: decisionResponse.usage.inputTokens,
+    outputTokens: decisionResponse.usage.outputTokens,
+  });
+
+  const parsed = parseLeadQualificationDecision(decisionResponse.text);
+
+  // Parse/validation failed — respond safely, no tool ever considered.
+  // See agents/lead-qualification.ts's parseLeadQualificationDecision()
+  // for why this is a plain response rather than any kind of retry.
+  if (parsed.kind === "fallback") {
+    return await finalizeLeadQualificationRun(supabase, executionId, route, {
+      status: "succeeded",
+      responseText: parsed.responseText,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+      costUsd: totalCostUsd,
+      inputSummary,
+    });
+  }
+
+  const decision = parsed.decision;
+
+  if (decision.type === "respond") {
+    return await finalizeLeadQualificationRun(supabase, executionId, route, {
+      status: "succeeded",
+      responseText: decision.response,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+      costUsd: totalCostUsd,
+      inputSummary,
+    });
+  }
+
+  // decision.type === "tool" from here on.
+
+  // Defense in depth, per this task's explicit instruction: even though
+  // the Zod schema already restricts `decision.tool` to exactly these two
+  // literal values, and the AI Tool Registry has its own separate
+  // allowlist, this file applies a THIRD, agent-level check before ever
+  // calling executeAITool(). Should be unreachable given the schema, but
+  // never trusted to be unreachable.
+  if (!LEAD_QUALIFICATION_TOOL_ALLOWLIST.has(decision.tool)) {
+    return await finalizeLeadQualificationRun(supabase, executionId, route, {
+      status: "succeeded",
+      responseText: GENERIC_FALLBACK_RESPONSE_LOCAL,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+      costUsd: totalCostUsd,
+      inputSummary: { ...inputSummary, tooling: { attempted: false, toolName: decision.tool, skippedReason: "not_in_agent_allowlist" } },
+    });
+  }
+
+  // ── ENTITY BINDING: both allowlisted tools are lead-scoped in AI-1J
+  // (add_internal_note is always bound to the current lead — see
+  // buildTrustedToolInput()). Without a trusted leadId there is nothing
+  // safe to bind to, and the model's own output is NEVER used to supply
+  // one (see this file's header trust boundary). The agent still answers
+  // normally; it simply cannot use a tool this turn.
+  if (!trustedContext.leadId) {
+    const message =
+      "I don't have a specific lead on file for this conversation yet, so I can't pull up or update any records — could you tell me a bit more about the project in the meantime?";
+    return await finalizeLeadQualificationRun(supabase, executionId, route, {
+      status: "succeeded",
+      responseText: message,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+      costUsd: totalCostUsd,
+      inputSummary: { ...inputSummary, tooling: { attempted: false, toolName: decision.tool, skippedReason: "no_trusted_lead_id" } },
+    });
+  }
+
+  const toolInput = buildTrustedToolInput(decision as LeadQualificationToolDecision, trustedContext.leadId);
+  const autonomyLevel = trustedContext.autonomyLevel ?? 1;
+
+  // ── Tool execution — the ONLY call site of executeAITool() in this
+  // file. Routes through the AI Tool Registry (AI-1B), which itself only
+  // ever calls the existing, unmodified Gen-2 executeStep() — never a
+  // handler or Supabase mutation directly from here. `sequence` is
+  // hardcoded to 1: AI-1J permits at most one tool call per execution, so
+  // there is never a second step to number.
+  const toolResult: AIToolExecutionResult = await executeAITool(
+    { toolName: decision.tool, input: toolInput },
+    {
+      supabase,
+      orgId: trustedContext.orgId,
+      actor: trustedContext.actor,
+      executionId,
+      sequence: 1,
+      autonomyLevel,
+      targetEntityType: "lead",
+      targetEntityId: trustedContext.leadId,
+      approvalSummary: decision.tool === "add_internal_note" ? "Lead Qualification requested adding an internal note to this lead." : undefined,
+    },
+  );
+
+  const toolingSummary: AIToolingSummary = { attempted: true, toolName: decision.tool };
+
+  if (toolResult.status === "approval_required") {
+    // Do NOT pretend the action occurred. AIRunResult's existing
+    // "awaiting_approval" status covers exactly this case — no new
+    // status invented.
+    const message = "I've prepared that for a teammate to review before it's added — I haven't made any changes yet.";
+    await finalizeExecution(supabase, executionId, {
+      agentKey: route.agentKey,
+      status: "awaiting_approval",
+      outputSummary: { responseText: message },
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+      costUsd: totalCostUsd,
+      inputSummary: { ...inputSummary, tooling: toolingSummary },
+    });
+    return { executionId, status: "awaiting_approval", agentKey: route.agentKey, responseText: message, toolResults: [toolResult] };
+  }
+
+  if (toolResult.status === "denied" || toolResult.status === "failed") {
+    // Never claim success. "denied" (blocked before executeStep — e.g. an
+    // allowlist mismatch inside the registry itself) and "failed" (the
+    // handler/executor genuinely failed) are both reported as a failed
+    // run — see this task's TOOL RESULT HANDLING: "do not conceal a
+    // failed CRM mutation as a successful tool action." toolResult.error
+    // is already sanitized by the Tool Registry (see tools/registry.ts's
+    // sanitizeError()) — never a raw DB error.
+    const message = "I wasn't able to complete that just now — let's continue, and a teammate can follow up on the details.";
+    return await finalizeLeadQualificationRun(supabase, executionId, route, {
+      status: "failed",
+      responseText: undefined,
+      errorMessage: message,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+      costUsd: totalCostUsd,
+      inputSummary: { ...inputSummary, tooling: toolingSummary },
+      toolResults: [toolResult],
+    });
+  }
+
+  // toolResult.status === "completed" — the ONLY case that proceeds to a
+  // second model call. That call is response-generation ONLY: no tool
+  // decision is requested, and its output is never parsed as one.
+  const finalRequest = buildLeadQualificationFinalRequest(
+    agentConfig.instructions,
+    context,
+    event,
+    summarizeToolSuccess(decision.tool),
+  );
+
+  let finalResponse;
+  try {
+    finalResponse = await modelProvider.run(finalRequest);
+  } catch (err) {
+    console.error(`[ai/orchestrator] lead_qualification final response call failed (execution ${executionId}):`, err);
+    // The tool itself already succeeded (e.g. a real internal note now
+    // exists) — that must never be concealed as if nothing happened, but
+    // a customer-facing response cannot be fabricated either. Reported as
+    // failed, with the real tool outcome still attached via toolResults
+    // so this isn't mistaken for "nothing happened."
+    const message = "The AI model could not generate a final response.";
+    return await finalizeLeadQualificationRun(supabase, executionId, route, {
+      status: "failed",
+      responseText: undefined,
+      errorMessage: message,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+      costUsd: totalCostUsd,
+      inputSummary: { ...inputSummary, tooling: toolingSummary },
+      toolResults: [toolResult],
+    });
+  }
+
+  totalInputTokens += finalResponse.usage.inputTokens;
+  totalOutputTokens += finalResponse.usage.outputTokens;
+  totalCostUsd += await recordUsageEvent(supabase, {
+    orgId: trustedContext.orgId,
+    executionId,
+    provider: finalResponse.provider,
+    model: finalResponse.model,
+    inputTokens: finalResponse.usage.inputTokens,
+    outputTokens: finalResponse.usage.outputTokens,
+  });
+
+  return await finalizeLeadQualificationRun(supabase, executionId, route, {
+    status: "succeeded",
+    responseText: finalResponse.text,
+    inputTokens: totalInputTokens,
+    outputTokens: totalOutputTokens,
+    costUsd: totalCostUsd,
+    inputSummary: { ...inputSummary, tooling: toolingSummary },
+    toolResults: [toolResult],
+  });
+}
+
+/** A safe, generic response the AI Tool Registry / trust checks fall back
+ * to — distinct from (but equivalent in spirit to) GENERIC_FALLBACK_RESPONSE
+ * in agents/lead-qualification.ts, which covers the JSON-parsing fallback
+ * specifically. Kept as a separate local constant so this file doesn't
+ * need to import a name whose doc comment is about parsing, for a case
+ * that isn't about parsing (the schema-level allowlist defense above). */
+const GENERIC_FALLBACK_RESPONSE_LOCAL =
+  "Thanks for reaching out — let me gather a bit more information to help with your request.";
+
+/** Shared finalize+return helper for every Lead Qualification exit path
+ * that reaches a terminal ("succeeded"/"failed") status — keeps the
+ * "finalize the row, then build the matching AIRunResult" pairing in one
+ * place rather than repeated at each call site above. Not used for the
+ * "awaiting_approval" exit, which has its own small inline block (its
+ * AIRunResult shape differs enough — no error, a required responseText —
+ * that sharing this helper would need more branching than it saves). */
+async function finalizeLeadQualificationRun(
+  supabase: SupabaseClient,
+  executionId: string,
+  route: AIRouteDecision,
+  params: {
+    status: "succeeded" | "failed";
+    responseText?: string;
+    errorMessage?: string;
+    inputTokens: number;
+    outputTokens: number;
+    costUsd: number;
+    inputSummary: AIExecutionInputSummary;
+    toolResults?: AIToolExecutionResult[];
+  },
+): Promise<AIRunResult> {
+  const finalized = await finalizeExecution(supabase, executionId, {
+    agentKey: route.agentKey,
+    status: params.status,
+    error: params.errorMessage,
+    outputSummary: params.responseText !== undefined ? { responseText: params.responseText } : undefined,
+    inputTokens: params.inputTokens,
+    outputTokens: params.outputTokens,
+    costUsd: params.costUsd,
+    inputSummary: params.inputSummary,
+  });
+  if (!finalized) {
+    console.error(`[ai/orchestrator] lead_qualification execution ${executionId} (${params.status}) could not be finalized in the database.`);
+  }
+
+  return {
+    executionId,
+    status: params.status === "succeeded" ? "completed" : "failed",
+    agentKey: route.agentKey,
+    responseText: params.responseText,
+    error: params.errorMessage,
+    toolResults: params.toolResults,
+  };
+}
+
 // ── agent_executions lifecycle ──────────────────────────────────────────
 
 /** Picks the single most specific entity to record as the execution's
@@ -437,7 +807,13 @@ async function createExecutionRow(
 
 type FinalizePatch = {
   agentKey: AIAgentKey;
-  status: "succeeded" | "failed";
+  /** AI-1J adds "awaiting_approval" — a real agent_executions.status
+   * value (see the Phase 9.6 migration's CHECK constraint), used only
+   * when a Lead Qualification tool call itself comes back
+   * approval_required. Matches the existing convention already
+   * established by agent-execute.ts (see finalizeExecution() below on
+   * completed_at). */
+  status: "succeeded" | "failed" | "awaiting_approval";
   error?: string;
   outputSummary?: Record<string, unknown>;
   inputTokens?: number;
@@ -449,11 +825,12 @@ type FinalizePatch = {
   inputSummary: AIExecutionInputSummary;
 };
 
-/** Updates the execution row to a terminal status. Never throws — a
- * failure here is logged and reported back via its boolean return so
- * callers can decide (per this task's EXECUTION FAILURE FINALIZATION
- * section) whether that changes what they return, without risking an
- * unhandled rejection on top of whatever already went wrong. */
+/** Updates the execution row to a terminal (or awaiting-approval) status.
+ * Never throws — a failure here is logged and reported back via its
+ * boolean return so callers can decide (per this task's EXECUTION
+ * FAILURE FINALIZATION section) whether that changes what they return,
+ * without risking an unhandled rejection on top of whatever already went
+ * wrong. */
 async function finalizeExecution(
   supabase: SupabaseClient,
   executionId: string,
@@ -462,7 +839,12 @@ async function finalizeExecution(
   const update: Record<string, unknown> = {
     agent_key: patch.agentKey,
     status: patch.status,
-    completed_at: new Date().toISOString(),
+    // Matches agent-execute.ts's own convention: an execution awaiting a
+    // human decision is not yet "completed" — completed_at stays null
+    // until the approval is acted on (a future phase's concern; AI-1J
+    // does not implement approval execution itself, see this file's
+    // AI-1J header addendum).
+    completed_at: patch.status === "awaiting_approval" ? null : new Date().toISOString(),
     input_summary: patch.inputSummary,
   };
   if (patch.error !== undefined) update.error = patch.error;
@@ -493,28 +875,7 @@ function buildModelRequest(
   event: AIChannelEvent,
 ): ModelRequest {
   const system = `${agentConfig.instructions}\n\nOrganization: ${context.organization.name}.`;
-
-  const contextLines: string[] = [];
-  if (context.contact) {
-    contextLines.push(`Contact: ${context.contact.name}${context.contact.phone ? ` (${context.contact.phone})` : ""}`);
-  }
-  if (context.lead) {
-    contextLines.push(
-      `Lead status: ${context.lead.status}${context.lead.source ? `, source: ${context.lead.source}` : ""}`,
-    );
-  }
-  if (context.project) {
-    contextLines.push(`Project: ${context.project.name} (${context.project.status})`);
-  }
-  if (context.conversation?.recentMessages?.length) {
-    // Already bounded by context-builder.ts's RECENT_MESSAGE_LIMIT (10) —
-    // formatted compactly as plain text lines, not a JSON dump.
-    const formatted = context.conversation.recentMessages
-      .map((m) => `${m.direction === "in" ? "Customer" : "Us"}: ${m.text}`)
-      .join("\n");
-    contextLines.push(`Recent conversation:\n${formatted}`);
-  }
-
+  const contextLines = buildContextLines(context);
   const inboundText = event.content.text?.trim() || "(no message text provided)";
 
   const userMessage = [

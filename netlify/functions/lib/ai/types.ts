@@ -238,6 +238,23 @@ export type AILeadSummary = {
   status: string;
   source?: string;
   score?: number;
+  /** The lead's own stored name snapshot (leads.name — a real, backfilled
+   * column; see 20260903_leads_add_name.sql), not derived from email or
+   * any external identifier. Populated even when no linked contact/
+   * contactId is available to the current run — the common case for a
+   * lead-only trusted context — so an agent can still greet the customer
+   * by name without requiring a separate contact lookup. */
+  name?: string;
+  /** From leads.estimated_value (a real numeric column). Added so an
+   * agent doesn't ask for budget that's already on file — see the AI-1J
+   * follow-up fix this field exists for. */
+  estimatedBudget?: number;
+  /** From leads.custom_fields->>'service' — the only place project type
+   * is currently stored (there is no dedicated leads column for it; see
+   * context-builder.ts's fetchLeadSummary for the extraction). Only this
+   * one string is ever surfaced — the rest of custom_fields is never
+   * read into this type. */
+  projectType?: string;
 };
 
 export type AIProjectSummary = {

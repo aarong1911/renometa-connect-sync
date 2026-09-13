@@ -267,15 +267,45 @@ export const handler: Handler = async (event) => {
     occurredAt: requestBody.event.occurredAt,
   };
 
+  // ── Autonomy level (TEMPORARY test-harness policy — AI-1J-B) ─────────
+  //
+  // AI-1G originally fixed this at 1 ("Recommend") for every request — "no
+  // tool execution regardless of this value, so the lowest safe level is
+  // sufficient." AI-1J broke that: Lead Qualification's add_internal_note
+  // (src/lib/agentic/action-registry.ts) has minimumAutonomyLevel 2, so
+  // action-executor.ts's own check (`autonomyLevel < action.minimumAutonomyLevel`)
+  // would unconditionally fail every attempt at level 1. AI-1J's first fix
+  // was a blanket bump to level 2 for every request — correct enough to
+  // prove the architecture, but not the permanent shape: it granted level
+  // 2 to plain Reception/internal traffic that has no business needing it.
+  //
+  // Inspected first, per this task's instruction, for a cleaner existing
+  // source before writing a heuristic: agent_instances.autonomy_level and
+  // src/lib/agentic/policies.ts's AgentPolicy.defaultAutonomyLevel both
+  // exist, but both are keyed to the LEGACY agent_definitions/
+  // agent_instances (AI Center v1) rows — the new architecture's agent
+  // keys ("reception"/"lead_qualification") have no corresponding
+  // agent_instances row and nothing in this file (or orchestrator.ts)
+  // reads either source today. There is no existing per-agent/org
+  // autonomy config wired to this endpoint to defer to yet.
+  //
+  // Smallest safe correction: derive the level from the validated,
+  // already-org-verified request shape itself, NEVER from a client-sent
+  // field (no `autonomyLevel` key exists anywhere in requestSchema — see
+  // this file's header). Only the narrow Lead Qualification Test shape
+  // (eventType "new_lead" WITH a leadId that has already passed
+  // verifyEntityBelongsToOrg() above) receives level 2; every other
+  // request — including plain Reception/manual_test traffic — keeps
+  // level 1. This is explicitly TEMPORARY test-harness policy, not a
+  // permanent architecture decision: it should be replaced once real
+  // agent/org permission configuration (versioned agent config, per the
+  // ai-center skill) becomes authoritative for autonomy level.
+  const isLeadQualificationTestRequest = requestBody.event.eventType === "new_lead" && !!requestBody.context?.leadId;
+  const autonomyLevel = isLeadQualificationTestRequest ? 2 : 1;
+
   // ── Construct AITrustedContext (server-owned values only) ───────────
   // actorType "user": this endpoint is authenticated-human-initiated
   // (the Test Console), matching agentic/types.ts's Actor shape exactly.
-  // autonomyLevel is fixed at 1 ("Recommend" — the lowest defined level,
-  // per agentic/types.ts's AUTONOMY_LEVEL_LABELS), NEVER read from the
-  // request body: AI-1F performs no tool execution regardless of this
-  // value, so the lowest safe level is also sufficient — this is a
-  // temporary AI-1G choice, to be revisited once real orchestrated tool
-  // use needs a higher level deliberately granted per agent/org.
   const trustedContext: AITrustedContext = {
     orgId,
     actor: { actorType: "user", actorId: userId, source: "ai_orchestrate_http" },
@@ -284,7 +314,7 @@ export const handler: Handler = async (event) => {
     leadId: requestBody.context?.leadId,
     projectId: requestBody.context?.projectId,
     conversationKey: requestBody.context?.conversationKey,
-    autonomyLevel: 1,
+    autonomyLevel,
   };
 
   // ── Orchestrate ──────────────────────────────────────────────────────

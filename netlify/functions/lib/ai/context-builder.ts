@@ -180,6 +180,17 @@ async function fetchContactSummary(
 // here because it's a real, type-matching column and may be populated by
 // a future agent — callers must not treat `undefined`/null score as "cold"
 // or any other meaningful signal today.
+//
+// AI-1J follow-up (CRM-awareness fix): also selects `name`, `estimated_value`,
+// and `custom_fields` — confirmed real/live-queried columns via
+// src/lib/leads-store.ts's own mapRow() (`row.name`, `row.estimated_value`,
+// `row.custom_fields`). `job_type` is NOT selected: a repo-wide check found
+// it referenced only in run-agent.ts, and a migration comment
+// (20260903_leads_add_name.sql) explicitly documents that reference as a
+// bug — leads.job_type is not a real column. `custom_fields` is a jsonb
+// blob; only its `service` string (the sole place "project type" is
+// stored today) is ever extracted into AILeadSummary.projectType — the
+// rest of the blob is discarded, never forwarded.
 async function fetchLeadSummary(
   supabase: SupabaseClient,
   orgId: string,
@@ -187,7 +198,7 @@ async function fetchLeadSummary(
 ): Promise<AILeadSummary | undefined> {
   const { data, error } = await supabase
     .from("leads")
-    .select("id, status, source, score")
+    .select("id, status, source, score, name, estimated_value, custom_fields")
     .eq("id", leadId)
     .eq("org_id", orgId)
     .maybeSingle();
@@ -198,11 +209,26 @@ async function fetchLeadSummary(
   }
   if (!data) return undefined;
 
+  const rawBudget = data.estimated_value;
+  const estimatedBudget =
+    rawBudget !== null && rawBudget !== undefined && rawBudget !== "" && Number.isFinite(Number(rawBudget)) && Number(rawBudget) > 0
+      ? Number(rawBudget)
+      : undefined;
+
+  const customFields = (data.custom_fields ?? {}) as Record<string, unknown>;
+  const projectType =
+    typeof customFields.service === "string" && customFields.service.trim().length > 0
+      ? customFields.service.trim()
+      : undefined;
+
   return {
     id: data.id,
     status: data.status ?? "new",
     source: data.source ?? undefined,
     score: data.score ?? undefined,
+    name: data.name ?? undefined,
+    estimatedBudget,
+    projectType,
   };
 }
 

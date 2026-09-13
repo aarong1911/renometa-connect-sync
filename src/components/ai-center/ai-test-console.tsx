@@ -29,17 +29,46 @@
 // shape this console actually needs is tiny and stable (five fields), so
 // a small local mirror type is defined below instead — see
 // AITestConsoleResult.
+//
+// AI-1J-B ADDENDUM: added a second, deliberately narrow "Lead
+// Qualification" test mode alongside the original ("Reception") mode.
+// Lead Qualification mode requires a manually-pasted Test Lead ID (no
+// dropdown of production leads — see TestMode's own comment) and sends
+// `eventType: "new_lead"` + `context: { leadId }`; Reception mode is
+// byte-for-byte unchanged from AI-1H. Org ownership of the pasted lead id
+// is verified entirely server-side (ai-orchestrate.ts's
+// verifyEntityBelongsToOrg()) — this file never attempts that check
+// itself. AITestConsoleResult also gained an optional `toolResults`
+// field (name + outcome only, see its own comment) so a successful
+// tool-enabled run can show which tool ran — no backend contract change
+// was needed since AIRunResult already carries this.
 import { useState } from "react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { AlertCircle, Loader2, Send } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { supabase } from "@/lib/supabase";
 import { AIRunInspector } from "@/components/ai-center/ai-run-inspector";
+
+// AI-1J-B: two deliberately narrow test modes. "Lead Qualification" is a
+// TEST HARNESS for the tool-enabled flow added in AI-1J — not a general
+// lead selector. There is no dropdown of production leads here on
+// purpose: the tester must know and paste a specific, deliberately chosen
+// test lead id, never casually pick a real customer from a list.
+type TestMode = "reception" | "lead_qualification";
+
+// Simple structural check only — the backend (ai-orchestrate.ts's Zod
+// schema, then verifyEntityBelongsToOrg()) remains the sole source of
+// truth for whether this id is well-formed AND actually belongs to the
+// caller's org. This regex only prevents submitting something that isn't
+// shaped like a UUID at all.
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Mirrors the backend's content.text bound in netlify/functions/
 // ai-orchestrate.ts's eventSchema — kept in sync manually; a mismatch
@@ -57,15 +86,28 @@ const KNOWN_RUN_STATUSES: ReadonlySet<string> = new Set([
   "failed",
 ]);
 
+/** AI-1J-B: minimal, display-only mirror of one AIToolExecutionResult —
+ * name and outcome only. Deliberately excludes `output`/`error`/
+ * `approvalRequestId` from the real backend type: never surface raw
+ * arguments, note content, internal handler output, or any id beyond the
+ * execution id already shown elsewhere. */
+type AITestConsoleToolResult = {
+  toolName: string;
+  status: string;
+};
+
 /** Minimal local mirror of AIRunResult — only the fields this console
  * actually renders. See this file's header for why it isn't imported
- * from the server contract directly. */
+ * from the server contract directly. `toolResults` added in AI-1J-B, same
+ * narrow-mirror approach as every other field here — no backend contract
+ * change was needed since AIRunResult already carries this. */
 type AITestConsoleResult = {
   executionId: string;
   status: AITestConsoleRunStatus;
   agentKey: string;
   responseText?: string;
   error?: string;
+  toolResults?: AITestConsoleToolResult[];
 };
 
 function isAITestConsoleResult(value: unknown): value is AITestConsoleResult {
@@ -76,6 +118,54 @@ function isAITestConsoleResult(value: unknown): value is AITestConsoleResult {
     typeof v.status === "string" &&
     KNOWN_RUN_STATUSES.has(v.status) &&
     typeof v.agentKey === "string"
+  );
+}
+
+/** Picks only `toolName`/`status` off whatever the response's `toolResults`
+ * array actually contains — never trusts or forwards any other field
+ * (see AITestConsoleToolResult's own comment on what's deliberately
+ * excluded). Returns undefined rather than an empty array when there's
+ * nothing safe/present to show. */
+function extractSafeToolResults(value: unknown): AITestConsoleToolResult[] | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = (value as Record<string, unknown>).toolResults;
+  if (!Array.isArray(raw)) return undefined;
+
+  const results: AITestConsoleToolResult[] = [];
+  for (const item of raw) {
+    if (item && typeof item === "object") {
+      const toolName = (item as Record<string, unknown>).toolName;
+      const status = (item as Record<string, unknown>).status;
+      if (typeof toolName === "string" && typeof status === "string") {
+        results.push({ toolName, status });
+      }
+    }
+  }
+  return results.length > 0 ? results : undefined;
+}
+
+const TOOL_RESULT_STATUS_LABEL: Record<string, string> = {
+  completed: "Completed",
+  approval_required: "Awaiting approval",
+  denied: "Denied",
+  failed: "Failed",
+};
+
+function ToolResultBadge({ status }: { status: string }) {
+  const isSuccess = status === "completed";
+  const isFailed = status === "failed" || status === "denied";
+  return (
+    <Badge
+      variant="secondary"
+      className={cn(
+        "h-5 rounded px-1.5 text-[10px]",
+        isSuccess && "border border-success/30 bg-success/15 text-success",
+        isFailed && "border border-destructive/30 bg-destructive/15 text-destructive",
+        !isSuccess && !isFailed && "border border-warning/30 bg-warning/15 text-warning",
+      )}
+    >
+      {TOOL_RESULT_STATUS_LABEL[status] ?? status}
+    </Badge>
   );
 }
 
@@ -120,6 +210,8 @@ function formatAgentKey(key: string): string {
 }
 
 export function AITestConsole() {
+  const [testMode, setTestMode] = useState<TestMode>("reception");
+  const [testLeadId, setTestLeadId] = useState("");
   const [message, setMessage] = useState("");
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<AITestConsoleResult | null>(null);
@@ -131,7 +223,14 @@ export function AITestConsole() {
   const [inspectorRefreshSignal, setInspectorRefreshSignal] = useState(0);
 
   const trimmedLength = message.trim().length;
-  const canRun = !running && trimmedLength > 0 && message.length <= MAX_MESSAGE_LENGTH;
+  const trimmedLeadId = testLeadId.trim();
+  const isLeadQualificationMode = testMode === "lead_qualification";
+  const isLeadIdShapeValid = UUID_SHAPE.test(trimmedLeadId);
+  const canRun =
+    !running &&
+    trimmedLength > 0 &&
+    message.length <= MAX_MESSAGE_LENGTH &&
+    (!isLeadQualificationMode || isLeadIdShapeValid);
 
   async function handleRun() {
     const text = message.trim();
@@ -149,18 +248,36 @@ export function AITestConsole() {
         return;
       }
 
+      // Reception keeps AI-1H's exact shape — no `context` field, so a
+      // Reception Test run is guaranteed to carry no customer-identifying
+      // data. Lead Qualification Test adds ONLY `context.leadId`; the
+      // endpoint (not this file) independently re-verifies that id
+      // belongs to the caller's org before it's ever used — see
+      // ai-orchestrate.ts's verifyEntityBelongsToOrg(). Neither branch
+      // ever sends orgId/organizationId/userId/actor/autonomyLevel/
+      // executionId/targetEntityId/targetEntityType — the endpoint owns
+      // all of that.
+      const requestBody = isLeadQualificationMode
+        ? {
+            event: {
+              channel: "internal",
+              eventType: "new_lead",
+              content: { type: "text", text },
+            },
+            context: { leadId: trimmedLeadId },
+          }
+        : {
+            event: {
+              channel: "internal",
+              eventType: "manual_test",
+              content: { type: "text", text },
+            },
+          };
+
       const res = await fetch("/.netlify/functions/ai-orchestrate", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
-        // No `context` field — every Test Console run omits contact/lead/
-        // project ids entirely, per AI-1H's safety boundary.
-        body: JSON.stringify({
-          event: {
-            channel: "internal",
-            eventType: "manual_test",
-            content: { type: "text", text },
-          },
-        }),
+        body: JSON.stringify(requestBody),
       });
 
       let body: unknown = null;
@@ -177,7 +294,7 @@ export function AITestConsole() {
       // Render that in the result panel (it's a real, informative
       // outcome), not as an opaque top-level error banner.
       if (isAITestConsoleResult(body)) {
-        setResult(body);
+        setResult({ ...body, toolResults: extractSafeToolResults(body) });
         setInspectorRefreshSignal((n) => n + 1);
         if (body.status === "failed") {
           toast.error("The AI test run failed.");
@@ -209,11 +326,28 @@ export function AITestConsole() {
         <Send className="h-4 w-4 shrink-0 text-violet-600 dark:text-violet-400" />
         <span className="text-sm font-semibold text-foreground">AI Test Console</span>
         <span className="text-xs text-muted-foreground">
-          Send a test message through the real AI Center runtime — Reception responds automatically.
+          Send a test message through the real AI Center runtime — {isLeadQualificationMode ? "Lead Qualification" : "Reception"} responds automatically.
         </span>
       </div>
 
       <Card className="space-y-3 p-4">
+        <div className="space-y-1.5">
+          <Label className="text-xs text-muted-foreground">Test Mode</Label>
+          <Tabs
+            value={testMode}
+            onValueChange={(v) => {
+              setTestMode(v as TestMode);
+              setResult(null);
+              setErrorMessage(null);
+            }}
+          >
+            <TabsList className="h-9">
+              <TabsTrigger value="reception" className="h-7 px-3 text-xs">Reception</TabsTrigger>
+              <TabsTrigger value="lead_qualification" className="h-7 px-3 text-xs">Lead Qualification</TabsTrigger>
+            </TabsList>
+          </Tabs>
+        </div>
+
         <div className="flex flex-wrap gap-5">
           <div>
             <Label className="text-xs text-muted-foreground">Channel</Label>
@@ -224,10 +358,31 @@ export function AITestConsole() {
           <div>
             <Label className="text-xs text-muted-foreground">Event type</Label>
             <div className="mt-1">
-              <Badge variant="outline" className="h-6 rounded px-2 text-xs">Manual test</Badge>
+              <Badge variant="outline" className="h-6 rounded px-2 text-xs">
+                {isLeadQualificationMode ? "New lead" : "Manual test"}
+              </Badge>
             </div>
           </div>
         </div>
+
+        {isLeadQualificationMode && (
+          <div className="space-y-1.5">
+            <Label htmlFor="ai-test-console-lead-id" className="text-xs">Test Lead ID</Label>
+            <Input
+              id="ai-test-console-lead-id"
+              value={testLeadId}
+              onChange={(e) => setTestLeadId(e.target.value)}
+              placeholder="00000000-0000-0000-0000-000000000000"
+              className={cn("h-9 font-mono text-xs", trimmedLeadId.length > 0 && !isLeadIdShapeValid && "border-destructive")}
+            />
+            {trimmedLeadId.length > 0 && !isLeadIdShapeValid && (
+              <p className="text-[11px] text-destructive">This doesn't look like a valid UUID.</p>
+            )}
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              Use only a designated test lead. This mode can read the lead and may add an internal CRM note.
+            </p>
+          </div>
+        )}
 
         <div className="space-y-1.5">
           <Label htmlFor="ai-test-console-message" className="text-xs">Message</Label>
@@ -236,7 +391,11 @@ export function AITestConsole() {
             value={message}
             onChange={(e) => setMessage(e.target.value)}
             maxLength={MAX_MESSAGE_LENGTH}
-            placeholder="Example: I need help remodeling my kitchen."
+            placeholder={
+              isLeadQualificationMode
+                ? "Example: I'm interested in remodeling my kitchen and replacing the cabinets and countertops."
+                : "Example: I need help remodeling my kitchen."
+            }
             className="min-h-28 text-sm"
           />
           <div className="flex justify-end text-[10.5px] text-muted-foreground">
@@ -245,7 +404,9 @@ export function AITestConsole() {
         </div>
 
         <div className="rounded-md border border-border bg-secondary/30 px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
-          Test runs use the live AI runtime and are recorded in AI Center activity. No customer message will be sent.
+          {isLeadQualificationMode
+            ? "This uses the live AI runtime. The agent may read this lead and may add one internal note. No customer message will be sent."
+            : "Test runs use the live AI runtime and are recorded in AI Center activity. No customer message will be sent."}
         </div>
 
         <div className="flex items-center gap-2">
@@ -280,6 +441,23 @@ export function AITestConsole() {
               <div className="mt-0.5 truncate font-mono text-[11px]" title={result.executionId}>{result.executionId}</div>
             </div>
           </div>
+
+          {result.toolResults && result.toolResults.length > 0 && (
+            <div>
+              <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Tool Activity</div>
+              <div className="mt-1 space-y-1">
+                {result.toolResults.map((tool, i) => (
+                  <div
+                    key={`${tool.toolName}-${i}`}
+                    className="flex items-center justify-between rounded-md border border-border bg-secondary/30 px-2.5 py-1.5 text-xs"
+                  >
+                    <span className="font-medium capitalize">{tool.toolName.replace(/_/g, " ")}</span>
+                    <ToolResultBadge status={tool.status} />
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {result.responseText && (
             <div>
