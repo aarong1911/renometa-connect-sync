@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { AgenticPreviewPanel } from "@/components/ai-center/agentic-preview-panel";
+import { AITestConsole } from "@/components/ai-center/ai-test-console";
 import {
   Sheet,
   SheetContent,
@@ -56,6 +57,7 @@ import {
   AudioLines,
   WandSparkles,
   ShieldCheck,
+  FlaskConical,
   X as XIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -74,14 +76,14 @@ import {
 } from "@/lib/ai-center-store";
 import { isAgentConfigured } from "@/lib/agent-config";
 
-type TopTab = "agents" | "tools" | "voice" | "agentic";
+type TopTab = "agents" | "tools" | "voice" | "agentic" | "console";
 type AgentsSearchParams = AgentSearchParams & { tab?: TopTab };
 
 export const Route = createFileRoute("/ai-center")({
   validateSearch: (search: Record<string, unknown>): AgentsSearchParams => ({
     agentId: typeof search.agentId === "string" ? search.agentId : undefined,
     tab:
-      search.tab === "agents" || search.tab === "tools" || search.tab === "voice" || search.tab === "agentic"
+      search.tab === "agents" || search.tab === "tools" || search.tab === "voice" || search.tab === "agentic" || search.tab === "console"
         ? search.tab
         : undefined,
   }),
@@ -200,6 +202,7 @@ const TOP_TABS: { value: TopTab; label: string; icon: LucideIcon }[] = [
   { value: "tools", label: "AI Tools", icon: WandSparkles },
   { value: "voice", label: "Voice Agent", icon: AudioLines },
   { value: "agentic", label: "Agentic (Beta)", icon: ShieldCheck },
+  { value: "console", label: "Test Console", icon: FlaskConical },
 ];
 
 function AgentsPage() {
@@ -433,6 +436,10 @@ function AgentsPage() {
 
         <TabsContent value="agentic" className="mt-3">
           <AgenticPreviewPanel />
+        </TabsContent>
+
+        <TabsContent value="console" className="mt-3">
+          <AITestConsole />
         </TabsContent>
       </Tabs>
     </div>
