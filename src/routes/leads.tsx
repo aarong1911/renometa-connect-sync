@@ -1121,12 +1121,24 @@ function LeadsPage() {
     toast.success(`Exported ${selectedLeads.length} selected lead${selectedLeads.length === 1 ? "" : "s"}`);
   };
 
-  const dailySeries = useMemo(() => {
+  // KPI sparklines — all four cards previously shared this single array
+  // (leads created per day), so every card's line was identical in shape
+  // and only its stroke color differed. Each card now gets its own
+  // semantically correct series, all four built over the SAME 30 daily
+  // buckets so they stay visually comparable.
+  const leadTrend = useMemo(() => {
     const today = new Date();
-    return Array.from({ length: 30 }, (_, index) => {
+    today.setHours(0, 0, 0, 0);
+    const dayStarts = Array.from({ length: 30 }, (_, index) => {
       const day = new Date(today);
-      day.setHours(0, 0, 0, 0);
       day.setDate(today.getDate() - (29 - index));
+      return day;
+    });
+    const windowStart = dayStarts[0];
+
+    // New Leads — leads created during each day (unchanged from the
+    // original single series).
+    const newSeries = dayStarts.map((day) => {
       const nextDay = new Date(day);
       nextDay.setDate(day.getDate() + 1);
       return leads.filter((lead) => {
@@ -1134,6 +1146,49 @@ function LeadsPage() {
         return created >= day && created < nextDay;
       }).length;
     });
+
+    // Total Leads — cumulative lead count as of each day: leads created
+    // before the 30-day window, plus a running sum of that day's new
+    // leads. Real data, no fabricated points.
+    const createdBeforeWindow = leads.filter((lead) => new Date(lead.createdAt) < windowStart).length;
+    let running = createdBeforeWindow;
+    const totalSeries = newSeries.map((count) => (running += count));
+
+    // Hot Leads — leads.score has no historical/timestamped record: it's a
+    // live classification computed from the lead's CURRENT budget + status
+    // (classifyScore() in leads-store.ts), not stored per-day. There is no
+    // way to know how many leads WERE hot on a past day without fabricating
+    // data. Nearest truthful signal supported by the data model: for each
+    // day, how many of the leads created that day are classified hot right
+    // now (i.e. hot leads acquired per day, using today's classification).
+    const hotSeries = dayStarts.map((day) => {
+      const nextDay = new Date(day);
+      nextDay.setDate(day.getDate() + 1);
+      return leads.filter((lead) => {
+        const created = new Date(lead.createdAt);
+        return created >= day && created < nextDay && lead.score === "hot";
+      }).length;
+    });
+
+    // Converted — leads has no dedicated converted_at column. lastActivity
+    // (leads.updated_at) is stamped by every status-changing write,
+    // including the one that sets status to "converted" (see
+    // updateLeadStatus/bulkUpdateStatus in leads-store.ts), so it's the
+    // nearest truthful proxy for "when this lead converted" without
+    // inventing a timestamp the schema doesn't have. Limitation: a
+    // converted lead edited again afterward for an unrelated reason (e.g.
+    // reassignment) would shift its bucket later than its true conversion
+    // date.
+    const convertedSeries = dayStarts.map((day) => {
+      const nextDay = new Date(day);
+      nextDay.setDate(day.getDate() + 1);
+      return leads.filter((lead) => {
+        const changed = new Date(lead.lastActivity);
+        return changed >= day && changed < nextDay && lead.status === "converted";
+      }).length;
+    });
+
+    return { totalSeries, newSeries, hotSeries, convertedSeries };
   }, [leads]);
 
   return (
@@ -1167,10 +1222,10 @@ function LeadsPage() {
       <ImportHistoryDialog open={historyOpen} onOpenChange={setHistoryOpen} entityType="lead" />
 
       <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
-        <LeadMetricCard label="Total Leads" value={stats.total} icon={Users} tone="blue" series={dailySeries} />
-        <LeadMetricCard label="New Leads" value={stats.newCount} icon={Plus} tone="violet" series={dailySeries} />
-        <LeadMetricCard label="Hot Leads" value={stats.hot} icon={Flame} tone="red" series={dailySeries} />
-        <LeadMetricCard label="Converted" value={stats.converted} icon={CheckCircleIcon} tone="green" series={dailySeries} />
+        <LeadMetricCard label="Total Leads" value={stats.total} icon={Users} tone="blue" series={leadTrend.totalSeries} />
+        <LeadMetricCard label="New Leads" value={stats.newCount} icon={Plus} tone="violet" series={leadTrend.newSeries} />
+        <LeadMetricCard label="Hot Leads" value={stats.hot} icon={Flame} tone="red" series={leadTrend.hotSeries} />
+        <LeadMetricCard label="Converted" value={stats.converted} icon={CheckCircleIcon} tone="green" series={leadTrend.convertedSeries} />
       </div>
 
       <Card className="overflow-hidden">
