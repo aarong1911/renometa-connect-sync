@@ -39,6 +39,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { AlertCircle, Loader2, Send } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { supabase } from "@/lib/supabase";
+import { AIRunInspector } from "@/components/ai-center/ai-run-inspector";
 
 // Mirrors the backend's content.text bound in netlify/functions/
 // ai-orchestrate.ts's eventSchema — kept in sync manually; a mismatch
@@ -124,6 +125,10 @@ export function AITestConsole() {
   const [result, setResult] = useState<AITestConsoleResult | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [showDetails, setShowDetails] = useState(false);
+  // Bumped only when a real AIRunResult comes back (a new agent_executions
+  // row genuinely exists then) — never on a 400/401/network failure, where
+  // no row was created and refreshing the inspector would be pointless.
+  const [inspectorRefreshSignal, setInspectorRefreshSignal] = useState(0);
 
   const trimmedLength = message.trim().length;
   const canRun = !running && trimmedLength > 0 && message.length <= MAX_MESSAGE_LENGTH;
@@ -173,6 +178,7 @@ export function AITestConsole() {
       // outcome), not as an opaque top-level error banner.
       if (isAITestConsoleResult(body)) {
         setResult(body);
+        setInspectorRefreshSignal((n) => n + 1);
         if (body.status === "failed") {
           toast.error("The AI test run failed.");
         } else {
@@ -307,6 +313,8 @@ export function AITestConsole() {
           )}
         </Card>
       )}
+
+      <AIRunInspector refreshSignal={inspectorRefreshSignal} />
     </div>
   );
 }

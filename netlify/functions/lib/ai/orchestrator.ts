@@ -52,8 +52,10 @@ import { buildAIContext } from "./context-builder";
 import { routeAIEvent } from "./router";
 import type {
   AIAgentKey,
+  AIChannel,
   AIChannelEvent,
   AIResolvedContext,
+  AIRouteDecision,
   AIRunResult,
   AITrustedContext,
 } from "./types";
@@ -84,6 +86,28 @@ import type { ModelProvider, ModelRequest } from "./providers/model-provider";
 // clear existing write pattern" exists, "otherwise defer"), orchestration
 // timeline instrumentation is deferred rather than forced into either
 // table.
+//
+// AI-1I-A ADDENDUM (persistent observability): the reasoning above still
+// holds — this file still writes to exactly one table. What changed is
+// that `agent_executions.input_summary` (a real, NOT NULL, default-'{}'
+// jsonb column from the original Phase 9.6 migration, previously never
+// written by anything in this codebase — confirmed by a full-repo grep
+// before this addendum was written) is now used to persist a compact
+// routing + context-presence summary alongside the response summary
+// already stored in `output_summary`. This required NO migration: the
+// column already existed, sized and typed exactly for this purpose, and
+// nothing else in the codebase reads or writes it, so there was nothing
+// to reconcile. `agent_events` was reconsidered for a finer-grained
+// lifecycle trace (execution.started/context.built/route.selected/etc.)
+// and rejected again: a full-repo grep found `emitAgentEvent`/
+// `AgentEventType` referenced nowhere outside their own defining file
+// (events.ts) — so there is genuinely no consumer today, but there is
+// also no requirement in AI-1I-A's own stated GOAL that isn't already
+// satisfiable by a single execution row's input_summary/output_summary
+// plus its existing agent_key/status/started_at/completed_at/
+// input_tokens/output_tokens/cost_usd_estimated columns. Adding
+// lifecycle-event production now would be observability beyond what this
+// task's GOAL actually requires — deferred, not ruled out for later.
 
 /**
  * Placeholder value written to agent_executions.agent_key at INSERT time.
@@ -160,6 +184,65 @@ const SYSTEM_AGENTS: Partial<Record<AIAgentKey, SystemAgentConfig>> = {
   // "scheduling" intentionally has no entry — it must not run in AI-1F.
 };
 
+// ── Observability summaries (AI-1I-A) ────────────────────────────────────
+//
+// The shape of agent_executions.input_summary as written by this file.
+// This is NOT a shared cross-module contract — a future Run Inspector
+// reads this jsonb column directly via Supabase, not through a TS import
+// of this type — so it stays local to this file rather than being added
+// to ai/types.ts, per this task's "make the smallest changes necessary"
+// scope. Deliberately excludes anything privacy-sensitive: no raw
+// inbound text, no full contact/lead/project rows, no recent-message
+// bodies — only booleans/counts/short strings already safe to persist
+// (see this file's header and context-builder.ts's own scoping).
+
+/** Which context CLASSES were available, not their contents. */
+type AIContextPresenceSummary = {
+  organization: boolean;
+  contact: boolean;
+  lead: boolean;
+  project: boolean;
+  /** Count only — never the message text itself. */
+  recentMessageCount: number;
+};
+
+function summarizeContextPresence(context: AIResolvedContext): AIContextPresenceSummary {
+  return {
+    organization: !!context.organization,
+    contact: !!context.contact,
+    lead: !!context.lead,
+    project: !!context.project,
+    recentMessageCount: context.conversation?.recentMessages?.length ?? 0,
+  };
+}
+
+/** The routing decision, safe to persist in full — AIRouteDecision.reason
+ * is already a short, human-readable, non-sensitive string by contract
+ * (see router.ts), never raw event content. `agentKey` is intentionally
+ * repeated here even though it's also the row's top-level `agent_key`
+ * column — this keeps the persisted routing snapshot self-contained for
+ * a reader who only looks at input_summary. */
+type AIRouteSummary = {
+  agentKey: AIAgentKey;
+  source: AIRouteDecision["source"];
+  reason: string;
+  confidence?: number;
+};
+
+function summarizeRoute(route: AIRouteDecision): AIRouteSummary {
+  return { agentKey: route.agentKey, source: route.source, reason: route.reason, confidence: route.confidence };
+}
+
+/** Full shape written to agent_executions.input_summary. `route`/`context`
+ * are omitted (not merely empty) when execution failed before routing/
+ * context-building completed — an absent key means "never computed,"
+ * distinct from a context summary that computed to all-false. */
+type AIExecutionInputSummary = {
+  channel: AIChannel;
+  route?: AIRouteSummary;
+  context?: AIContextPresenceSummary;
+};
+
 export type OrchestrateAIParams = {
   /** Server-side (service-role or equivalent) Supabase client. */
   supabase: SupabaseClient;
@@ -217,10 +300,20 @@ export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunR
 
     const route = routeAIEvent(event, context);
 
+    // Computed once route+context both exist, reused by every finalize
+    // call below (including the failure branches) so a Run Inspector can
+    // later show "why did this land on Reception" even for a run that
+    // failed after routing succeeded.
+    const inputSummary: AIExecutionInputSummary = {
+      channel: event.channel,
+      route: summarizeRoute(route),
+      context: summarizeContextPresence(context),
+    };
+
     const agentConfig = SYSTEM_AGENTS[route.agentKey];
     if (!agentConfig) {
       const message = `Agent "${route.agentKey}" has no AI-1 runtime behavior yet.`;
-      await finalizeExecution(supabase, executionId, { agentKey: route.agentKey, status: "failed", error: message });
+      await finalizeExecution(supabase, executionId, { agentKey: route.agentKey, status: "failed", error: message, inputSummary });
       return { executionId, status: "failed", agentKey: route.agentKey, error: message };
     }
 
@@ -232,7 +325,7 @@ export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunR
     } catch (err) {
       console.error(`[ai/orchestrator] modelProvider.run failed (execution ${executionId}):`, err);
       const message = "The AI model could not generate a response.";
-      await finalizeExecution(supabase, executionId, { agentKey: route.agentKey, status: "failed", error: message });
+      await finalizeExecution(supabase, executionId, { agentKey: route.agentKey, status: "failed", error: message, inputSummary });
       return { executionId, status: "failed", agentKey: route.agentKey, error: message };
     }
 
@@ -257,6 +350,7 @@ export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunR
       inputTokens: modelResponse.usage.inputTokens,
       outputTokens: modelResponse.usage.outputTokens,
       costUsd,
+      inputSummary,
     });
     if (!finalized) {
       // A DB bookkeeping failure after a real model success does not
@@ -277,8 +371,15 @@ export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunR
   } catch (err) {
     console.error(`[ai/orchestrator] orchestrateAI failed unexpectedly (execution ${executionId}):`, err);
     const message = "AI Center could not process this event.";
+    // route/context are declared inside the inner try block above and are
+    // not in scope here — this branch is reached only when the failure
+    // happened before or during context building (e.g. buildAIContext()
+    // itself threw), so there is no route/context summary to persist yet.
+    // channel is always safe: `event` is a function parameter, in scope
+    // for this entire function.
+    const inputSummary: AIExecutionInputSummary = { channel: event.channel };
     try {
-      await finalizeExecution(supabase, executionId, { agentKey: UNROUTED_AGENT_KEY, status: "failed", error: message });
+      await finalizeExecution(supabase, executionId, { agentKey: UNROUTED_AGENT_KEY, status: "failed", error: message, inputSummary });
     } catch (finalizeErr) {
       console.error(`[ai/orchestrator] finalizeExecution ALSO failed after an earlier error (execution ${executionId}):`, finalizeErr);
     }
@@ -342,6 +443,10 @@ type FinalizePatch = {
   inputTokens?: number;
   outputTokens?: number;
   costUsd?: number;
+  /** Always provided by every call site (at minimum {channel}) — see
+   * AIExecutionInputSummary and orchestrateAI()'s own comments on why a
+   * partial summary is still written even on early failure. */
+  inputSummary: AIExecutionInputSummary;
 };
 
 /** Updates the execution row to a terminal status. Never throws — a
@@ -358,6 +463,7 @@ async function finalizeExecution(
     agent_key: patch.agentKey,
     status: patch.status,
     completed_at: new Date().toISOString(),
+    input_summary: patch.inputSummary,
   };
   if (patch.error !== undefined) update.error = patch.error;
   if (patch.outputSummary !== undefined) update.output_summary = patch.outputSummary;
