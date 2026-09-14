@@ -12,6 +12,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { AgenticPreviewPanel } from "@/components/ai-center/agentic-preview-panel";
 import { AITestConsole } from "@/components/ai-center/ai-test-console";
+import { AIEmergencyPauseControl } from "@/components/ai-center/ai-emergency-pause-control";
 import {
   Sheet,
   SheetContent,
@@ -315,19 +316,22 @@ function AgentsPage() {
         title="AI Center"
         subtitle="Manage autonomous agents, AI tools, voice agents, approvals, and execution activity."
         actions={
-          <span className="inline-flex h-7 items-center gap-1.5 rounded-full border border-success/30 bg-success/10 px-2.5 text-[11px] font-medium text-success">
-            <span className="relative flex h-1.5 w-1.5">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60" />
-              <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-success" />
+          <div className="flex items-center gap-2">
+            <span className="inline-flex h-7 items-center gap-1.5 rounded-full border border-success/30 bg-success/10 px-2.5 text-[11px] font-medium text-success">
+              <span className="relative flex h-1.5 w-1.5">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60" />
+                <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-success" />
+              </span>
+              {/* AI-H1.1 badge-audit fix — this counts agent_instances.is_enabled
+                  (Autonomous Agents only, via useAICenterAgents()); it never
+                  included Voice Agents or Agentic Beta. The unscoped "agent(s)
+                  live" wording read as an AI-Center-wide claim while only ever
+                  reflecting one subsystem — label it explicitly instead of
+                  fabricating a real cross-system total. */}
+              {loading ? "…" : `${stats.active} autonomous agent${stats.active === 1 ? "" : "s"} live`}
             </span>
-            {/* AI-H1.1 badge-audit fix — this counts agent_instances.is_enabled
-                (Autonomous Agents only, via useAICenterAgents()); it never
-                included Voice Agents or Agentic Beta. The unscoped "agent(s)
-                live" wording read as an AI-Center-wide claim while only ever
-                reflecting one subsystem — label it explicitly instead of
-                fabricating a real cross-system total. */}
-            {loading ? "…" : `${stats.active} autonomous agent${stats.active === 1 ? "" : "s"} live`}
-          </span>
+            <AIEmergencyPauseControl />
+          </div>
         }
       />
 
