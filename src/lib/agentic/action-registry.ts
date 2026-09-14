@@ -358,6 +358,11 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition<any, any>> = {
     timeoutMs: 15000,
     retryPolicy: DEFAULT_RETRY,
     isExecutable: false,
+    // AI-1L: identifies this as a real outbound send for centralized
+    // opt-out enforcement (action-executor.ts) — not currently reachable
+    // anyway (isExecutable: false), but tagged now so enforcement is
+    // already correct the moment this action ever becomes executable.
+    outboundChannel: "sms",
   },
   send_email: {
     key: "send_email",
@@ -373,6 +378,7 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition<any, any>> = {
     timeoutMs: 15000,
     retryPolicy: DEFAULT_RETRY,
     isExecutable: false,
+    outboundChannel: "email",
   },
 };
 

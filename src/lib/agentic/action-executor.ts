@@ -5,6 +5,7 @@
 // spec's "Core Architecture Principle"):
 //
 //   registered action → input validation → org/permission validation →
+//   EMERGENCY PAUSE → OPT-OUT/COMMUNICATION POLICY (AI-1L) →
 //   autonomy/approval decision → idempotency check → business operation →
 //   execution/audit log → usage recording → result
 //
@@ -12,13 +13,48 @@
 // client) only. It is deliberately NOT imported by any React component —
 // per the phase requirement "no action implementation inside React
 // components," UI code only ever calls the Netlify functions over HTTP.
-
+//
+// ── AI-1L: centralized emergencyPaused / enforceOptOut enforcement ──────
+//
+// The earlier repository audit found `AgentPolicy.emergencyPaused` and
+// `AgentPolicy.enforceOptOut` (src/lib/agentic/policies.ts) existed but
+// had zero readers anywhere in the codebase — confirmed by a full-repo
+// grep before this pass. This file is the single seam every AI-executed
+// action already passes through (executeAITool() -> executeStep() ->
+// handler, per netlify/functions/lib/ai/tools/registry.ts), so it is the
+// correct, and only, place to enforce these — never per-agent, never in
+// the orchestrator, never in individual handlers only.
+//
+// AI-1L CORRECTION PASS: the original AI-1L implementation accepted an
+// OPTIONAL `policy` field on ExecuteStepParams/executeApprovedStep, which
+// every real caller left unset — resolveAgentPolicy(undefined) was what
+// actually ran, so emergencyPaused had no way to ever be persisted or
+// engaged. Fixed by removing that optional field entirely: there is no
+// longer any parameter for a caller to pass a policy through (accidentally
+// or otherwise) — both executeStep() and executeApprovedStep() now call
+// resolveExecutionPolicy() (policy-resolver.ts) UNCONDITIONALLY,
+// themselves, using only the already-trusted `orgId`/`supabase` already
+// required for everything else in this file. See policy-resolver.ts's own
+// header for exactly where that policy is persisted today (an interim
+// location — no migration was created without first surfacing that
+// decision, per this task's explicit instruction) and its fail-safe
+// contract on lookup failure.
+//
+// This is still SERVER-OWNED ONLY: nothing in this file, or anywhere
+// upstream in AI Center (netlify/functions/lib/ai/orchestrator.ts,
+// ai-orchestrate.ts), reads emergencyPaused/enforceOptOut from a model,
+// request body, or tool argument — there is no field for either on
+// AIChannelEvent, AITrustedContext, or any AI Center Zod schema to even
+// carry one, and now not on ExecuteStepParams either.
 import type { SupabaseClient } from "@supabase/supabase-js";
-import type { Actor, AutonomyLevel, StepStatus, StepType } from "./types";
+import type { ActionDefinition, Actor, AutonomyLevel, StepStatus, StepType } from "./types";
 import { getActionDefinition } from "./action-registry";
 import { autonomyAllowsAutoExecution } from "./autonomy";
 import { createApprovalRequest } from "./approvals";
 import { recordUsageEvent } from "./usage";
+import type { AgentPolicy } from "./policies";
+import { resolveExecutionPolicy } from "./policy-resolver";
+import { splitByChannelEligibility, type AudienceContact } from "../marketing-audience";
 
 export type ExecuteStepParams = {
   supabase: SupabaseClient;
@@ -198,6 +234,119 @@ async function recordIdempotencyResult(supabase: SupabaseClient, orgId: string, 
   if (error) console.error("[action-executor] recordIdempotencyResult failed:", error);
 }
 
+// ── AI-1L: centralized policy checks ─────────────────────────────────────
+
+export type PolicyCheckResult = { allowed: true } | { allowed: false; reason: string };
+
+/** A pure read (riskLevel "read") is never blocked by an emergency pause —
+ * the pause exists to stop the agent from DOING things, not from
+ * answering what it already knows (per policies.ts's own comment:
+ * "Emergency stop... checked before every execution, independent of
+ * autonomy level"). Everything else (low/medium/high risk — i.e. any
+ * write or communication) is blocked. Uses the action's existing
+ * `riskLevel` metadata only — no action key is ever hard-coded here. */
+export function checkEmergencyPause(action: ActionDefinition<unknown, unknown>, policy: AgentPolicy): PolicyCheckResult {
+  if (!policy.emergencyPaused) return { allowed: true };
+  if (action.riskLevel === "read") return { allowed: true };
+  return {
+    allowed: false,
+    reason: "Blocked by emergency pause: autonomous actions are currently paused for this organization.",
+  };
+}
+
+/**
+ * Blocks outbound customer communication to a contact who has opted out,
+ * per the REAL consent data model (src/lib/marketing-audience.ts's
+ * `marketing_contact_preferences`-backed `splitByChannelEligibility()` —
+ * reused as-is here, not re-implemented, so AI-driven sends and bulk
+ * marketing sends can never silently diverge on what "eligible" means).
+ *
+ * Only applies to actions with `outboundChannel` set (see
+ * ActionDefinition's own comment) — internal/read/draft-only actions
+ * (get_lead_context, add_internal_note, draft_customer_reply) have no
+ * such field and always pass through unaffected.
+ *
+ * FAIL CLOSED in every uncertain case: no contactId in the validated
+ * input, a channel with no consent mechanism in this schema
+ * (whatsapp/messenger/instagram/voice — none exist today), a contact
+ * lookup that errors, or a contactId that doesn't resolve to a real
+ * contact IN THIS ORG all block the action rather than allowing it. A
+ * missing contact row is never distinguished from "belongs to a
+ * different org" in the returned reason, so this check can't be used to
+ * probe whether an id exists elsewhere.
+ */
+export async function checkOutboundConsent(
+  supabase: SupabaseClient,
+  orgId: string,
+  action: ActionDefinition<unknown, unknown>,
+  parsedInput: unknown,
+  policy: AgentPolicy,
+): Promise<PolicyCheckResult> {
+  if (!policy.enforceOptOut) return { allowed: true };
+
+  const channel = action.outboundChannel;
+  if (!channel) return { allowed: true }; // not an outbound-communication action at all
+
+  const SAFE_BLOCKED_REASON = "Could not verify recipient consent for this communication.";
+
+  // Genuine business input for every currently-registered outbound
+  // action (sendSmsInput/sendEmailInput both use `contactId`) — never
+  // read from anywhere else. If a future outbound action doesn't carry
+  // one, this fails closed rather than guessing another field name.
+  const contactId =
+    parsedInput && typeof parsedInput === "object" ? (parsedInput as Record<string, unknown>).contactId : undefined;
+  if (typeof contactId !== "string" || !contactId) {
+    return { allowed: false, reason: SAFE_BLOCKED_REASON };
+  }
+
+  if (channel !== "email" && channel !== "sms") {
+    // No consent mechanism exists anywhere in the current schema for
+    // whatsapp/messenger/instagram/voice — confirmed by repository audit
+    // before this pass. Fail closed rather than assuming safe or
+    // over-generalizing SMS/email opt-out onto a channel it was never
+    // designed for.
+    return { allowed: false, reason: SAFE_BLOCKED_REASON };
+  }
+
+  const [{ data: contactRow, error: contactError }, { data: prefRow, error: prefError }] = await Promise.all([
+    supabase.from("contacts").select("id, full_name, email, phone").eq("id", contactId).eq("org_id", orgId).maybeSingle(),
+    supabase
+      .from("marketing_contact_preferences")
+      .select("email_unsubscribed, email_suppressed, sms_status")
+      .eq("contact_id", contactId)
+      .eq("org_id", orgId)
+      .maybeSingle(),
+  ]);
+
+  if (contactError || prefError) {
+    console.error("[action-executor] checkOutboundConsent lookup failed:", contactError ?? prefError);
+    return { allowed: false, reason: SAFE_BLOCKED_REASON };
+  }
+  if (!contactRow) {
+    // Does not resolve to a real contact in THIS org — never trust a
+    // model-supplied id, and never reveal (via a different message)
+    // whether it belongs to another org.
+    return { allowed: false, reason: SAFE_BLOCKED_REASON };
+  }
+
+  const audienceContact: AudienceContact = {
+    id: contactRow.id,
+    full_name: contactRow.full_name ?? "Unknown",
+    email: contactRow.email ?? null,
+    phone: contactRow.phone ?? null,
+    email_unsubscribed: !!prefRow?.email_unsubscribed,
+    email_suppressed: !!prefRow?.email_suppressed,
+    sms_status: (prefRow?.sms_status as AudienceContact["sms_status"] | undefined) ?? "unknown",
+  };
+
+  const { eligible } = splitByChannelEligibility([audienceContact], channel);
+  if (eligible.length > 0) return { allowed: true };
+  return {
+    allowed: false,
+    reason: `Recipient is not eligible for ${channel} communication (opted out, suppressed, or missing contact info).`,
+  };
+}
+
 /**
  * Executes (or proposes) exactly one registered action as one execution
  * step. Never throws for an expected business-rule outcome (unknown
@@ -232,6 +381,33 @@ export async function executeStep(params: ExecuteStepParams): Promise<ExecuteSte
     await finishStep(supabase, stepId, { status: "failed", error: `Actor type '${actor.actorType}' is not permitted to invoke '${actionKey}'.` });
     return { stepId, status: "failed", error: "Actor type not permitted for this action." };
   }
+
+  // ── AI-1L: emergency pause + opt-out/communication policy ────────────
+  // Deliberately BEFORE the autonomy/approval decision below: a
+  // policy-forbidden communication must never generate an approval
+  // request (there is nothing for a human to usefully approve — the
+  // action is not allowed to run regardless of who signs off), and must
+  // never claim an idempotency slot (see the idempotency block further
+  // down — a policy-blocked attempt must not prevent a later allowed
+  // retry once the policy changes).
+  //
+  // Resolved fresh, unconditionally, from persisted org config — never
+  // from a caller-supplied value (see this file's header "AI-1L
+  // CORRECTION PASS" note and policy-resolver.ts).
+  const policy = await resolveExecutionPolicy({ supabase, orgId });
+
+  const pauseCheck = checkEmergencyPause(action, policy);
+  if (!pauseCheck.allowed) {
+    await finishStep(supabase, stepId, { status: "failed", error: pauseCheck.reason });
+    return { stepId, status: "failed", error: pauseCheck.reason };
+  }
+
+  const consentCheck = await checkOutboundConsent(supabase, orgId, action, parsedInput, policy);
+  if (!consentCheck.allowed) {
+    await finishStep(supabase, stepId, { status: "failed", error: consentCheck.reason });
+    return { stepId, status: "failed", error: consentCheck.reason };
+  }
+
   if (action.riskLevel === "prohibited") {
     await finishStep(supabase, stepId, { status: "failed", error: "This action is prohibited for autonomous/agent execution." });
     return { stepId, status: "failed", error: "Action is prohibited." };
@@ -351,6 +527,39 @@ export async function executeApprovedStep(params: {
   if (!action || !action.handler) {
     await finishStep(supabase, stepId, { status: "failed", error: "Action has no handler configured." });
     return { stepId, status: "failed", error: "Action has no handler configured." };
+  }
+
+  // ── AI-1L: emergency pause + opt-out/communication policy ────────────
+  // CRITICAL: resolved FRESH here, at execution time — never a value
+  // carried over from when the approval request was created. An approval
+  // can sit pending for an arbitrary amount of time; if emergency pause is
+  // engaged (or a contact opts out) after the approval was requested but
+  // before a human clicks "approve," this re-checks the CURRENT state
+  // right before the handler runs, so approval can never become a way to
+  // bypass a policy that's active right now. Same ordering rationale as
+  // executeStep() — before idempotency, so a policy-blocked approval
+  // attempt never consumes a slot that would block a later, allowed
+  // retry. `approvedInput` is parsed defensively here only to extract a
+  // contactId for the consent check; a parse failure here doesn't skip
+  // the check, it just means checkOutboundConsent() fails closed on "no
+  // contactId" — the try block below still re-parses properly and
+  // handles a genuine validation failure on its own terms.
+  const policy = await resolveExecutionPolicy({ supabase, orgId });
+  const pauseCheck = checkEmergencyPause(action, policy);
+  if (!pauseCheck.allowed) {
+    await finishStep(supabase, stepId, { status: "failed", error: pauseCheck.reason });
+    return { stepId, status: "failed", error: pauseCheck.reason };
+  }
+  let parsedForConsentCheck: unknown;
+  try {
+    parsedForConsentCheck = action.inputSchema.parse(approvedInput);
+  } catch {
+    parsedForConsentCheck = undefined;
+  }
+  const consentCheck = await checkOutboundConsent(supabase, orgId, action, parsedForConsentCheck, policy);
+  if (!consentCheck.allowed) {
+    await finishStep(supabase, stepId, { status: "failed", error: consentCheck.reason });
+    return { stepId, status: "failed", error: consentCheck.reason };
   }
 
   if (action.idempotent && params.idempotencyKey) {
