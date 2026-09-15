@@ -34,25 +34,23 @@
 
 import type { Handler, HandlerEvent } from '@netlify/functions';
 import { createClient } from '@supabase/supabase-js';
+import { resolveOrgAndAuthority } from './lib/resolve-org';
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-// Same org+authority resolution pattern already established in
-// agent-approve-action.ts — a user whose profile directly carries
-// organization_id is the account's own owner/creator; otherwise fall back
-// to org_memberships.role. Reused here rather than reinvented.
-async function resolveOrgAndAuthority(userId: string): Promise<{ orgId: string | null; isOwnerOrAdmin: boolean }> {
-  const { data: profile } = await supabase.from('profiles').select('organization_id').eq('id', userId).maybeSingle();
-  if (profile?.organization_id) {
-    return { orgId: profile.organization_id, isOwnerOrAdmin: true };
-  }
-  const { data: membership } = await supabase.from('org_memberships').select('org_id, role').eq('member_id', userId).maybeSingle();
-  if (!membership) return { orgId: null, isOwnerOrAdmin: false };
-  return { orgId: membership.org_id, isOwnerOrAdmin: membership.role === 'owner' || membership.role === 'admin' };
-}
+// AI-1M security completion pass: this used to carry its own inline
+// resolveOrgAndAuthority() that treated "profile.organization_id is set"
+// as proof of owner/admin authority. Live data proved that assumption
+// unsafe — profiles.organization_id is populated for every org member
+// (viewer, project_manager, etc.), not just the owner/creator — so that
+// shortcut granted call-log-deletion authority to any org member. Now
+// uses the canonical resolveOrgAndAuthority() from lib/resolve-org.ts,
+// which resolves authority from org_memberships.role exclusively
+// (falling back to profiles.role === "owner" only when no membership row
+// exists at all). See that file's header for the full rationale.
 
 export const handler: Handler = async (event: HandlerEvent) => {
   if (event.httpMethod !== 'POST' && event.httpMethod !== 'DELETE') {
@@ -70,9 +68,9 @@ export const handler: Handler = async (event: HandlerEvent) => {
     return { statusCode: 401, body: JSON.stringify({ error: 'Unauthorized' }) };
   }
 
-  const { orgId, isOwnerOrAdmin } = await resolveOrgAndAuthority(user.id);
+  const { orgId, isOwnerOrAdmin } = await resolveOrgAndAuthority(supabase, user.id);
   if (!orgId) {
-    return { statusCode: 401, body: JSON.stringify({ error: 'Unauthorized' }) };
+    return { statusCode: 403, body: JSON.stringify({ error: 'Could not resolve your organization.' }) };
   }
   if (!isOwnerOrAdmin) {
     return { statusCode: 403, body: JSON.stringify({ error: 'Only an organization owner or admin may delete call logs.' }) };
