@@ -135,6 +135,102 @@ export const addInternalNote: ActionHandler<AddInternalNoteInput, AddInternalNot
   return { ok: true, output: { noteId: data.id } };
 };
 
+type SendSmsInput = { contactId: string; body: string };
+type SendSmsOutput = { providerMessageId: string | null };
+
+/**
+ * AI-2A. The real handler behind the `send_sms` action — previously
+ * `isExecutable: false` with no handler (see action-registry.ts's own
+ * comment). Only reachable through the existing Gen-2 pipeline
+ * (executeStep()/executeApprovedStep() in action-executor.ts), which by
+ * this point has already: validated input against sendSmsInput (contactId
+ * + body only — no phone/orgId field exists on that schema for a model to
+ * supply), checked emergency pause, checked outbound consent
+ * (checkOutboundConsent() — SMS fails closed unless
+ * marketing_contact_preferences.sms_status === "eligible"), and — because
+ * send_sms.requiresApproval is unconditionally true — gone through a real
+ * human approval (agent-approve-action.ts, which itself is owner/admin-
+ * gated). This handler performs NO policy checks of its own; it trusts
+ * that executeStep()/executeApprovedStep() already ran them, exactly like
+ * every other handler in this file.
+ *
+ * Recipient binding: the destination phone number is ALWAYS resolved
+ * server-side from `input.contactId` (looked up in `contacts`, scoped to
+ * `ctx.orgId`) — there is no phone field on SendSmsInput for a model or
+ * caller to supply, so there is nothing to override even if one tried.
+ * Twilio credentials are read the same way send-inbox-message.ts already
+ * does (organizations.integration_settings.twilio, per-org) — no new
+ * credential-storage convention introduced.
+ */
+export const sendSms: ActionHandler<SendSmsInput, SendSmsOutput> = async (ctx, input) => {
+  const { data: contact, error: contactError } = await ctx.supabase
+    .from("contacts")
+    .select("id, phone")
+    .eq("id", input.contactId)
+    .eq("org_id", ctx.orgId)
+    .maybeSingle();
+  if (contactError) return { ok: false, error: "Could not load recipient contact." };
+  if (!contact?.phone) return { ok: false, error: "Recipient contact has no phone number on file." };
+
+  const { data: org, error: orgError } = await ctx.supabase
+    .from("organizations")
+    .select("integration_settings")
+    .eq("id", ctx.orgId)
+    .maybeSingle();
+  if (orgError) return { ok: false, error: "Could not load organization settings." };
+
+  const twilio = (org?.integration_settings as { twilio?: { accountSid?: string; authToken?: string; phoneNumber?: string } } | null)?.twilio;
+  if (!twilio?.accountSid || !twilio?.authToken || !twilio?.phoneNumber) {
+    return { ok: false, error: "Twilio is not configured for this organization." };
+  }
+
+  const toE164 = (raw: string): string => {
+    const digits = raw.replace(/\D/g, "");
+    if (digits.length === 10) return `+1${digits}`;
+    if (digits.length === 11 && digits[0] === "1") return `+${digits}`;
+    return raw.startsWith("+") ? raw : `+${digits}`;
+  };
+
+  const recipientPhone = contact.phone;
+  let providerMessageId: string | null = null;
+  try {
+    const auth = Buffer.from(`${twilio.accountSid}:${twilio.authToken}`).toString("base64");
+    const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${twilio.accountSid}/Messages.json`, {
+      method: "POST",
+      headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ From: toE164(twilio.phoneNumber), To: toE164(recipientPhone), Body: input.body }).toString(),
+    });
+    if (!res.ok) {
+      const errBody: any = await res.json().catch(() => ({}));
+      console.error("[agentic/handlers] sendSms Twilio send failed:", res.status, errBody?.code, errBody?.message);
+      return { ok: false, error: "Could not send the SMS." };
+    }
+    const twilioResult: any = await res.json().catch(() => ({}));
+    providerMessageId = twilioResult?.sid ?? null;
+  } catch (err) {
+    console.error("[agentic/handlers] sendSms Twilio send threw:", err);
+    return { ok: false, error: "Could not send the SMS." };
+  }
+
+  const { error: insertErr } = await ctx.supabase.from("sms_meta_messages").insert({
+    org_id: ctx.orgId,
+    contact_id: input.contactId,
+    channel: "sms",
+    direction: "out",
+    body: input.body,
+    from_address: recipientPhone,
+    provider_message_id: providerMessageId,
+  });
+  if (insertErr) {
+    // The send already succeeded — losing the local history row is a
+    // lesser problem than reporting a false failure (same tradeoff
+    // send-inbox-message.ts already makes for its own SMS persistence).
+    console.error("[agentic/handlers] sendSms sms_meta_messages insert failed:", insertErr.message);
+  }
+
+  return { ok: true, output: { providerMessageId } };
+};
+
 type DraftCustomerReplyInput = { leadId: string; tone: "friendly" | "formal" };
 type DraftCustomerReplyOutput = { draft: string; isStub: true };
 

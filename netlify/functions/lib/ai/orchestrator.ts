@@ -62,7 +62,7 @@ import type {
 } from "./types";
 import { createAnthropicProvider } from "./providers/anthropic";
 import type { ModelProvider, ModelRequest } from "./providers/model-provider";
-import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines } from "./prompting";
+import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines, channelGuidance } from "./prompting";
 import { executeAITool } from "./tools/registry";
 import type { AIToolExecutionResult } from "./tools/types";
 import {
@@ -1150,7 +1150,8 @@ function buildModelRequest(
   context: AIResolvedContext,
   event: AIChannelEvent,
 ): ModelRequest {
-  const system = `${agentConfig.instructions}\n\nOrganization: ${context.organization.name}.`;
+  const guidance = channelGuidance(context.channel);
+  const system = `${agentConfig.instructions}${guidance ? `\n\n${guidance}` : ""}\n\nOrganization: ${context.organization.name}.`;
   const contextLines = buildContextLines(context);
   const inboundText = event.content.text?.trim() || "(no message text provided)";
 

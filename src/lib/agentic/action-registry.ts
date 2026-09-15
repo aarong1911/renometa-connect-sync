@@ -27,7 +27,7 @@
 import { z } from "zod";
 import type { ActionDefinition } from "./types";
 import {
-  getLeadContext, createFollowUpTask, addInternalNote, draftCustomerReply,
+  getLeadContext, createFollowUpTask, addInternalNote, draftCustomerReply, sendSms,
 } from "./handlers";
 
 // ── Zod input schemas ────────────────────────────────────────────────────
@@ -347,7 +347,7 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition<any, any>> = {
   send_sms: {
     key: "send_sms",
     displayName: "Send SMS",
-    description: "Proposes sending a customer-facing SMS. Never auto-sent in Phase 9.6 — always requires approval regardless of autonomy level.",
+    description: "Proposes sending a customer-facing SMS. Never auto-sent — always requires approval regardless of autonomy level.",
     category: "communication",
     riskLevel: "high",
     supportedActorTypes: ["user", "agent", "workflow"],
@@ -357,11 +357,18 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition<any, any>> = {
     idempotent: true,
     timeoutMs: 15000,
     retryPolicy: DEFAULT_RETRY,
-    isExecutable: false,
+    // AI-2A: wired to a real handler (handlers.ts's sendSms) so an
+    // approved send_sms request actually sends, via the same Twilio REST
+    // pattern send-inbox-message.ts already uses. requiresApproval/
+    // minimumAutonomyLevel/riskLevel/supportedActorTypes/inputSchema are
+    // UNCHANGED from before this pass — this handler is only ever reached
+    // after executeStep()/executeApprovedStep()'s existing emergency-
+    // pause, outbound-consent, and (since requiresApproval is
+    // unconditional) human-approval gates have already run.
+    isExecutable: true,
+    handler: sendSms,
     // AI-1L: identifies this as a real outbound send for centralized
-    // opt-out enforcement (action-executor.ts) — not currently reachable
-    // anyway (isExecutable: false), but tagged now so enforcement is
-    // already correct the moment this action ever becomes executable.
+    // opt-out enforcement (action-executor.ts's checkOutboundConsent()).
     outboundChannel: "sms",
   },
   send_email: {

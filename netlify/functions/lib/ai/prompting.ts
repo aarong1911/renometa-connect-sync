@@ -11,7 +11,7 @@
 // Nothing here calls a model or touches Supabase — pure formatting and
 // constants only.
 
-import type { AIResolvedContext } from "./types";
+import type { AIChannel, AIResolvedContext } from "./types";
 
 /**
  * Temporary default model, unchanged since AI-1A/AI-1F — the exact alias
@@ -69,4 +69,18 @@ export function buildContextLines(context: AIResolvedContext): string[] {
   }
 
   return contextLines;
+}
+
+/**
+ * AI-2A. One short, optional line of channel-aware guidance — not a
+ * per-channel agent, not a hardcoded character limit (none exists in this
+ * product's behavior today; see this task's own instruction not to invent
+ * one). Empty string for every channel but sms, so every existing caller
+ * (voice/web_chat/manual_test/etc.) is byte-for-byte unaffected.
+ */
+export function channelGuidance(channel: AIChannel): string {
+  if (channel === "sms") {
+    return "This conversation is happening over SMS text message — keep your reply short, natural, and easy to read as a text (a sentence or two), not an email or a list.";
+  }
+  return "";
 }

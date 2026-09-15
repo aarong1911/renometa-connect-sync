@@ -38,9 +38,9 @@
 // for more than one action in a single decision.
 
 import { z } from "zod";
-import type { AIAgentHandoff, AIChannelEvent, AIResolvedContext } from "../types";
+import type { AIAgentHandoff, AIChannel, AIChannelEvent, AIResolvedContext } from "../types";
 import type { ModelRequest } from "../providers/model-provider";
-import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines } from "../prompting";
+import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines, channelGuidance } from "../prompting";
 
 // ── AI-1K: optional handoff continuity (see orchestrator.ts's "Reception
 // turn") ─────────────────────────────────────────────────────────────────
@@ -218,9 +218,11 @@ export function summarizeToolSuccess(tool: LeadQualificationToolDecision["tool"]
 
 // ── Prompt builders ───────────────────────────────────────────────────────
 
-function buildDecisionSystemInstructions(agentInstructions: string, organizationName: string): string {
+function buildDecisionSystemInstructions(agentInstructions: string, organizationName: string, channel: AIChannel): string {
+  const guidance = channelGuidance(channel);
   return [
     agentInstructions,
+    ...(guidance ? ["", guidance] : []),
     "",
     "You may optionally use ONE of the following tools, or simply respond directly — most turns should simply respond:",
     "- get_lead_context: re-reads the current lead's CRM record, if you need to confirm details beyond what's already provided below.",
@@ -249,7 +251,7 @@ export function buildLeadQualificationDecisionRequest(
   event: AIChannelEvent,
   handoff?: AIAgentHandoff,
 ): ModelRequest {
-  const baseSystem = buildDecisionSystemInstructions(agentInstructions, context.organization.name);
+  const baseSystem = buildDecisionSystemInstructions(agentInstructions, context.organization.name, context.channel);
   const system = handoff ? `${baseSystem}\n\n${HANDOFF_CONTINUITY_INSTRUCTION}` : baseSystem;
   const contextLines = buildContextLines(context);
   const inboundText = event.content.text?.trim() || "(no message text provided)";
@@ -279,8 +281,10 @@ export function buildLeadQualificationFinalRequest(
   toolResultSummary: string,
   handoff?: AIAgentHandoff,
 ): ModelRequest {
+  const guidance = channelGuidance(context.channel);
   const systemParts = [
     agentInstructions,
+    ...(guidance ? ["", guidance] : []),
     "",
     "You just completed an internal action. Do not mention internal tools, notes, or CRM systems to the customer — respond naturally based on what you now know.",
     `Organization: ${context.organization.name}.`,

@@ -28,17 +28,32 @@
 // Responds with empty TwiML so Twilio does not also fire its own
 // account-level auto-reply on top of this (both would otherwise send a
 // confirmation).
+//
+// AI-2A CORRECTION PASS: netlify/functions/ai-twilio-sms-inbound.ts is now
+// the canonical, signature-verified inbound SMS webhook — it processes
+// this exact same STOP handling (via lib/sms-compliance.ts, extracted
+// from this file so both call identical logic) BEFORE ever dispatching AI
+// orchestration, then continues to normal inbound persistence/AI dispatch
+// for non-compliance messages. This file is kept in place, UNCHANGED IN
+// BEHAVIOR (still no signature validation, still STOP-only, still no
+// general persistence), only for any Twilio number whose Console webhook
+// might still point here. New/repointed numbers should use
+// ai-twilio-sms-inbound.ts instead — see that file's own header. Not
+// deleted in this pass: no live organization currently has Twilio
+// configured at all (confirmed live before this pass), so nothing is
+// actually broken by leaving it as a working, backward-compatible target,
+// but it should be considered deprecated in favor of the canonical
+// endpoint and removed once confirmed nothing points at it.
 
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
+import { isStopKeyword, processStopKeyword } from "./lib/sms-compliance";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!,
   { auth: { autoRefreshToken: false, persistSession: false } },
 );
-
-const STOP_KEYWORDS = new Set(["stop", "stopall", "unsubscribe", "cancel", "end", "quit"]);
 
 const EMPTY_TWIML = { statusCode: 200, headers: { "Content-Type": "text/xml" }, body: "<Response></Response>" };
 
@@ -53,9 +68,9 @@ export const handler: Handler = async (event) => {
   const params = new URLSearchParams(event.body ?? "");
   const from = params.get("From");
   const to = params.get("To");
-  const body = (params.get("Body") ?? "").trim().toLowerCase();
+  const body = params.get("Body") ?? "";
 
-  if (!from || !to || !STOP_KEYWORDS.has(body)) {
+  if (!from || !to || !isStopKeyword(body)) {
     return EMPTY_TWIML;
   }
 
@@ -85,12 +100,7 @@ export const handler: Handler = async (event) => {
     const matchedContact = (contacts ?? []).find((c: any) => c.phone && normalizeDigits(c.phone) === fromDigits);
 
     if (matchedContact) {
-      await supabaseAdmin
-        .from("marketing_contact_preferences")
-        .upsert(
-          { org_id: owningOrg.id, contact_id: matchedContact.id, sms_status: "opted_out", sms_status_updated_at: new Date().toISOString() },
-          { onConflict: "contact_id" },
-        );
+      await processStopKeyword(supabaseAdmin, owningOrg.id, matchedContact.id);
     } else {
       console.warn("[marketing-sms-inbound] STOP from unknown number for org", owningOrg.id);
     }

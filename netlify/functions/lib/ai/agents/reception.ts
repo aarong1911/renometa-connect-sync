@@ -40,9 +40,9 @@
 // itself, not by a runtime counter.
 
 import { z } from "zod";
-import type { AIChannelEvent, AIResolvedContext } from "../types";
+import type { AIChannel, AIChannelEvent, AIResolvedContext } from "../types";
 import type { ModelRequest } from "../providers/model-provider";
-import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines } from "../prompting";
+import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines, channelGuidance } from "../prompting";
 
 // ── Handoff allowlist (AI-1K) ─────────────────────────────────────────────
 //
@@ -148,9 +148,11 @@ export function parseReceptionDecision(rawText: string): ParsedReceptionDecision
 
 // ── Prompt builder ─────────────────────────────────────────────────────────
 
-function buildDecisionSystemInstructions(agentInstructions: string, organizationName: string): string {
+function buildDecisionSystemInstructions(agentInstructions: string, organizationName: string, channel: AIChannel): string {
+  const guidance = channelGuidance(channel);
   return [
     agentInstructions,
+    ...(guidance ? ["", guidance] : []),
     "",
     "You may either respond directly, or hand this conversation off to Lead Qualification — a specialist on the same team who will continue naturally as part of the same business conversation (the customer will not be told about a hand-off).",
     "Hand off to Lead Qualification only when the customer is clearly presenting a potential project, job, or service opportunity for this business — e.g. a remodeling/renovation request, an estimate request, or a description of project scope, budget, timeline, or property work.",
@@ -177,7 +179,7 @@ export function buildReceptionDecisionRequest(
   context: AIResolvedContext,
   event: AIChannelEvent,
 ): ModelRequest {
-  const system = buildDecisionSystemInstructions(agentInstructions, context.organization.name);
+  const system = buildDecisionSystemInstructions(agentInstructions, context.organization.name, context.channel);
   const contextLines = buildContextLines(context);
   const inboundText = event.content.text?.trim() || "(no message text provided)";
 

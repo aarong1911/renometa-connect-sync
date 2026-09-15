@@ -72,6 +72,47 @@ export type ExecuteStepParams = {
   targetEntityId?: string;
   /** Human-readable one-liner for an approval request's `summary` column, if this step ends up requiring approval. */
   approvalSummary?: string;
+  /**
+   * AI-2A correction pass. Separates "this execution may autonomously
+   * execute actions up to its own autonomyLevel" from "trusted server
+   * code — never a model, never a request body — may PROPOSE a specific
+   * action for explicit human approval, without granting the calling
+   * execution's own autonomyLevel field elevated auto-execution power."
+   *
+   * ROOT CAUSE this fixes: the autonomy-floor check below
+   * (`autonomyLevel < action.minimumAutonomyLevel`) ran unconditionally,
+   * BEFORE the requiresApproval/approval-creation branch — so even an
+   * action that unconditionally requires human approval (e.g. send_sms,
+   * minimumAutonomyLevel 4) could never even reach "awaiting_approval"
+   * unless the CALLING EXECUTION already carried autonomyLevel >= 4. A
+   * channel adapter that only ever wants to propose one approval-gated
+   * action was forced to set its entire execution's autonomyLevel to 4,
+   * which would also (incorrectly) raise the ceiling for every OTHER
+   * action that execution might touch (e.g. a future auto-executing tool
+   * with a lower minimumAutonomyLevel).
+   *
+   * When `trustedProposal` is true AND `action.requiresApproval` is true,
+   * the autonomy-floor check below is skipped for THIS action only — the
+   * action still unconditionally lands in the approval-creation branch
+   * (needsApproval is already forced true by requiresApproval, regardless
+   * of autonomyLevel), it is never auto-executed, and every other check
+   * (input validation, actor-type, emergency pause, outbound consent,
+   * prohibited-risk) still runs exactly as before, in the same order. For
+   * any action where `requiresApproval` is false, this flag has NO
+   * effect — the normal autonomy floor still applies exactly as before,
+   * so it can never be used to widen auto-execution eligibility, only to
+   * reach the approval-creation branch for an already
+   * approval-mandatory action.
+   *
+   * There is no field on any Zod tool-input schema, AIChannelEvent,
+   * AITrustedContext, or HTTP request body that can set this — it is a
+   * TypeScript-only parameter on this function's params type, settable
+   * only by Netlify function code that imports executeStep() directly
+   * (e.g. a channel adapter proposing a reply). See
+   * ai-twilio-sms-orchestrate-background.ts for the one caller that uses
+   * it today.
+   */
+  trustedProposal?: boolean;
 };
 
 export type ExecuteStepResult = {
@@ -412,7 +453,13 @@ export async function executeStep(params: ExecuteStepParams): Promise<ExecuteSte
     await finishStep(supabase, stepId, { status: "failed", error: "This action is prohibited for autonomous/agent execution." });
     return { stepId, status: "failed", error: "Action is prohibited." };
   }
-  if (autonomyLevel < action.minimumAutonomyLevel) {
+  // AI-2A correction pass: `trustedProposal` (only ever set by trusted
+  // server code, never derived from a model/request — see this file's
+  // ExecuteStepParams doc comment) skips ONLY this floor check, and ONLY
+  // for an action that unconditionally requires approval — see that
+  // comment for the full reasoning.
+  const skipAutonomyFloorForTrustedProposal = params.trustedProposal === true && action.requiresApproval === true;
+  if (autonomyLevel < action.minimumAutonomyLevel && !skipAutonomyFloorForTrustedProposal) {
     await finishStep(supabase, stepId, { status: "failed", error: `Requires autonomy level ${action.minimumAutonomyLevel}, current is ${autonomyLevel}.` });
     return { stepId, status: "failed", error: "Autonomy level insufficient." };
   }

@@ -234,14 +234,21 @@ export function AIRunInspector({ refreshSignal }: { refreshSignal?: number }) {
       const { data: executionRows } = await supabase
         .from("agent_executions")
         .select("id, agent_key, status, started_at, completed_at, input_tokens, output_tokens, cost_usd_estimated, input_summary, output_summary, error, source")
-        // Scopes to the new AI Center HTTP runtime only (ai-orchestrate.ts
-        // sets actor.source = "ai_orchestrate_http" — see orchestrator.ts's
-        // createExecutionRow()). Without this, legacy/POC Gen-2 executions
-        // (e.g. agent-execute.ts's "contacts_or_leads_manual_run") would
-        // mix into this view. Historical rows from this same runtime still
-        // show even when input_summary is `{}` (predating AI-1I-A) — this
-        // filters by source, not by whether input_summary is populated.
-        .eq("source", "ai_orchestrate_http")
+        // Scopes to the new AI Center orchestrator runtime only (every
+        // trusted caller of orchestrateAI() sets a real actor.source — see
+        // orchestrator.ts's createExecutionRow()). Without this, legacy/POC
+        // Gen-2 executions (e.g. agent-execute.ts's
+        // "contacts_or_leads_manual_run") would mix into this view.
+        // Historical rows from this same runtime still show even when
+        // input_summary is `{}` (predating AI-1I-A) — this filters by
+        // source, not by whether input_summary is populated.
+        //
+        // AI-2A addition: "twilio_inbound_sms" is the real Twilio SMS
+        // channel adapter (ai-twilio-sms-orchestrate-background.ts) —
+        // added alongside the Test Console's "ai_orchestrate_http" rather
+        // than replacing it, so both real and test-console runs remain
+        // visible here.
+        .in("source", ["ai_orchestrate_http", "twilio_inbound_sms"])
         .eq("org_id", orgId)
         .order("created_at", { ascending: false })
         .limit(RECENT_EXECUTIONS_LIMIT);
