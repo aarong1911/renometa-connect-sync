@@ -24,6 +24,7 @@ import {
   postInvoiceIssued, postInvoicePaymentSucceeded, computeServerReconciliation,
   type InvoiceForPosting, type PaymentForPosting, type PostJournalEntryResult,
 } from "../lib/accounting";
+import { resolveOrgAndAuthority } from "./lib/resolve-org";
 
 const admin = createClient(
   process.env.SUPABASE_URL!,
@@ -33,18 +34,6 @@ const admin = createClient(
 
 function json(statusCode: number, body: Record<string, unknown>): HandlerResponse {
   return { statusCode, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }, body: JSON.stringify(body) };
-}
-
-// Same org+role resolution idiom as agent-approve-action.ts: a profile
-// carrying organization_id directly is that account's own owner/creator
-// (always authorized); otherwise only an org_memberships row with
-// role owner/admin is authorized. Never trusts a client-supplied org id.
-async function resolveOrgAndAuthority(userId: string): Promise<{ orgId: string | null; isOwnerOrAdmin: boolean }> {
-  const { data: profile } = await admin.from("profiles").select("organization_id").eq("id", userId).maybeSingle();
-  if (profile?.organization_id) return { orgId: profile.organization_id, isOwnerOrAdmin: true };
-  const { data: membership } = await admin.from("org_memberships").select("org_id, role").eq("member_id", userId).maybeSingle();
-  if (!membership) return { orgId: null, isOwnerOrAdmin: false };
-  return { orgId: membership.org_id, isOwnerOrAdmin: membership.role === "owner" || membership.role === "admin" };
 }
 
 const ISSUED_STATUSES = new Set(["sent", "viewed", "partial", "paid", "overdue"]);
@@ -210,7 +199,13 @@ export const handler: Handler = async (event: HandlerEvent): Promise<HandlerResp
   const { data: { user }, error: authError } = await admin.auth.getUser(token);
   if (authError || !user) return json(401, { error: "Invalid token" });
 
-  const { orgId, isOwnerOrAdmin } = await resolveOrgAndAuthority(user.id);
+  // Authorization cleanup pass: this used to carry its own inline
+  // resolveOrgAndAuthority() that treated "profile.organization_id is
+  // set" as proof of owner/admin authority — unsafe, since every org
+  // member (not just the owner) has that field populated. Now uses the
+  // canonical resolveOrgAndAuthority() from lib/resolve-org.ts, which
+  // resolves authority from org_memberships.role exclusively.
+  const { orgId, isOwnerOrAdmin } = await resolveOrgAndAuthority(admin, user.id);
   if (!orgId) return json(403, { error: "No organization was found for this user." });
   if (!isOwnerOrAdmin) return json(403, { error: "Only an organization owner or admin may perform accounting initialization." });
 

@@ -46,7 +46,7 @@ export async function resolveOrgFromBearerToken(
   return { userId: user.id, orgId };
 }
 
-export type ResolvedOrgAndAuthority = { orgId: string | null; isOwnerOrAdmin: boolean };
+export type ResolvedOrgAndAuthority = { orgId: string | null; isOwnerOrAdmin: boolean; role: string | null };
 
 // Server-side owner/admin resolution for AI Center's Emergency Pause
 // endpoint (ai-emergency-pause.ts). Deliberately does NOT reuse the
@@ -81,6 +81,14 @@ export type ResolvedOrgAndAuthority = { orgId: string | null; isOwnerOrAdmin: bo
 //
 // Never trusts a role/orgId supplied by the caller; both are derived from
 // the authenticated userId against server-side tables.
+//
+// `role` (added for the accounting-backfill.ts / remove-member.ts fix
+// pass) exposes the exact resolved role string (the fine-grained
+// org_memberships.role value, or the coarse profiles.role fallback when no
+// membership row exists) for callers that need a stricter check than
+// "owner or admin" — e.g. an owner-only action. `isOwnerOrAdmin` remains
+// the convenience field for the common case and is always consistent with
+// `role`.
 export async function resolveOrgAndAuthority(
   supabaseAdmin: SupabaseClient,
   userId: string,
@@ -100,7 +108,7 @@ export async function resolveOrgAndAuthority(
       .maybeSingle();
     orgId = membership?.org_id ?? null;
   }
-  if (!orgId) return { orgId: null, isOwnerOrAdmin: false };
+  if (!orgId) return { orgId: null, isOwnerOrAdmin: false, role: null };
 
   const { data: membershipRole } = await supabaseAdmin
     .from("org_memberships")
@@ -110,12 +118,14 @@ export async function resolveOrgAndAuthority(
     .maybeSingle();
 
   if (membershipRole?.role) {
-    return { orgId, isOwnerOrAdmin: membershipRole.role === "owner" || membershipRole.role === "admin" };
+    const role = membershipRole.role as string;
+    return { orgId, isOwnerOrAdmin: role === "owner" || role === "admin", role };
   }
 
   // No org_memberships row for this org — fall back to profiles.role's
   // coarse flag, fail-closed (only an exact 'owner' match authorizes).
-  return { orgId, isOwnerOrAdmin: profile?.role === "owner" };
+  const fallbackRole = profile?.role === "owner" ? "owner" : (profile?.role ?? null);
+  return { orgId, isOwnerOrAdmin: fallbackRole === "owner", role: fallbackRole };
 }
 
 // Re-confirms a user still belongs to a SPECIFIC org, server-side — for
