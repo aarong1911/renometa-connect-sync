@@ -38,6 +38,114 @@ function logCheckpoint(checkpoint: string, fields: Record<string, unknown>) {
   console.log(JSON.stringify({ checkpoint, debugVersion: DEBUG_VERSION, serviceRoleConfigured, ...fields }));
 }
 
+// ── AI-2B live-incident correction pass ──────────────────────────────────
+//
+// ROOT CAUSE of a real live bug: this file was originally written only
+// for create_follow_up_task (the one action AI-2B's predecessor phases
+// had wired end-to-end) and never generalized when send_sms became a
+// second real, executable, approval-required action:
+//
+//   1. idempotencyKey below was hardcoded to
+//      `action_key === "create_follow_up_task" ? ... : undefined` — for
+//      any OTHER action key (send_sms included), executeApprovedStep()
+//      received NO idempotency key at all, meaning its own
+//      claimIdempotencySlot()/recordIdempotencyResult() machinery
+//      (action-executor.ts, unmodified and correct) never ran for
+//      send_sms — a duplicate/retried approve click had NO protection
+//      against sending the SAME SMS twice via Twilio.
+//
+//   2. The "was this really a success" check further below required
+//      `realResult?.taskId` to be present — again, a create_follow_up_
+//      task-specific verification shape. A real, successful send_sms
+//      call (Twilio accepted it, a real provider_message_id was
+//      persisted to sms_meta_messages) returns `{providerMessageId}`,
+//      not `{taskId}` — so `taskId` was always undefined for send_sms,
+//      and this code WRONGLY marked a genuinely successful external SMS
+//      send as `agent_approval_requests.status = "failed"`. Confirmed
+//      live: a real approval (send_sms) whose SMS was verifiably
+//      delivered (a real Twilio MessageSid was persisted to
+//      sms_meta_messages) was shown as "Failed" in the Approvals UI
+//      because of this exact code path — not because anything about the
+//      send or the DB persistence actually failed.
+//
+// Both are fixed by generalizing per-action-key instead of hardcoding to
+// one action. create_follow_up_task's own behavior (idempotency key
+// shape, and its deliberately paranoid "must have a real taskId or it's
+// not a real success" check) is preserved BYTE-FOR-BYTE — only send_sms
+// (and, structurally, any future approval-required action) now gets its
+// own correct treatment instead of silently falling through
+// create_follow_up_task's assumptions.
+function idempotencyKeyFor(actionKey: string, approval: { target_entity_id?: string | null; requested_at: string; execution_id: string }): string | undefined {
+  if (actionKey === "create_follow_up_task") {
+    return `create_follow_up_task:v2:${approval.target_entity_id}:${new Date(approval.requested_at).toISOString().slice(0, 10)}`;
+  }
+  if (actionKey === "send_sms") {
+    // Matches the exact key the AI-2A/AI-2B Twilio channel adapter
+    // documents using (ai-twilio-sms-orchestrate-background.ts) — one
+    // send per execution, ever, regardless of how many times this
+    // endpoint is called for the same approval.
+    return `sms_reply:${approval.execution_id}`;
+  }
+  return undefined;
+}
+
+// ── Hardening pass: EXPLICIT per-action success verification ────────────
+//
+// The prior correction pass fixed the live send_sms bug with a single
+// "else" branch trusting execResult.status === "succeeded" alone for any
+// action other than create_follow_up_task. That is correct FOR SEND_SMS
+// TODAY (see its own case below), but as a general design it silently
+// verifies any future approval-required action the same way, without ever
+// requiring that action's own real proof-of-success field to exist. This
+// replaces that generic branch with an explicit allowlist: each known
+// action key states exactly which field on its handler's real output
+// counts as proof, and anything NOT explicitly listed here fails closed
+// — it is never marked "executed" merely because executeApprovedStep()
+// reported "succeeded". Adding a new approval-required, executable action
+// in the future requires adding its own case here deliberately; there is
+// no silent default that verifies it.
+type ActionVerification = { verified: true } | { verified: false; reason: string; publicError: string };
+
+function verifyActionSuccess(actionKey: string, realResult: Record<string, unknown> | undefined): ActionVerification {
+  if (actionKey === "create_follow_up_task") {
+    // UNCHANGED from before this pass: a "success" response is only ever
+    // built from a real, proven taskId, never from an assumption.
+    const taskId = realResult?.taskId;
+    if (typeof taskId === "string" && taskId.length > 0) return { verified: true };
+    return {
+      verified: false,
+      reason: "Handler completed without a verifiable task id.",
+      publicError: "Could not verify the task was created. Please try again.",
+    };
+  }
+
+  if (actionKey === "send_sms") {
+    // The Twilio MessageSid returned by handlers.ts's sendSms() — the
+    // same field persisted onto sms_meta_messages.provider_message_id.
+    // Its presence is the real proof Twilio accepted the message; a
+    // "succeeded" status with no id is treated as unverified, not
+    // trusted.
+    const providerMessageId = realResult?.providerMessageId;
+    if (typeof providerMessageId === "string" && providerMessageId.length > 0) return { verified: true };
+    return {
+      verified: false,
+      reason: "Handler completed without a verifiable Twilio message id.",
+      publicError: "Could not verify the message was sent. Please try again.",
+    };
+  }
+
+  // Unknown/future approval-required action key — fail closed. This
+  // endpoint must never mark an action "executed" without an explicit,
+  // action-specific verification rule above; a new action key needs its
+  // own case added here before approvals for it can ever succeed through
+  // this endpoint.
+  return {
+    verified: false,
+    reason: `No success-verification rule is configured for action key "${actionKey}".`,
+    publicError: "Could not verify this action completed. Please try again.",
+  };
+}
+
 // AI-1M security completion pass: this used to carry its own inline
 // resolveOrgAndAuthority() that treated "profile.organization_id is set"
 // as proof of owner/admin authority. Live data proved that assumption
@@ -124,10 +232,10 @@ export const handler: Handler = async (event) => {
     approvedInput: approval.proposed_input,
     // Re-derive the SAME idempotency key the original proposing step
     // would have used, so an approval can never execute the same
-    // underlying write twice even if this endpoint is called twice.
-    idempotencyKey: approval.action_key === "create_follow_up_task"
-      ? `create_follow_up_task:v2:${approval.target_entity_id}:${new Date(approval.requested_at).toISOString().slice(0, 10)}`
-      : undefined,
+    // underlying write (or, for send_sms, the same Twilio send) twice
+    // even if this endpoint is called twice — see idempotencyKeyFor()'s
+    // own header for the live bug this generalization fixes.
+    idempotencyKey: idempotencyKeyFor(approval.action_key, approval),
   });
 
   // Only mark the approval executed when the underlying write is actually
@@ -148,26 +256,28 @@ export const handler: Handler = async (event) => {
   const isDuplicateOfRealExecution = duplicateResult?.reason === "duplicate_suppressed";
 
   if (execResult.status === "succeeded" || isDuplicateOfRealExecution) {
-    const realResult = (isDuplicateOfRealExecution ? duplicateResult?.result : execResult.output) as { taskId?: string } | undefined;
-    const taskId = realResult?.taskId;
+    const realResult = (isDuplicateOfRealExecution ? duplicateResult?.result : execResult.output) as Record<string, unknown> | undefined;
+    const verification = verifyActionSuccess(approval.action_key, realResult);
 
-    // A "success" response is only ever built from a real, proven taskId —
-    // never from an assumption. If the handler's own output shape ever
-    // changes and stops including a taskId, this reports failure rather
-    // than a false success ("a response without a real id must not be
-    // treated as success").
-    if (!taskId) {
-      logCheckpoint("missing_task_id", { approvalId: reqBody.approvalId, executionId: approval.execution_id, stepId: approval.execution_step_id, status: execResult.status });
+    if (!verification.verified) {
+      logCheckpoint("verification_failed", {
+        approvalId: reqBody.approvalId, executionId: approval.execution_id, stepId: approval.execution_step_id,
+        actionKey: approval.action_key, status: execResult.status, reason: verification.reason,
+      });
       await supabaseAdmin.from("agent_approval_requests").update({ status: "failed" }).eq("id", reqBody.approvalId);
-      await supabaseAdmin.from("agent_executions").update({ status: "failed", error: "Handler completed without a verifiable task id.", completed_at: new Date().toISOString() }).eq("id", approval.execution_id).eq("status", "awaiting_approval");
-      return { statusCode: 200, headers, body: JSON.stringify({ success: false, status: "failed", error: "Could not verify the task was created. Please try again.", debugVersion: DEBUG_VERSION }) };
+      await supabaseAdmin.from("agent_executions").update({ status: "failed", error: verification.reason, completed_at: new Date().toISOString() }).eq("id", approval.execution_id).eq("status", "awaiting_approval");
+      return { statusCode: 200, headers, body: JSON.stringify({ success: false, status: "failed", error: verification.publicError, debugVersion: DEBUG_VERSION }) };
     }
 
-    logCheckpoint("task_insert_succeeded", { approvalId: reqBody.approvalId, executionId: approval.execution_id, stepId: approval.execution_step_id, taskId, alreadyExecuted: isDuplicateOfRealExecution });
+    logCheckpoint("action_verified", {
+      approvalId: reqBody.approvalId, executionId: approval.execution_id, stepId: approval.execution_step_id,
+      actionKey: approval.action_key, alreadyExecuted: isDuplicateOfRealExecution,
+    });
+
     await markApprovalExecuted(supabaseAdmin, reqBody.approvalId, orgId);
-    logCheckpoint("approval_marked_executed", { approvalId: reqBody.approvalId, executionId: approval.execution_id, taskId });
+    logCheckpoint("approval_marked_executed", { approvalId: reqBody.approvalId, executionId: approval.execution_id });
     await supabaseAdmin.from("agent_executions").update({ status: "succeeded", completed_at: new Date().toISOString() }).eq("id", approval.execution_id).eq("status", "awaiting_approval");
-    logCheckpoint("execution_finalized", { approvalId: reqBody.approvalId, executionId: approval.execution_id, stepId: approval.execution_step_id, taskId, status: "succeeded" });
+    logCheckpoint("execution_finalized", { approvalId: reqBody.approvalId, executionId: approval.execution_id, stepId: approval.execution_step_id, status: "succeeded" });
 
     return {
       statusCode: 200,
@@ -178,7 +288,12 @@ export const handler: Handler = async (event) => {
         approvalId: reqBody.approvalId,
         executionId: approval.execution_id,
         stepId: approval.execution_step_id,
-        taskId,
+        // Preserved for backward compatibility with any existing caller
+        // that reads body.taskId/body.providerMessageId directly —
+        // undefined for any other action key, exactly matching the
+        // explicit per-action verification above.
+        taskId: approval.action_key === "create_follow_up_task" && typeof realResult?.taskId === "string" ? realResult.taskId : undefined,
+        providerMessageId: approval.action_key === "send_sms" && typeof realResult?.providerMessageId === "string" ? realResult.providerMessageId : undefined,
         result: realResult,
         debugVersion: DEBUG_VERSION,
       }),

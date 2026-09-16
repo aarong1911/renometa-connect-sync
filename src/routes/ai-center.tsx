@@ -13,6 +13,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { AgenticPreviewPanel } from "@/components/ai-center/agentic-preview-panel";
 import { AITestConsole } from "@/components/ai-center/ai-test-console";
 import { AIEmergencyPauseControl } from "@/components/ai-center/ai-emergency-pause-control";
+import { AIApprovalsTab } from "@/components/ai-center/ai-approvals-tab";
+import { supabase } from "@/lib/supabase";
+import { useOrgId } from "@/lib/org-id";
 import {
   Sheet,
   SheetContent,
@@ -77,14 +80,14 @@ import {
 } from "@/lib/ai-center-store";
 import { isAgentConfigured } from "@/lib/agent-config";
 
-type TopTab = "agents" | "tools" | "voice" | "agentic" | "console";
+type TopTab = "agents" | "tools" | "voice" | "agentic" | "approvals" | "console";
 type AgentsSearchParams = AgentSearchParams & { tab?: TopTab };
 
 export const Route = createFileRoute("/ai-center")({
   validateSearch: (search: Record<string, unknown>): AgentsSearchParams => ({
     agentId: typeof search.agentId === "string" ? search.agentId : undefined,
     tab:
-      search.tab === "agents" || search.tab === "tools" || search.tab === "voice" || search.tab === "agentic" || search.tab === "console"
+      search.tab === "agents" || search.tab === "tools" || search.tab === "voice" || search.tab === "agentic" || search.tab === "approvals" || search.tab === "console"
         ? search.tab
         : undefined,
   }),
@@ -198,13 +201,25 @@ const CATEGORY_FILTER_LABEL: Record<"all" | AgentCategory, string> = {
 type StatusFilter = "all" | "active" | "paused";
 
 // ── Top-level tab config (Part 4) ───────────────────────────────────────────
+// AI-2B: "Approvals" placed after "Agentic (Beta)" and before "Test
+// Console" — it's a first-class operational tab (real pending human
+// decisions), not a beta/preview surface, so it belongs with the other
+// production tabs rather than folded into Agentic (Beta); Test Console
+// stays last since it's the "simulate/inspect" tool, not a queue an
+// operator needs day-to-day.
 const TOP_TABS: { value: TopTab; label: string; icon: LucideIcon }[] = [
   { value: "agents", label: "Autonomous Agents", icon: Bot },
   { value: "tools", label: "AI Tools", icon: WandSparkles },
   { value: "voice", label: "Voice Agent", icon: AudioLines },
   { value: "agentic", label: "Agentic (Beta)", icon: ShieldCheck },
+  { value: "approvals", label: "Approvals", icon: ClipboardList },
   { value: "console", label: "Test Console", icon: FlaskConical },
 ];
+
+// AI-2B: the first real live send_sms approval (AI-2A's first successful
+// end-to-end run) — surfaced with a highlight so it's easy to find for
+// manual review. One-off pointer; safe to remove once reviewed/decided.
+const FIRST_LIVE_APPROVAL_ID = "d3cb364c-aaba-43df-a21c-5f40220c7693";
 
 function AgentsPage() {
   const [query, setQuery] = useState("");
@@ -217,6 +232,27 @@ function AgentsPage() {
   const [selectedId, setSelectedId] = useState<string | null>(urlAgentId ?? null);
 
   const { instances, loading } = useAICenterAgents();
+
+  // AI-2B: pending-approval badge count for the Approvals tab trigger —
+  // needs to be visible even while a DIFFERENT tab is active, so it's
+  // fetched independently here (on org resolution and on every tab
+  // switch) rather than only relying on AIApprovalsTab having mounted.
+  // While the Approvals tab itself IS active, AIApprovalsTab's own
+  // onPendingCountChange callback keeps this same state fresh after every
+  // approve/reject/refresh without waiting for a tab switch.
+  const [pendingApprovalCount, setPendingApprovalCount] = useState(0);
+  const orgIdForApprovalsBadge = useOrgId();
+  useEffect(() => {
+    if (!orgIdForApprovalsBadge) return;
+    let cancelled = false;
+    supabase
+      .from("agent_approval_requests")
+      .select("id", { count: "exact", head: true })
+      .eq("org_id", orgIdForApprovalsBadge)
+      .eq("status", "pending")
+      .then(({ count }) => { if (!cancelled) setPendingApprovalCount(count ?? 0); });
+    return () => { cancelled = true; };
+  }, [orgIdForApprovalsBadge, topTab]);
 
   // Sync URL search params
   useEffect(() => { setSelectedId(urlAgentId ?? null); }, [urlAgentId]);
@@ -350,6 +386,11 @@ function AgentsPage() {
             >
               <t.icon className="h-4 w-4" />
               {t.label}
+              {t.value === "approvals" && pendingApprovalCount > 0 && (
+                <Badge variant="destructive" className="h-4.5 min-w-4.5 rounded-full px-1 text-[10px] leading-none">
+                  {pendingApprovalCount}
+                </Badge>
+              )}
             </TabsTrigger>
           ))}
         </TabsList>
@@ -440,6 +481,10 @@ function AgentsPage() {
 
         <TabsContent value="agentic" className="mt-3">
           <AgenticPreviewPanel />
+        </TabsContent>
+
+        <TabsContent value="approvals" className="mt-3">
+          <AIApprovalsTab onPendingCountChange={setPendingApprovalCount} liveApprovalId={FIRST_LIVE_APPROVAL_ID} />
         </TabsContent>
 
         <TabsContent value="console" className="mt-3">

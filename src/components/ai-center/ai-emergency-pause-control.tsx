@@ -115,20 +115,36 @@ export function AIEmergencyPauseControl() {
   return (
     <>
       <div className="flex flex-col items-end gap-1">
-        <button
-          type="button"
-          onClick={() => setConfirmOpen(true)}
-          disabled={saving}
+        {/* DOM-nesting fix: a <button> can never contain the shadcn/Radix
+            Switch, which renders its own <button role="switch"> — nested
+            buttons are invalid HTML and trigger a hydration warning. Using
+            a <label htmlFor> here instead of a <div> keeps the exact same
+            "click anywhere in the pill" UX (a label click natively
+            activates its associated control, and does nothing when that
+            control is disabled — the same behavior the old disabled
+            button had) while making the Switch itself the only real
+            interactive element, per the standard "switch is the control,
+            surrounding text/icon are presentation" pattern. Radix's
+            Switch is already a real, focusable, keyboard-operable button
+            under the hood, so no extra keyboard handling is needed. */}
+        <label
+          htmlFor="emergency-pause-switch"
           className={
             isPaused
-              ? "inline-flex h-7 items-center gap-1.5 rounded-full border border-destructive/40 bg-destructive/10 px-2.5 text-[11px] font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:opacity-60"
-              : "inline-flex h-7 items-center gap-1.5 rounded-full border border-border bg-secondary/60 px-2.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-secondary disabled:opacity-60"
+              ? "inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-full border border-destructive/40 bg-destructive/10 px-2.5 text-[11px] font-medium text-destructive transition-colors hover:bg-destructive/15 has-[button[disabled]]:cursor-not-allowed has-[button[disabled]]:opacity-60"
+              : "inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-full border border-border bg-secondary/60 px-2.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-secondary has-[button[disabled]]:cursor-not-allowed has-[button[disabled]]:opacity-60"
           }
         >
           {isPaused ? <AlertTriangle className="h-3 w-3" /> : <ShieldCheck className="h-3 w-3" />}
           {isPaused ? "AI Actions Paused" : "Emergency Pause: OFF"}
-          <Switch checked={isPaused} disabled={saving} className="ml-1 scale-75" />
-        </button>
+          <Switch
+            id="emergency-pause-switch"
+            checked={isPaused}
+            disabled={saving}
+            onCheckedChange={() => setConfirmOpen(true)}
+            className="ml-1 scale-75"
+          />
+        </label>
         <span className="max-w-[220px] text-right text-[10px] leading-snug text-muted-foreground">
           Emergency Pause blocks AI mutations and outbound actions. Read-only context and conversational responses remain available.
         </span>

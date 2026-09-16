@@ -243,6 +243,31 @@ export const handler: Handler = async (event) => {
 
   const result = await orchestrateAI({ supabase: supabaseAdmin, event: aiEvent, trustedContext });
 
+  // AI-2B addition: durable linkage from this inbound message to the
+  // execution it produced. Discovered while building the Approvals UI —
+  // nothing previously recorded which agent_executions row a given
+  // sms_meta_messages row led to, so there was no reliable way for the
+  // UI to show "the inbound message this approval is replying to"
+  // without an unreliable heuristic (e.g. matching by contact + nearest
+  // timestamp, which breaks if a second message arrives while the first
+  // approval is still pending). Fixed with the smallest possible
+  // addition — no migration needed, `meta` is already a flexible jsonb
+  // column on sms_meta_messages (AI-2A's own dedupe-claim already writes
+  // to it) — merging `execution_id` into the SAME row's `meta` alongside
+  // the existing `ai_dispatch_claimed_at` marker. The Approvals UI then
+  // looks up `sms_meta_messages` where `meta->>'execution_id'` equals the
+  // approval's own `execution_id` — an exact, non-heuristic match. Does
+  // not touch orchestrator.ts/action-executor.ts — this file already owns
+  // sms_meta_messages writes (see claimForAiDispatch() above).
+  {
+    const { error: linkErr } = await supabaseAdmin
+      .from("sms_meta_messages")
+      .update({ meta: { ai_dispatch_claimed_at: new Date().toISOString(), execution_id: result.executionId } })
+      .eq("id", inboundMessageId)
+      .eq("org_id", orgId);
+    if (linkErr) console.error("[ai-twilio-sms-orchestrate-background] could not link execution_id onto inbound message:", linkErr);
+  }
+
   if (result.status === "failed" || !result.responseText) {
     console.error("[ai-twilio-sms-orchestrate-background] AI run did not produce a response.", {
       executionId: result.executionId,
