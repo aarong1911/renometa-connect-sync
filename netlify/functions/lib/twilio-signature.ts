@@ -65,14 +65,49 @@ export function verifyTwilioSignature(
   }
 }
 
+/** First value of a possibly comma-separated forwarded-header (a chain of
+ * proxies appends its own value — the FIRST entry is the one closest to
+ * the original client/edge, which is the one that matters here), trimmed.
+ * Undefined/empty stays undefined. */
+function firstForwardedValue(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const first = raw.split(",")[0]?.trim();
+  return first || undefined;
+}
+
 /**
- * Reconstructs the request's own full URL from Netlify's HandlerEvent
- * fields — `event.rawUrl` (when present) is authoritative and used first;
- * otherwise falls back to the same x-forwarded-proto/x-forwarded-host/host
- * reconstruction already used by change-order-send.ts/estimate-send.ts.
- * IMPORTANT: this must byte-for-byte match the URL configured as the
- * number's webhook in the Twilio Console (including trailing slash and
- * query string) or every signature check will fail — see this file's
+ * Reconstructs the request's own EXTERNALLY-VISIBLE full URL — the one
+ * Twilio itself made the request to, which is what its signature was
+ * computed against.
+ *
+ * ORDER OF PREFERENCE (bug fix — see below): x-forwarded-proto +
+ * x-forwarded-host are checked FIRST, before event.rawUrl. A local
+ * `netlify dev` instance behind an HTTPS-terminating tunnel (ngrok, and
+ * anything shaped like it) receives the proxied request over plain HTTP
+ * on localhost — event.rawUrl in that case reflects the LOCAL leg
+ * (http://<tunnel-host>/...), even though the tunnel host itself is
+ * correct, because rawUrl's scheme comes from the connection Netlify's
+ * dev server actually terminated, not from the original external one.
+ * ngrok (like Netlify's own production edge, and any standards-following
+ * reverse proxy) sets x-forwarded-proto to the ORIGINAL external scheme
+ * (https) and x-forwarded-host to the ORIGINAL external host — those are
+ * the authoritative signal for what Twilio actually called, and must be
+ * preferred over rawUrl whenever both are present, not just used as a
+ * fallback. This fixes real production traffic identically to local
+ * tunneled traffic (Netlify's own edge always sets both headers too), and
+ * requires no ngrok-specific hostname/branching of any kind.
+ *
+ * rawUrl remains a fallback for a direct request with no forwarding
+ * headers at all (e.g. hitting the function directly with no proxy in
+ * front of it) — the same x-forwarded-proto/x-forwarded-host/host
+ * reconstruction pattern already used by change-order-send.ts/
+ * estimate-send.ts, generalized here to also cover rawUrl's own
+ * proto/host in the same order of preference rather than trusting it
+ * unconditionally.
+ *
+ * IMPORTANT: the result must byte-for-byte match the URL configured as
+ * the number's webhook in the Twilio Console (including trailing slash
+ * and query string) or every signature check will fail — see this file's
  * header.
  */
 export function reconstructRequestUrl(event: {
@@ -81,9 +116,24 @@ export function reconstructRequestUrl(event: {
   headers: Record<string, string | undefined>;
   rawQuery?: string;
 }): string {
+  const forwardedProto = firstForwardedValue(event.headers["x-forwarded-proto"]);
+  const forwardedHost = firstForwardedValue(event.headers["x-forwarded-host"]) ?? event.headers.host;
+
+  if (forwardedProto && forwardedHost) {
+    const query = event.rawQuery ? `?${event.rawQuery}` : "";
+    return `${forwardedProto}://${forwardedHost}${event.path}${query}`;
+  }
+
   if (event.rawUrl) return event.rawUrl;
-  const proto = event.headers["x-forwarded-proto"] ?? "https";
-  const host = event.headers["x-forwarded-host"] ?? event.headers.host ?? "";
+
+  // No forwarding signal and no rawUrl at all — last-resort
+  // reconstruction. "https" is the safe default (this is a webhook
+  // endpoint; a legitimate direct-HTTP local call with no forwarded
+  // headers and no rawUrl is not a realistic Twilio scenario), but never
+  // reached for any case this file was actually built to handle (a
+  // proxy/tunnel or Netlify's own edge, both of which set forwarded
+  // headers; or netlify dev, which always populates rawUrl).
+  const host = event.headers.host ?? "";
   const query = event.rawQuery ? `?${event.rawQuery}` : "";
-  return `${proto}://${host}${event.path}${query}`;
+  return `https://${host}${event.path}${query}`;
 }

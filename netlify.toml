@@ -10,6 +10,7 @@
 
 [functions]
   directory = "netlify/functions"
+  node_bundler = "esbuild"
 
 # Phase 14.1 Campaigns — durable batch worker for queued/scheduled campaign
 # sends. See netlify/functions/marketing-campaign-process-queue.ts for why
