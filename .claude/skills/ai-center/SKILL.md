@@ -56,6 +56,42 @@ All channels share the same:
 
 ---
 
+## Required supporting skills
+
+`ai-center` remains authoritative for AI Center architecture. These
+supporting skills govern their own specialty areas and must also be loaded
+when the work touches them:
+
+- For provider/webhook/channel work (Twilio, Vapi, Meta, email, or any
+  future provider): load and follow `channel-integrations`.
+- For consent/opt-out/STOP/START/HELP/email-unsubscribe/communication
+  policy work: load and follow `communications-compliance`.
+- For authenticated server endpoints, privileged actions, owner/admin
+  checks, tenant isolation, or org authority: load and follow
+  `server-authorization`.
+- For schema/migration work: load and follow the existing
+  `database-migrations` skill.
+
+**Hierarchy:** `ai-center` is authoritative for AI Center architecture;
+each supporting skill is authoritative for its own specialty. If a true
+conflict appears between this skill and a supporting one, stop and report
+it rather than silently picking one.
+
+## Cross-cutting AI Center rules
+
+- AI Center owns orchestration — channels/providers are transports.
+- Policy and permissions are server-owned, never trusted from client or
+  model input.
+- Compliance (opt-out, consent) is deterministic, never LLM-decided.
+- All external mutations flow through trusted action execution
+  (`executeStep()`/`executeApprovedStep()`), never a direct provider call
+  from orchestrator/agent/model code.
+- No model output or request payload can grant itself authority — org,
+  actor, autonomy, and approval state are always server-resolved.
+- Tenant isolation is mandatory at every read and write.
+
+---
+
 # Core Architecture
 
 The high-level runtime is:
