@@ -34,6 +34,7 @@
 // longer holds and must be re-verified, not assumed to still be true.
 
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { sendTwilioSms } from "../../../src/lib/agentic/sms-transport";
 
 export type SmsComplianceIntent = "stop" | "start" | "help" | null;
 
@@ -159,4 +160,153 @@ export async function processStartKeyword(
       { org_id: orgId, contact_id: contactId, sms_status: "eligible", sms_status_updated_at: new Date().toISOString() },
       { onConflict: "contact_id" },
     );
+}
+
+// ── AI-2C.1: deterministic HELP reply ────────────────────────────────────
+//
+// Sent ONLY when the org has explicitly configured
+// organizations.ai_center_settings.smsCompliance.helpReply (a plain-text,
+// operator-authored string — never inferred from org name/phone/website,
+// never composed by a model). Missing/empty configuration means HELP is
+// classified and kept out of AI (see classifySmsComplianceMessage()) but
+// no reply is sent — that is the deliberate default, not a bug.
+
+const HELP_REPLY_MAX_LENGTH = 1600; // matches sendSmsInput's own max (action-registry.ts) — the same SMS transport, same real limit.
+
+export type AICenterSmsComplianceSettings = { helpReply?: string };
+export type AICenterSettingsForCompliance = { smsCompliance?: AICenterSmsComplianceSettings; [key: string]: unknown };
+
+function parseAICenterSettings(value: unknown): AICenterSettingsForCompliance {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as AICenterSettingsForCompliance;
+  }
+  return {};
+}
+
+/** Loads the org's configured HELP reply text, or null if unset/blank. */
+export async function loadHelpReply(supabase: SupabaseClient, orgId: string): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("organizations")
+    .select("ai_center_settings")
+    .eq("id", orgId)
+    .maybeSingle();
+  if (error) {
+    console.error("[sms-compliance] loadHelpReply lookup failed:", error);
+    return null;
+  }
+  const settings = parseAICenterSettings(data?.ai_center_settings);
+  const reply = settings.smsCompliance?.helpReply;
+  return typeof reply === "string" && reply.trim().length > 0 ? reply.trim().slice(0, HELP_REPLY_MAX_LENGTH) : null;
+}
+
+/**
+ * HELP-specific consent check — DELIBERATELY NOT the same as
+ * checkOutboundConsent()/splitByChannelEligibility() (marketing-eligibility
+ * semantics, action-executor.ts / marketing-audience.ts). A HELP reply is
+ * a deterministic compliance/support response, not a marketing message —
+ * gating it behind marketing opt-in status would be backwards: a contact
+ * who has never opted into marketing SMS (`unknown`), or who has already
+ * opted out (`opted_out`) and is now asking HELP, is exactly who a
+ * compliance reply must still be able to reach. The one status that DOES
+ * block a HELP reply is `suppressed` — reserved for a future carrier-level
+ * undeliverable-number signal (see processStartKeyword()'s own comment);
+ * sending anything, including a compliance reply, to a number flagged
+ * undeliverable is a transport-safety concern, not a consent one, and is
+ * treated the same conservative way STOP/START already treat it (never
+ * overridden). No CRM contact at all (`contactId` null — an unmatched
+ * sender) is treated as "no known reason to block" — see this file's HELP
+ * sender for the full unmatched-sender reasoning.
+ */
+async function helpReplyBlockedBySuppression(supabase: SupabaseClient, contactId: string | null): Promise<boolean> {
+  if (!contactId) return false;
+  const { data } = await supabase.from("marketing_contact_preferences").select("sms_status").eq("contact_id", contactId).maybeSingle();
+  return data?.sms_status === "suppressed";
+}
+
+/**
+ * Atomically claims the inbound sms_meta_messages row for a HELP reply —
+ * the durable idempotency guard this task requires beyond the inbound
+ * MessageSid dedupe alone. The inbound insert's own unique index already
+ * prevents a genuine Twilio webhook retry from ever reaching this function
+ * a second time for the SAME delivery (a duplicate MessageSid insert
+ * fails with 23505 and returns before compliance handling ever runs) —
+ * this claim is the belt-and-suspenders guard against any OTHER path that
+ * could re-invoke this function for the same already-persisted row (e.g.
+ * infrastructure-level function retry), using the exact same conditional-
+ * UPDATE-with-meta pattern ai-twilio-sms-orchestrate-background.ts already
+ * uses for its own AI-dispatch claim. Reuses the same `meta` column —
+ * never collides with that AI-dispatch claim, since a given inbound row is
+ * either a compliance message (this claim) or a normal message (the AI
+ * claim), never both.
+ */
+async function claimForHelpReply(supabase: SupabaseClient, orgId: string, inboundMessageId: string): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("sms_meta_messages")
+    .update({ meta: { compliance_reply: "help", claimed_at: new Date().toISOString() } })
+    .eq("id", inboundMessageId)
+    .eq("org_id", orgId)
+    .is("meta", null)
+    .select("id");
+  if (error) {
+    console.error("[sms-compliance] claimForHelpReply failed:", error);
+    return false;
+  }
+  return (data ?? []).length > 0;
+}
+
+/**
+ * Sends the org's configured deterministic HELP reply, if any, and if not
+ * blocked by suppression — entirely outside AI (no model call, no
+ * orchestrator, no Gen-2 action/approval workflow; uses the shared
+ * low-level sendTwilioSms() transport directly, then persists the
+ * outbound row itself, mirroring handlers.ts's sendSms() persistence
+ * shape). Safe to call unconditionally from the HELP branch of an inbound
+ * webhook — every guard (missing config, suppression, duplicate claim,
+ * send failure) is internal and this function never throws.
+ */
+export async function sendHelpReplyIfConfigured(
+  supabase: SupabaseClient,
+  orgId: string,
+  inboundMessageId: string,
+  toPhone: string,
+  contactId: string | null,
+): Promise<void> {
+  const helpReply = await loadHelpReply(supabase, orgId);
+  if (!helpReply) {
+    console.log("[sms-compliance] HELP received but no helpReply is configured for org", orgId, "— no reply sent.");
+    return;
+  }
+
+  if (await helpReplyBlockedBySuppression(supabase, contactId)) {
+    console.log("[sms-compliance] HELP reply blocked — contact is suppressed, org", orgId);
+    return;
+  }
+
+  const claimed = await claimForHelpReply(supabase, orgId, inboundMessageId);
+  if (!claimed) {
+    console.log("[sms-compliance] HELP reply already claimed for inbound message", inboundMessageId, "— skipping duplicate send.");
+    return;
+  }
+
+  const sendResult = await sendTwilioSms(supabase, orgId, toPhone, helpReply);
+  if (!sendResult.ok) {
+    console.error("[sms-compliance] HELP reply send failed for org", orgId, ":", sendResult.error);
+    return;
+  }
+
+  const { error: insertErr } = await supabase.from("sms_meta_messages").insert({
+    org_id: orgId,
+    contact_id: contactId,
+    channel: "sms",
+    direction: "out",
+    body: helpReply,
+    from_address: toPhone,
+    provider_message_id: sendResult.providerMessageId,
+  });
+  if (insertErr) {
+    // The send already succeeded — losing the local history row is a
+    // lesser problem than reporting a false failure (same tradeoff
+    // handlers.ts's sendSms() already makes for its own persistence).
+    console.error("[sms-compliance] HELP reply sms_meta_messages insert failed:", insertErr.message);
+  }
 }

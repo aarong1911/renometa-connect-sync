@@ -18,6 +18,7 @@
 
 import type { ActionHandler } from "./types";
 import { createLeadLinkedTask } from "./lead-tasks";
+import { sendTwilioSms } from "./sms-transport";
 
 type LeadContextInput = { leadId: string };
 type LeadContextOutput = {
@@ -172,45 +173,14 @@ export const sendSms: ActionHandler<SendSmsInput, SendSmsOutput> = async (ctx, i
   if (contactError) return { ok: false, error: "Could not load recipient contact." };
   if (!contact?.phone) return { ok: false, error: "Recipient contact has no phone number on file." };
 
-  const { data: org, error: orgError } = await ctx.supabase
-    .from("organizations")
-    .select("integration_settings")
-    .eq("id", ctx.orgId)
-    .maybeSingle();
-  if (orgError) return { ok: false, error: "Could not load organization settings." };
-
-  const twilio = (org?.integration_settings as { twilio?: { accountSid?: string; authToken?: string; phoneNumber?: string } } | null)?.twilio;
-  if (!twilio?.accountSid || !twilio?.authToken || !twilio?.phoneNumber) {
-    return { ok: false, error: "Twilio is not configured for this organization." };
-  }
-
-  const toE164 = (raw: string): string => {
-    const digits = raw.replace(/\D/g, "");
-    if (digits.length === 10) return `+1${digits}`;
-    if (digits.length === 11 && digits[0] === "1") return `+${digits}`;
-    return raw.startsWith("+") ? raw : `+${digits}`;
-  };
-
   const recipientPhone = contact.phone;
-  let providerMessageId: string | null = null;
-  try {
-    const auth = Buffer.from(`${twilio.accountSid}:${twilio.authToken}`).toString("base64");
-    const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${twilio.accountSid}/Messages.json`, {
-      method: "POST",
-      headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ From: toE164(twilio.phoneNumber), To: toE164(recipientPhone), Body: input.body }).toString(),
-    });
-    if (!res.ok) {
-      const errBody: any = await res.json().catch(() => ({}));
-      console.error("[agentic/handlers] sendSms Twilio send failed:", res.status, errBody?.code, errBody?.message);
-      return { ok: false, error: "Could not send the SMS." };
-    }
-    const twilioResult: any = await res.json().catch(() => ({}));
-    providerMessageId = twilioResult?.sid ?? null;
-  } catch (err) {
-    console.error("[agentic/handlers] sendSms Twilio send threw:", err);
-    return { ok: false, error: "Could not send the SMS." };
-  }
+  // AI-2C.1: transport extracted to sms-transport.ts (shared with the
+  // deterministic HELP compliance reply) — this handler's own
+  // responsibility is now just contact resolution + persistence, exactly
+  // as before.
+  const sendResult = await sendTwilioSms(ctx.supabase, ctx.orgId, recipientPhone, input.body);
+  if (!sendResult.ok) return { ok: false, error: sendResult.error };
+  const providerMessageId = sendResult.providerMessageId;
 
   const { error: insertErr } = await ctx.supabase.from("sms_meta_messages").insert({
     org_id: ctx.orgId,

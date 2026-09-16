@@ -12,8 +12,13 @@
 // status filters, and an execution-detail drawer. Keeping both would mean
 // two competing approval UIs on the same page, which this task's own
 // architecture explicitly rules out ("do not create a second approval
-// system"). This panel now only holds the deterministic "Prepare
-// Follow-Up" proof of concept, which is unrelated to approvals display.
+// system").
+//
+// AI-2C.1: added the SMS Help Reply settings card (src/components/
+// ai-center/sms-compliance-settings.tsx) — this tab is AI Center's
+// existing catch-all for operational/compliance controls that don't fit
+// Autonomous Agents/AI Tools/Voice/Approvals/Test Console, so it's the
+// smallest appropriate home rather than a new top-level tab.
 
 import { useState } from "react";
 import { toast } from "sonner";
@@ -27,6 +32,7 @@ import { supabase } from "@/lib/supabase";
 import { useLeads } from "@/lib/leads-store";
 import { AUTONOMY_LEVEL_LABELS } from "@/lib/agentic/types";
 import { formatEstimatedCostUsd } from "@/lib/agentic/usage";
+import { SmsComplianceSettings } from "@/components/ai-center/sms-compliance-settings";
 
 async function authHeader(): Promise<Record<string, string>> {
   const { data: { session } } = await supabase.auth.getSession();
@@ -104,6 +110,8 @@ export function AgenticPreviewPanel() {
           </div>
         )}
       </Card>
+
+      <SmsComplianceSettings />
     </div>
   );
 }

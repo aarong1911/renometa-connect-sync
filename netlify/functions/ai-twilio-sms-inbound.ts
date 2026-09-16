@@ -51,8 +51,9 @@
 // centralized in lib/sms-compliance.ts's classifySmsComplianceMessage() —
 // see that file's header for the exact keyword sets and the evidence that
 // Twilio is not already intercepting these at the platform level for this
-// number. HELP is classified (and kept out of AI) but does not yet send a
-// deterministic reply — see the "help" branch below for why.
+// number. HELP sends a deterministic, org-configured reply (AI-2C.1) via
+// lib/sms-compliance.ts's sendHelpReplyIfConfigured() — still never
+// through AI.
 //
 // ── UNMATCHED CONTACT: NO AI DISPATCH AT ALL ─────────────────────────────
 //
@@ -101,7 +102,7 @@ import type { Handler, HandlerEvent } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { normalizePhone } from "../../src/lib/phone";
 import { verifyTwilioSignature, reconstructRequestUrl } from "./lib/twilio-signature";
-import { classifySmsComplianceMessage, processStopKeyword, processStartKeyword } from "./lib/sms-compliance";
+import { classifySmsComplianceMessage, processStopKeyword, processStartKeyword, sendHelpReplyIfConfigured } from "./lib/sms-compliance";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -300,20 +301,22 @@ export const handler: Handler = async (event: HandlerEvent) => {
     }
 
     if (complianceIntent === "help") {
-      // AI-2C: classification only. Deliberately NOT sending a
-      // deterministic HELP reply in this pass — there is no authoritative,
-      // per-org-configured SMS support/help text anywhere in the current
-      // schema (organizations.phone is general business contact info, not
-      // something any org has explicitly designated as an SMS compliance
-      // support line), and this task's own instruction is to stop rather
-      // than invent support contact info or compliance copy. The hard
-      // requirement — HELP must never reach the AI model or create an
-      // execution/approval — is fully satisfied by returning here. See
-      // the AI-2C report for the exact product/config decision needed
-      // before a real HELP reply can be added.
+      // AI-2C.1: sends the org's own explicitly-configured, plain-text
+      // helpReply (organizations.ai_center_settings.smsCompliance.
+      // helpReply) — entirely outside AI (no model, no orchestrator, no
+      // Gen-2 action/approval workflow; see lib/sms-compliance.ts's
+      // sendHelpReplyIfConfigured()). If nothing is configured, this is
+      // still a safe no-op (classified, persisted, no reply) — the AI-2C
+      // default behavior. Sent even for an unmatched sender (no CRM
+      // contact) — a HELP reply is fixed compliance/support text, not
+      // personalized or marketing content, so there is no CRM-identity or
+      // marketing-eligibility precondition for sending it; only
+      // `suppressed` (a deliverability signal, checked internally) blocks
+      // it. See this file's AI-2C.1 report for the full analysis.
       if (!contactId) {
         console.warn("[ai-twilio-sms-inbound] HELP from unmatched number for org", owningOrg.id);
       }
+      await sendHelpReplyIfConfigured(supabaseAdmin, owningOrg.id, inboundRow.id, from, contactId);
       return EMPTY_TWIML;
     }
 

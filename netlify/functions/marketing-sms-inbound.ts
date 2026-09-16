@@ -78,11 +78,18 @@ export const handler: Handler = async (event) => {
   const body = params.get("Body") ?? "";
   const complianceIntent = classifySmsComplianceMessage(body);
 
-  // HELP is deliberately not handled here — see ai-twilio-sms-inbound.ts's
-  // own "help" branch for why (no authoritative reply content exists
-  // yet). Ordinary messages are always a no-op in this legacy file (see
-  // this file's own header — it never had general inbound persistence or
-  // AI dispatch).
+  // AI-2C.1: HELP is deliberately STILL not handled here, even though the
+  // canonical endpoint now sends a real deterministic reply — this file
+  // has no signature validation (so a HELP-triggered send could be forged
+  // by anyone) and no general inbound persistence (so there is no
+  // inbound row to atomically claim for send idempotency, the same guard
+  // ai-twilio-sms-inbound.ts's HELP path relies on). Sending here would
+  // mean a HELP-family message could be sent, unverified and
+  // unprotected against duplicates, straight through Twilio — leaving
+  // this a compatibility no-op is the safe choice per this file's
+  // existing, deliberately narrow scope. Ordinary messages remain a
+  // no-op too (see this file's header — it never had general inbound
+  // persistence or AI dispatch).
   if (!from || !to || (complianceIntent !== "stop" && complianceIntent !== "start")) {
     return EMPTY_TWIML;
   }
