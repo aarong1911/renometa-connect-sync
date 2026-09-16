@@ -7,23 +7,24 @@
 // handling for Campaigns sends.
 //
 // Twilio POSTs application/x-www-form-urlencoded with `From`/`To`/`Body`.
-// This handler ONLY looks for the standard opt-out keywords (STOP,
-// STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT — Twilio's own default list) as
-// the entire message body and, on a match, sets sms_status = 'opted_out'
-// in marketing_contact_preferences (the dedicated service-role-owned
-// preference table — never a column on `contacts`, which ordinary
-// authenticated CRM edits can freely write to) for the contact matching
-// the sending phone number within the org that owns the receiving Twilio
-// number. Anything else is a no-op (this is not a general inbound-SMS-to-
-// Inbox pipeline — that would be a separate, larger feature).
+// This handler ONLY looks for STOP-family and START-family keywords (see
+// lib/sms-compliance.ts) as the entire message body and, on a match,
+// updates sms_status in marketing_contact_preferences (the dedicated
+// service-role-owned preference table — never a column on `contacts`,
+// which ordinary authenticated CRM edits can freely write to) for the
+// contact matching the sending phone number within the org that owns the
+// receiving Twilio number. Anything else (including HELP — see
+// ai-twilio-sms-inbound.ts) is a no-op (this is not a general
+// inbound-SMS-to-Inbox pipeline — that would be a separate, larger
+// feature).
 //
-// opted_out is terminal from THIS webhook's point of view: it only ever
-// sets opted_out, never clears it back to 'eligible'/'unknown'. An
-// opted-out contact must never become eligible again merely because their
-// phone number is later edited on the contacts row — eligibility can only
-// move forward again through the explicit trusted
-// marketing-contact-preferences-set.ts path, which itself refuses to
-// revert opted_out/suppressed (see that file).
+// 'suppressed' is never touched by either keyword family — see
+// lib/sms-compliance.ts's processStartKeyword() for why. 'opted_out' can
+// only move forward to 'eligible' through a real customer-initiated START
+// (this file, or ai-twilio-sms-inbound.ts) or the explicit trusted
+// marketing-contact-preferences-set.ts staff path — never implicitly
+// (e.g. merely editing a contact's phone number on the CRM record never
+// changes sms_status).
 //
 // Responds with empty TwiML so Twilio does not also fire its own
 // account-level auto-reply on top of this (both would otherwise send a
@@ -39,15 +40,21 @@
 // general persistence), only for any Twilio number whose Console webhook
 // might still point here. New/repointed numbers should use
 // ai-twilio-sms-inbound.ts instead — see that file's own header. Not
-// deleted in this pass: no live organization currently has Twilio
-// configured at all (confirmed live before this pass), so nothing is
-// actually broken by leaving it as a working, backward-compatible target,
-// but it should be considered deprecated in favor of the canonical
-// endpoint and removed once confirmed nothing points at it.
+// deleted in this pass: nothing is actually broken by leaving it as a
+// working, backward-compatible target, but it should be considered
+// deprecated in favor of the canonical endpoint and removed once confirmed
+// nothing points at it.
+//
+// AI-2C: updated to call the SAME classifySmsComplianceMessage()/
+// processStartKeyword() the canonical endpoint uses, so STOP/START
+// behavior cannot silently diverge between the two files — this file is
+// still deliberately narrower than the canonical one (no signature
+// validation, no HELP handling, no general inbound persistence, no AI
+// dispatch of any kind), matching its existing, documented scope.
 
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
-import { isStopKeyword, processStopKeyword } from "./lib/sms-compliance";
+import { classifySmsComplianceMessage, processStopKeyword, processStartKeyword } from "./lib/sms-compliance";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -69,8 +76,14 @@ export const handler: Handler = async (event) => {
   const from = params.get("From");
   const to = params.get("To");
   const body = params.get("Body") ?? "";
+  const complianceIntent = classifySmsComplianceMessage(body);
 
-  if (!from || !to || !isStopKeyword(body)) {
+  // HELP is deliberately not handled here — see ai-twilio-sms-inbound.ts's
+  // own "help" branch for why (no authoritative reply content exists
+  // yet). Ordinary messages are always a no-op in this legacy file (see
+  // this file's own header — it never had general inbound persistence or
+  // AI dispatch).
+  if (!from || !to || (complianceIntent !== "stop" && complianceIntent !== "start")) {
     return EMPTY_TWIML;
   }
 
@@ -100,9 +113,13 @@ export const handler: Handler = async (event) => {
     const matchedContact = (contacts ?? []).find((c: any) => c.phone && normalizeDigits(c.phone) === fromDigits);
 
     if (matchedContact) {
-      await processStopKeyword(supabaseAdmin, owningOrg.id, matchedContact.id);
+      if (complianceIntent === "stop") {
+        await processStopKeyword(supabaseAdmin, owningOrg.id, matchedContact.id);
+      } else {
+        await processStartKeyword(supabaseAdmin, owningOrg.id, matchedContact.id);
+      }
     } else {
-      console.warn("[marketing-sms-inbound] STOP from unknown number for org", owningOrg.id);
+      console.warn(`[marketing-sms-inbound] ${complianceIntent?.toUpperCase()} from unknown number for org`, owningOrg.id);
     }
   } catch (err: any) {
     console.error("[marketing-sms-inbound]", err.message);

@@ -14,14 +14,18 @@
 // Deliberately narrow and one-directional:
 //   - Only 'unknown' -> 'eligible' is permitted through this endpoint.
 //   - It can NEVER set 'opted_out' or 'suppressed' (those are exclusively
-//     owned by marketing-sms-inbound.ts's STOP handling / future carrier
+//     owned by the inbound SMS webhooks' STOP handling / future carrier
 //     suppression signals).
 //   - It can NEVER revert an existing 'opted_out'/'suppressed' contact
 //     back to 'eligible' or 'unknown' — once a contact has opted out, an
 //     ordinary staff action must not be able to silently undo that. A
-//     contact who wants back in must text back in through the carrier
-//     flow (Twilio's own START/UNSTOP handling on their platform), not
-//     through this app.
+//     contact who wants back in must text START/UNSTOP back to the
+//     number themselves — AI-2C confirmed no Twilio-platform-level
+//     Advanced Opt-Out is active for this account, so that re-subscribe
+//     is handled by THIS application's own inbound webhook
+//     (netlify/functions/lib/sms-compliance.ts's processStartKeyword(),
+//     called from ai-twilio-sms-inbound.ts), not by Twilio itself — never
+//     through this staff-facing endpoint.
 //
 // No browser code calls Supabase directly for this — marketing_contact_
 // preferences has no authenticated write grant at all (see the migration).

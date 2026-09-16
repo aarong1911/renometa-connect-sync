@@ -43,15 +43,16 @@
 //
 // ── COMPLIANCE KEYWORDS PROCESSED BEFORE AI, UNCONDITIONALLY ────────────
 //
-// A STOP-family message NEVER reaches AI dispatch — structurally, not
-// just by convention: the compliance-keyword branch below returns before
-// dispatchBackgroundOrchestration() is ever called, so there is no code
-// path from "message body is a STOP keyword" to "AI execution created" or
-// "send_sms approval proposed." Only Twilio's own default opt-out keyword
-// set is recognized (STOP/STOPALL/UNSUBSCRIBE/CANCEL/END/QUIT) — no
-// HELP/START/re-subscribe handling exists anywhere in this repo (verified
-// by a full-repo search before this pass), and none is invented here; see
-// this task's own report for that gap.
+// AI-2C: a STOP/START/HELP-family message NEVER reaches AI dispatch —
+// structurally, not just by convention: each compliance branch below
+// returns before dispatchBackgroundOrchestration() is ever called, so
+// there is no code path from a recognized compliance keyword to "AI
+// execution created" or "send_sms approval proposed." Classification is
+// centralized in lib/sms-compliance.ts's classifySmsComplianceMessage() —
+// see that file's header for the exact keyword sets and the evidence that
+// Twilio is not already intercepting these at the platform level for this
+// number. HELP is classified (and kept out of AI) but does not yet send a
+// deterministic reply — see the "help" branch below for why.
 //
 // ── UNMATCHED CONTACT: NO AI DISPATCH AT ALL ─────────────────────────────
 //
@@ -100,7 +101,7 @@ import type { Handler, HandlerEvent } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { normalizePhone } from "../../src/lib/phone";
 import { verifyTwilioSignature, reconstructRequestUrl } from "./lib/twilio-signature";
-import { isStopKeyword, processStopKeyword } from "./lib/sms-compliance";
+import { classifySmsComplianceMessage, processStopKeyword, processStartKeyword } from "./lib/sms-compliance";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -269,12 +270,49 @@ export const handler: Handler = async (event: HandlerEvent) => {
     }
 
     // ── Compliance keyword — processed BEFORE any AI dispatch, and
-    // structurally exclusive of it (see this file's header). ────────────
-    if (isStopKeyword(body)) {
+    // structurally exclusive of it (see this file's header). Covers
+    // STOP/START/HELP via one deterministic classifier
+    // (lib/sms-compliance.ts) — none of the three branches below ever
+    // calls dispatchBackgroundOrchestration(). ──────────────────────────
+    const complianceIntent = classifySmsComplianceMessage(body);
+
+    if (complianceIntent === "stop") {
       if (contactId) {
         await processStopKeyword(supabaseAdmin, owningOrg.id, contactId);
       } else {
-        console.warn("[ai-twilio-sms-inbound] STOP from unknown number for org", owningOrg.id);
+        console.warn("[ai-twilio-sms-inbound] STOP from unmatched number for org", owningOrg.id);
+      }
+      return EMPTY_TWIML;
+    }
+
+    if (complianceIntent === "start") {
+      if (contactId) {
+        await processStartKeyword(supabaseAdmin, owningOrg.id, contactId);
+      } else {
+        console.warn("[ai-twilio-sms-inbound] START from unmatched number for org", owningOrg.id);
+      }
+      // No confirmation SMS is sent — matches STOP's existing silent
+      // behavior in this app (no outbound reply for either). If a
+      // customer-facing confirmation is wanted later, it needs the same
+      // trusted-transport/persistence/idempotency treatment as any other
+      // outbound send — not added speculatively here.
+      return EMPTY_TWIML;
+    }
+
+    if (complianceIntent === "help") {
+      // AI-2C: classification only. Deliberately NOT sending a
+      // deterministic HELP reply in this pass — there is no authoritative,
+      // per-org-configured SMS support/help text anywhere in the current
+      // schema (organizations.phone is general business contact info, not
+      // something any org has explicitly designated as an SMS compliance
+      // support line), and this task's own instruction is to stop rather
+      // than invent support contact info or compliance copy. The hard
+      // requirement — HELP must never reach the AI model or create an
+      // execution/approval — is fully satisfied by returning here. See
+      // the AI-2C report for the exact product/config decision needed
+      // before a real HELP reply can be added.
+      if (!contactId) {
+        console.warn("[ai-twilio-sms-inbound] HELP from unmatched number for org", owningOrg.id);
       }
       return EMPTY_TWIML;
     }
