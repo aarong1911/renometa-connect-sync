@@ -19,6 +19,14 @@
 // existing catch-all for operational/compliance controls that don't fit
 // Autonomous Agents/AI Tools/Voice/Approvals/Test Console, so it's the
 // smallest appropriate home rather than a new top-level tab.
+//
+// AI-2D: added the AI SMS Replies mode card (src/components/ai-center/
+// sms-reply-mode-settings.tsx) — same placement reasoning. Also corrected
+// the top safety-summary strip below, which used to unconditionally claim
+// "No messages are sent automatically" — no longer universally true once
+// an org opts into AI-2D's automatic reply mode, so this now reflects
+// that AI SMS Replies has its own dedicated, explicit setting instead of
+// making a blanket claim this panel can no longer guarantee.
 
 import { useState } from "react";
 import { toast } from "sonner";
@@ -33,6 +41,7 @@ import { useLeads } from "@/lib/leads-store";
 import { AUTONOMY_LEVEL_LABELS } from "@/lib/agentic/types";
 import { formatEstimatedCostUsd } from "@/lib/agentic/usage";
 import { SmsComplianceSettings } from "@/components/ai-center/sms-compliance-settings";
+import { SmsReplyModeSettings } from "@/components/ai-center/sms-reply-mode-settings";
 
 async function authHeader(): Promise<Record<string, string>> {
   const { data: { session } } = await supabase.auth.getSession();
@@ -73,7 +82,7 @@ export function AgenticPreviewPanel() {
         <ShieldCheck className="h-4 w-4 shrink-0 text-violet-600 dark:text-violet-400" />
         <span className="text-sm font-semibold text-foreground">Agentic Beta</span>
         <Badge variant="outline" className="h-5 rounded text-[10px]">Autonomy: {AUTONOMY_LEVEL_LABELS[2]}</Badge>
-        <span className="text-xs text-muted-foreground">No messages are sent automatically.</span>
+        <span className="text-xs text-muted-foreground">Outbound messages require approval unless explicitly set to automatic below.</span>
       </div>
 
       {/* Prepare Follow-Up proof of concept */}
@@ -111,6 +120,7 @@ export function AgenticPreviewPanel() {
         )}
       </Card>
 
+      <SmsReplyModeSettings />
       <SmsComplianceSettings />
     </div>
   );

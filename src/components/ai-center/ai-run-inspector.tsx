@@ -26,6 +26,14 @@
 // by our own orchestrator, never by a customer or a model directly, but
 // older rows (from before AI-1I-A) may have `{}` in either column, so
 // every field is read optionally and rendered with a safe fallback.
+//
+// AI-2D: output_summary can also carry smsReplyMode/smsReplyStatus, a
+// small follow-up write ai-twilio-sms-orchestrate-background.ts makes
+// AFTER orchestrator.ts's own write to this column (read-merged, never
+// replacing responseText) — the smallest way to make "this reply
+// required human approval" vs "this reply was sent automatically"
+// visible here, without a new table, a step/approval list, or any other
+// redesign of this file.
 
 import { useCallback, useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
@@ -74,6 +82,15 @@ type RunInputSummary = {
 
 type RunOutputSummary = {
   responseText?: string;
+  /** AI-2D: stamped by a small follow-up update from
+   * ai-twilio-sms-orchestrate-background.ts, AFTER orchestrator.ts's own
+   * write of `{responseText}` to this same column — read-merged, never
+   * replaces responseText. Only present on twilio_inbound_sms executions
+   * that produced a reply; absent on every other execution (including
+   * older ones from before AI-2D), so both fields are read defensively
+   * below rather than assumed present. */
+  smsReplyMode?: string;
+  smsReplyStatus?: string;
 };
 
 function asRunInputSummary(value: unknown): RunInputSummary {
@@ -430,6 +447,21 @@ function ExecutionDetail({ row, usage }: { row: ExecutionRow; usage?: UsageInfo 
           <p className="whitespace-pre-wrap rounded-md border border-border bg-secondary/30 p-2.5 text-sm leading-relaxed">
             {output.responseText}
           </p>
+          {/* AI-2D: makes "required human approval" vs "sent automatically"
+           * visible here — the only place this execution's SMS reply
+           * outcome is shown, since this row has no step/approval list. */}
+          {output.smsReplyStatus === "awaiting_approval" && (
+            <Badge variant="outline" className="h-5 rounded text-[10px]">SMS reply awaiting approval</Badge>
+          )}
+          {output.smsReplyStatus === "succeeded" && output.smsReplyMode === "automatic" && (
+            <Badge variant="outline" className="h-5 rounded text-[10px]">SMS reply sent automatically</Badge>
+          )}
+          {output.smsReplyStatus === "succeeded" && output.smsReplyMode !== "automatic" && (
+            <Badge variant="outline" className="h-5 rounded text-[10px]">SMS reply sent (approved)</Badge>
+          )}
+          {output.smsReplyStatus === "failed" && (
+            <Badge variant="outline" className="h-5 rounded text-[10px]">SMS reply failed to send</Badge>
+          )}
         </div>
       )}
 

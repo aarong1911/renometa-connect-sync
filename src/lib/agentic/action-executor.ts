@@ -113,6 +113,33 @@ export type ExecuteStepParams = {
    * it today.
    */
   trustedProposal?: boolean;
+  /**
+   * AI-2D — Simple AI SMS Reply Mode. A SEPARATE, narrower mechanism from
+   * `trustedProposal` above: where `trustedProposal` only ever reaches the
+   * approval-creation branch, this one skips approval creation entirely
+   * and goes straight to execution — but ONLY for `actionKey ===
+   * "send_sms"` (checked inside this file, not left to caller discipline;
+   * see `isAutoApprovedReactiveSmsReply` below), and only when the caller
+   * has ALREADY verified two things before setting this flag: (1) the
+   * org's current AI SMS reply mode (organizations.ai_center_settings.
+   * smsReplies.mode, read FRESH right before this call — see
+   * lib/sms-reply-mode.ts) is "automatic", and (2) this specific send is a
+   * reply to a real, trusted, already-persisted inbound SMS — never a
+   * proactive send, campaign, follow-up, or any other outbound trigger.
+   * ai-twilio-sms-orchestrate-background.ts is the ONLY caller that sets
+   * this today, and it can only ever exist there because that whole code
+   * path only runs in response to a real inbound Twilio webhook delivery.
+   *
+   * Does NOT change `send_sms.requiresApproval` in action-registry.ts
+   * (still unconditionally `true` — a human-initiated or any other
+   * `send_sms` proposal still always requires approval). Does NOT skip
+   * emergency pause, outbound consent, input validation, actor-type
+   * checks, or idempotency — all of those run exactly as before, in the
+   * same order, for this path too. Never settable from a model, a tool
+   * argument, or an HTTP request body — this is a TypeScript-only
+   * parameter on this function's own params type.
+   */
+  autoApprovedSmsReply?: boolean;
 };
 
 export type ExecuteStepResult = {
@@ -453,12 +480,25 @@ export async function executeStep(params: ExecuteStepParams): Promise<ExecuteSte
     await finishStep(supabase, stepId, { status: "failed", error: "This action is prohibited for autonomous/agent execution." });
     return { stepId, status: "failed", error: "Action is prohibited." };
   }
+
+  // AI-2D — see this narrow flag's own doc comment on ExecuteStepParams.
+  // Structurally impossible to affect any action other than send_sms,
+  // regardless of what a caller passes — this `actionKey === "send_sms"`
+  // check lives HERE, inside the executor, not left to caller discipline.
+  const isAutoApprovedReactiveSmsReply = params.autoApprovedSmsReply === true && actionKey === "send_sms";
+
   // AI-2A correction pass: `trustedProposal` (only ever set by trusted
   // server code, never derived from a model/request — see this file's
   // ExecuteStepParams doc comment) skips ONLY this floor check, and ONLY
   // for an action that unconditionally requires approval — see that
-  // comment for the full reasoning.
-  const skipAutonomyFloorForTrustedProposal = params.trustedProposal === true && action.requiresApproval === true;
+  // comment for the full reasoning. AI-2D's auto-approved reactive SMS
+  // reply skips it too, for the same reason `trustedProposal` does (a
+  // trusted server decision, not a model/request-derived one) — it's
+  // about to skip the approval branch entirely below, so the floor check
+  // (whose only purpose is gating whether autonomy is high enough to be
+  // CONSIDERED for auto-execution/approval at all) would otherwise block
+  // it for no safety benefit.
+  const skipAutonomyFloorForTrustedProposal = (params.trustedProposal === true && action.requiresApproval === true) || isAutoApprovedReactiveSmsReply;
   if (autonomyLevel < action.minimumAutonomyLevel && !skipAutonomyFloorForTrustedProposal) {
     await finishStep(supabase, stepId, { status: "failed", error: `Requires autonomy level ${action.minimumAutonomyLevel}, current is ${autonomyLevel}.` });
     return { stepId, status: "failed", error: "Autonomy level insufficient." };
@@ -481,7 +521,15 @@ export async function executeStep(params: ExecuteStepParams): Promise<ExecuteSte
   // ever created. The write's idempotency key is now only ever claimed
   // immediately before a handler actually runs (see the Execute block
   // below, and executeApprovedStep()).
-  const needsApproval = action.requiresApproval || !autonomyAllowsAutoExecution(action, autonomyLevel);
+  //
+  // AI-2D: `isAutoApprovedReactiveSmsReply` forces needsApproval to false
+  // — this is the ONLY place send_sms.requiresApproval (still
+  // unconditionally true in action-registry.ts) is ever overridden, and
+  // only for this one verified, narrow path. No approval row is created;
+  // execution falls through to the SAME idempotency-claim + handler-call
+  // path every other auto-executing action already uses below — nothing
+  // about that path changes for this case.
+  const needsApproval = !isAutoApprovedReactiveSmsReply && (action.requiresApproval || !autonomyAllowsAutoExecution(action, autonomyLevel));
   if (needsApproval) {
     const { data: approval, error } = await createApprovalRequest(supabase, {
       orgId,

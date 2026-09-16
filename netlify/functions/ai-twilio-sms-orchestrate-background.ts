@@ -60,6 +60,7 @@ import { timingSafeEqual } from "node:crypto";
 import { orchestrateAI } from "./lib/ai/orchestrator";
 import type { AIChannelEvent, AITrustedContext } from "./lib/ai/types";
 import { executeStep } from "../../src/lib/agentic/action-executor";
+import { loadSmsReplyMode } from "./lib/sms-reply-mode";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -283,12 +284,31 @@ export const handler: Handler = async (event) => {
   // Gen-2 pipeline every other AI Center action uses: input-schema
   // validation, emergency pause, outbound consent
   // (marketing_contact_preferences.sms_status === "eligible" only), and —
-  // because send_sms.requiresApproval is unconditionally true — a real
-  // human approval via agent-approve-action.ts (owner/admin-gated) before
+  // unless AI-2D's automatic mode applies (see below) — a real human
+  // approval via agent-approve-action.ts (owner/admin-gated) before
   // handlers.ts's sendSms() ever calls Twilio. This call does NOT send
-  // anything itself. `trustedProposal: true` is what lets this reach the
-  // approval-creation branch at EXECUTION_AUTONOMY_LEVEL (2) instead of
-  // send_sms's own minimumAutonomyLevel (4) — see the comment above.
+  // anything itself.
+  //
+  // AI-2D — Simple AI SMS Reply Mode: read FRESH here, AFTER
+  // orchestrateAI() (and therefore every model call it made) has already
+  // completed — never before, and never cached from the top of this
+  // function. This is what makes the "policy race" safe: if the model
+  // took several seconds to generate a reply and the owner switched the
+  // mode back to "review" during that window, this read sees the CURRENT
+  // value and correctly falls back to a normal approval request, not the
+  // value that was true when generation started. `autoApprovedSmsReply`
+  // is the narrow, send_sms-only bypass documented on action-executor.ts's
+  // ExecuteStepParams — it does not touch send_sms.requiresApproval in
+  // action-registry.ts, and every other safety check (emergency pause,
+  // consent, idempotency) still runs exactly as before, fresh, inside
+  // executeStep() regardless of this value. `trustedProposal: true` is
+  // kept alongside it — for the "review" (default) outcome, this is
+  // exactly the same proposal-creation call as before AI-2D; for the
+  // "automatic" outcome, `autoApprovedSmsReply` takes precedence inside
+  // executeStep() and no approval row is created at all.
+  const replyMode = await loadSmsReplyMode(supabaseAdmin, orgId);
+  const autoApprovedSmsReply = replyMode === "automatic";
+
   const truncatedBody = result.responseText.slice(0, 1600);
   const proposeResult = await executeStep({
     supabase: supabaseAdmin,
@@ -300,17 +320,53 @@ export const handler: Handler = async (event) => {
     rawInput: { contactId, body: truncatedBody },
     autonomyLevel: EXECUTION_AUTONOMY_LEVEL,
     trustedProposal: true,
+    autoApprovedSmsReply,
     idempotencyKey: `sms_reply:${result.executionId}`,
     targetEntityType: "contact",
     targetEntityId: contactId,
     approvalSummary: "AI Center proposed an SMS reply to an inbound text message.",
   });
 
-  console.log("[ai-twilio-sms-orchestrate-background] send_sms proposal result:", {
+  console.log("[ai-twilio-sms-orchestrate-background] send_sms result:", {
     executionId: result.executionId,
+    replyMode,
     status: proposeResult.status,
     approvalRequestId: proposeResult.approvalRequestId,
   });
+
+  // AI-2D — Run Inspector observability (report section N): "reply
+  // required human approval" vs "reply was sent automatically" is not
+  // otherwise visible anywhere — agent_executions.status is set by
+  // orchestrateAI() itself, BEFORE this file's own reply-mode decision
+  // even runs, so it can't distinguish the two outcomes. Rather than add
+  // a new table or teach ai-run-inspector.tsx to read
+  // agent_execution_steps/agent_approval_requests (an actual redesign,
+  // which this task explicitly rules out), this stamps two small fields
+  // onto the SAME agent_executions.output_summary jsonb column
+  // orchestrator.ts already writes `{responseText}` into — read-merge,
+  // never blind-replace, so orchestrator.ts's own responseText survives.
+  // This is the same "small follow-up write onto a column this file
+  // doesn't primarily own" pattern AI-2B already established for
+  // sms_meta_messages.meta's execution_id linkage.
+  const { data: execRowForSummary } = await supabaseAdmin
+    .from("agent_executions")
+    .select("output_summary")
+    .eq("id", result.executionId)
+    .maybeSingle();
+  const currentOutputSummary =
+    execRowForSummary?.output_summary && typeof execRowForSummary.output_summary === "object" && !Array.isArray(execRowForSummary.output_summary)
+      ? (execRowForSummary.output_summary as Record<string, unknown>)
+      : {};
+  await supabaseAdmin
+    .from("agent_executions")
+    .update({
+      output_summary: {
+        ...currentOutputSummary,
+        smsReplyMode: replyMode,
+        smsReplyStatus: proposeResult.status,
+      },
+    })
+    .eq("id", result.executionId);
 
   return { statusCode: 200, body: "" };
 };
