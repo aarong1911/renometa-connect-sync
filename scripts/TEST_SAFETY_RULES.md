@@ -3,24 +3,43 @@
 Established 2026-09-17 after a real incident: a disposable test org
 (`WA-OAuth-Test-5`, created by a WhatsApp OAuth test via a plain
 `organizations` insert) triggered at least one real "Welcome to RenoMeta —
-Your Free Trial Is Active" email to a live inbox. No code in this
-repository sent that email — the exact external mechanism (most likely a
-Supabase Database Webhook or a Make.com scenario watching `organizations`,
-given a live, repo-code-unused `RESEND_API_KEY` sits in `.env`) lives
-outside this repo's tracked code and was never fully confirmed. See
-`scripts/test-network-guard.mjs`'s header and the incident report for the
-full trace.
+Your Free Trial Is Active" email to a live inbox. **The exact external
+mechanism/provider that sent that email is UNCONFIRMED** — do not name a
+specific provider (e.g. Resend) as the cause without direct proof; a live,
+repo-code-unused `RESEND_API_KEY` in `.env` is circumstantial evidence at
+most. What IS confirmed: no code in this repository sent it, and the
+trigger fires on the bare row existing (something outside this repo's
+tracked code — Database Webhook, Make.com poll, or otherwise — reacts to
+`organizations` inserts). See `scripts/test-network-guard.mjs`'s header
+and the incident report for the full trace.
+
+**CORRECTION (2026-09-18):** an earlier version of this file told tests to
+reuse org `6f488e04-8976-4ffd-84dc-b99ce7b5a514` as a "dedicated test
+org." That was wrong — this org has been used for real RenoMeta live
+SMS/AI verification and must be treated as production-like. It may be
+used for a READ-ONLY snapshot/comparison (e.g. proving a change never
+touched it), but automated tests must never write to it, and it is not a
+safe fixture for FK satisfaction either.
 
 ## Hard rules
 
-1. **Never insert into `organizations` from an automated test.** Reuse
-   the existing dedicated test org (`6f488e04-8976-4ffd-84dc-b99ce7b5a514`
-   as of this writing) for every test that just needs a valid `org_id` to
-   satisfy a foreign key. If a test genuinely needs to prove cross-org
-   isolation, that needs a deliberate, reviewed design decision (e.g.
-   mocking the org-resolution query itself) — not a fresh `organizations`
-   row, until the external trigger is confirmed and safely
-   handled/allowlisted for test data.
+1. **Never insert into `organizations` from an automated test, and never
+   write to any real/customer org — including `6f488e04-8976-4ffd-84dc-
+   b99ce7b5a514`, which is production-like, not disposable.** If DB-
+   dependent logic needs a row with an `org_id` foreign key (e.g.
+   `meta_connections`, `meta_whatsapp_pending_selections`), prefer
+   extracting that logic into a function that takes an already-constructed
+   `SupabaseClient` as a parameter (dependency injection — see
+   `netlify/functions/lib/meta-whatsapp-selection-store.ts` for the
+   pattern), then unit-test it against `scripts/fake-supabase-client.mjs`
+   (an in-memory fake, no real Postgres, no FK constraints to satisfy —
+   see that file's own header for exactly what it does and does NOT
+   cover). If a test genuinely requires a REAL Postgres instance (to
+   validate a migration's actual FK/unique/RLS enforcement), that needs a
+   dedicated, isolated test-safe environment — local Supabase (`supabase
+   start`, requires Docker) or a separate Supabase test project — not a
+   real RenoMeta org. If neither is available, STOP and report that
+   specific gap rather than using production data as a fixture.
 
 2. **Install `installNetworkGuard()` from `scripts/test-network-guard.mjs`
    at the very top of every test script**, before any dynamic import of
