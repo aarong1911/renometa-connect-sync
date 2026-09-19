@@ -5,6 +5,8 @@ import crypto from "node:crypto";
 import { ensureMetaLeadgenSubscription } from "./lib/meta-lead-ads";
 import { ensureMetaMessengerSubscription, ensureMetaInstagramSubscription } from "./lib/meta-messaging";
 import { getAppConfigs } from "./lib/app-config-store";
+import { discoverWhatsAppCandidates, toSafeCandidate, decideCandidateAction } from "./lib/meta-whatsapp-candidates";
+import { reservePendingSelection } from "./lib/meta-whatsapp-selection-store";
 
 // ─────────────────────────────────────────────────────────────────────────
 // meta-oauth-callback.ts
@@ -131,6 +133,38 @@ function popupResponse(success: boolean, message: string): { statusCode: number;
   window.close();
 </script>
 <p>${success ? "Connected. You can close this window." : `Connection failed: ${message}`}</p>
+</body></html>`;
+  return { statusCode: 200, headers: { "Content-Type": "text/html" }, body: html };
+}
+
+// WhatsApp OAuth connection-quality fix: when discoverWhatsAppCandidates()
+// finds more than one business/WABA/phone-number combination, the
+// callback can no longer decide unilaterally which one is "the" WhatsApp
+// number — it must hand a SAFE (no access token, no raw Graph payload,
+// no unrelated technical ids) candidate list plus a single-use
+// selectionToken back to the popup's opener, which shows a selection UI
+// and completes the connection via meta-whatsapp-select-number.ts. The
+// popup still closes itself immediately (same UX shape as success/
+// failure) — the selection UI lives in the PARENT window, not a second
+// popup round trip.
+function popupResponseSelectionRequired(selectionToken: string, candidates: ReturnType<typeof toSafeCandidate>[]): { statusCode: number; headers: any; body: string } {
+  const html = `<!DOCTYPE html>
+<html><body>
+<script>
+  window.opener && window.opener.postMessage(
+    {
+      source: "meta-oauth",
+      success: false,
+      selectionRequired: true,
+      product: "whatsapp",
+      selectionToken: ${JSON.stringify(selectionToken)},
+      candidates: ${JSON.stringify(candidates)}
+    },
+    window.location.origin
+  );
+  window.close();
+</script>
+<p>Multiple WhatsApp numbers found — choose one in the RenoMeta Connect window.</p>
 </body></html>`;
   return { statusCode: 200, headers: { "Content-Type": "text/html" }, body: html };
 }
@@ -340,27 +374,68 @@ export const handler: Handler = async (event) => {
       console.warn("[meta-oauth-callback] page discovery failed:", e);
     }
 
-    if (product === "whatsapp" && businessId) {
-      try {
-        const wabaListRes = await fetch(
-          `https://graph.facebook.com/v21.0/${businessId}/owned_whatsapp_business_accounts?access_token=${encodeURIComponent(accessToken)}`,
+    // WhatsApp OAuth connection-quality fix: enumerate EVERY business/WABA/
+    // phone-number combination this token can see (not just the first
+    // business — discoverWhatsAppCandidates() itself scans all of them),
+    // then decide: zero -> fail safely, one -> auto-connect exactly like
+    // before, more than one -> hand off to explicit operator selection
+    // (see popupResponseSelectionRequired() and meta-whatsapp-select-
+    // number.ts) rather than silently picking index 0. See this file's
+    // header and this pass's own report for the full reasoning — this
+    // block ONLY changes WhatsApp discovery; every other product
+    // (Messenger, Instagram, Lead Ads, Ads) below is untouched.
+    if (product === "whatsapp") {
+      const candidates = await discoverWhatsAppCandidates(accessToken);
+      const action = decideCandidateAction(candidates);
+
+      if (action.type === "zero_candidates") {
+        return popupResponse(
+          false,
+          "No WhatsApp phone number is available on this Meta Business account. Add or verify a WhatsApp number in Meta Business Manager, then try connecting again.",
         );
-        const wabaList = await wabaListRes.json();
-        const firstWaba = wabaList?.data?.[0];
-        if (firstWaba) {
-          wabaId = firstWaba.id;
-          const phonesRes = await fetch(
-            `https://graph.facebook.com/v21.0/${firstWaba.id}/phone_numbers?access_token=${encodeURIComponent(accessToken)}`,
-          );
-          const phones = await phonesRes.json();
-          const firstPhone = phones?.data?.[0];
-          if (firstPhone) {
-            wabaPhoneNumberId = firstPhone.id;
-            wabaDisplayPhone = firstPhone.display_phone_number;
-          }
+      }
+
+      if (action.type === "auto_connect") {
+        const only = action.candidate;
+        businessId = only.businessId;
+        businessName = only.businessName;
+        wabaId = only.wabaId;
+        wabaPhoneNumberId = only.phoneNumberId;
+        wabaDisplayPhone = only.displayPhoneNumber;
+      } else {
+        // More than one candidate — persist NOTHING to meta_connections
+        // yet. Reserve a short-lived, single-use selection record (same
+        // reserve-then-consume shape as meta_oauth_nonces above) holding
+        // the encrypted token, token metadata, and the FULL candidate
+        // list (server-side only), then hand the browser only a safe
+        // subset plus an opaque selectionToken.
+        const selectionToken = crypto.randomBytes(32).toString("hex");
+        const selectionTokenHash = crypto.createHash("sha256").update(selectionToken).digest("hex");
+        const selectionExpiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+        const reserveResult = await reservePendingSelection(supabaseAdmin, {
+          selectionTokenHash,
+          orgId,
+          userId,
+          product: productKey,
+          encryptedAccessToken: encryptToken(accessToken),
+          tokenType,
+          tokenExpiresAt: expiresInSec ? new Date(Date.now() + expiresInSec * 1000).toISOString() : null,
+          grantedScopes,
+          metaUserId: me.id,
+          metaUserName: me.name ?? null,
+          metaUserPictureUrl: me.picture?.data?.url ?? null,
+          pageId: pageId ?? existingRow?.page_id ?? null,
+          pageName: pageName ?? existingRow?.page_name ?? null,
+          candidates: action.candidates,
+          expiresAt: selectionExpiresAt,
+        });
+        if (!reserveResult.ok) {
+          console.error("[meta-oauth-callback] pending WhatsApp selection insert failed:", reserveResult.error);
+          return popupResponse(false, "Could not start WhatsApp number selection — please try again");
         }
-      } catch (e) {
-        console.warn("[meta-oauth-callback] WABA discovery failed:", e);
+
+        return popupResponseSelectionRequired(selectionToken, action.candidates.map(toSafeCandidate));
       }
     }
 

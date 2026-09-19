@@ -81,6 +81,20 @@ interface MetaConnection {
   updated_at: string;
 }
 
+// WhatsApp OAuth connection-quality fix — mirrors the SAFE candidate
+// shape meta-oauth-callback.ts's toSafeCandidate() sends over
+// postMessage (netlify/functions/lib/meta-whatsapp-candidates.ts). No
+// access token, no raw Graph payload, no technical ids beyond
+// phoneNumberId (needed to submit the selection back).
+interface WhatsAppSafeCandidate {
+  phoneNumberId: string;
+  businessName: string | null;
+  wabaName: string | null;
+  displayPhoneNumber: string;
+  verifiedName: string | null;
+  qualityRating: string | null;
+}
+
 async function getOrgId(): Promise<string | null> {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return null;
@@ -241,6 +255,17 @@ export function IntegrationConfigDrawer({
   const [reconfiguring, setReconfiguring] = useState(false);
   const [metaConnection, setMetaConnection] = useState<MetaConnection | null>(null);
   const [metaConnecting, setMetaConnecting] = useState(false);
+  // WhatsApp OAuth connection-quality fix — mirrors the Google Ads
+  // selection-mode state below, but fed by the OAuth popup's postMessage
+  // (selectionToken + safe candidate list) rather than a separate GET
+  // call, since nothing is persisted server-side until a candidate is
+  // actually chosen (see meta-oauth-callback.ts / meta-whatsapp-select-
+  // number.ts).
+  const [waSelectionMode, setWaSelectionMode] = useState(false);
+  const [waCandidates, setWaCandidates] = useState<WhatsAppSafeCandidate[]>([]);
+  const [waSelectionToken, setWaSelectionToken] = useState<string | null>(null);
+  const [waSelectedPhoneNumberId, setWaSelectedPhoneNumberId] = useState<string | null>(null);
+  const [waSubmitting, setWaSubmitting] = useState(false);
   const [googleAdsConnecting, setGoogleAdsConnecting] = useState(false);
 
   // ── Google Ads account-selection UI state ────────────────────────────
@@ -341,6 +366,41 @@ export function IntegrationConfigDrawer({
     }
   }
 
+  async function handleWaSelectNumber() {
+    if (!waSelectedPhoneNumberId || !waSelectionToken || waSubmitting) return; // guard against duplicate submission
+    setWaSubmitting(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        toast.error("You must be signed in");
+        return;
+      }
+      const res = await fetch("/.netlify/functions/meta-whatsapp-select-number", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ selectionToken: waSelectionToken, phoneNumberId: waSelectedPhoneNumberId }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json.success) {
+        toast.error(json.error ?? "Could not save your WhatsApp number selection — please try again");
+        return; // keep the selection UI open on failure, per spec
+      }
+      toast.success("WhatsApp connected");
+      setWaSelectionMode(false);
+      setWaCandidates([]);
+      setWaSelectionToken(null);
+      setWaSelectedPhoneNumberId(null);
+      const conn = await fetchMetaConnection("whatsapp");
+      setMetaConnection(conn);
+      setIsConfigured(!!conn);
+      if (conn) onConnect?.(integration!);
+    } catch {
+      toast.error("Network error — could not save your WhatsApp number selection");
+    } finally {
+      setWaSubmitting(false);
+    }
+  }
+
   // Load existing connection status when drawer opens
   useEffect(() => {
     if (!open || !integration) return;
@@ -350,6 +410,10 @@ export function IntegrationConfigDrawer({
     setTouched({});
     setReconfiguring(false);
     setMetaConnection(null);
+    setWaSelectionMode(false);
+    setWaCandidates([]);
+    setWaSelectionToken(null);
+    setWaSelectedPhoneNumberId(null);
 
     if (currentId === GOOGLE_ADS_ID) {
       setGoogleAdsAccounts(null);
@@ -422,6 +486,17 @@ export function IntegrationConfigDrawer({
       if (e.origin !== window.location.origin) return;
       if (e.data?.source !== "meta-oauth") return;
       setMetaConnecting(false);
+      // WhatsApp OAuth connection-quality fix: more than one business/
+      // WABA/phone-number candidate was found — nothing was persisted
+      // server-side yet (see meta-oauth-callback.ts). Show the selection
+      // UI instead of treating this as a success or a failure.
+      if (e.data.selectionRequired && e.data.product === "whatsapp") {
+        setWaCandidates(Array.isArray(e.data.candidates) ? e.data.candidates : []);
+        setWaSelectionToken(typeof e.data.selectionToken === "string" ? e.data.selectionToken : null);
+        setWaSelectedPhoneNumberId(null);
+        setWaSelectionMode(true);
+        return;
+      }
       if (e.data.success) {
         toast.success(`${integration!.name} connected`);
         (async () => {
@@ -736,7 +811,60 @@ export function IntegrationConfigDrawer({
 
           {integration.connectMethod === "oauth" && META_IDS.has(int.id) && (
             <div className="space-y-3 rounded-lg border border-border p-4">
-              {metaConnection ? (
+              {int.id === "whatsapp" && waSelectionMode ? (
+                <div className="space-y-3">
+                  <p className="text-xs text-muted-foreground">
+                    More than one WhatsApp number is available on this Meta Business account. Select the number you want RenoMeta Connect to use.
+                  </p>
+                  {waCandidates.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">No candidates to show — please reconnect.</p>
+                  ) : (
+                    <>
+                      <div className="max-h-64 space-y-1.5 overflow-y-auto">
+                        {waCandidates.map((c) => {
+                          const isSelected = waSelectedPhoneNumberId === c.phoneNumberId;
+                          return (
+                            <button
+                              key={c.phoneNumberId}
+                              type="button"
+                              onClick={() => setWaSelectedPhoneNumberId(c.phoneNumberId)}
+                              className={`w-full rounded-md border px-3 py-2 text-left transition-colors ${
+                                isSelected ? "border-primary bg-primary/5" : "border-border hover:bg-muted/50"
+                              }`}
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="truncate text-sm font-medium text-foreground">{c.displayPhoneNumber}</span>
+                                {c.qualityRating && (
+                                  <Badge variant="secondary" className="h-4 shrink-0 rounded-full px-1.5 text-[9px]">{c.qualityRating}</Badge>
+                                )}
+                              </div>
+                              {(c.businessName || c.wabaName) && (
+                                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                                  {[c.businessName, c.wabaName].filter(Boolean).join(" · ")}
+                                </p>
+                              )}
+                              {c.verifiedName && (
+                                <p className="mt-0.5 text-[11px] text-muted-foreground">Verified name: {c.verifiedName}</p>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <Button
+                        className="w-full"
+                        disabled={!waSelectedPhoneNumberId || waSubmitting}
+                        onClick={handleWaSelectNumber}
+                      >
+                        {waSubmitting ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+                        {waSubmitting ? "Connecting…" : "Connect this number"}
+                      </Button>
+                      <Button variant="ghost" size="sm" className="w-full" disabled={waSubmitting} onClick={() => { setWaSelectionMode(false); setWaCandidates([]); setWaSelectionToken(null); setWaSelectedPhoneNumberId(null); }}>
+                        Cancel
+                      </Button>
+                    </>
+                  )}
+                </div>
+              ) : metaConnection ? (
                 <div className="space-y-3">
                   <div className="flex items-center gap-3 rounded-md bg-success/10 px-3 py-2.5">
                     <Avatar className="h-9 w-9 shrink-0">
