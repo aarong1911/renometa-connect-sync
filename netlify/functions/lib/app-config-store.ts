@@ -44,13 +44,54 @@ const MISS_TTL_MS = 30 * 1000; // 30 seconds — see header comment
 type CacheEntry = { value: string | null; expiresAt: number };
 const cache = new Map<string, CacheEntry>();
 
-/** Netlify sets CONTEXT to "production" | "deploy-preview" | "branch-deploy" | "dev". Never resolved from a request/browser parameter. */
+/**
+ * SECURITY CORRECTION (2026-09-19, same-day follow-up): an earlier version
+ * of this fix inferred "production" from AWS_LAMBDA_FUNCTION_NAME /
+ * AWS_EXECUTION_ENV being present. That was itself unsafe — Netlify's own
+ * documentation states the only Function-runtime variables it guarantees
+ * are URL, SITE_NAME, and SITE_ID; CONTEXT is NOT guaranteed at runtime
+ * (proven by the live production incident this file's history documents),
+ * and deploy-preview/branch-deploy Functions also run on AWS Lambda under
+ * the hood. Inferring "production" from a Lambda-runtime signal alone
+ * would misclassify a deploy-preview or branch-deploy invocation as
+ * production whenever CONTEXT also happened to be missing there — reading
+ * REAL production `app_config_secrets` rows (Meta app secret, Stripe key,
+ * Twilio credentials, etc.) from a non-production deploy. That risk is
+ * strictly worse than the original bug (production reading nothing).
+ *
+ * Fixed by making environment resolution EXPLICIT rather than inferred:
+ * a dedicated, non-secret, Function-scoped env var, APP_CONFIG_ENV, must
+ * be deliberately set to "production" | "deploy-preview" | "branch-deploy"
+ * per Netlify deploy context (e.g. via netlify.toml's
+ * `[context.<name>.environment]` blocks, or the Netlify UI's per-context
+ * environment variables) — see this pass's own report for why the code
+ * fix alone is not sufficient until APP_CONFIG_ENV is actually configured
+ * for each context. CONTEXT itself is no longer consulted anywhere in
+ * this function; it was the unreliable signal that caused the original
+ * incident.
+ *
+ * `NETLIFY_DEV === "true"` remains the one inferred signal kept, since it
+ * doesn't need to disambiguate any secret-affecting label — it only ever
+ * selects "development", i.e. "read no production-labeled secret", which
+ * is the fail-closed direction regardless of whether that inference is
+ * ever wrong.
+ *
+ * FAIL-CLOSED: any missing or unrecognized APP_CONFIG_ENV value — this
+ * includes a genuinely deployed production Lambda that simply hasn't had
+ * APP_CONFIG_ENV configured yet — resolves to "development", never
+ * "production". A misconfigured production deploy therefore fails by
+ * finding no config (the original symptom) rather than by risking a
+ * misclassified non-production deploy reading real production secrets.
+ *
+ * Never resolved from a request/browser parameter.
+ */
 export function resolveEnvironment(): string {
-  const ctx = process.env.CONTEXT;
-  if (ctx === "production") return "production";
-  if (ctx === "deploy-preview") return "deploy-preview";
-  if (ctx === "branch-deploy") return "branch-deploy";
-  return "development"; // netlify dev locally, or unrecognized context
+  const explicit = process.env.APP_CONFIG_ENV;
+  if (explicit === "production" || explicit === "deploy-preview" || explicit === "branch-deploy") {
+    return explicit;
+  }
+  if (process.env.NETLIFY_DEV === "true") return "development";
+  return "development";
 }
 
 function cacheKey(environment: string, key: string): string {
