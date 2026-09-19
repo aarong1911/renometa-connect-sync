@@ -46,6 +46,88 @@ export async function resolveOrgFromBearerToken(
   return { userId: user.id, orgId };
 }
 
+export type ResolvedOrgAndAuthority = { orgId: string | null; isOwnerOrAdmin: boolean; role: string | null };
+
+// Server-side owner/admin resolution for AI Center's Emergency Pause
+// endpoint (ai-emergency-pause.ts). Deliberately does NOT reuse the
+// "profile carries organization_id => always owner/admin" shortcut
+// duplicated inline in agent-approve-action.ts and voice-call-delete.ts —
+// a live check while building this (2026-09-14, org
+// d7963ad6-4bfe-4cc2-b9c2-949a02a3fa72) proved that shortcut unsafe:
+// EVERY member of that org (the real owner, a 'viewer', and a
+// 'project_manager') has profiles.organization_id populated, not just the
+// account owner/creator. That shortcut would grant owner/admin authority
+// to any org member for whatever it gates — flagged as a pre-existing
+// concern in those two files, out of scope to fix here.
+//
+// The canonical, fine-grained per-org role (owner / admin / office_manager
+// / estimator / sales / project_manager / field_worker / accountant /
+// viewer — the same set src/lib/permissions.ts's Role type and
+// src/lib/organization.ts's team roster use) lives on
+// org_memberships.role, scoped to (member_id, org_id) — this is the same
+// table/column src/lib/organization.ts's fetchTeamMembersForOrg() reads to
+// build the roster that useCurrentUserRole() derives the frontend's role
+// from. That is the source of truth used here.
+//
+// org id resolution keeps the same precedence as resolveOrgFromBearerToken
+// (profiles.organization_id first, org_memberships fallback) — org
+// lookup, not authority, is what that precedence is for. Once orgId is
+// known, authority ALWAYS comes from a fresh org_memberships.role lookup
+// scoped to that exact org, never inferred from profile presence alone.
+// Only if no org_memberships row exists at all (legacy/edge case) does
+// this fall back to profiles.role's own coarse owner/member flag — and
+// only the literal 'owner' value there is treated as authorized; anything
+// else (including missing) fails closed to not-authorized.
+//
+// Never trusts a role/orgId supplied by the caller; both are derived from
+// the authenticated userId against server-side tables.
+//
+// `role` (added for the accounting-backfill.ts / remove-member.ts fix
+// pass) exposes the exact resolved role string (the fine-grained
+// org_memberships.role value, or the coarse profiles.role fallback when no
+// membership row exists) for callers that need a stricter check than
+// "owner or admin" — e.g. an owner-only action. `isOwnerOrAdmin` remains
+// the convenience field for the common case and is always consistent with
+// `role`.
+export async function resolveOrgAndAuthority(
+  supabaseAdmin: SupabaseClient,
+  userId: string,
+): Promise<ResolvedOrgAndAuthority> {
+  const { data: profile } = await supabaseAdmin
+    .from("profiles")
+    .select("organization_id, role")
+    .eq("id", userId)
+    .maybeSingle();
+  let orgId: string | null = profile?.organization_id ?? null;
+
+  if (!orgId) {
+    const { data: membership } = await supabaseAdmin
+      .from("org_memberships")
+      .select("org_id")
+      .eq("member_id", userId)
+      .maybeSingle();
+    orgId = membership?.org_id ?? null;
+  }
+  if (!orgId) return { orgId: null, isOwnerOrAdmin: false, role: null };
+
+  const { data: membershipRole } = await supabaseAdmin
+    .from("org_memberships")
+    .select("role")
+    .eq("member_id", userId)
+    .eq("org_id", orgId)
+    .maybeSingle();
+
+  if (membershipRole?.role) {
+    const role = membershipRole.role as string;
+    return { orgId, isOwnerOrAdmin: role === "owner" || role === "admin", role };
+  }
+
+  // No org_memberships row for this org — fall back to profiles.role's
+  // coarse flag, fail-closed (only an exact 'owner' match authorizes).
+  const fallbackRole = profile?.role === "owner" ? "owner" : (profile?.role ?? null);
+  return { orgId, isOwnerOrAdmin: fallbackRole === "owner", role: fallbackRole };
+}
+
 // Re-confirms a user still belongs to a SPECIFIC org, server-side — for
 // callbacks that received userId/orgId from a verified-but-earlier-issued
 // source (e.g. a signed OAuth state minted up to 10 minutes ago), where
