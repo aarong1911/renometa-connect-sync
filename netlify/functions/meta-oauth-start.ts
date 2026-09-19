@@ -2,7 +2,7 @@
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
-import { getAppConfigs, resolveEnvironment } from "./lib/app-config-store";
+import { getAppConfigs } from "./lib/app-config-store";
 
 // ─────────────────────────────────────────────────────────────────────────
 // meta-oauth-start.ts
@@ -74,64 +74,9 @@ export const handler: Handler = async (event) => {
     return { statusCode: 400, body: "Missing userId" };
   }
 
-  // ── TEMPORARY DIAGNOSTIC LOGGING (production Meta OAuth regression,
-  // 2026-09-19) — remove once the runtime cause is identified. Booleans/
-  // metadata only: never a secret value, an encrypted_value row, or a
-  // request auth header. getAppConfigs() itself already catches and
-  // console.error's both a DB-read failure ("[app-config-store] batch
-  // read failed: ...") and a per-key decrypt failure ("[app-config-store]
-  // decrypt failed for "KEY": ...") internally — see that file — so it
-  // NEVER throws past this call; hasConfigMetaAppId/hasConfigStateSecret
-  // below being false with configLookupSucceeded true means the DB query
-  // ran but returned nothing/failed to decrypt for that key (check the
-  // Netlify function log lines immediately before this one for exactly
-  // which). configLookupSucceeded only turns false if something OTHER
-  // than getAppConfigs's own handled cases throws synchronously (e.g. a
-  // malformed supabaseAdmin instance) — the try/catch below is
-  // defense-in-depth, not the expected path.
-  console.log(JSON.stringify({
-    diagnostic: "meta_oauth_config",
-    phase: "before",
-    resolvedEnvironment: resolveEnvironment(),
-    hasSupabaseUrl: !!process.env.SUPABASE_URL,
-    hasServiceRoleKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
-    hasEncryptionKey: !!process.env.ENCRYPTION_KEY,
-    hasProcessEnvMetaAppId: !!process.env.META_APP_ID,
-    hasProcessEnvStateSecret: !!process.env.META_OAUTH_STATE_SECRET,
-  }));
-
-  let metaConfig: Record<string, string | null> = {};
-  let configLookupSucceeded = true;
-  let configErrorName: string | null = null;
-  let configErrorMessageSafe: string | null = null;
-  try {
-    metaConfig = await getAppConfigs(supabaseAdmin, ["META_OAUTH_STATE_SECRET", "META_APP_ID"]);
-  } catch (err: any) {
-    configLookupSucceeded = false;
-    configErrorName = err?.name ?? "UnknownError";
-    // .slice() bound is defensive only — getAppConfigs/decryptBytea error
-    // messages are short, static strings (e.g. "ENCRYPTION_KEY env var is
-    // not set"), never a secret value, but never trust that blindly for
-    // an UNEXPECTED thrown error either.
-    configErrorMessageSafe = typeof err?.message === "string" ? err.message.slice(0, 200) : null;
-  }
-
+  const metaConfig = await getAppConfigs(supabaseAdmin, ["META_OAUTH_STATE_SECRET", "META_APP_ID"]);
   const stateSecret = metaConfig.META_OAUTH_STATE_SECRET || process.env.ENCRYPTION_KEY;
   const appId = metaConfig.META_APP_ID;
-
-  console.log(JSON.stringify({
-    diagnostic: "meta_oauth_config",
-    phase: "after",
-    configLookupSucceeded,
-    hasConfigMetaAppId: !!metaConfig.META_APP_ID,
-    hasConfigStateSecret: !!metaConfig.META_OAUTH_STATE_SECRET,
-    hasResolvedMetaAppId: !!appId,
-    hasResolvedStateSecret: !!stateSecret,
-    configErrorName,
-    configErrorMessageSafe,
-  }));
-  // ── END TEMPORARY DIAGNOSTIC LOGGING ──────────────────────────────────
-
   if (!stateSecret || !appId) {
     return { statusCode: 500, body: "Meta OAuth is not configured (missing META_APP_ID or META_OAUTH_STATE_SECRET)" };
   }
