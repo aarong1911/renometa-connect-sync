@@ -27,7 +27,7 @@
 import { z } from "zod";
 import type { ActionDefinition } from "./types";
 import {
-  getLeadContext, createFollowUpTask, addInternalNote, draftCustomerReply,
+  getLeadContext, createFollowUpTask, addInternalNote, draftCustomerReply, sendSms, sendWhatsapp,
 } from "./handlers";
 
 // ── Zod input schemas ────────────────────────────────────────────────────
@@ -72,6 +72,17 @@ const moveDealStageInput = z.object({
 });
 
 const sendSmsInput = z.object({
+  contactId: z.string().uuid(),
+  body: z.string().min(1).max(1600),
+});
+
+// AI-2E. Deliberately the SAME shape as sendSmsInput — no phone/connection
+// field a model could supply, recipient always server-resolved from
+// contactId. Meta's WhatsApp body limit is much higher than SMS's, but
+// this stays at 1600 for now (matches the reactive free-form reply use
+// case AI-2E targets; can be revisited if a real need for longer AI
+// replies appears).
+const sendWhatsappInput = z.object({
   contactId: z.string().uuid(),
   body: z.string().min(1).max(1600),
 });
@@ -347,7 +358,7 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition<any, any>> = {
   send_sms: {
     key: "send_sms",
     displayName: "Send SMS",
-    description: "Proposes sending a customer-facing SMS. Never auto-sent in Phase 9.6 — always requires approval regardless of autonomy level.",
+    description: "Proposes sending a customer-facing SMS. Never auto-sent — always requires approval regardless of autonomy level.",
     category: "communication",
     riskLevel: "high",
     supportedActorTypes: ["user", "agent", "workflow"],
@@ -357,7 +368,49 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition<any, any>> = {
     idempotent: true,
     timeoutMs: 15000,
     retryPolicy: DEFAULT_RETRY,
-    isExecutable: false,
+    // AI-2A: wired to a real handler (handlers.ts's sendSms) so an
+    // approved send_sms request actually sends, via the same Twilio REST
+    // pattern send-inbox-message.ts already uses. requiresApproval/
+    // minimumAutonomyLevel/riskLevel/supportedActorTypes/inputSchema are
+    // UNCHANGED from before this pass — this handler is only ever reached
+    // after executeStep()/executeApprovedStep()'s existing emergency-
+    // pause, outbound-consent, and (since requiresApproval is
+    // unconditional) human-approval gates have already run.
+    isExecutable: true,
+    handler: sendSms,
+    // AI-1L: identifies this as a real outbound send for centralized
+    // opt-out enforcement (action-executor.ts's checkOutboundConsent()).
+    outboundChannel: "sms",
+  },
+  send_whatsapp: {
+    key: "send_whatsapp",
+    displayName: "Send WhatsApp",
+    description: "Proposes sending a customer-facing WhatsApp reply. Never auto-sent in AI-2E — always requires approval regardless of autonomy level.",
+    category: "communication",
+    riskLevel: "high",
+    supportedActorTypes: ["user", "agent", "workflow"],
+    inputSchema: sendWhatsappInput,
+    requiresApproval: true,
+    minimumAutonomyLevel: 4,
+    idempotent: true,
+    timeoutMs: 15000,
+    retryPolicy: DEFAULT_RETRY,
+    // AI-2E: a distinct action from send_sms (never overloaded onto it —
+    // see the channel-integrations skill and this pass's own report for
+    // why), wired to a real handler (handlers.ts's sendWhatsapp).
+    // requiresApproval is unconditional and NOT configurable in AI-2E —
+    // unlike send_sms, there is no automatic-mode setting for WhatsApp
+    // yet (see AI-2D for the analogous SMS setting, deliberately not
+    // replicated here this phase).
+    isExecutable: true,
+    handler: sendWhatsapp,
+    // AI-1L: identifies this as a real outbound send for centralized
+    // opt-out/eligibility enforcement (action-executor.ts's
+    // checkOutboundConsent()) — see that function's WhatsApp branch for
+    // why WhatsApp fails closed unless a real reactive conversation
+    // window is open, rather than reusing SMS's marketing_contact_
+    // preferences model.
+    outboundChannel: "whatsapp",
   },
   send_email: {
     key: "send_email",
@@ -373,6 +426,7 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition<any, any>> = {
     timeoutMs: 15000,
     retryPolicy: DEFAULT_RETRY,
     isExecutable: false,
+    outboundChannel: "email",
   },
 };
 

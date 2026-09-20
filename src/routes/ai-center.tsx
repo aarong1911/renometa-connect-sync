@@ -11,6 +11,11 @@ import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { AgenticPreviewPanel } from "@/components/ai-center/agentic-preview-panel";
+import { AITestConsole } from "@/components/ai-center/ai-test-console";
+import { AIEmergencyPauseControl } from "@/components/ai-center/ai-emergency-pause-control";
+import { AIApprovalsTab } from "@/components/ai-center/ai-approvals-tab";
+import { supabase } from "@/lib/supabase";
+import { useOrgId } from "@/lib/org-id";
 import {
   Sheet,
   SheetContent,
@@ -56,6 +61,7 @@ import {
   AudioLines,
   WandSparkles,
   ShieldCheck,
+  FlaskConical,
   X as XIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -74,14 +80,14 @@ import {
 } from "@/lib/ai-center-store";
 import { isAgentConfigured } from "@/lib/agent-config";
 
-type TopTab = "agents" | "tools" | "voice" | "agentic";
+type TopTab = "agents" | "tools" | "voice" | "agentic" | "approvals" | "console";
 type AgentsSearchParams = AgentSearchParams & { tab?: TopTab };
 
 export const Route = createFileRoute("/ai-center")({
   validateSearch: (search: Record<string, unknown>): AgentsSearchParams => ({
     agentId: typeof search.agentId === "string" ? search.agentId : undefined,
     tab:
-      search.tab === "agents" || search.tab === "tools" || search.tab === "voice" || search.tab === "agentic"
+      search.tab === "agents" || search.tab === "tools" || search.tab === "voice" || search.tab === "agentic" || search.tab === "approvals" || search.tab === "console"
         ? search.tab
         : undefined,
   }),
@@ -195,11 +201,19 @@ const CATEGORY_FILTER_LABEL: Record<"all" | AgentCategory, string> = {
 type StatusFilter = "all" | "active" | "paused";
 
 // ── Top-level tab config (Part 4) ───────────────────────────────────────────
+// AI-2B: "Approvals" placed after "Agentic (Beta)" and before "Test
+// Console" — it's a first-class operational tab (real pending human
+// decisions), not a beta/preview surface, so it belongs with the other
+// production tabs rather than folded into Agentic (Beta); Test Console
+// stays last since it's the "simulate/inspect" tool, not a queue an
+// operator needs day-to-day.
 const TOP_TABS: { value: TopTab; label: string; icon: LucideIcon }[] = [
   { value: "agents", label: "Autonomous Agents", icon: Bot },
   { value: "tools", label: "AI Tools", icon: WandSparkles },
   { value: "voice", label: "Voice Agent", icon: AudioLines },
   { value: "agentic", label: "Agentic (Beta)", icon: ShieldCheck },
+  { value: "approvals", label: "Approvals", icon: ClipboardList },
+  { value: "console", label: "Test Console", icon: FlaskConical },
 ];
 
 function AgentsPage() {
@@ -213,6 +227,27 @@ function AgentsPage() {
   const [selectedId, setSelectedId] = useState<string | null>(urlAgentId ?? null);
 
   const { instances, loading } = useAICenterAgents();
+
+  // AI-2B: pending-approval badge count for the Approvals tab trigger —
+  // needs to be visible even while a DIFFERENT tab is active, so it's
+  // fetched independently here (on org resolution and on every tab
+  // switch) rather than only relying on AIApprovalsTab having mounted.
+  // While the Approvals tab itself IS active, AIApprovalsTab's own
+  // onPendingCountChange callback keeps this same state fresh after every
+  // approve/reject/refresh without waiting for a tab switch.
+  const [pendingApprovalCount, setPendingApprovalCount] = useState(0);
+  const orgIdForApprovalsBadge = useOrgId();
+  useEffect(() => {
+    if (!orgIdForApprovalsBadge) return;
+    let cancelled = false;
+    supabase
+      .from("agent_approval_requests")
+      .select("id", { count: "exact", head: true })
+      .eq("org_id", orgIdForApprovalsBadge)
+      .eq("status", "pending")
+      .then(({ count }) => { if (!cancelled) setPendingApprovalCount(count ?? 0); });
+    return () => { cancelled = true; };
+  }, [orgIdForApprovalsBadge, topTab]);
 
   // Sync URL search params
   useEffect(() => { setSelectedId(urlAgentId ?? null); }, [urlAgentId]);
@@ -312,19 +347,22 @@ function AgentsPage() {
         title="AI Center"
         subtitle="Manage autonomous agents, AI tools, voice agents, approvals, and execution activity."
         actions={
-          <span className="inline-flex h-7 items-center gap-1.5 rounded-full border border-success/30 bg-success/10 px-2.5 text-[11px] font-medium text-success">
-            <span className="relative flex h-1.5 w-1.5">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60" />
-              <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-success" />
+          <div className="flex items-center gap-2">
+            <span className="inline-flex h-7 items-center gap-1.5 rounded-full border border-success/30 bg-success/10 px-2.5 text-[11px] font-medium text-success">
+              <span className="relative flex h-1.5 w-1.5">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60" />
+                <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-success" />
+              </span>
+              {/* AI-H1.1 badge-audit fix — this counts agent_instances.is_enabled
+                  (Autonomous Agents only, via useAICenterAgents()); it never
+                  included Voice Agents or Agentic Beta. The unscoped "agent(s)
+                  live" wording read as an AI-Center-wide claim while only ever
+                  reflecting one subsystem — label it explicitly instead of
+                  fabricating a real cross-system total. */}
+              {loading ? "…" : `${stats.active} autonomous agent${stats.active === 1 ? "" : "s"} live`}
             </span>
-            {/* AI-H1.1 badge-audit fix — this counts agent_instances.is_enabled
-                (Autonomous Agents only, via useAICenterAgents()); it never
-                included Voice Agents or Agentic Beta. The unscoped "agent(s)
-                live" wording read as an AI-Center-wide claim while only ever
-                reflecting one subsystem — label it explicitly instead of
-                fabricating a real cross-system total. */}
-            {loading ? "…" : `${stats.active} autonomous agent${stats.active === 1 ? "" : "s"} live`}
-          </span>
+            <AIEmergencyPauseControl />
+          </div>
         }
       />
 
@@ -343,6 +381,11 @@ function AgentsPage() {
             >
               <t.icon className="h-4 w-4" />
               {t.label}
+              {t.value === "approvals" && pendingApprovalCount > 0 && (
+                <Badge variant="destructive" className="h-4.5 min-w-4.5 rounded-full px-1 text-[10px] leading-none">
+                  {pendingApprovalCount}
+                </Badge>
+              )}
             </TabsTrigger>
           ))}
         </TabsList>
@@ -433,6 +476,14 @@ function AgentsPage() {
 
         <TabsContent value="agentic" className="mt-3">
           <AgenticPreviewPanel />
+        </TabsContent>
+
+        <TabsContent value="approvals" className="mt-3">
+          <AIApprovalsTab onPendingCountChange={setPendingApprovalCount} />
+        </TabsContent>
+
+        <TabsContent value="console" className="mt-3">
+          <AITestConsole />
         </TabsContent>
       </Tabs>
     </div>

@@ -6,6 +6,7 @@ import { isMetaLeadgenChange, extractMetaLeadgenEvent, processMetaLeadgenEvent }
 import { resolveMessengerContactAndLead } from "./lib/meta-messenger-crm";
 import { resolveInstagramContactAndLead } from "./lib/meta-instagram-crm";
 import { getAppConfig } from "./lib/app-config-store";
+import { processWhatsAppInbound } from "./lib/meta-whatsapp-inbound";
 
 // Writes inbound messages to sms_meta_messages — see
 // supabase/migrations/005_sms_meta_messages.sql for the real schema.
@@ -120,7 +121,13 @@ async function processPayload(rawBody: string): Promise<void> {
   }
 
   if (payload.object === "whatsapp_business_account") {
-    await processWhatsAppPayload(payload);
+    // AI-2E TESTABILITY REFACTOR: the WhatsApp branch now lives in
+    // lib/meta-whatsapp-inbound.ts as a dependency-injected function so it
+    // can be exercised in an automated test against a fake Supabase client
+    // — see that file's header. This handler still owns constructing the
+    // real admin client and everything HTTP-level (signature verification,
+    // response codes) above; only the WhatsApp-specific logic moved.
+    await processWhatsAppInbound(payload, { supabase: supabaseAdmin });
     return;
   }
   if (payload.object === "page") {
@@ -196,101 +203,6 @@ async function processPagePayload(payload: any): Promise<void> {
 
   if (messengerEntries.length > 0) {
     await processMessengerOrInstagramPayload({ ...payload, entry: messengerEntries }, "messenger");
-  }
-}
-
-async function processWhatsAppPayload(payload: any): Promise<void> {
-  for (const entry of payload.entry ?? []) {
-    const wabaId: string = entry.id; // WhatsApp Business Account ID
-
-    for (const change of entry.changes ?? []) {
-      if (change.field !== "messages") continue;
-
-      const value = change.value ?? {};
-
-      for (const msg of value.messages ?? []) {
-        // Skip non-text for now (image, audio, etc.)
-        if (msg.type !== "text") continue;
-
-        const fromPhone: string  = msg.from;                  // digits only, no leading +
-        const body: string       = msg.text?.body ?? "";
-        const msgId: string      = msg.id;
-        const receivedAt: string = new Date(parseInt(msg.timestamp, 10) * 1000).toISOString();
-        const senderName: string = value.contacts?.[0]?.profile?.name ?? fromPhone;
-
-        // Find the org whose WhatsApp connection matches this WABA ID.
-        // Primary path: meta_connections (real OAuth flow, see
-        // .claude/skills/meta-integrations/SKILL.md). Falls back to the
-        // legacy organizations.integration_settings JSONB path so any
-        // connections made before the meta_connections migration still
-        // route correctly — remove the fallback once confirmed unused.
-        let orgId: string | undefined;
-
-        const { data: connRow, error: connErr } = await supabaseAdmin
-          .from("meta_connections")
-          .select("org_id")
-          .eq("waba_id", wabaId)
-          .maybeSingle();
-
-        if (connErr) {
-          console.error("[meta-webhook] meta_connections lookup error:", connErr.message);
-        }
-        orgId = connRow?.org_id;
-
-        if (!orgId) {
-          const { data: orgs, error: orgErr } = await supabaseAdmin
-            .from("organizations")
-            .select("id")
-            .filter("integration_settings->whatsapp->>waba_id", "eq", wabaId);
-
-          if (orgErr) {
-            console.error("[meta-webhook] legacy org lookup error:", orgErr.message);
-          }
-          orgId = orgs?.[0]?.id;
-        }
-
-        if (!orgId) {
-          console.warn("[meta-webhook] no org found for waba_id:", wabaId);
-          continue;
-        }
-
-        const e164 = `+${fromPhone}`;
-
-        // Upsert contact by phone so they appear in the Inbox conversation list
-        const { data: contactRow, error: contactErr } = await supabaseAdmin
-          .from("contacts")
-          .upsert(
-            { org_id: orgId, phone: e164, full_name: senderName },
-            { onConflict: "org_id,phone" },
-          )
-          .select("id")
-          .maybeSingle();
-
-        if (contactErr) {
-          console.error("[meta-webhook] contact upsert error:", contactErr.message);
-        }
-
-        const contactId: string | null = contactRow?.id ?? null;
-
-        // Persist the inbound message
-        const { error: insertErr } = await supabaseAdmin
-          .from("sms_meta_messages")
-          .insert({
-            org_id:       orgId,
-            contact_id:   contactId,
-            channel:      "whatsapp",
-            direction:    "in",
-            body,
-            from_address: e164,
-            provider_message_id: msgId,
-            meta:         { waba_id: wabaId },
-          });
-
-        if (insertErr) {
-          console.error("[meta-webhook] message insert error:", insertErr.message);
-        }
-      }
-    }
   }
 }
 

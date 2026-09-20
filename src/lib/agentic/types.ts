@@ -79,6 +79,23 @@ export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 export type ActionCategory =
   | "context" | "task" | "note" | "communication" | "lead" | "deal" | "scheduling";
 
+/**
+ * AI-1L addition. `category: "communication"` alone is NOT enough to tell
+ * a real customer send (send_sms/send_email) apart from a draft-only
+ * action (draft_customer_reply, also category "communication", but never
+ * sends anything) — confirmed by reading every current registry entry
+ * before adding this. `outboundChannel` exists specifically so
+ * centralized policy enforcement (action-executor.ts) can identify "this
+ * action, if executed, sends something to a customer over this channel"
+ * without hard-coding action keys. Limited to the channels this repo
+ * actually has a real consent/opt-out data model for today (email, sms —
+ * see marketing_contact_preferences) plus the channels a future action
+ * might target with no consent mechanism yet (whatsapp/messenger/
+ * instagram/voice) — action-executor.ts fails closed for any of the
+ * latter, it does not assume they're safe.
+ */
+export type OutboundCommunicationChannel = "sms" | "email" | "whatsapp" | "messenger" | "instagram" | "voice";
+
 /** Which actor kinds are allowed to invoke this action at all — independent of risk/approval. */
 export type SupportedActorType = ActorType;
 
@@ -128,4 +145,9 @@ export type ActionDefinition<TInput = unknown, TOutput = unknown> = {
   isExecutable: boolean;
   /** Undefined for proposal-only / not-yet-executable actions. */
   handler?: ActionHandler<TInput, TOutput>;
+  /** Set ONLY on actions that send something to a customer over this
+   * channel — see OutboundCommunicationChannel's own comment. Undefined
+   * for every read/internal/draft-only action (including
+   * draft_customer_reply). */
+  outboundChannel?: OutboundCommunicationChannel;
 };

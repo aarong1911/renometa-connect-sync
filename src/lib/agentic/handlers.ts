@@ -18,6 +18,8 @@
 
 import type { ActionHandler } from "./types";
 import { createLeadLinkedTask } from "./lead-tasks";
+import { sendTwilioSms } from "./sms-transport";
+import { sendWhatsAppText } from "./whatsapp-transport";
 
 type LeadContextInput = { leadId: string };
 type LeadContextOutput = {
@@ -133,6 +135,130 @@ export const addInternalNote: ActionHandler<AddInternalNoteInput, AddInternalNot
 
   if (error) return { ok: false, error: "Could not add the note." };
   return { ok: true, output: { noteId: data.id } };
+};
+
+type SendSmsInput = { contactId: string; body: string };
+type SendSmsOutput = { providerMessageId: string | null };
+
+/**
+ * AI-2A. The real handler behind the `send_sms` action — previously
+ * `isExecutable: false` with no handler (see action-registry.ts's own
+ * comment). Only reachable through the existing Gen-2 pipeline
+ * (executeStep()/executeApprovedStep() in action-executor.ts), which by
+ * this point has already: validated input against sendSmsInput (contactId
+ * + body only — no phone/orgId field exists on that schema for a model to
+ * supply), checked emergency pause, checked outbound consent
+ * (checkOutboundConsent() — SMS fails closed unless
+ * marketing_contact_preferences.sms_status === "eligible"), and — because
+ * send_sms.requiresApproval is unconditionally true — gone through a real
+ * human approval (agent-approve-action.ts, which itself is owner/admin-
+ * gated). This handler performs NO policy checks of its own; it trusts
+ * that executeStep()/executeApprovedStep() already ran them, exactly like
+ * every other handler in this file.
+ *
+ * Recipient binding: the destination phone number is ALWAYS resolved
+ * server-side from `input.contactId` (looked up in `contacts`, scoped to
+ * `ctx.orgId`) — there is no phone field on SendSmsInput for a model or
+ * caller to supply, so there is nothing to override even if one tried.
+ * Twilio credentials are read the same way send-inbox-message.ts already
+ * does (organizations.integration_settings.twilio, per-org) — no new
+ * credential-storage convention introduced.
+ */
+export const sendSms: ActionHandler<SendSmsInput, SendSmsOutput> = async (ctx, input) => {
+  const { data: contact, error: contactError } = await ctx.supabase
+    .from("contacts")
+    .select("id, phone")
+    .eq("id", input.contactId)
+    .eq("org_id", ctx.orgId)
+    .maybeSingle();
+  if (contactError) return { ok: false, error: "Could not load recipient contact." };
+  if (!contact?.phone) return { ok: false, error: "Recipient contact has no phone number on file." };
+
+  const recipientPhone = contact.phone;
+  // AI-2C.1: transport extracted to sms-transport.ts (shared with the
+  // deterministic HELP compliance reply) — this handler's own
+  // responsibility is now just contact resolution + persistence, exactly
+  // as before.
+  const sendResult = await sendTwilioSms(ctx.supabase, ctx.orgId, recipientPhone, input.body);
+  if (!sendResult.ok) return { ok: false, error: sendResult.error };
+  const providerMessageId = sendResult.providerMessageId;
+
+  const { error: insertErr } = await ctx.supabase.from("sms_meta_messages").insert({
+    org_id: ctx.orgId,
+    contact_id: input.contactId,
+    channel: "sms",
+    direction: "out",
+    body: input.body,
+    from_address: recipientPhone,
+    provider_message_id: providerMessageId,
+  });
+  if (insertErr) {
+    // The send already succeeded — losing the local history row is a
+    // lesser problem than reporting a false failure (same tradeoff
+    // send-inbox-message.ts already makes for its own SMS persistence).
+    console.error("[agentic/handlers] sendSms sms_meta_messages insert failed:", insertErr.message);
+  }
+
+  return { ok: true, output: { providerMessageId } };
+};
+
+type SendWhatsappInput = { contactId: string; body: string };
+type SendWhatsappOutput = { providerMessageId: string | null };
+
+/**
+ * AI-2E. The real handler behind the `send_whatsapp` action — modeled
+ * directly on sendSms above. Only reachable through the existing Gen-2
+ * pipeline (executeStep()/executeApprovedStep()), which by this point has
+ * already: validated input against sendWhatsappInput (contactId + body
+ * only — no phone/connection field for a model to supply), checked
+ * emergency pause, checked outbound eligibility (checkOutboundConsent()'s
+ * WhatsApp branch — action-executor.ts — which fails closed unless the
+ * contact has an open 24-hour reactive conversation window, i.e. messaged
+ * this business recently; see that function for why WhatsApp cannot reuse
+ * SMS's marketing_contact_preferences model), and — because
+ * send_whatsapp.requiresApproval is unconditionally true in AI-2E — gone
+ * through a real human approval (agent-approve-action.ts, owner/admin-
+ * gated). This handler performs NO policy checks of its own; it trusts
+ * that executeStep()/executeApprovedStep() already ran them, exactly like
+ * sendSms.
+ *
+ * Recipient binding: the destination phone is ALWAYS resolved server-side
+ * from `input.contactId` (looked up in `contacts`, scoped to
+ * `ctx.orgId`) — there is no phone/connection field on SendWhatsappInput
+ * for a model or caller to supply. Only ever sends `type: "text"` (see
+ * whatsapp-transport.ts) — never a template — matching AI-2E's explicit
+ * "reactive free-form replies only" scope.
+ */
+export const sendWhatsapp: ActionHandler<SendWhatsappInput, SendWhatsappOutput> = async (ctx, input) => {
+  const { data: contact, error: contactError } = await ctx.supabase
+    .from("contacts")
+    .select("id, phone")
+    .eq("id", input.contactId)
+    .eq("org_id", ctx.orgId)
+    .maybeSingle();
+  if (contactError) return { ok: false, error: "Could not load recipient contact." };
+  if (!contact?.phone) return { ok: false, error: "Recipient contact has no phone number on file." };
+
+  const recipientPhone = contact.phone;
+  const sendResult = await sendWhatsAppText(ctx.supabase, ctx.orgId, recipientPhone, input.body);
+  if (!sendResult.ok) return { ok: false, error: sendResult.error };
+  const providerMessageId = sendResult.providerMessageId;
+
+  const { error: insertErr } = await ctx.supabase.from("sms_meta_messages").insert({
+    org_id: ctx.orgId,
+    contact_id: input.contactId,
+    channel: "whatsapp",
+    direction: "out",
+    body: input.body,
+    from_address: recipientPhone,
+    provider_message_id: providerMessageId,
+  });
+  if (insertErr) {
+    // The send already succeeded — same tradeoff sendSms makes above.
+    console.error("[agentic/handlers] sendWhatsapp sms_meta_messages insert failed:", insertErr.message);
+  }
+
+  return { ok: true, output: { providerMessageId } };
 };
 
 type DraftCustomerReplyInput = { leadId: string; tone: "friendly" | "formal" };
