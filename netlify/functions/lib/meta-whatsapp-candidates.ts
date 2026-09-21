@@ -32,9 +32,15 @@ const MAX_BUSINESSES_SCANNED = 10;
 const MAX_WABAS_PER_BUSINESS = 10;
 
 export type WhatsAppCandidate = {
-  businessId: string;
+  // businessId/wabaId are null for a manually-validated candidate (see
+  // validateWhatsAppPhoneNumberId below) — the whole reason that fallback
+  // exists is that Meta's enumeration edges did NOT attribute this phone
+  // number to any business/WABA this token could walk to. Every enumerated
+  // candidate (discoverWhatsAppCandidates) still always sets both, since
+  // they come directly from the business/WABA loop variables.
+  businessId: string | null;
   businessName: string | null;
-  wabaId: string;
+  wabaId: string | null;
   wabaName: string | null;
   phoneNumberId: string;
   displayPhoneNumber: string;
@@ -149,4 +155,93 @@ export function decideCandidateAction(candidates: WhatsAppCandidate[]): Candidat
   if (candidates.length === 0) return { type: "zero_candidates" };
   if (candidates.length === 1) return { type: "auto_connect", candidate: candidates[0] };
   return { type: "selection_required", candidates };
+}
+
+// ── "I don't see my number" manual fallback ──────────────────────────────
+//
+// Repo-wide audit finding (read-only audits, this session): Meta's Graph
+// API sometimes does not attribute a real, healthy CLOUD_API phone number
+// to ANY business/WABA combination the connecting token can walk via
+// /me/businesses -> owned_whatsapp_business_accounts (or
+// client_whatsapp_business_accounts) — confirmed against a real case where
+// a GREEN-quality, CLOUD_API phone number was invisible to
+// discoverWhatsAppCandidates() above despite being directly readable by
+// node id with the same token. No alternate generic Meta edge was found
+// anywhere in this codebase or documented locally that can discover such a
+// number automatically (see that audit's own report) — a manual,
+// operator-supplied phoneNumberId is the only generic (non-hardcoded,
+// works-for-any-org) way to reach it.
+//
+// This function is the ONLY thing that makes a manually-entered id
+// trustworthy enough to treat as a real candidate: it re-derives every
+// field from Meta's own live response using the org's OWN already-granted
+// pending-selection access token — never from anything the browser claims
+// about the number. See netlify/functions/meta-whatsapp-validate-number.ts
+// for the endpoint that calls this.
+export type PhoneNodeValidation =
+  | {
+      ok: true;
+      phoneNumberId: string;
+      displayPhoneNumber: string;
+      verifiedName: string | null;
+      codeVerificationStatus: string | null;
+      platformType: string;
+      qualityRating: string | null;
+    }
+  | { ok: false; reason: string };
+
+/**
+ * Validates that `phoneNumberId` is a real, accessible WhatsApp Cloud API
+ * phone-number node for the given access token — a direct-by-id Graph
+ * read, not an enumeration. Fails closed on any Meta error, an id
+ * mismatch, a missing display_phone_number, or any platform_type other
+ * than exactly "CLOUD_API" (rejects ON_PREMISE and anything unrecognized —
+ * this is precisely the signal that distinguishes a healthy Cloud API
+ * number from a stale on-premise one in the case this fallback exists
+ * for). Never throws; a network failure is reported the same way any other
+ * validation failure is, through the discriminated return type.
+ */
+export async function validateWhatsAppPhoneNumberId(
+  accessToken: string,
+  phoneNumberId: string,
+): Promise<PhoneNodeValidation> {
+  let body: any;
+  try {
+    body = await fetchJson(
+      `https://graph.facebook.com/v21.0/${encodeURIComponent(phoneNumberId)}` +
+        `?fields=id,display_phone_number,verified_name,code_verification_status,platform_type,quality_rating` +
+        `&access_token=${encodeURIComponent(accessToken)}`,
+    );
+  } catch (e) {
+    console.warn("[meta-whatsapp-candidates] manual phone validation request failed:", e);
+    return { ok: false, reason: "Could not reach Meta to verify this phone number." };
+  }
+
+  // Graph returns errors as a 200 with an `error` object for some node
+  // reads, and as non-2xx for others — fetchJson() above never inspects
+  // res.ok, so both shapes are checked here. Never surface Meta's raw
+  // error object to the caller (may contain fbtrace_id or other internal
+  // detail) — only a safe, generic reason string.
+  if (body?.error) {
+    return { ok: false, reason: "Meta could not find or authorize access to this phone number." };
+  }
+  if (typeof body?.id !== "string" || body.id !== phoneNumberId) {
+    return { ok: false, reason: "Meta returned a different result than requested." };
+  }
+  if (typeof body?.display_phone_number !== "string" || !body.display_phone_number) {
+    return { ok: false, reason: "This does not appear to be a WhatsApp phone number." };
+  }
+  if (typeof body?.platform_type !== "string" || body.platform_type !== "CLOUD_API") {
+    return { ok: false, reason: "This phone number is not on WhatsApp Cloud API." };
+  }
+
+  return {
+    ok: true,
+    phoneNumberId: body.id,
+    displayPhoneNumber: body.display_phone_number,
+    verifiedName: typeof body.verified_name === "string" ? body.verified_name : null,
+    codeVerificationStatus: typeof body.code_verification_status === "string" ? body.code_verification_status : null,
+    platformType: body.platform_type,
+    qualityRating: typeof body.quality_rating === "string" ? body.quality_rating : null,
+  };
 }

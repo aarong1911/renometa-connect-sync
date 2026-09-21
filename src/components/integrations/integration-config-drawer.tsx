@@ -266,6 +266,24 @@ export function IntegrationConfigDrawer({
   const [waSelectionToken, setWaSelectionToken] = useState<string | null>(null);
   const [waSelectedPhoneNumberId, setWaSelectedPhoneNumberId] = useState<string | null>(null);
   const [waSubmitting, setWaSubmitting] = useState(false);
+  // "I don't see my number" manual fallback — see
+  // meta-whatsapp-validate-number.ts. waManualValidated is the confirmed,
+  // server-derived metadata for the (unrelated to any enumerated
+  // candidate) phoneNumberId the operator typed in; Connect reuses the
+  // SAME handleWaSelectNumber()/finalize flow every enumerated candidate
+  // already goes through, once validation has staged it.
+  const [waManualMode, setWaManualMode] = useState(false);
+  const [waManualPhoneNumberId, setWaManualPhoneNumberId] = useState("");
+  const [waManualValidating, setWaManualValidating] = useState(false);
+  const [waManualError, setWaManualError] = useState<string | null>(null);
+  const [waManualValidated, setWaManualValidated] = useState<{
+    phoneNumberId: string;
+    displayPhoneNumber: string;
+    verifiedName: string | null;
+    codeVerificationStatus: string | null;
+    platformType: string;
+    qualityRating: string | null;
+  } | null>(null);
   const [googleAdsConnecting, setGoogleAdsConnecting] = useState(false);
 
   // ── Google Ads account-selection UI state ────────────────────────────
@@ -366,8 +384,17 @@ export function IntegrationConfigDrawer({
     }
   }
 
-  async function handleWaSelectNumber() {
-    if (!waSelectedPhoneNumberId || !waSelectionToken || waSubmitting) return; // guard against duplicate submission
+  // Accepts an explicit phoneNumberId override so the manual-fallback flow
+  // (handleWaConnectManual below) can call this with the just-validated id
+  // without depending on a same-tick state update — React state setters
+  // don't apply synchronously, so calling this immediately after
+  // setWaSelectedPhoneNumberId(...) would otherwise still see the OLD
+  // value. The normal candidate-list flow is unaffected: its own "Connect
+  // this number" button still calls this with no argument, falling back
+  // to waSelectedPhoneNumberId exactly as before.
+  async function handleWaSelectNumber(phoneNumberIdOverride?: string) {
+    const phoneNumberId = phoneNumberIdOverride ?? waSelectedPhoneNumberId;
+    if (!phoneNumberId || !waSelectionToken || waSubmitting) return; // guard against duplicate submission
     setWaSubmitting(true);
     try {
       const { data: { session } } = await supabase.auth.getSession();
@@ -378,7 +405,7 @@ export function IntegrationConfigDrawer({
       const res = await fetch("/.netlify/functions/meta-whatsapp-select-number", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
-        body: JSON.stringify({ selectionToken: waSelectionToken, phoneNumberId: waSelectedPhoneNumberId }),
+        body: JSON.stringify({ selectionToken: waSelectionToken, phoneNumberId }),
       });
       const json = await res.json().catch(() => ({}));
       if (!res.ok || !json.success) {
@@ -390,6 +417,10 @@ export function IntegrationConfigDrawer({
       setWaCandidates([]);
       setWaSelectionToken(null);
       setWaSelectedPhoneNumberId(null);
+      setWaManualMode(false);
+      setWaManualPhoneNumberId("");
+      setWaManualValidated(null);
+      setWaManualError(null);
       const conn = await fetchMetaConnection("whatsapp");
       setMetaConnection(conn);
       setIsConfigured(!!conn);
@@ -399,6 +430,61 @@ export function IntegrationConfigDrawer({
     } finally {
       setWaSubmitting(false);
     }
+  }
+
+  // "I don't see my number" — validates a manually-entered phoneNumberId
+  // server-side (meta-whatsapp-validate-number.ts) using the SAME pending
+  // selection's already-granted access token. Never persists a connection
+  // by itself — only stages the server-derived candidate so a subsequent
+  // handleWaConnectManual() (below) can finalize it through the existing,
+  // unmodified select-number endpoint/RPC.
+  async function handleWaValidateManual() {
+    const phoneNumberId = waManualPhoneNumberId.trim();
+    if (!phoneNumberId || !waSelectionToken || waManualValidating) return;
+    setWaManualValidating(true);
+    setWaManualError(null);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        toast.error("You must be signed in");
+        return;
+      }
+      const res = await fetch("/.netlify/functions/meta-whatsapp-validate-number", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+        body: JSON.stringify({ selectionToken: waSelectionToken, phoneNumberId }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json.success) {
+        setWaManualError(json.error ?? "Could not verify this phone number — please check the ID and try again.");
+        return;
+      }
+      setWaManualValidated({
+        phoneNumberId: json.phoneNumberId,
+        displayPhoneNumber: json.displayPhoneNumber,
+        verifiedName: json.verifiedName ?? null,
+        codeVerificationStatus: json.codeVerificationStatus ?? null,
+        platformType: json.platformType,
+        qualityRating: json.qualityRating ?? null,
+      });
+    } catch {
+      setWaManualError("Network error — could not verify this phone number.");
+    } finally {
+      setWaManualValidating(false);
+    }
+  }
+
+  function handleWaConnectManual() {
+    if (!waManualValidated) return;
+    void handleWaSelectNumber(waManualValidated.phoneNumberId);
+  }
+
+  function resetWaManualState() {
+    setWaManualMode(false);
+    setWaManualPhoneNumberId("");
+    setWaManualValidating(false);
+    setWaManualError(null);
+    setWaManualValidated(null);
   }
 
   // Load existing connection status when drawer opens
@@ -414,6 +500,7 @@ export function IntegrationConfigDrawer({
     setWaCandidates([]);
     setWaSelectionToken(null);
     setWaSelectedPhoneNumberId(null);
+    resetWaManualState();
 
     if (currentId === GOOGLE_ADS_ID) {
       setGoogleAdsAccounts(null);
@@ -811,7 +898,66 @@ export function IntegrationConfigDrawer({
 
           {integration.connectMethod === "oauth" && META_IDS.has(int.id) && (
             <div className="space-y-3 rounded-lg border border-border p-4">
-              {int.id === "whatsapp" && waSelectionMode ? (
+              {int.id === "whatsapp" && waSelectionMode && waManualMode ? (
+                <div className="space-y-3">
+                  {!waManualValidated ? (
+                    <>
+                      <p className="text-xs text-muted-foreground">
+                        Enter the <span className="font-medium text-foreground">Phone number ID</span> for the WhatsApp number you want to connect — found in
+                        {" "}<span className="font-medium text-foreground">WhatsApp Manager → API Setup</span> (or Business Settings → Accounts → WhatsApp
+                        Accounts → your phone number → "Phone number ID"). This is a numeric ID, not the phone number itself.
+                      </p>
+                      <div className="space-y-1.5">
+                        <Label htmlFor="wa-manual-phone-id" className="text-xs">Meta phone number ID</Label>
+                        <Input
+                          id="wa-manual-phone-id"
+                          value={waManualPhoneNumberId}
+                          onChange={(e) => { setWaManualPhoneNumberId(e.target.value); setWaManualError(null); }}
+                          placeholder="e.g. 123456789012345"
+                          disabled={waManualValidating}
+                        />
+                        {waManualError && <p className="text-xs text-destructive">{waManualError}</p>}
+                      </div>
+                      <Button
+                        className="w-full"
+                        disabled={!waManualPhoneNumberId.trim() || waManualValidating}
+                        onClick={handleWaValidateManual}
+                      >
+                        {waManualValidating ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+                        {waManualValidating ? "Validating…" : "Validate"}
+                      </Button>
+                      <Button variant="ghost" size="sm" className="w-full" disabled={waManualValidating} onClick={resetWaManualState}>
+                        Cancel
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <div className="space-y-1.5 rounded-md border border-border bg-muted/30 p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-medium text-foreground">{waManualValidated.displayPhoneNumber}</span>
+                          {waManualValidated.qualityRating && (
+                            <Badge variant="secondary" className="h-4 shrink-0 rounded-full px-1.5 text-[9px]">{waManualValidated.qualityRating}</Badge>
+                          )}
+                        </div>
+                        {waManualValidated.verifiedName && (
+                          <p className="text-[11px] text-muted-foreground">Verified name: {waManualValidated.verifiedName}</p>
+                        )}
+                        <p className="text-[11px] text-muted-foreground">Platform: {waManualValidated.platformType}</p>
+                        {waManualValidated.codeVerificationStatus && (
+                          <p className="text-[11px] text-muted-foreground">Verification status: {waManualValidated.codeVerificationStatus}</p>
+                        )}
+                      </div>
+                      <Button className="w-full" disabled={waSubmitting} onClick={handleWaConnectManual}>
+                        {waSubmitting ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+                        {waSubmitting ? "Connecting…" : "Connect this number"}
+                      </Button>
+                      <Button variant="ghost" size="sm" className="w-full" disabled={waSubmitting} onClick={resetWaManualState}>
+                        Back
+                      </Button>
+                    </>
+                  )}
+                </div>
+              ) : int.id === "whatsapp" && waSelectionMode ? (
                 <div className="space-y-3">
                   <p className="text-xs text-muted-foreground">
                     More than one WhatsApp number is available on this Meta Business account. Select the number you want RenoMeta Connect to use.
@@ -853,12 +999,15 @@ export function IntegrationConfigDrawer({
                       <Button
                         className="w-full"
                         disabled={!waSelectedPhoneNumberId || waSubmitting}
-                        onClick={handleWaSelectNumber}
+                        onClick={() => handleWaSelectNumber()}
                       >
                         {waSubmitting ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
                         {waSubmitting ? "Connecting…" : "Connect this number"}
                       </Button>
-                      <Button variant="ghost" size="sm" className="w-full" disabled={waSubmitting} onClick={() => { setWaSelectionMode(false); setWaCandidates([]); setWaSelectionToken(null); setWaSelectedPhoneNumberId(null); }}>
+                      <Button variant="ghost" size="sm" className="w-full" disabled={waSubmitting} onClick={() => setWaManualMode(true)}>
+                        I don't see my number
+                      </Button>
+                      <Button variant="ghost" size="sm" className="w-full" disabled={waSubmitting} onClick={() => { setWaSelectionMode(false); setWaCandidates([]); setWaSelectionToken(null); setWaSelectedPhoneNumberId(null); resetWaManualState(); }}>
                         Cancel
                       </Button>
                     </>

@@ -136,3 +136,126 @@ export async function finalizeMetaWhatsAppSelectionAtomic(
   if (row.status === "invalid_candidate") return { ok: true, status: "invalid_candidate" };
   return { ok: true, status: "not_found_or_expired" };
 }
+
+// ── "I don't see my number" manual fallback — reads/candidate append ────
+//
+// Both functions below exist ONLY to support
+// meta-whatsapp-validate-number.ts. Neither touches meta_connections —
+// they only read/extend the SAME short-lived pending_selections row the
+// normal multi-candidate flow already reserved. finalize_meta_whatsapp_
+// selection (above) is completely UNCHANGED and remains the only path
+// that ever writes meta_connections — a manually-validated candidate only
+// becomes a real connection by going through that exact same, already-
+// atomic RPC, the same way an enumerated candidate does. This is
+// deliberate: reusing the hardened, tested finalize path is safer than
+// adding a second write path with its own trust/atomicity story.
+
+export type PendingSelectionTokenLookup =
+  | { ok: true; encryptedAccessToken: string }
+  | { ok: false; reason: "not_found" | "expired" | "consumed" };
+
+/**
+ * Loads ONLY the encrypted access token for an existing, still-valid
+ * pending WhatsApp selection — scoped to the exact org/user/product a
+ * multi-candidate OAuth callback reserved it for, exactly like the
+ * finalize RPC's own WHERE clause (org_id + user_id + product +
+ * unconsumed + unexpired). Never returns the token to the browser; the
+ * caller (meta-whatsapp-validate-number.ts) uses it server-side only, to
+ * call Meta on the operator's behalf. A stricter check than the finalize
+ * RPC's `for update` row lock is unnecessary here — this is a read used to
+ * make an OUTBOUND Meta call, not a write, so no row-level lock is taken.
+ */
+export async function loadPendingSelectionAccessToken(
+  supabase: SupabaseClient,
+  params: { selectionTokenHash: string; orgId: string; userId: string; product: string },
+): Promise<PendingSelectionTokenLookup> {
+  const { data, error } = await supabase
+    .from("meta_whatsapp_pending_selections")
+    .select("encrypted_access_token, expires_at, consumed_at")
+    .eq("selection_token_hash", params.selectionTokenHash)
+    .eq("org_id", params.orgId)
+    .eq("user_id", params.userId)
+    .eq("product", params.product)
+    .maybeSingle();
+
+  if (error) {
+    console.error("[meta-whatsapp-selection-store] loadPendingSelectionAccessToken lookup failed:", error.message);
+    return { ok: false, reason: "not_found" };
+  }
+  if (!data) return { ok: false, reason: "not_found" };
+  if (data.consumed_at) return { ok: false, reason: "consumed" };
+  if (new Date(data.expires_at as string) <= new Date()) return { ok: false, reason: "expired" };
+
+  return { ok: true, encryptedAccessToken: data.encrypted_access_token as string };
+}
+
+export type AppendManualCandidateResult = { ok: true } | { ok: false; reason: "not_found" | "expired" | "consumed" | "write_failed" };
+
+/**
+ * Appends one server-validated manual candidate to a pending selection's
+ * stored candidate list — the ONLY way a manually-entered phoneNumberId
+ * can ever become something finalize_meta_whatsapp_selection will accept,
+ * since that RPC only ever matches phoneNumberId against candidates
+ * ALREADY present in this exact column (never trusts a phoneNumberId
+ * supplied at finalize time beyond using it as a lookup key). Re-checks
+ * the same scoping/expiry/consumed conditions as the read above
+ * immediately before writing, and re-checks `consumed_at is null` again in
+ * the UPDATE's own WHERE clause as a best-effort guard against a race with
+ * a concurrent finalize — not a full row lock (this table has no exposed
+ * RPC for it), but finalize's own `for update` transaction remains the
+ * actual, final source of truth regardless: if this update loses a narrow
+ * race, the worst case is a candidate that doesn't get appended in time
+ * for that specific finalize attempt, never a security bypass or a
+ * double-write.
+ *
+ * Idempotent: re-validating the same phoneNumberId twice (e.g. the
+ * operator clicks Validate again) does not duplicate the candidate.
+ */
+export async function appendValidatedManualCandidate(
+  supabase: SupabaseClient,
+  params: {
+    selectionTokenHash: string;
+    orgId: string;
+    userId: string;
+    product: string;
+    candidate: WhatsAppCandidate;
+  },
+): Promise<AppendManualCandidateResult> {
+  const { data, error } = await supabase
+    .from("meta_whatsapp_pending_selections")
+    .select("candidates, expires_at, consumed_at")
+    .eq("selection_token_hash", params.selectionTokenHash)
+    .eq("org_id", params.orgId)
+    .eq("user_id", params.userId)
+    .eq("product", params.product)
+    .maybeSingle();
+
+  if (error) {
+    console.error("[meta-whatsapp-selection-store] appendValidatedManualCandidate read failed:", error.message);
+    return { ok: false, reason: "not_found" };
+  }
+  if (!data) return { ok: false, reason: "not_found" };
+  if (data.consumed_at) return { ok: false, reason: "consumed" };
+  if (new Date(data.expires_at as string) <= new Date()) return { ok: false, reason: "expired" };
+
+  const existing: WhatsAppCandidate[] = Array.isArray(data.candidates) ? data.candidates : [];
+  const alreadyPresent = existing.some((c) => c?.phoneNumberId === params.candidate.phoneNumberId);
+  const nextCandidates = alreadyPresent ? existing : [...existing, params.candidate];
+
+  if (!alreadyPresent) {
+    const { error: updateErr } = await supabase
+      .from("meta_whatsapp_pending_selections")
+      .update({ candidates: nextCandidates })
+      .eq("selection_token_hash", params.selectionTokenHash)
+      .eq("org_id", params.orgId)
+      .eq("user_id", params.userId)
+      .eq("product", params.product)
+      .is("consumed_at", null);
+    if (updateErr) {
+      console.error("[meta-whatsapp-selection-store] appendValidatedManualCandidate write failed:", updateErr.message);
+      return { ok: false, reason: "write_failed" };
+    }
+  }
+
+  return { ok: true };
+}

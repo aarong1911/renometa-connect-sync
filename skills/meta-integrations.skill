@@ -208,6 +208,21 @@ const wabaRes = await fetch(
 );
 // then for each business: /v21.0/{business_id}/owned_whatsapp_business_accounts
 // then for the WABA: /v21.0/{waba_id}/phone_numbers
+//
+// KNOWN GAP (read-only architecture audit, 2026-09): this enumeration can
+// miss a real, healthy, accessible CLOUD_API phone number if Meta's graph
+// doesn't attribute it to any business this token can walk via the two
+// edges above (and client_whatsapp_business_accounts doesn't surface it
+// either) — confirmed against a real case. The phone node itself was
+// still directly readable by id (`GET /{phone_number_id}?fields=id,
+// display_phone_number,verified_name,code_verification_status,
+// platform_type,quality_rating`) even though no enumeration edge ever
+// returned it. No alternate generic Meta edge was found that closes this
+// gap automatically. meta-whatsapp-validate-number.ts is the resulting
+// "I don't see my number" fallback (see the WABA ID section below) — it
+// re-uses this exact direct-by-id read, server-side, with the same
+// already-granted token, and fails closed unless platform_type is exactly
+// CLOUD_API.
 ```
 
 Required scopes/products to request in the Meta App dashboard depending on
@@ -220,16 +235,46 @@ which integration card triggered the flow:
   Business Asset User Profile Access is requested implicitly via the Business
   Login config — it isn't a separate scope string.
 
-### WhatsApp send (pairs with existing `meta-webhook.ts` receiver)
+### WhatsApp send + inbound org resolution — CURRENT, LIVE behavior (AI-2E)
 
-`meta-webhook.ts` already handles inbound messages and looks up the org via
-`organizations.integration_settings->whatsapp->>waba_id` — **that lookup
-path is now stale** once `meta_connections` exists; update it to query
-`meta_connections` by `waba_id` instead (see migration note below).
+**This section replaces an earlier draft of this doc that described a
+still-in-progress migration and a `meta-send-whatsapp.ts` file — that
+migration is long since complete and that file no longer exists** (it was
+superseded by `send-inbox-message.ts`'s WhatsApp branch for manual replies
+and `src/lib/agentic/whatsapp-transport.ts` for AI-2E's approved-action
+sends). Kept here only so a reader who finds an old reference to either
+doesn't go looking for dead code.
+
+**Inbound org resolution** (`netlify/functions/lib/meta-whatsapp-inbound.ts`,
+called from `meta-webhook.ts`): resolves the org from the webhook payload's
+`value.metadata.phone_number_id`, matched against
+`meta_connections.waba_phone_number_id` scoped to `product = 'whatsapp'`:
 
 ```typescript
-// meta-send-whatsapp.ts
-await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+const { data: connRow } = await supabaseAdmin
+  .from("meta_connections")
+  .select("org_id")
+  .eq("product", "whatsapp")
+  .eq("waba_phone_number_id", phoneNumberId)
+  .maybeSingle();
+const orgId = connRow?.org_id;
+```
+
+**This is NOT a lookup by `waba_id`.** An earlier version of this webhook
+(and an earlier version of this doc) resolved org via
+`organizations.integration_settings->whatsapp->>waba_id`, then later via
+`meta_connections.waba_id` — both are gone. `waba_id` is **metadata only**
+today: it's persisted on the row for display/history but is not read by
+any inbound resolution, outbound send, or connection-management code path.
+`waba_phone_number_id` is the one functional identifier the entire live
+WhatsApp runtime depends on — see "`waba_id` may be null" below for why.
+
+**Outbound send** (both `send-inbox-message.ts`'s manual-reply branch and
+`whatsapp-transport.ts`'s AI-2E approved-send path use the identical
+target):
+
+```typescript
+await fetch(`https://graph.facebook.com/v21.0/${conn.waba_phone_number_id}/messages`, {
   method: "POST",
   headers: {
     Authorization: `Bearer ${accessToken}`,
@@ -237,30 +282,31 @@ await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
   },
   body: JSON.stringify({
     messaging_product: "whatsapp",
-    to: toPhoneE164.replace("+", ""),
+    to: toPhoneDigitsNoPlus,
     type: "text",
     text: { body: messageText },
   }),
 });
 ```
 
-### Migration note: `meta-webhook.ts`
+### `waba_id` may be null — this is expected, not a bug
 
-The existing webhook queries `organizations.integration_settings`. Once
-`meta_connections` ships, change the org lookup in `meta-webhook.ts` to:
-
-```typescript
-const { data: conn } = await supabaseAdmin
-  .from("meta_connections")
-  .select("org_id")
-  .eq("waba_id", wabaId)
-  .maybeSingle();
-const orgId = conn?.org_id;
-```
-
-Don't delete the old `integration_settings` path until this migration is
-confirmed in production — keep both lookups temporarily and log which one
-matched, then remove the old path once `meta_connections` is the only source.
+`meta_connections.waba_id` and `meta_connections.waba_phone_number_id` are
+both plain nullable `text` columns (no `NOT NULL`, no `CHECK`) — see
+`supabase/migrations/20260904_meta_schema_baseline.sql`. A connection can
+exist today with `waba_phone_number_id` set and `waba_id` `NULL`: this
+happens for any number connected through the **"I don't see my number"**
+manual fallback (`netlify/functions/meta-whatsapp-validate-number.ts`),
+used when Meta's own enumeration (`owned_whatsapp_business_accounts` /
+`client_whatsapp_business_accounts`) doesn't surface a real, accessible,
+`CLOUD_API` phone number for whatever reason (see the KNOWN GAP note
+above). Every live runtime path — inbound resolution, both outbound send
+paths, disconnect (`meta-disconnect.ts`, keyed on `(org_id, product)`
+only) — already tolerates this correctly; only `meta-connection-status.ts`
+and the Settings UI display `waba_id`, purely as optional metadata. Do not
+add a `NOT NULL` constraint or a code assumption that `waba_id` is always
+present without first checking whether the manual-fallback path is still
+in use.
 
 ## Environment variables (new)
 
