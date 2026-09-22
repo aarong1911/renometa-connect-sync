@@ -245,3 +245,43 @@ export async function validateWhatsAppPhoneNumberId(
     qualityRating: typeof body.quality_rating === "string" ? body.quality_rating : null,
   };
 }
+
+// ── WhatsApp Embedded Signup (coexistence) completion validation ────────
+//
+// Phase 1 (2026-09). The Embedded Signup completion `message` event
+// (window.postMessage, type "WA_EMBEDDED_SIGNUP") hands the browser a
+// waba_id/phone_number_id/business_id directly — no enumeration needed,
+// unlike the OAuth-redirect candidate-discovery flow above. But those
+// values come from the BROWSER, which received them from a client-side
+// event Meta's own JS populates — this codebase's standing rule is that
+// nothing client-supplied is trusted as a real identifier without a
+// server-side Graph re-check (same discipline
+// validateWhatsAppPhoneNumberId already applies to the manual-fallback
+// phoneNumberId). validateWhatsAppWabaId is the WABA-side counterpart,
+// used best-effort by meta-whatsapp-embedded-signup-complete.ts: a WABA
+// id that fails this check is dropped (staged candidate proceeds with
+// wabaId: null, exactly like the manual-fallback path already tolerates)
+// rather than blocking the whole completion — the phone-number validation
+// above remains the one hard requirement.
+export type WabaNodeValidation =
+  | { ok: true; wabaId: string; name: string | null }
+  | { ok: false; reason: string };
+
+export async function validateWhatsAppWabaId(accessToken: string, wabaId: string): Promise<WabaNodeValidation> {
+  let body: any;
+  try {
+    body = await fetchJson(
+      `https://graph.facebook.com/v21.0/${encodeURIComponent(wabaId)}?fields=id,name&access_token=${encodeURIComponent(accessToken)}`,
+    );
+  } catch (e) {
+    console.warn("[meta-whatsapp-candidates] WABA validation request failed:", e);
+    return { ok: false, reason: "Could not reach Meta to verify this WhatsApp Business Account." };
+  }
+  if (body?.error) {
+    return { ok: false, reason: "Meta could not find or authorize access to this WhatsApp Business Account." };
+  }
+  if (typeof body?.id !== "string" || body.id !== wabaId) {
+    return { ok: false, reason: "Meta returned a different result than requested." };
+  }
+  return { ok: true, wabaId: body.id, name: typeof body.name === "string" ? body.name : null };
+}

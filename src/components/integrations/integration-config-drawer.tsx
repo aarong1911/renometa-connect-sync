@@ -9,7 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
 import { Link2, Copy, ExternalLink, Loader2, CheckCircle2, AlertTriangle, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import type { Integration } from "@/lib/integrations-data";
 import { supabase } from "@/lib/supabase";
 import {
@@ -18,6 +18,12 @@ import {
   type GoogleAdsSafeAccount,
 } from "@/lib/google-ads-format";
 import { getMetaLeadForms, reconcileMetaLeadAds, type MetaLeadForm } from "@/lib/meta-lead-ads-client";
+import { loadFacebookSdk } from "@/lib/meta-embedded-signup-sdk";
+import {
+  isTrustedMetaOrigin,
+  parseEmbeddedSignupMessage,
+  createEmbeddedSignupCompletionCoordinator,
+} from "@/lib/meta-embedded-signup-session";
 
 interface Props {
   integration: Integration | null;
@@ -284,6 +290,22 @@ export function IntegrationConfigDrawer({
     platformType: string;
     qualityRating: string | null;
   } | null>(null);
+  // WhatsApp Embedded Signup / coexistence, Phase 2. Separate from every
+  // other WhatsApp state above — this is a distinct client-side JS-SDK
+  // flow (FB.login() + a window "message" listener), not the existing
+  // server-redirect OAuth popup those other states belong to. "waiting_pairing"
+  // deliberately covers the ENTIRE span from FB.login() being invoked
+  // until either the message event or a login-callback cancellation
+  // arrives — our own code cannot distinguish what step Meta's own hosted
+  // UI (business picker vs. QR pairing) is currently showing inside that
+  // window, so this state is honestly coarse rather than pretending to
+  // more granularity than we actually have visibility into.
+  const [waEmbeddedMode, setWaEmbeddedMode] = useState(false);
+  const [waEmbeddedState, setWaEmbeddedState] = useState<
+    "ready" | "opening" | "waiting_pairing" | "completing" | "connected" | "cancelled" | "error"
+  >("ready");
+  const [waEmbeddedError, setWaEmbeddedError] = useState<string | null>(null);
+  const waEmbeddedListenerRef = useRef<((e: MessageEvent) => void) | null>(null);
   const [googleAdsConnecting, setGoogleAdsConnecting] = useState(false);
 
   // ── Google Ads account-selection UI state ────────────────────────────
@@ -384,17 +406,19 @@ export function IntegrationConfigDrawer({
     }
   }
 
-  // Accepts an explicit phoneNumberId override so the manual-fallback flow
-  // (handleWaConnectManual below) can call this with the just-validated id
-  // without depending on a same-tick state update — React state setters
-  // don't apply synchronously, so calling this immediately after
-  // setWaSelectedPhoneNumberId(...) would otherwise still see the OLD
-  // value. The normal candidate-list flow is unaffected: its own "Connect
-  // this number" button still calls this with no argument, falling back
-  // to waSelectedPhoneNumberId exactly as before.
-  async function handleWaSelectNumber(phoneNumberIdOverride?: string) {
+  // Accepts explicit phoneNumberId/selectionToken overrides so callers
+  // that just OBTAINED a fresh value (the manual-fallback flow below, and
+  // the Embedded Signup coexistence flow) can call this without depending
+  // on a same-tick state update — React state setters don't apply
+  // synchronously, so calling this immediately after
+  // setWaSelectedPhoneNumberId(...)/setWaSelectionToken(...) would
+  // otherwise still see the OLD values. The normal candidate-list flow is
+  // unaffected: its own "Connect this number" button still calls this
+  // with no arguments, falling back to component state exactly as before.
+  async function handleWaSelectNumber(phoneNumberIdOverride?: string, selectionTokenOverride?: string) {
     const phoneNumberId = phoneNumberIdOverride ?? waSelectedPhoneNumberId;
-    if (!phoneNumberId || !waSelectionToken || waSubmitting) return; // guard against duplicate submission
+    const selectionToken = selectionTokenOverride ?? waSelectionToken;
+    if (!phoneNumberId || !selectionToken || waSubmitting) return; // guard against duplicate submission
     setWaSubmitting(true);
     try {
       const { data: { session } } = await supabase.auth.getSession();
@@ -405,7 +429,7 @@ export function IntegrationConfigDrawer({
       const res = await fetch("/.netlify/functions/meta-whatsapp-select-number", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
-        body: JSON.stringify({ selectionToken: waSelectionToken, phoneNumberId }),
+        body: JSON.stringify({ selectionToken, phoneNumberId }),
       });
       const json = await res.json().catch(() => ({}));
       if (!res.ok || !json.success) {
@@ -487,6 +511,146 @@ export function IntegrationConfigDrawer({
     setWaManualValidated(null);
   }
 
+  // ── WhatsApp Embedded Signup / coexistence, Phase 2 ─────────────────────
+  //
+  // A distinct entry point from the existing WhatsApp OAuth connect above —
+  // does not touch waSelectionMode/waManualMode/metaConnection state, and
+  // is only ever entered via the dedicated "Connect existing WhatsApp
+  // Business number" button (JSX below). Preserves every existing flow
+  // unchanged.
+
+  function removeWaEmbeddedListener() {
+    if (waEmbeddedListenerRef.current) {
+      window.removeEventListener("message", waEmbeddedListenerRef.current);
+      waEmbeddedListenerRef.current = null;
+    }
+  }
+
+  function resetWaEmbeddedState() {
+    removeWaEmbeddedListener();
+    setWaEmbeddedMode(false);
+    setWaEmbeddedState("ready");
+    setWaEmbeddedError(null);
+  }
+
+  async function handleStartEmbeddedSignup() {
+    setWaEmbeddedMode(true);
+    setWaEmbeddedState("opening");
+    setWaEmbeddedError(null);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        setWaEmbeddedError("You must be signed in.");
+        setWaEmbeddedState("error");
+        return;
+      }
+
+      const configRes = await fetch("/.netlify/functions/meta-whatsapp-embedded-signup-config", {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      const configJson = await configRes.json().catch(() => ({}));
+      if (!configRes.ok || !configJson.appId || !configJson.embeddedSignupConfigId) {
+        setWaEmbeddedError("Could not start the WhatsApp connection — please try again.");
+        setWaEmbeddedState("error");
+        return;
+      }
+
+      const FB = await loadFacebookSdk({
+        appId: configJson.appId,
+        graphApiVersion: configJson.graphApiVersion || "v21.0",
+      });
+
+      const coordinator = createEmbeddedSignupCompletionCoordinator(async (result) => {
+        removeWaEmbeddedListener();
+        setWaEmbeddedState("completing");
+        try {
+          const completeRes = await fetch("/.netlify/functions/meta-whatsapp-embedded-signup-complete", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
+            body: JSON.stringify({
+              code: result.code,
+              phoneNumberId: result.phoneNumberId,
+              ...(result.wabaId ? { wabaId: result.wabaId } : {}),
+              ...(result.businessId ? { businessId: result.businessId } : {}),
+            }),
+          });
+          const completeJson = await completeRes.json().catch(() => ({}));
+          if (!completeRes.ok || !completeJson.success || !completeJson.selectionToken || !completeJson.candidate?.phoneNumberId) {
+            setWaEmbeddedError(completeJson.error ?? "Could not complete the WhatsApp connection — please try again.");
+            setWaEmbeddedState("error");
+            return;
+          }
+          // Reuse the EXISTING finalize endpoint/RPC — no second write
+          // path. Overrides passed explicitly since setWaSelectionToken
+          // below wouldn't be visible synchronously to this same call.
+          setWaSelectionToken(completeJson.selectionToken);
+          await handleWaSelectNumber(completeJson.candidate.phoneNumberId, completeJson.selectionToken);
+          setWaEmbeddedState("connected");
+        } catch {
+          setWaEmbeddedError("Network error — could not complete the WhatsApp connection.");
+          setWaEmbeddedState("error");
+        }
+      });
+
+      function onMessage(e: MessageEvent) {
+        const trusted = isTrustedMetaOrigin(e.origin);
+        const parsed = parseEmbeddedSignupMessage(trusted, e.data);
+        if (parsed.kind === "ignored") return;
+        if (parsed.kind === "success") {
+          coordinator.submitSession({
+            phoneNumberId: parsed.phoneNumberId,
+            wabaId: parsed.wabaId,
+            businessId: parsed.businessId,
+          });
+          return;
+        }
+        if (parsed.kind === "cancel") {
+          removeWaEmbeddedListener();
+          setWaEmbeddedState("cancelled");
+          return;
+        }
+        // kind === "error" — never surface Meta's raw error text to the user.
+        removeWaEmbeddedListener();
+        setWaEmbeddedError("The WhatsApp connection could not be completed.");
+        setWaEmbeddedState("error");
+      }
+      waEmbeddedListenerRef.current = onMessage;
+      window.addEventListener("message", onMessage);
+
+      setWaEmbeddedState("waiting_pairing");
+      FB.login(
+        (response) => {
+          const code = response.authResponse?.code;
+          if (!code) {
+            if (!coordinator.hasFired) {
+              removeWaEmbeddedListener();
+              setWaEmbeddedState("cancelled");
+            }
+            return;
+          }
+          coordinator.submitCode(code);
+        },
+        {
+          config_id: configJson.embeddedSignupConfigId,
+          response_type: "code",
+          override_default_response_type: true,
+          extras: { setup: {}, featureType: "whatsapp_business_app_onboarding", sessionInfoVersion: "3" },
+        },
+      );
+    } catch {
+      removeWaEmbeddedListener();
+      setWaEmbeddedError("Could not start the WhatsApp connection — please try again.");
+      setWaEmbeddedState("error");
+    }
+  }
+
+  // Unmount safety — never leave a "message" listener registered if the
+  // drawer/component unmounts mid-flow.
+  useEffect(() => {
+    return () => { removeWaEmbeddedListener(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Load existing connection status when drawer opens
   useEffect(() => {
     if (!open || !integration) return;
@@ -501,6 +665,7 @@ export function IntegrationConfigDrawer({
     setWaSelectionToken(null);
     setWaSelectedPhoneNumberId(null);
     resetWaManualState();
+    resetWaEmbeddedState();
 
     if (currentId === GOOGLE_ADS_ID) {
       setGoogleAdsAccounts(null);
@@ -898,7 +1063,52 @@ export function IntegrationConfigDrawer({
 
           {integration.connectMethod === "oauth" && META_IDS.has(int.id) && (
             <div className="space-y-3 rounded-lg border border-border p-4">
-              {int.id === "whatsapp" && waSelectionMode && waManualMode ? (
+              {int.id === "whatsapp" && waEmbeddedMode ? (
+                <div className="space-y-3">
+                  {waEmbeddedState === "opening" && (
+                    <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" /> Preparing to open Meta…
+                    </div>
+                  )}
+                  {waEmbeddedState === "waiting_pairing" && (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" /> Finish connecting in the Meta window — select your business and pair your WhatsApp number there.
+                      </div>
+                      <Button variant="ghost" size="sm" className="w-full" onClick={resetWaEmbeddedState}>
+                        Cancel
+                      </Button>
+                    </div>
+                  )}
+                  {waEmbeddedState === "completing" && (
+                    <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" /> Finishing connection…
+                    </div>
+                  )}
+                  {waEmbeddedState === "connected" && (
+                    <div className="flex items-center gap-2 rounded-md bg-success/10 px-3 py-2.5 text-sm text-foreground">
+                      <CheckCircle2 className="h-4 w-4 shrink-0 text-success" /> WhatsApp connected.
+                    </div>
+                  )}
+                  {waEmbeddedState === "cancelled" && (
+                    <div className="space-y-2">
+                      <p className="text-xs text-muted-foreground">Connection cancelled.</p>
+                      <Button className="w-full" onClick={handleStartEmbeddedSignup}>Try again</Button>
+                      <Button variant="ghost" size="sm" className="w-full" onClick={resetWaEmbeddedState}>Back</Button>
+                    </div>
+                  )}
+                  {waEmbeddedState === "error" && (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                        {waEmbeddedError ?? "The WhatsApp connection could not be completed."}
+                      </div>
+                      <Button className="w-full" onClick={handleStartEmbeddedSignup}>Try again</Button>
+                      <Button variant="ghost" size="sm" className="w-full" onClick={resetWaEmbeddedState}>Back</Button>
+                    </div>
+                  )}
+                </div>
+              ) : int.id === "whatsapp" && waSelectionMode && waManualMode ? (
                 <div className="space-y-3">
                   {!waManualValidated ? (
                     <>
@@ -1089,6 +1299,11 @@ export function IntegrationConfigDrawer({
                     {metaConnecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ExternalLink className="h-3.5 w-3.5" />}
                     {metaConnecting ? "Waiting for Facebook…" : `Connect with ${integration.vendor}`}
                   </Button>
+                  {int.id === "whatsapp" && (
+                    <Button variant="ghost" size="sm" className="w-full" onClick={handleStartEmbeddedSignup}>
+                      Connect existing WhatsApp Business number
+                    </Button>
+                  )}
                 </>
               )}
             </div>
