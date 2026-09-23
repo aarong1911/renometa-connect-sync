@@ -18,6 +18,7 @@ import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { encryptToBytea } from "./lib/gmail-token-crypto";
 import { buildGmailRedirectUri, logGmailOAuthEnvDiagnostics } from "./lib/gmail-oauth-shared";
+import { getAppConfigs } from "./lib/app-config-store";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -69,7 +70,7 @@ function settingsRedirect(
 }
 
 export const handler: Handler = async (event) => {
-  logGmailOAuthEnvDiagnostics("callback");
+  await logGmailOAuthEnvDiagnostics(supabaseAdmin, "callback");
 
   const params = event.queryStringParameters ?? {};
   const { code, state, error: googleError, error_description } = params;
@@ -100,8 +101,12 @@ export const handler: Handler = async (event) => {
   }
   const orgId: string = stateRow.org_id;
 
-  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+  // Env-footprint reduction (2026-09) — see google-ads-config.ts's header;
+  // supabaseAdmin already exists at module scope, so these are not
+  // bootstrap secrets and resolve via app_config_secrets instead.
+  const gmailOAuthConfig = await getAppConfigs(supabaseAdmin, ["GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"]);
+  const clientId = gmailOAuthConfig.GOOGLE_OAUTH_CLIENT_ID;
+  const clientSecret = gmailOAuthConfig.GOOGLE_OAUTH_CLIENT_SECRET;
   if (!clientId || !clientSecret) {
     return settingsRedirect("error", "Gmail OAuth is not configured on the server");
   }

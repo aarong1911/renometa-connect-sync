@@ -11,7 +11,9 @@
 // HTTP status code and Google's own short machine-readable `error` field
 // (never `error_description`) are logged on failure.
 
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { fetchWithTimeout } from "./google-ads-api";
+import { getAppConfigs } from "./app-config-store";
 
 export type GoogleAdsTokenRefreshErrorCode = "server_configuration" | "reconnect_required" | "network_error";
 
@@ -19,9 +21,15 @@ export type GoogleAdsTokenRefreshResult =
   | { ok: true; accessToken: string; expiresInSec: number }
   | { ok: false; errorCode: GoogleAdsTokenRefreshErrorCode };
 
-export async function refreshGoogleAdsAccessToken(refreshToken: string): Promise<GoogleAdsTokenRefreshResult> {
-  const clientId = process.env.GOOGLE_ADS_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_ADS_CLIENT_SECRET;
+export async function refreshGoogleAdsAccessToken(
+  supabaseAdmin: SupabaseClient,
+  refreshToken: string,
+): Promise<GoogleAdsTokenRefreshResult> {
+  // Env-footprint reduction (2026-09) — see google-ads-config.ts's header
+  // for why this reads via app_config_secrets instead of process.env now.
+  const config = await getAppConfigs(supabaseAdmin, ["GOOGLE_ADS_CLIENT_ID", "GOOGLE_ADS_CLIENT_SECRET"]);
+  const clientId = config.GOOGLE_ADS_CLIENT_ID;
+  const clientSecret = config.GOOGLE_ADS_CLIENT_SECRET;
   if (!clientId || !clientSecret) {
     console.error("[google-ads-oauth-token] missing GOOGLE_ADS_CLIENT_ID/SECRET");
     return { ok: false, errorCode: "server_configuration" };

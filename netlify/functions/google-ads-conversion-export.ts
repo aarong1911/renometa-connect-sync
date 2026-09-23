@@ -31,6 +31,7 @@ import { resolveOrgFromBearerToken } from "./lib/resolve-org";
 import { googleAdsCorsHeaders } from "./lib/google-ads-cors";
 import { decryptBytea } from "./lib/gmail-token-crypto";
 import { refreshGoogleAdsAccessToken } from "./lib/google-ads-oauth-token";
+import { getGoogleAdsDeveloperToken } from "./lib/google-ads-config";
 import {
   searchGoogleAds,
   parseGoogleAdsConversionActions,
@@ -191,7 +192,7 @@ export const handler: Handler = async (event) => {
 
   // ── 5. Load the org's Google Ads connection + preflight (same pattern
   // as every other Google Ads endpoint) ──────────────────────────────────
-  const developerToken = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
+  const developerToken = await getGoogleAdsDeveloperToken(supabaseAdmin);
   if (!developerToken) {
     console.error("[google-ads-conversion-export] server_configuration: missing developer token");
     return errorResponse(headers, 500, "server_configuration");
@@ -231,7 +232,7 @@ export const handler: Handler = async (event) => {
     return errorResponse(headers, 500, "server_configuration");
   }
 
-  const tokenResult = await refreshGoogleAdsAccessToken(refreshTokenPlain);
+  const tokenResult = await refreshGoogleAdsAccessToken(supabaseAdmin, refreshTokenPlain);
   if (!tokenResult.ok) {
     if (tokenResult.errorCode === "reconnect_required") {
       await supabaseAdmin
