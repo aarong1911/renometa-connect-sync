@@ -28,6 +28,7 @@ import crypto from "node:crypto";
 import { verifyGoogleAdsOAuthState } from "./lib/google-ads-oauth-state";
 import { userBelongsToOrg } from "./lib/resolve-org";
 import { encryptToBytea } from "./lib/gmail-token-crypto";
+import { getGoogleAdsCredentials } from "./lib/google-ads-config";
 import {
   listAccessibleCustomers,
   discoverGoogleAdsAccounts,
@@ -108,28 +109,21 @@ export const handler: Handler = async (event) => {
     return integrationsRedirect("error", "server_configuration");
   }
 
-  // ── 1. Validate configuration BEFORE constructing the Supabase client or
-  // touching the request further. Never reveal which specific var(s) are
-  // missing in the response — only in the log, and only as booleans.
-  const clientId = process.env.GOOGLE_ADS_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_ADS_CLIENT_SECRET;
+  // ── 1. Validate the true BOOTSTRAP secrets first — the ones needed
+  // before app_config_secrets can even be reached (a Supabase client, and
+  // the signing secret for verifying `state`, which must be checked before
+  // this handler does anything else). Never reveal which specific var(s)
+  // are missing in the response — only in the log, and only as booleans.
   const redirectUri = process.env.GOOGLE_ADS_REDIRECT_URI;
   const stateSecret = process.env.GOOGLE_ADS_OAUTH_STATE_SECRET;
-  const developerToken = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
   const encryptionKey = process.env.ENCRYPTION_KEY;
   const supabaseUrl = process.env.SUPABASE_URL;
   const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  if (
-    !clientId || !clientSecret || !redirectUri || !stateSecret ||
-    !developerToken || !encryptionKey || !supabaseUrl || !supabaseServiceRoleKey
-  ) {
+  if (!redirectUri || !stateSecret || !encryptionKey || !supabaseUrl || !supabaseServiceRoleKey) {
     err("state_verification", {
-      hasClientId: !!clientId,
-      hasClientSecret: !!clientSecret,
       hasRedirectUri: !!redirectUri,
       hasStateSecret: !!stateSecret,
-      hasDeveloperToken: !!developerToken,
       hasEncryptionKey: !!encryptionKey,
       hasSupabaseUrl: !!supabaseUrl,
       hasSupabaseServiceRoleKey: !!supabaseServiceRoleKey,
@@ -140,6 +134,18 @@ export const handler: Handler = async (event) => {
   const supabaseAdmin: SupabaseClient = createClient(supabaseUrl, supabaseServiceRoleKey, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
+
+  // ── 1b. Now that a Supabase client exists, resolve the Google Ads app
+  // credentials via app_config_secrets (env-footprint reduction, 2026-09
+  // — see google-ads-config.ts's header). These are NOT bootstrap secrets
+  // — nothing above this line needs them — so they don't have to live in
+  // Netlify's Function env.
+  const googleAdsCredentials = await getGoogleAdsCredentials(supabaseAdmin);
+  if (!googleAdsCredentials) {
+    err("state_verification", { hasGoogleAdsCredentials: false });
+    return integrationsRedirect("error", "server_configuration");
+  }
+  const { clientId, clientSecret, developerToken } = googleAdsCredentials;
 
   const params = event.queryStringParameters ?? {};
   const { code, state, error: googleError, error_description: _errorDescription } = params;

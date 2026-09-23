@@ -19,6 +19,7 @@ import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
 import { buildGmailRedirectUri, logGmailOAuthEnvDiagnostics } from "./lib/gmail-oauth-shared";
+import { getAppConfig } from "./lib/app-config-store";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -35,7 +36,7 @@ const CORS = {
 const STATE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 export const handler: Handler = async (event) => {
-  logGmailOAuthEnvDiagnostics("start");
+  await logGmailOAuthEnvDiagnostics(supabaseAdmin, "start");
 
   if (event.httpMethod === "OPTIONS") return { statusCode: 200, headers: CORS, body: "" };
   if (event.httpMethod !== "POST") {
@@ -71,7 +72,9 @@ export const handler: Handler = async (event) => {
     return { statusCode: 403, headers: CORS, body: JSON.stringify({ error: "No organization found for this user" }) };
   }
 
-  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
+  // Env-footprint reduction (2026-09) — see google-ads-config.ts's header;
+  // supabaseAdmin already exists at module scope above.
+  const clientId = await getAppConfig(supabaseAdmin, "GOOGLE_OAUTH_CLIENT_ID");
   const scopes = process.env.GOOGLE_GMAIL_SCOPES;
   if (!clientId || !scopes) {
     return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: "Gmail OAuth is not configured on the server" }) };
