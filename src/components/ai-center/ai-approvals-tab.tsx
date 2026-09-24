@@ -24,7 +24,8 @@
 // server-side and forwards the operator's decision to the one endpoint
 // authorized to act on it.
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -41,24 +42,17 @@ import { Loader2, MessageSquareText, RefreshCw, ShieldAlert, User } from "lucide
 import { supabase } from "@/lib/supabase";
 import { useOrgId } from "@/lib/org-id";
 import { useCurrentUserRole } from "@/lib/permissions";
-
-type ApprovalStatus = "pending" | "approved" | "rejected" | "expired" | "cancelled" | "executed" | "failed";
-
-type ApprovalRow = {
-  id: string;
-  execution_id: string;
-  action_key: string;
-  target_entity_type: string | null;
-  target_entity_id: string | null;
-  proposed_input: unknown;
-  summary: string;
-  risk_level: string;
-  status: ApprovalStatus;
-  requested_at: string;
-  reviewed_at: string | null;
-  expires_at: string | null;
-  rejection_reason: string | null;
-};
+import { queryKeys } from "@/lib/query-keys";
+import {
+  fetchAiApprovalsList,
+  channelForActionKey,
+  readSmsBody,
+  type ApprovalStatus,
+  type ApprovalRow,
+  type ContactSummary,
+  type InboundMessage,
+  type FilterValue,
+} from "@/lib/ai-approvals-list";
 
 type ExecutionRow = {
   id: string;
@@ -80,19 +74,12 @@ type ExecutionStepRow = {
   error: string | null;
 };
 
-type ContactSummary = { id: string; name: string; phone: string | null };
-type InboundMessage = { body: string; from_address: string | null; created_at: string };
-
-type FilterValue = "pending" | "completed" | "rejected" | "all";
-
 const FILTERS: { value: FilterValue; label: string }[] = [
   { value: "pending", label: "Pending" },
   { value: "completed", label: "Completed" },
   { value: "rejected", label: "Rejected" },
   { value: "all", label: "All" },
 ];
-
-const RECENT_LIMIT = 50;
 
 async function authHeader(): Promise<Record<string, string>> {
   const { data: { session } } = await supabase.auth.getSession();
@@ -106,22 +93,6 @@ function maskPhone(phone: string | null | undefined): string {
   const digits = phone.replace(/\D/g, "");
   if (digits.length < 4) return "•••-•••-••••";
   return `•••-•••-${digits.slice(-4)}`;
-}
-
-function readContactId(proposedInput: unknown): string | undefined {
-  if (proposedInput && typeof proposedInput === "object") {
-    const v = (proposedInput as Record<string, unknown>).contactId;
-    return typeof v === "string" ? v : undefined;
-  }
-  return undefined;
-}
-
-function readSmsBody(proposedInput: unknown): string | undefined {
-  if (proposedInput && typeof proposedInput === "object") {
-    const v = (proposedInput as Record<string, unknown>).body;
-    return typeof v === "string" ? v : undefined;
-  }
-  return undefined;
 }
 
 function statusBadgeVariant(status: ApprovalStatus): "default" | "secondary" | "destructive" | "outline" {
@@ -152,18 +123,6 @@ function actionDisplayName(actionKey: string): string {
   return actionKey.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-/** AI-2E: the two action keys that render the shared "message reply"
- * contact/inbound/proposed-reply layout below — generalized from AI-2B's
- * original send_sms-only `isSms` gate so send_whatsapp renders with full
- * context instead of falling back to the generic `a.summary` line. Maps
- * an action key to the `sms_meta_messages.channel` value used to look up
- * its inbound linkage. */
-function channelForActionKey(actionKey: string): "sms" | "whatsapp" | undefined {
-  if (actionKey === "send_sms") return "sms";
-  if (actionKey === "send_whatsapp") return "whatsapp";
-  return undefined;
-}
-
 export function AIApprovalsTab({
   onPendingCountChange,
 }: {
@@ -174,125 +133,61 @@ export function AIApprovalsTab({
   const orgId = useOrgId();
   const role = useCurrentUserRole();
   const isOwnerOrAdmin = role === "owner" || role === "admin";
+  // Sidebar "AI Center" pending-approval badge (ai-approvals-count.ts) is a
+  // SEPARATE TanStack Query cache/key from this component's own approvals
+  // LIST cache (queryKeys.aiApprovals.list) — approving/rejecting here
+  // mutates the database but does nothing to the OTHER cache on its own.
+  // The central realtime bridge (realtime-bridge.tsx) invalidates both via
+  // the shared aiApprovals.all(orgId) prefix, but that's cross-tab/
+  // server-change coverage, not a substitute for immediate same-tab
+  // consistency: invalidate both directly right after a decision succeeds,
+  // exactly like every other mutation-success handler in this app already
+  // does for its own domain's query key(s).
+  const queryClient = useQueryClient();
 
   const [filter, setFilter] = useState<FilterValue>("pending");
-  const [approvals, setApprovals] = useState<ApprovalRow[]>([]);
-  const [loading, setLoading] = useState(true);
   const [decidingId, setDecidingId] = useState<string | null>(null);
-
-  // Per-approval resolved display context — contact name/phone, inbound
-  // message text — keyed by approval id. Populated after the approval
-  // list itself loads (needs contactId/executionId from each row first).
-  const [contactByApproval, setContactByApproval] = useState<Map<string, ContactSummary>>(new Map());
-  const [inboundByApproval, setInboundByApproval] = useState<Map<string, InboundMessage | null>>(new Map());
 
   const [detailApproval, setDetailApproval] = useState<ApprovalRow | null>(null);
   const [detailExecution, setDetailExecution] = useState<ExecutionRow | null>(null);
   const [detailStep, setDetailStep] = useState<ExecutionStepRow | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 
-  const loadApprovals = useCallback(async () => {
-    if (!orgId) { setApprovals([]); setLoading(false); return; }
-    setLoading(true);
-    try {
-      let query = supabase
-        .from("agent_approval_requests")
-        .select("id, execution_id, action_key, target_entity_type, target_entity_id, proposed_input, summary, risk_level, status, requested_at, reviewed_at, expires_at, rejection_reason")
-        .eq("org_id", orgId)
-        .order("requested_at", { ascending: false })
-        .limit(RECENT_LIMIT);
+  // Platform State Sync (S6.2) — the approval list itself, per (org,
+  // filter). Replaces the previous useState(approvals)/useState(loading)/
+  // loadApprovals() trio: those had no query key the central realtime
+  // bridge could invalidate, so a webhook-created approval updated the
+  // sidebar's separate pendingCount query live but left THIS list stale
+  // until a manual Refresh. See fetchAiApprovalsList() above and
+  // query-keys.ts's aiApprovals.list().
+  const approvalsQuery = useQuery({
+    queryKey: orgId ? queryKeys.aiApprovals.list(orgId, filter) : ["aiApprovals", "list", filter],
+    queryFn: () => fetchAiApprovalsList(orgId as string, filter),
+    enabled: !!orgId,
+    staleTime: 15_000,
+  });
+  const approvals = approvalsQuery.data?.approvals ?? [];
+  const contactByApproval = approvalsQuery.data?.contactByApproval ?? new Map<string, ContactSummary>();
+  const inboundByApproval = approvalsQuery.data?.inboundByApproval ?? new Map<string, InboundMessage | null>();
+  // isPending (no data yet at all) drives the full-panel spinner-instead-
+  // of-content branch below — NOT isFetching, so a realtime-triggered
+  // background refetch (new approval arriving while this tab is open)
+  // updates the list in place instead of blanking it out first. This is
+  // the one intentional, strictly-better deviation from the old
+  // "setLoading(true) on every single load" behavior — every other Query-
+  // backed list in this app (conversations, leads, deals, …) already
+  // behaves this way; it isn't a visual redesign, same cards/empty state.
+  const loading = !orgId || approvalsQuery.isPending;
 
-      if (filter === "pending") query = query.eq("status", "pending");
-      else if (filter === "completed") query = query.eq("status", "executed");
-      else if (filter === "rejected") query = query.eq("status", "rejected");
-      // "all": no status filter — every real DB status value renders with
-      // its own real label (statusLabel()); nothing invented.
-
-      const { data, error } = await query;
-      if (error) { console.error("[ai-approvals-tab] load failed:", error); setApprovals([]); return; }
-      setApprovals((data ?? []) as ApprovalRow[]);
-
-      // send_sms/send_whatsapp contextual resolution — org-scoped,
-      // trusted-id-bound. AI-2E widened this from send_sms-only to both
-      // message-reply actions (see channelForActionKey()) — the lookup
-      // logic itself is channel-agnostic (contactId, execution_id).
-      const smsRows = (data ?? []).filter((a: any) => channelForActionKey(a.action_key) !== undefined);
-      const contactIds = Array.from(new Set(smsRows.map((a: any) => readContactId(a.proposed_input)).filter((x: unknown): x is string => !!x)));
-      const nextContacts = new Map<string, ContactSummary>();
-      if (contactIds.length > 0) {
-        const { data: contacts } = await supabase
-          .from("contacts")
-          .select("id, full_name, phone")
-          .eq("org_id", orgId)
-          .in("id", contactIds);
-        for (const c of contacts ?? []) {
-          nextContacts.set(c.id, { id: c.id, name: c.full_name ?? "Unknown", phone: c.phone ?? null });
-        }
-      }
-      setContactByApproval((prev) => {
-        const merged = new Map(prev);
-        for (const a of smsRows as any[]) {
-          const cid = readContactId(a.proposed_input);
-          if (cid && nextContacts.has(cid)) merged.set(a.id, nextContacts.get(cid)!);
-        }
-        return merged;
-      });
-
-      // Inbound-message linkage — see ai-twilio-sms-orchestrate-
-      // background.ts's AI-2B addition: sms_meta_messages.meta->>
-      // 'execution_id' is an exact match to the approval's own
-      // execution_id, never a heuristic (timestamp/text) match.
-      const executionIds = new Set(smsRows.map((a: any) => a.execution_id as string));
-      const nextInbound = new Map<string, InboundMessage | null>();
-      if (executionIds.size > 0) {
-        // Filtered in-memory by meta->>execution_id rather than a
-        // PostgREST jsonb-arrow `.in()` filter (uncertain cross-version
-        // support) — bounded to this org's recent inbound SMS, which is
-        // small at this stage of the product. Exact match only, never a
-        // timestamp/text heuristic (see this file's header).
-        const { data: inboundRows } = await supabase
-          .from("sms_meta_messages")
-          .select("body, from_address, created_at, meta")
-          .eq("org_id", orgId)
-          .eq("direction", "in")
-          .in("channel", ["sms", "whatsapp"])
-          .order("created_at", { ascending: false })
-          .limit(200);
-        const byExecutionId = new Map<string, InboundMessage>();
-        for (const row of inboundRows ?? []) {
-          const execId = (row as any).meta?.execution_id as string | undefined;
-          if (execId && executionIds.has(execId) && !byExecutionId.has(execId)) {
-            byExecutionId.set(execId, { body: row.body, from_address: row.from_address, created_at: row.created_at });
-          }
-        }
-        for (const a of smsRows as any[]) {
-          nextInbound.set(a.id, byExecutionId.get(a.execution_id) ?? null);
-        }
-      }
-      setInboundByApproval((prev) => {
-        const merged = new Map(prev);
-        for (const [k, v] of nextInbound) merged.set(k, v);
-        return merged;
-      });
-
-      if (onPendingCountChange) {
-        if (filter === "pending") {
-          onPendingCountChange((data ?? []).length);
-        } else {
-          const { count } = await supabase
-            .from("agent_approval_requests")
-            .select("id", { count: "exact", head: true })
-            .eq("org_id", orgId)
-            .eq("status", "pending");
-          onPendingCountChange(count ?? 0);
-        }
-      }
-    } finally {
-      setLoading(false);
+  // Reports the current PENDING count up to the parent (ai-center.tsx's
+  // own Approvals-tab-trigger badge) — same value, same two-branch
+  // computation as before (see fetchAiApprovalsList's pendingCount), now
+  // sourced from this query's result instead of a duplicate inline fetch.
+  useEffect(() => {
+    if (onPendingCountChange && approvalsQuery.data) {
+      onPendingCountChange(approvalsQuery.data.pendingCount);
     }
-  }, [orgId, filter, onPendingCountChange]);
-
-  useEffect(() => { void loadApprovals(); }, [loadApprovals]);
+  }, [approvalsQuery.data, onPendingCountChange]);
 
   async function handleDecision(approval: ApprovalRow, decision: "approve" | "reject") {
     setDecidingId(approval.id);
@@ -339,7 +234,21 @@ export function AIApprovalsTab({
         toast.success(body.status === "already_executed" ? "Already executed — no duplicate action taken." : "Action approved and executed.");
       }
 
-      await loadApprovals();
+      // Immediate same-tab consistency for BOTH the sidebar badge and this
+      // list — see the comment on `queryClient` above. Always a full
+      // invalidate/refetch from the database, never a manual decrement/
+      // splice (a decision here could be a no-op re-execution of an
+      // already-decided approval — see body.status === "already_executed"
+      // above — so a fixed -1 or a spliced-out row could easily be wrong;
+      // only the database's actual current state is trusted). One prefix
+      // invalidation covers pendingCount AND every cached list filter
+      // (Pending/Completed/Rejected/All) — the currently-active filter
+      // refetches immediately, so a rejected/approved row disappears from
+      // Pending right away, and the other tabs pick up the change next
+      // time they're viewed.
+      if (orgId) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.aiApprovals.all(orgId) });
+      }
     } catch {
       toast.error("Network error — please try again.");
     } finally {
@@ -402,8 +311,8 @@ export function AIApprovalsTab({
             ))}
           </TabsList>
         </Tabs>
-        <Button size="sm" variant="outline" className="h-9 text-xs" onClick={() => void loadApprovals()} disabled={loading}>
-          {loading ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 h-3.5 w-3.5" />}
+        <Button size="sm" variant="outline" className="h-9 text-xs" onClick={() => void approvalsQuery.refetch()} disabled={approvalsQuery.isFetching}>
+          {approvalsQuery.isFetching ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 h-3.5 w-3.5" />}
           Refresh
         </Button>
       </div>

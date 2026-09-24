@@ -20,6 +20,7 @@ import { useCurrentUserRole, filterNavGroups, canAccessSettings } from "@/lib/pe
 import { useOrganization } from "@/lib/organization";
 import { useSmsMetaConversations } from "@/lib/sms-meta-conversations";
 import { useConversationArchiveStates, conversationMapKey } from "@/lib/conversation-states";
+import { useAiApprovalPendingCount, formatBadgeCount, pendingApprovalAriaLabel } from "@/lib/ai-approvals-count";
 import { ContactAvatar } from "@/components/ui/contact-avatar";
 import { signOut } from "@/lib/auth";
 import { supabase } from "@/lib/supabase";
@@ -28,7 +29,7 @@ import { useAuthSession } from "@/lib/auth-session";
 
 const LOGO_KEY = "rm_org_logo";
 
-type NavItem = { to: string; label: string; icon: React.ComponentType<{ className?: string }>; badgeKey?: "inbox" };
+type NavItem = { to: string; label: string; icon: React.ComponentType<{ className?: string }>; badgeKey?: "inbox" | "aiApprovals" };
 
 // Flat single-list nav (Lovable design), in Lovable's exact order — mapped
 // to this app's real routes. Role-based visibility preserved via
@@ -46,7 +47,7 @@ const NAV: NavItem[] = [
   { to: "/tasks",                 label: "Tasks",           icon: ListTodo },
   { to: "/contacts",              label: "Contacts",        icon: Users },
   { to: "/companies",             label: "Accounts",        icon: Building2 },
-  { to: ROUTES.AI_CENTER,         label: "AI Center",       icon: Bot },
+  { to: ROUTES.AI_CENTER,         label: "AI Center",       icon: Bot, badgeKey: "aiApprovals" },
   { to: ROUTES.WORKFLOWS,         label: "Workflows",       icon: Workflow },
   { to: "/marketing",             label: "Marketing",       icon: Megaphone },
   { to: "/insights/reputation",   label: "Reviews",         icon: Star },
@@ -70,6 +71,7 @@ export function Sidebar({ collapsed: desktopCollapsed, onToggle }: { collapsed: 
   const org       = useOrganization();
   const { conversations } = useSmsMetaConversations();
   const { archivedMap } = useConversationArchiveStates();
+  const aiApprovalsPendingCount = useAiApprovalPendingCount();
 
   const [logoUrl, setLogoUrl] = useState<string | null>(() => {
     try { return localStorage.getItem(LOGO_KEY) || null; } catch { return null; }
@@ -237,9 +239,32 @@ export function Sidebar({ collapsed: desktopCollapsed, onToggle }: { collapsed: 
         {/* Nav */}
         <div className={cn("min-h-0 flex-1 overflow-y-auto overscroll-contain scrollbar-thin py-2", collapsed ? "px-2" : "px-3")}>
           <div className="space-y-0.5">
-            {items.map(item => (
-              <NavLinkRow key={item.to} item={item} active={isNavActive(item.to)} collapsed={collapsed} badgeCount={item.badgeKey === "inbox" ? unreadCount : undefined} />
-            ))}
+            {items.map(item => {
+              // badgeCount: explicit per-key mapping, one branch per
+              // badgeKey, falling through to `undefined` (no badge) for
+              // every nav item that isn't inbox or aiApprovals — never a
+              // bare boolean/truthy shortcut that could silently coerce a
+              // real 0 vs. "not applicable" into the same falsy value.
+              let badgeCount: number | undefined;
+              if (item.badgeKey === "inbox") {
+                badgeCount = unreadCount;
+              } else if (item.badgeKey === "aiApprovals") {
+                badgeCount = aiApprovalsPendingCount;
+              } else {
+                badgeCount = undefined;
+              }
+              const badgeAriaLabel = item.badgeKey === "aiApprovals" ? pendingApprovalAriaLabel(aiApprovalsPendingCount) : undefined;
+              return (
+                <NavLinkRow
+                  key={item.to}
+                  item={item}
+                  active={isNavActive(item.to)}
+                  collapsed={collapsed}
+                  badgeCount={badgeCount}
+                  badgeAriaLabel={badgeAriaLabel}
+                />
+              );
+            })}
           </div>
         </div>
 
@@ -308,8 +333,14 @@ export function Sidebar({ collapsed: desktopCollapsed, onToggle }: { collapsed: 
 
 }
 
-function NavLinkRow({ item, active, collapsed, badgeCount }: { item: NavItem; active: boolean; collapsed: boolean; badgeCount?: number }) {
+function NavLinkRow({ item, active, collapsed, badgeCount, badgeAriaLabel }: { item: NavItem; active: boolean; collapsed: boolean; badgeCount?: number; badgeAriaLabel?: string }) {
   const Icon = item.icon;
+  // formatBadgeCount(): null (hidden) for 0, exact number for 1-99, "99+"
+  // above that — same display rule for every badge on this nav, so the AI
+  // Center pending-approval badge (the reason this cap exists) uses the
+  // exact same visual language as the pre-existing Inbox unread badge
+  // rather than a second, slightly-different notification style.
+  const badgeText = badgeCount == null ? null : formatBadgeCount(badgeCount);
   const content = (
     <Link to={item.to} className={cn(
       "group relative flex items-center rounded-lg text-sm font-medium transition-colors",
@@ -320,11 +351,23 @@ function NavLinkRow({ item, active, collapsed, badgeCount }: { item: NavItem; ac
         <Icon className={cn("h-4 w-4", active && "text-gold-hover")} />
         {!collapsed && <span>{item.label}</span>}
       </span>
-      {!!badgeCount && (
+      {badgeText != null && (
         collapsed ? (
-          <span className="absolute -top-0.5 -right-0.5 grid h-4 min-w-4 place-items-center rounded-full bg-primary px-1 text-[9px] font-semibold text-primary-foreground">{badgeCount}</span>
+          <span
+            className="absolute -top-0.5 -right-0.5 grid h-4 min-w-4 place-items-center rounded-full bg-primary px-1 text-[9px] font-semibold text-primary-foreground"
+            title={badgeAriaLabel}
+            aria-label={badgeAriaLabel}
+          >
+            {badgeText}
+          </span>
         ) : (
-          <span className="grid h-5 min-w-5 place-items-center rounded-full bg-primary px-1.5 text-[10px] font-semibold text-primary-foreground">{badgeCount}</span>
+          <span
+            className="grid h-5 min-w-5 place-items-center rounded-full bg-primary px-1.5 text-[10px] font-semibold text-primary-foreground"
+            title={badgeAriaLabel}
+            aria-label={badgeAriaLabel}
+          >
+            {badgeText}
+          </span>
         )
       )}
     </Link>
