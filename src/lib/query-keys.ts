@@ -207,4 +207,34 @@ export const queryKeys = {
      */
     pipelinePulse: (orgId: string, period: string) => ["dashboard", orgId, "pipelinePulse", period] as const,
   },
+
+  /**
+   * AI Center — approvals domain. `pendingCount` (sidebar badge, a single
+   * count-only query per org) predates `list`/`all` — see
+   * ai-approvals-count.ts's useAiApprovalPendingCount(). NOT touched by
+   * this addition: same key shape, same behavior, same consumer.
+   *
+   * `list` was added once ai-approvals-tab.tsx's own approval list (the
+   * Pending/Completed/Rejected/All tabs) moved onto TanStack Query too —
+   * previously local useState + a bespoke loadApprovals() loader, which
+   * meant the central realtime bridge had a query key to invalidate for
+   * the sidebar COUNT but nothing to invalidate for the LIST itself, so a
+   * webhook-created approval updated the badge live but the Approvals
+   * panel stayed on stale data until a manual refresh. One key per
+   * (org, filter) — "pending"/"completed"/"rejected"/"all" are each their
+   * own cache entry, matching the existing UI (exactly one filter tab
+   * rendered/active at a time; switching tabs is a genuinely different
+   * query, not a client-side re-filter of one big list).
+   *
+   * `all` is a prefix-only key (like `conversations.all` above) — never
+   * fetched directly, only used to invalidate `pendingCount` AND every
+   * cached `list` filter variant in one call, since all three key shapes
+   * share this same ["aiApprovals", orgId, ...] prefix and TanStack's
+   * default `invalidateQueries` match is prefix-based.
+   */
+  aiApprovals: {
+    all: (orgId: string) => ["aiApprovals", orgId] as const,
+    pendingCount: (orgId: string) => ["aiApprovals", orgId, "pendingCount"] as const,
+    list: (orgId: string, filter: string) => ["aiApprovals", orgId, "list", filter] as const,
+  },
 };

@@ -171,6 +171,44 @@
 //                                   than every member's permissions)
 // Same DELETE-filter caveat as everything above.
 //
+// S6 (AI Center sidebar approval badge) adds `agent_approval_requests`
+// INSERT/UPDATE/DELETE. The sidebar's pending-approval count
+// (ai-approvals-count.ts's useAiApprovalPendingCount(), Query-backed under
+// queryKeys.aiApprovals.pendingCount(orgId)) must refresh the moment a new
+// approval is created, or an existing one is approved/rejected/expires —
+// recalculating the count via a fresh query rather than trying to
+// increment/decrement client-side, same "database is the source of truth"
+// discipline as everything else in this file. Fan-out (as of S6.2, see
+// below): queryKeys.aiApprovals.all(orgId) — a prefix invalidation that
+// covers both pendingCount and the Approvals tab's own list query.
+//
+// S6.1 (2026-09, same investigation): originally added to the SHARED
+// channel with an `org_id=eq.${orgId}` filter, exactly like every other
+// org-scoped table here. A live investigation (SUBSCRIBED confirmed,
+// same-tab direct invalidation confirmed working, but a webhook-created
+// row's INSERT never reached the shared channel's handler at all) found
+// the identical failure signature already documented above for
+// sms_meta_messages — so agent_approval_requests now gets its own
+// dedicated channel (`realtime-ai-approvals-${orgId}`, see below, created/
+// torn down alongside `channel` and `smsChannel`) with NO postgres-side
+// filter, org scoping enforced client-side in the callback instead — the
+// same proven-working topology, not a new one. Same DELETE-filter caveat
+// as every other table here (no org_id in a DELETE payload) — accepted;
+// approval rows are essentially never hard-deleted in normal operation
+// (status transitions to a terminal value instead), so this is a
+// belt-and-suspenders handler, not the primary freshness path.
+//
+// S6.2 (2026-09, same investigation): the AI Center Approvals tab's own
+// list (Pending/Completed/Rejected/All) was still plain useState + a
+// bespoke loadApprovals() loader — no query key existed for THIS bridge to
+// invalidate, so a webhook-created approval updated the sidebar badge live
+// but left the Approvals panel stale until a manual refresh. Migrated the
+// list onto TanStack Query (queryKeys.aiApprovals.list(orgId, filter), see
+// ai-approvals-list.ts's fetchAiApprovalsList()) and widened this table's
+// invalidation from pendingCount alone to the aiApprovals.all(orgId)
+// prefix, which matches pendingCount AND every cached list filter variant
+// in one call. No change to the channel/subscription topology itself.
+//
 // Never logs row payloads (message bodies, contact PII) — every handler
 // below only ever logs the table name and event type, both safe.
 
@@ -304,6 +342,23 @@ export function RealtimeBridge(): null {
       // S5C: Files is Query-backed (files-store.ts). No denormalized file
       // count exists anywhere else, so this refreshes only the Files list.
       queryClient.invalidateQueries({ queryKey: queryKeys.files(orgId) });
+    };
+    const invalidateAiApprovals = () => {
+      // S6/S6.2: sidebar pending-approval badge AND the AI Center
+      // Approvals tab's list (Pending/Completed/Rejected/All — now
+      // TanStack Query-backed, see query-keys.ts's aiApprovals.list()).
+      // Always recalculates (a fresh query) rather than incrementing/
+      // decrementing or splicing a cached array locally — this correctly
+      // handles every transition the task requires (new pending, pending->
+      // approved, pending->rejected, pending->expired, and even a
+      // hypothetical revert back to pending) with one code path, since
+      // each query always re-derives its result from the database.
+      // aiApprovals.all(orgId) is a PREFIX invalidation — it matches
+      // pendingCount AND every cached list filter variant in one call
+      // (TanStack's default invalidateQueries match is prefix-based), so
+      // whichever filter tab is currently open refetches immediately and
+      // every other cached tab is marked stale for its next view.
+      queryClient.invalidateQueries({ queryKey: queryKeys.aiApprovals.all(orgId) });
     };
     const invalidatePipelinePulse = () => {
       // Prefix match (no `period` argument) — invalidates every cached
@@ -604,9 +659,68 @@ export function RealtimeBridge(): null {
         }
       });
 
+    // Dedicated channel for agent_approval_requests only — same reasoning
+    // and topology as the sms_meta_messages channel directly above (S6.1,
+    // 2026-09). This table's INSERT/UPDATE bindings were originally on the
+    // shared channel WITH an `org_id=eq.${orgId}` filter; a live
+    // investigation confirmed the shared channel reliably reported
+    // SUBSCRIBED and same-tab direct-invalidation worked, but a
+    // webhook-created row's INSERT never reached the shared channel's
+    // handler at all (no console log, no invalidation, count stayed stale
+    // until a manual refresh) — the exact same failure signature already
+    // documented above for sms_meta_messages. Moving to its own channel
+    // AND dropping the postgres-side filter (org scoping enforced
+    // client-side in the callback instead, exactly like sms_meta_messages)
+    // rather than only decongesting the shared channel, since this
+    // codebase already has direct proof that a FILTERED subscription can
+    // fail here even once decongestion is ruled out as the sole variable —
+    // no need to re-discover that the hard way a second time.
+    const approvalsChannel = supabase
+      .channel(`realtime-ai-approvals-${orgId}`)
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "agent_approval_requests" },
+        (payload) => {
+          if ((payload.new as any)?.org_id !== orgId) return;
+          invalidateAiApprovals();
+        },
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "agent_approval_requests" },
+        (payload) => {
+          if ((payload.new as any)?.org_id !== orgId) return;
+          invalidateAiApprovals();
+        },
+      )
+      .on(
+        "postgres_changes",
+        // No org filter possible here — a DELETE payload carries only the
+        // primary key (same REPLICA IDENTITY limitation documented at the
+        // top of this file for every other table's DELETE handler), so
+        // there is no org_id to check client-side either. Accepted the
+        // same way as everywhere else in this bridge: approval rows are
+        // essentially never hard-deleted in normal operation (a decision
+        // transitions `status` instead), so this is belt-and-suspenders,
+        // not the primary freshness path — and invalidating a count query
+        // for the wrong org here would just cause one harmless extra
+        // refetch, never leak data (the refetch itself is still org-scoped
+        // by its own .eq("org_id", ...) filter).
+        { event: "DELETE", schema: "public", table: "agent_approval_requests" },
+        () => {
+          invalidateAiApprovals();
+        },
+      )
+      .subscribe((status, err) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          console.error("[realtime-ai-approvals] subscribe failed", { orgId, status, message: err?.message });
+        }
+      });
+
     return () => {
       supabase.removeChannel(channel);
       supabase.removeChannel(smsChannel);
+      supabase.removeChannel(approvalsChannel);
     };
   }, [orgId, queryClient]);
 
