@@ -6,6 +6,7 @@ import crypto from "node:crypto";
 import { getOrgSecret, setOrgSecret } from "./lib/org-secret-store";
 import { getMetaPageAccessToken, MetaPageTokenMissingError } from "./lib/meta-page-access";
 import { MetaGraphApiError } from "./lib/meta-graph-api";
+import { persistSmtpSentEmail, type SmtpSentEmailInput } from "./lib/gmail-sent-reconcile";
 
 const CORS = {
   "Content-Type": "application/json",
@@ -103,6 +104,9 @@ export const handler: Handler = async (event) => {
   // Populated from each provider's own send response below — never
   // fabricated, left null if a provider response doesn't include one.
   let providerMessageId: string | null = null;
+  // Email only: set right after sendMail() succeeds; persisted into
+  // gmail_messages below (see lib/gmail-sent-reconcile.ts).
+  let emailToPersist: SmtpSentEmailInput | null = null;
 
   try {
     if (channel === "sms") {
@@ -244,6 +248,19 @@ export const handler: Handler = async (event) => {
       // later match against (see gmail-sync.ts's rfc_message_id column) to
       // update this row instead of creating a duplicate.
       providerMessageId = sendResult?.messageId ?? null;
+      if (providerMessageId) {
+        emailToPersist = {
+          orgId,
+          messageId: providerMessageId,
+          threadId: email_thread_id ?? null,
+          fromEmail: `${from_name ?? "RenoMeta Connect"} <${smtpUser}>`,
+          to,
+          subject: subject || "(no subject)",
+          body,
+          inReplyTo: inReplyTo ?? null,
+          references: referencesHeader ?? null,
+        };
+      }
 
       // Legacy-plaintext migration — only after the send has genuinely
       // succeeded (a failed send shouldn't trigger a storage migration for
@@ -507,13 +524,10 @@ export const handler: Handler = async (event) => {
 
     // Persist the outbound message for the 4 channels that have a real
     // table for it (see supabase/migrations/005_sms_meta_messages.sql).
-    // Email is NOT included here — it has its own dedicated tables
-    // (inbox_emails / emails / gmail_messages) with a richer schema
-    // (gmail_message_id, body_html, thread linkage) that almost certainly
-    // already has its own sync/send logic elsewhere; duplicating that here
-    // without seeing it risks creating a second, conflicting source of
-    // truth for email history. "note" is a client-side-only concept with
-    // no external send and no persistence table.
+    // Email is NOT persisted into sms_meta_messages — its history lives in
+    // gmail_messages and is persisted by the dedicated email block below.
+    // "note" is a client-side-only concept with no external send and no
+    // persistence table.
     let persisted = true;
     let persistWarning: string | null = null;
     if (channel === "sms" || channel === "whatsapp" || channel === "messenger" || channel === "instagram") {
@@ -540,6 +554,23 @@ export const handler: Handler = async (event) => {
         console.error("[send-inbox-message] sms_meta_messages insert failed:", insertErr.message);
         persisted = false;
         persistWarning = "Message was sent, but saving it to conversation history failed. It may not appear in the Inbox.";
+      }
+    }
+
+    if (channel === "email") {
+      // SMTP has already succeeded at this point (a failed sendMail() threw
+      // above and never reaches here, so no row is ever created for an
+      // unsent email). Persist into gmail_messages so the CRM thread shows
+      // it immediately; gmail-sync.ts re-keys it to the real Gmail id later.
+      // On any failure here the email is STILL sent — return ok:true with
+      // persisted:false (never an error, which would invite a duplicate
+      // resend) and let the client keep its local-echo fallback.
+      const outcome = emailToPersist
+        ? await persistSmtpSentEmail(supabaseAdmin, emailToPersist)
+        : { persisted: false };
+      if (!outcome.persisted) {
+        persisted = false;
+        persistWarning = "Email was sent, but saving it to conversation history failed. It will appear after the next Gmail sync.";
       }
     }
 

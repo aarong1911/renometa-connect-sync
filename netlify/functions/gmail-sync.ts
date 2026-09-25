@@ -38,6 +38,7 @@ import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { decryptBytea, encryptToBytea } from "./lib/gmail-token-crypto";
 import { getAppConfigs } from "./lib/app-config-store";
+import { reconcileSmtpSentRows } from "./lib/gmail-sent-reconcile";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -324,6 +325,12 @@ export const handler: Handler = async (event) => {
   }
 
   if (rows.length > 0) {
+    // Re-key any temporary "smtp:" row (persisted at send time by
+    // send-inbox-message.ts) to the real Gmail id BEFORE the upsert, so the
+    // upsert updates that row in place instead of inserting a second row with
+    // the same (org_id, rfc_message_id) — which the unique index would reject,
+    // failing the whole batch. Best-effort: never throws.
+    await reconcileSmtpSentRows(supabaseAdmin, orgId, rows);
     const { error: upsertErr } = await supabaseAdmin.from("gmail_messages").upsert(rows, { onConflict: "id" });
     if (upsertErr) {
       const msg = `Failed to save fetched messages: ${upsertErr.message}`;
