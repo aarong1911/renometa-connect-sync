@@ -36,7 +36,14 @@ export const handler: Handler = async (event) => {
   try {
     const transporter = nodemailer.createTransport({
       host: "smtp.gmail.com", port: 587, secure: false,
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      // SMTP_PASSWORD, not SMTP_PASS — every other SMTP sender in this repo
+      // (invite-member.ts, invoice-send.ts, portal-invite.ts,
+      // appointment-post-booking.ts, execute-workflow.ts) already reads
+      // SMTP_PASSWORD; this file was the one holdout still reading the
+      // legacy SMTP_PASS alias, requiring the same secret to be duplicated
+      // under two Netlify env var names. Consolidated onto the canonical
+      // name — see CLAUDE.md's Common Gotchas table.
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
     });
 
     await transporter.sendMail({

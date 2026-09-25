@@ -25,6 +25,7 @@ import {
   type GoogleAdsOAuthStatePayload,
   type GoogleAdsOAuthIntent,
 } from "./lib/google-ads-oauth-state";
+import { getAppConfig } from "./lib/app-config-store";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -79,7 +80,11 @@ export const handler: Handler = async (event) => {
   }
   const intent: GoogleAdsOAuthIntent = reqBody.intent === "reconnect" ? "reconnect" : "connect";
 
-  const clientId = process.env.GOOGLE_ADS_CLIENT_ID;
+  // Env-footprint reduction (2026-09) — clientId is not a bootstrap
+  // secret (supabaseAdmin already exists at module scope above), so it
+  // resolves via app_config_secrets now instead of process.env directly.
+  // See google-ads-config.ts's header for the full rationale.
+  const clientId = await getAppConfig(supabaseAdmin, "GOOGLE_ADS_CLIENT_ID");
   const redirectUri = process.env.GOOGLE_ADS_REDIRECT_URI;
   const stateSecret = process.env.GOOGLE_ADS_OAUTH_STATE_SECRET;
   if (!clientId || !redirectUri || !stateSecret) {

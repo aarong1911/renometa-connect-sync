@@ -20,6 +20,7 @@ import { resolveOrgFromBearerToken } from "./lib/resolve-org";
 import { googleAdsCorsHeaders } from "./lib/google-ads-cors";
 import { decryptBytea } from "./lib/gmail-token-crypto";
 import { refreshGoogleAdsAccessToken } from "./lib/google-ads-oauth-token";
+import { getGoogleAdsDeveloperToken } from "./lib/google-ads-config";
 import {
   listAccessibleCustomers,
   discoverGoogleAdsAccounts,
@@ -85,7 +86,7 @@ export const handler: Handler = async (event) => {
     return { statusCode: 405, headers, body: JSON.stringify({ error: "Method not allowed" }) };
   }
 
-  const developerToken = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
+  const developerToken = await getGoogleAdsDeveloperToken(supabaseAdmin);
   if (!developerToken) {
     log("server_configuration", { hasDeveloperToken: false });
     return { statusCode: 500, headers, body: JSON.stringify({ status: "error", reason: "server_configuration" }) };
@@ -119,7 +120,7 @@ export const handler: Handler = async (event) => {
     return { statusCode: 500, headers, body: JSON.stringify({ status: "error", reason: "server_configuration" }) };
   }
 
-  const tokenResult = await refreshGoogleAdsAccessToken(refreshTokenPlain);
+  const tokenResult = await refreshGoogleAdsAccessToken(supabaseAdmin, refreshTokenPlain);
   if (!tokenResult.ok) {
     if (tokenResult.errorCode === "reconnect_required") {
       // Persist visibility into the connection row — a working connection

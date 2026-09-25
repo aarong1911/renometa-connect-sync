@@ -37,6 +37,7 @@
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { decryptBytea, encryptToBytea } from "./lib/gmail-token-crypto";
+import { getAppConfigs } from "./lib/app-config-store";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -86,8 +87,14 @@ function splitAddressList(raw: string | null): string[] | null {
 }
 
 async function refreshAccessToken(refreshToken: string): Promise<{ accessToken: string; expiresAt: string }> {
-  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+  // Env-footprint reduction (2026-09) — see google-ads-config.ts's header
+  // for the same pattern applied to the Google Ads credentials; Gmail's
+  // GOOGLE_OAUTH_CLIENT_ID/SECRET move onto the same app_config_secrets
+  // resolver rather than process.env now that supabaseAdmin is available
+  // module-wide in this file.
+  const config = await getAppConfigs(supabaseAdmin, ["GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"]);
+  const clientId = config.GOOGLE_OAUTH_CLIENT_ID;
+  const clientSecret = config.GOOGLE_OAUTH_CLIENT_SECRET;
   if (!clientId || !clientSecret) {
     throw new Error("GOOGLE_OAUTH_CLIENT_ID/GOOGLE_OAUTH_CLIENT_SECRET are not configured on the server");
   }
