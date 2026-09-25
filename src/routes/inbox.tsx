@@ -1192,13 +1192,19 @@ function InboxPage() {
         // from a stale localStorage entry, once from the real row.
         if (composeChannel !== "email") {
           refreshRealConvs();
+        } else if (result.persisted === true) {
+          // send-inbox-message.ts persisted the sent email into
+          // gmail_messages itself (temporary "smtp:" id, re-keyed to the
+          // real Gmail id by gmail-sync.ts) — refresh so the real,
+          // server-backed row shows up now, like the sms_meta_messages
+          // channels above. No local echo, so nothing can render twice.
+          refreshGmailConvs();
         } else {
-          // Email has no equivalent "refresh and see the real row" path —
-          // it's sent via SMTP (send-inbox-message.ts), not the Gmail API,
-          // so there's no way to know when (or whether) it lands in
-          // gmail_messages. Show it immediately as a local echo, flagged
-          // pendingGmailSync so it can be reconciled away once/if a
-          // matching real row shows up (see GMAIL RECONCILIATION below).
+          // Fallback only: the email WAS sent, but saving its history row
+          // failed server-side (persisted:false). Show a local echo, flagged
+          // pendingGmailSync so it can be reconciled away once a matching
+          // real row arrives via Gmail sync (see GMAIL RECONCILIATION
+          // below). The toast above already reported success — no resend.
           setLocalMessages((prev) => [...prev, {
             id: `local-email-${Date.now()}`,
             conversationId: active.id,
