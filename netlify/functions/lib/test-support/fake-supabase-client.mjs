@@ -57,6 +57,8 @@ function evalCondition(row, f) {
   // SQL comparison with NULL is never true.
   if (f.op === "gt") return val !== null && val > f.val;
   if (f.op === "lt") return val !== null && val < f.val;
+  if (f.op === "gte") return val !== null && val >= f.val;
+  if (f.op === "lte") return val !== null && val <= f.val;
   if (f.op === "in") return f.val.includes(val);
   throw new Error("not implemented in fake-supabase-client: filter op " + f.op);
 }
@@ -110,6 +112,8 @@ class FakeQueryBuilder {
   is(col, val) { this.filters.push({ col, op: "is", val }); return this; }
   gt(col, val) { this.filters.push({ col, op: "gt", val }); return this; }
   lt(col, val) { this.filters.push({ col, op: "lt", val }); return this; }
+  gte(col, val) { this.filters.push({ col, op: "gte", val }); return this; }
+  lte(col, val) { this.filters.push({ col, op: "lte", val }); return this; }
   filter(col, op, val) { this.filters.push({ col, op, val }); return this; }
   or(expr) { this.filters.push({ op: "or", branches: splitTopLevel(expr).map((i) => [parseCondition(i)]) }); return this; }
   in(col, vals) { this.filters.push({ col, op: "in", val: vals }); return this; }

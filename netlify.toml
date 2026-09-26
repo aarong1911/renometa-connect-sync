@@ -23,6 +23,12 @@
 [functions."appointment-reminder-sms"]
   schedule = "*/5 * * * *"
 
+# Lost-dispatch recovery for inbound WhatsApp messages. Re-drives the same
+# internal background endpoint for messages whose dispatch never started; see
+# netlify/functions/lib/meta-whatsapp-recovery.ts.
+[functions."whatsapp-dispatch-recovery"]
+  schedule = "*/2 * * * *"
+
 # Vite dev-server-only paths must reach the proxied Vite target
 # (netlify dev's [dev] targetPort) untouched, never fall through to the
 # SPA catch-all below. Without these, netlify dev's redirect matching

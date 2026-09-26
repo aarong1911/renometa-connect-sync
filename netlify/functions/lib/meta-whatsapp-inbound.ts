@@ -48,27 +48,43 @@ export type WhatsAppDispatchPayload = {
  * calling processWhatsAppInbound() without one.
  */
 export async function dispatchWhatsAppOrchestration(payload: WhatsAppDispatchPayload): Promise<void> {
+  await dispatchWhatsAppOrchestrationChecked(payload);
+}
+
+/**
+ * Same request as dispatchWhatsAppOrchestration(), but reports whether the
+ * background function accepted it (HTTP 202). Used by the lost-dispatch
+ * recovery sweep (lib/meta-whatsapp-recovery.ts), which needs to know. Never
+ * throws; a false return means "not accepted" (not "processing failed").
+ */
+export async function dispatchWhatsAppOrchestrationChecked(payload: WhatsAppDispatchPayload, opts: { timeoutMs?: number } = {}): Promise<boolean> {
   const secret = process.env.AI_WHATSAPP_INTERNAL_DISPATCH_SECRET;
   if (!secret) {
     console.error("[meta-whatsapp-inbound] AI_WHATSAPP_INTERNAL_DISPATCH_SECRET is not set — cannot dispatch AI orchestration.");
-    return;
+    return false;
   }
   const siteUrl = process.env.URL || process.env.DEPLOY_URL;
   if (!siteUrl) {
     console.error("[meta-whatsapp-inbound] No site URL available (URL/DEPLOY_URL env var) — cannot dispatch AI orchestration.");
-    return;
+    return false;
   }
   try {
     const res = await fetch(`${siteUrl}/.netlify/functions/ai-whatsapp-orchestrate-background`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Internal-Secret": secret },
       body: JSON.stringify(payload),
+      // Only the recovery sweep passes a timeout (it runs inside a 30 s scheduled
+      // function); the webhook path keeps the platform default, unchanged.
+      ...(opts.timeoutMs ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
     });
     if (res.status !== 202) {
       console.error("[meta-whatsapp-inbound] WhatsApp background dispatch did not return 202:", res.status);
+      return false;
     }
+    return true;
   } catch (err) {
     console.error("[meta-whatsapp-inbound] WhatsApp background dispatch failed:", err);
+    return false;
   }
 }
 
