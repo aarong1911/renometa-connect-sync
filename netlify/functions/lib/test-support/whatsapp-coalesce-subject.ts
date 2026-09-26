@@ -5,3 +5,4 @@ export { processWhatsAppBackground } from "../meta-whatsapp-background";
 export * from "../meta-whatsapp-coalesce";
 export { approveRequest, rejectRequest, hashProposedInput } from "../../../../src/lib/agentic/approvals";
 export * from "../meta-whatsapp-claim";
+export * from "../meta-whatsapp-recovery";
