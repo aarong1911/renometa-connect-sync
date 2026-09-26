@@ -100,13 +100,18 @@ import { useVoiceConversations } from "@/lib/voice-conversations";
 import { useSmsMetaConversations } from "@/lib/sms-meta-conversations";
 import { analyzeSmsLength } from "@/lib/sms-segments";
 import { conversationMapKey, resolveConversationIdentity, useConversationArchiveStates, useConversationStarStates } from "@/lib/conversation-states";
-import { normalizeEmail, useGmailConversations } from "@/lib/gmail-conversations";
+import { normalizeEmail, useGmailBodies, useGmailConversations } from "@/lib/gmail-conversations";
 import { getOrgId } from "@/lib/org-id";
 import { UnmatchedGmailSenderBanner } from "@/components/inbox/unmatched-gmail-sender-banner";
 import { GmailSenderAvatar } from "@/components/inbox/gmail-sender-avatar";
 import { unlinkGmailContactFromThread } from "@/lib/gmail-contact-actions";
 import { extractReplyAddress, resolveComposerRecipient } from "@/lib/composer-recipient";
-import { triggerGmailSync, fetchGmailConnectionStatus } from "@/lib/gmail-sync-client";
+import { fetchGmailConnectionStatus } from "@/lib/gmail-sync-client";
+import { useGmailAutoSync } from "@/lib/use-gmail-auto-sync";
+import { shouldRefreshAfterSync } from "@/lib/gmail-auto-sync";
+import { useThreadScroll } from "@/lib/use-thread-scroll";
+import { shouldShowSubject } from "@/lib/email-body-presentation";
+import { EmailMessageBody } from "@/components/inbox/email-message-body";
 import { tagDisplayLabel, tagComparisonKey, isManuallyAssignableTag } from "@/lib/tag-utils";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -384,11 +389,16 @@ function InboxPage() {
   // mount (not gated to the Email tab like gmailLastSyncAt above) since
   // avatars render in the conversation list regardless of which channel
   // filter tab is currently selected.
+  // Gmail connected (real OAuth connection, from gmail-connection-status). Gates
+  // the automatic refresh below — it is keyed on `connected`, not on whether the
+  // account e-mail/picture happened to be captured.
+  const [gmailConnected, setGmailConnected] = useState(false);
   const [gmailAccountEmail, setGmailAccountEmail] = useState<string | null>(null);
   const [gmailAccountPictureUrl, setGmailAccountPictureUrl] = useState<string | null>(null);
   useEffect(() => {
     fetchGmailConnectionStatus().then((status) => {
       if (!status) return;
+      setGmailConnected(status.connected === true);
       setGmailAccountEmail(status.accountEmail);
       setGmailAccountPictureUrl(status.accountPictureUrl);
     });
@@ -421,10 +431,23 @@ function InboxPage() {
     })();
   }, []);
 
+  // Automatic Gmail refresh while Conversations is open: the SAME real server
+  // sync as the manual button (gmail-sync.ts), on open / focus / visibility /
+  // every ~45 s, never overlapping. After a sync that wrote something, the real
+  // conversation queries are invalidated so the open thread updates. See
+  // src/lib/gmail-auto-sync.ts.
+  const gmailAutoSync = useGmailAutoSync({
+    enabled: gmailConnected,
+    onSynced: (result, source) => {
+      setGmailLastSyncAt(new Date().toISOString());
+      if (shouldRefreshAfterSync(result, source)) refreshGmailConvs();
+    },
+  });
+
   const handleSyncGmailInInbox = async () => {
     setGmailSyncing(true);
     try {
-      const result = await triggerGmailSync();
+      const result = await gmailAutoSync.syncNow("manual");
       if (!result.ok) {
         toast.error(result.error, {
           action: {
@@ -703,9 +726,21 @@ function InboxPage() {
   const active = allConversations.find((c) => c.id === activeId)
     ?? conversations.find((c) => !c.id.startsWith("voice-"))
     ?? conversations[0];
+  // Full email bodies for the OPEN thread only (gmail_messages.body_text); rows
+  // without one keep their snippet.
+  const activeEmailRowIds = active?.channel === "email"
+    ? allMessages.filter((m) => m.conversationId === active.id && m.emailRowId).map((m) => m.emailRowId as string)
+    : [];
+  const gmailBodies = useGmailBodies(activeEmailRowIds);
+  // Scroll owner: the .conversation-thread-body element below (see
+  // src/lib/thread-scroll.ts). Starts at the latest message, follows new ones
+  // only while the reader is at the bottom.
+  const threadScroll = useThreadScroll(active?.id);
   const thread: LocalMessage[] = active
     ? [
-        ...(allMessages.filter((m) => m.conversationId === active.id) as LocalMessage[]),
+        ...(allMessages
+          .filter((m) => m.conversationId === active.id)
+          .map((m) => (m.emailRowId && gmailBodies[m.emailRowId] ? { ...m, body: gmailBodies[m.emailRowId] } : m)) as LocalMessage[]),
         ...localMessages
           .filter((m) => m.conversationId === active.id)
           .filter((m) => !isLocalEmailReconciled(m, active, gmailConvs, gmailMsgs)),
@@ -721,6 +756,19 @@ function InboxPage() {
   // replacement for, the server's own real check (an outbound-only thread
   // still safely no-ops server-side if this were ever stale).
   const activeHasInboundMessage = thread.some((m) => m.direction === "in");
+
+  // Subject is its own field, shown where it changes (first email / new subject).
+  const showSubjectById = new Map<string, boolean>();
+  {
+    let previousSubject: string | undefined;
+    let firstEmail = true;
+    for (const m of thread) {
+      if (m.channel !== "email") continue;
+      showSubjectById.set(m.id, shouldShowSubject(m.subject, previousSubject, firstEmail));
+      previousSubject = m.subject ?? previousSubject;
+      firstEmail = false;
+    }
+  }
 
   // Opening a conversation marks its unread inbound messages read — ONCE
   // per conversation identity, not every time active.unread flips true.
@@ -1119,6 +1167,10 @@ function InboxPage() {
       return;
     }
     const to = recipientResult.to;
+
+    // The user's own message should always be followed to the bottom once it
+    // appears (even if they had scrolled up to read history).
+    threadScroll.followBottom();
 
     try {
       const { data: { session } } = await supabase.auth.getSession();
@@ -1992,7 +2044,8 @@ function InboxPage() {
                 />
               )}
 
-              <div className="conversation-thread-body min-h-0 flex-1 space-y-7 overflow-y-auto px-8 py-6">
+              <div ref={threadScroll.containerRef} className="conversation-thread-body min-h-0 flex-1 overflow-y-auto px-8 py-6">
+              <div ref={threadScroll.contentRef} className="space-y-7">
                 {groupByDay(thread).map((group) => (
                   <div key={group.day}>
                     <div className="mb-4 flex items-center gap-3">
@@ -2011,7 +2064,7 @@ function InboxPage() {
                         // conversation-message-state.ts. Re-enable by
                         // restoring `m.dbId ? () => setDeleteMessageId(m.dbId!) : undefined`
                         // once the migration is applied and confirmed.
-                        <MessageBubble key={m.id} msg={m} />
+                        <MessageBubble key={m.id} msg={m} showSubject={showSubjectById.get(m.id) ?? false} />
                       ))}
                     </div>
                   </div>
@@ -2038,6 +2091,7 @@ function InboxPage() {
                     </div>
                   </div>
                 )}
+              </div>
               </div>
 
               {/* Composer */}
@@ -3174,8 +3228,9 @@ function ConversationRow({
   );
 }
 
-function MessageBubble({ msg, onDelete }: { msg: LocalMessage; onDelete?: () => void }) {
+function MessageBubble({ msg, onDelete, showSubject }: { msg: LocalMessage; onDelete?: () => void; showSubject?: boolean }) {
   const isOut = msg.direction === "out";
+  const isEmail = msg.channel === "email";
 
   // Internal note
   if (msg.channel === "note") {
@@ -3201,7 +3256,7 @@ function MessageBubble({ msg, onDelete }: { msg: LocalMessage; onDelete?: () => 
   // SMS / Email (+ scheduled variant)
   return (
     <div className={`group flex ${isOut ? "justify-end" : "justify-start"}`}>
-      <div className={`flex max-w-[72%] flex-col gap-1 sm:max-w-md lg:max-w-lg ${isOut ? "items-end" : "items-start"}`}>
+      <div className={`flex flex-col gap-1 ${isEmail ? "max-w-[88%] sm:max-w-xl lg:max-w-2xl" : "max-w-[72%] sm:max-w-md lg:max-w-lg"} ${isOut ? "items-end" : "items-start"}`}>
         <div className={`flex items-start gap-1 ${isOut ? "flex-row-reverse" : ""}`}>
           <div
             className={`conversation-message-bubble rounded-2xl border px-4 py-3 text-sm leading-relaxed ${
@@ -3212,7 +3267,7 @@ function MessageBubble({ msg, onDelete }: { msg: LocalMessage; onDelete?: () => 
                   : "rounded-bl-md border-[#E5E7EB] bg-[#F3F4F6] text-[#273142]"
             }`}
           >
-            {msg.body}
+            {isEmail ? <EmailMessageBody body={msg.body} subject={msg.subject} showSubject={!!showSubject} /> : msg.body}
           </div>
           {/* CRM-local delete only — see the confirmation dialog's copy.
               Only offered for messages that carry a real database id

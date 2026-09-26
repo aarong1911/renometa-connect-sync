@@ -39,6 +39,7 @@ import { createClient } from "@supabase/supabase-js";
 import { decryptBytea, encryptToBytea } from "./lib/gmail-token-crypto";
 import { getAppConfigs } from "./lib/app-config-store";
 import { reconcileSmtpSentRows } from "./lib/gmail-sent-reconcile";
+import { extractGmailBody, type GmailPayloadPart } from "./lib/gmail-mime";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -73,11 +74,12 @@ type GmailMessageDetail = {
   labelIds?: string[];
   snippet?: string;
   internalDate?: string;
-  payload?: { headers?: { name: string; value: string }[] };
+  // format=full: headers plus the MIME tree (see lib/gmail-mime.ts).
+  payload?: GmailPayloadPart;
 };
 
 function headerValue(detail: GmailMessageDetail, name: string): string | null {
-  const h = detail.payload?.headers?.find((x) => x.name.toLowerCase() === name.toLowerCase());
+  const h = detail.payload?.headers?.find((x: { name: string; value: string }) => x.name.toLowerCase() === name.toLowerCase());
   return h?.value ?? null;
 }
 
@@ -162,7 +164,7 @@ export const handler: Handler = async (event) => {
     return { statusCode: 403, headers: CORS, body: JSON.stringify({ error: "No organization found for this user" }) };
   }
 
-  let reqBody: { limit?: number; windowDays?: number } = {};
+  let reqBody: { limit?: number; windowDays?: number; silent?: boolean } = {};
   try { reqBody = event.body ? JSON.parse(event.body) : {}; } catch { /* default to {} */ }
   const limit = Math.min(Math.max(1, Number(reqBody.limit) || DEFAULT_LIMIT), MAX_LIMIT);
   // Gmail search-syntax date filter, not a client-side post-filter — keeps
@@ -171,6 +173,11 @@ export const handler: Handler = async (event) => {
   // "Load more history" action; every normal call uses the 7-day default.
   const windowDays = Math.max(1, Number(reqBody.windowDays) || DEFAULT_WINDOW_DAYS);
   const gmailQuery = encodeURIComponent(`newer_than:${windowDays}d`);
+
+  // `silent` = the Conversations auto-refresh (see src/lib/gmail-auto-sync.ts):
+  // same sync, but a no-change run does not write an integration_sync_logs row
+  // (that would be one log row every ~45 s per open Inbox).
+  const silent = reqBody.silent === true;
 
   const startedAt = new Date().toISOString();
 
@@ -260,7 +267,7 @@ export const handler: Handler = async (event) => {
   const fetchedIds = (listJson.messages ?? []).map((m) => m.id);
 
   if (fetchedIds.length === 0) {
-    await logResult("success", "No messages returned by Gmail", { fetched: 0, inserted: 0, updated: 0, skipped: 0 });
+    if (!silent) await logResult("success", "No messages returned by Gmail", { fetched: 0, inserted: 0, updated: 0, skipped: 0 });
     await supabaseAdmin.from("integrations").update({ last_sync_at: new Date().toISOString(), last_sync_status: "ok", sync_error: null }).eq("id", integration.id);
     return { statusCode: 200, headers: CORS, body: JSON.stringify({ ok: true, fetched: 0, inserted: 0, updated: 0, skipped: 0 }) };
   }
@@ -271,25 +278,34 @@ export const handler: Handler = async (event) => {
   // key), independent of this lookup.
   const { data: existingRows } = await supabaseAdmin
     .from("gmail_messages")
-    .select("id")
+    .select("id, body_text")
     .eq("org_id", orgId)
     .in("id", fetchedIds);
   const existingIds = new Set((existingRows ?? []).map((r: any) => r.id));
+  // A message already stored WITH a body (body_text is a string, "" included =
+  // "looked, nothing to show") never needs another detail fetch. Steady state
+  // for an auto-refresh with nothing new is therefore ONE list call and zero
+  // detail calls; new messages and legacy snippet-only rows (body_text null)
+  // are fetched in full, which also backfills their bodies.
+  const hasBody = new Set((existingRows ?? []).filter((r: any) => typeof r.body_text === "string").map((r: any) => r.id));
+  const idsToFetch = fetchedIds.filter((id) => !hasBody.has(id));
+  const unchanged = fetchedIds.length - idsToFetch.length;
 
   // Message-ID/In-Reply-To/References are RFC 5322 threading headers — NOT
   // the same thing as Gmail's own thread_id (already captured separately
   // below via detail.threadId). Needed so send-inbox-message.ts can build
   // real inReplyTo/references values for outbound replies.
-  const detailHeaders = "&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Bcc&metadataHeaders=Message-ID&metadataHeaders=In-Reply-To&metadataHeaders=References";
+  // format=full returns every header plus the MIME tree; the body is extracted
+  // by lib/gmail-mime.ts and stored as gmail_messages.body_text.
   const rows: any[] = [];
   let skipped = 0;
 
-  for (let i = 0; i < fetchedIds.length; i += DETAIL_FETCH_CONCURRENCY) {
-    const batch = fetchedIds.slice(i, i + DETAIL_FETCH_CONCURRENCY);
+  for (let i = 0; i < idsToFetch.length; i += DETAIL_FETCH_CONCURRENCY) {
+    const batch = idsToFetch.slice(i, i + DETAIL_FETCH_CONCURRENCY);
     const results = await Promise.all(
       batch.map(async (id) => {
         try {
-          const res = await gmailFetch(`/messages/${id}?format=metadata${detailHeaders}`, accessToken);
+          const res = await gmailFetch(`/messages/${id}?format=full`, accessToken);
           if (!res.ok) return null;
           return (await res.json()) as GmailMessageDetail;
         } catch {
@@ -305,6 +321,9 @@ export const handler: Handler = async (event) => {
         thread_id: detail.threadId,
         internal_date: detail.internalDate ? new Date(Number(detail.internalDate)).toISOString() : null,
         snippet: detail.snippet ?? null,
+        // "" (not null) when the message has no text content, so it is not
+        // re-fetched on every sync; the UI falls back to the snippet.
+        body_text: extractGmailBody(detail.payload).text,
         from_email: headerValue(detail, "From"),
         to_emails: splitAddressList(headerValue(detail, "To")),
         cc_emails: splitAddressList(headerValue(detail, "Cc")),
@@ -353,16 +372,21 @@ export const handler: Handler = async (event) => {
     .update({ last_sync_at: new Date().toISOString(), last_sync_status: "ok", sync_error: null })
     .eq("id", integration.id);
 
-  await logResult("success", `Synced ${rows.length} of ${fetchedIds.length} fetched messages`, {
-    fetched: fetchedIds.length,
-    inserted,
-    updated,
-    skipped,
-  });
+  if (!(silent && rows.length === 0)) {
+    await logResult("success", `Synced ${rows.length} of ${fetchedIds.length} fetched messages (${unchanged} unchanged)`, {
+      fetched: fetchedIds.length,
+      inserted,
+      updated,
+      skipped,
+      unchanged,
+    });
+  }
 
   return {
     statusCode: 200,
     headers: CORS,
-    body: JSON.stringify({ ok: true, fetched: fetchedIds.length, inserted, updated, skipped }),
+    // `changed` = rows actually written (new messages + body backfills). The
+    // client refetches its conversation data only when this is > 0.
+    body: JSON.stringify({ ok: true, fetched: fetchedIds.length, inserted, updated, skipped, unchanged, changed: rows.length }),
   };
 };

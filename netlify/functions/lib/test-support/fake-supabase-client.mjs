@@ -47,6 +47,7 @@ function columnValue(row, col) {
 }
 
 function evalCondition(row, f) {
+  if (f.op === "not") return !evalCondition(row, f.inner);
   if (f.op === "or") return f.branches.some((br) => br.every((c) => evalCondition(row, c)));
   if (f.op === "and") return f.conds.every((c) => evalCondition(row, c));
   // A column absent from an inserted object (e.g. consumed_at never set
@@ -112,6 +113,7 @@ class FakeQueryBuilder {
   is(col, val) { this.filters.push({ col, op: "is", val }); return this; }
   gt(col, val) { this.filters.push({ col, op: "gt", val }); return this; }
   lt(col, val) { this.filters.push({ col, op: "lt", val }); return this; }
+  not(col, op, val) { this.filters.push({ op: "not", inner: { col, op, val } }); return this; }
   gte(col, val) { this.filters.push({ col, op: "gte", val }); return this; }
   lte(col, val) { this.filters.push({ col, op: "lte", val }); return this; }
   filter(col, op, val) { this.filters.push({ col, op, val }); return this; }
@@ -255,6 +257,21 @@ class FakeQueryBuilder {
       const matched = rows.filter((r) => matchesFilters(r, this.filters));
       for (const row of matched) Object.assign(row, this.payload);
       return { data: matched, error: null };
+    }
+
+    if (this.op === "upsert" && Array.isArray(this.payload)) {
+      // Bulk upsert (gmail-sync.ts upserts an array): apply row by row.
+      const out = [];
+      for (const p of this.payload) {
+        const one = new FakeQueryBuilder(this.table, this.store, this.uniqueConstraints);
+        one.op = "upsert";
+        one.payload = p;
+        one.upsertOpts = this.upsertOpts;
+        const r = await one._execute();
+        if (r.error) return r;
+        out.push(...(r.data ?? []));
+      }
+      return { data: out, error: null };
     }
 
     if (this.op === "upsert") {
