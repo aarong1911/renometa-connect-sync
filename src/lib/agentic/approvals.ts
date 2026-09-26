@@ -31,6 +31,10 @@ export type CreateApprovalRequestInput = {
   requestedBy: Actor;
   /** Defaults to 24h if not given — every approval must expire (Priority 5). */
   expiresInMs?: number;
+  /** Stored as agent_approval_requests.metadata (jsonb). Used e.g. to record
+   * which inbound message triggered a WhatsApp reply proposal, so newer
+   * proposals can supersede older ones deterministically. */
+  metadata?: Record<string, unknown>;
 };
 
 const DEFAULT_APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
@@ -56,6 +60,7 @@ export async function createApprovalRequest(supabase: SupabaseClient, input: Cre
       requested_by_actor_type: input.requestedBy.actorType,
       requested_by_actor_id: input.requestedBy.actorId,
       expires_at: expiresAt,
+      ...(input.metadata ? { metadata: input.metadata } : {}),
     })
     .select("*")
     .single();
@@ -88,20 +93,26 @@ export async function approveRequest(
   if (error || !existing) return { ok: false, reason: "not_found" };
   if (existing.status !== "pending") return { ok: false, reason: "already_decided" };
   if (existing.expires_at && new Date(existing.expires_at) < new Date()) {
-    await supabase.from("agent_approval_requests").update({ status: "expired" }).eq("id", approvalId);
+    await supabase.from("agent_approval_requests").update({ status: "expired" }).eq("id", approvalId).eq("org_id", orgId).eq("status", "pending");
     return { ok: false, reason: "expired" };
   }
 
   const recomputedHash = await hashProposedInput(currentProposedInput ?? existing.proposed_input);
   if (recomputedHash !== existing.proposed_input_hash) return { ok: false, reason: "input_mismatch" };
 
+  // Conditional on status = 'pending': if the approval was superseded/
+  // rejected/expired between the read above and this write (e.g. a new
+  // inbound WhatsApp message just replaced it), this matches nothing and
+  // the stale approval is NOT approved or executed.
   const { data: updated } = await supabase
     .from("agent_approval_requests")
     .update({ status: "approved", reviewed_by: reviewerId, reviewed_at: new Date().toISOString() })
     .eq("id", approvalId)
     .eq("org_id", orgId)
+    .eq("status", "pending")
     .select("*")
-    .single();
+    .maybeSingle();
+  if (!updated) return { ok: false, reason: "already_decided" };
 
   return { ok: true, approval: updated };
 }
@@ -128,8 +139,10 @@ export async function rejectRequest(
     .update({ status: "rejected", reviewed_by: reviewerId, reviewed_at: new Date().toISOString(), rejection_reason: reason })
     .eq("id", approvalId)
     .eq("org_id", orgId)
+    .eq("status", "pending")
     .select("*")
-    .single();
+    .maybeSingle();
+  if (!updated) return { ok: false, reason: "already_decided" };
 
   return { ok: true, approval: updated };
 }

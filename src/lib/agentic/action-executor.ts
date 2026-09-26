@@ -72,6 +72,8 @@ export type ExecuteStepParams = {
   targetEntityId?: string;
   /** Human-readable one-liner for an approval request's `summary` column, if this step ends up requiring approval. */
   approvalSummary?: string;
+  /** Stored on the approval row's `metadata`, if this step ends up requiring approval. */
+  approvalMetadata?: Record<string, unknown>;
   /**
    * AI-2A correction pass. Separates "this execution may autonomously
    * execute actions up to its own autonomyLevel" from "trusted server
@@ -582,6 +584,7 @@ export async function executeStep(params: ExecuteStepParams): Promise<ExecuteSte
       targetEntityId: params.targetEntityId,
       proposedInput: parsedInput,
       summary: params.approvalSummary ?? `${action.displayName} requested.`,
+      metadata: params.approvalMetadata,
       riskLevel: action.riskLevel,
       requestedBy: actor,
     });
