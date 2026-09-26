@@ -351,6 +351,13 @@ export type Message = {
   // local echo against the synced Gmail row; undefined for every other
   // channel and for email messages synced before this column existed.
   rfcMessageId?: string;
+  // Email only — the Subject header as its own field. It is never merged into
+  // `body` (see gmail-conversations.ts / EmailMessageBody).
+  subject?: string;
+  // Email only — the gmail_messages primary key this message was built from,
+  // used to lazily load the full body (gmail_messages.body_text) for the OPEN
+  // thread only. `body` starts as the snippet (legacy fallback) until it loads.
+  emailRowId?: string;
   // The real sms_meta_messages.id (a bare uuid), distinct from `id` above
   // (which is prefixed, e.g. "sm-msg-<uuid>", for React key/lookup
   // purposes). Only set for SMS/WhatsApp/Messenger/Instagram messages —

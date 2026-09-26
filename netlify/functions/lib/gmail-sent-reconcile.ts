@@ -57,6 +57,10 @@ export function buildSmtpSentRow(input: SmtpSentEmailInput): Record<string, unkn
     thread_id: input.threadId || `${SMTP_THREAD_ID_PREFIX}${bare}`,
     internal_date: (input.now ?? new Date()).toISOString(),
     snippet: input.body,
+    // The full text that was actually sent (send-inbox-message.ts sends it as
+    // text/plain), so the thread shows the whole message immediately and it
+    // survives the later re-key to the real Gmail id (see reconcileSmtpSentRows).
+    body_text: input.body,
     from_email: input.fromEmail,
     to_emails: [input.to],
     subject: input.subject,
@@ -82,7 +86,13 @@ export async function persistSmtpSentEmail(
   const row = buildSmtpSentRow(input);
   if (!row) return { persisted: false };
   try {
-    const { error } = await supabase.from("gmail_messages").insert(row);
+    let { error } = await supabase.from("gmail_messages").insert(row);
+    if (error && error.code !== "23505" && /body_text/i.test(error.message ?? "")) {
+      // The body_text migration has not been applied yet: persist without it
+      // rather than lose the immediate-outbound row (snippet still holds the text).
+      const { body_text: _omit, ...withoutBody } = row as Record<string, unknown>;
+      ({ error } = await supabase.from("gmail_messages").insert(withoutBody));
+    }
     // 23505: this Message-ID/id is already stored — the row exists.
     if (error && error.code !== "23505") {
       console.error("[gmail-sent-reconcile] insert failed:", error.message);
@@ -103,18 +113,22 @@ export async function persistSmtpSentEmail(
 export async function reconcileSmtpSentRows(
   supabase: SupabaseClient,
   orgId: string,
-  fetchedRows: Array<{ id: string; rfc_message_id?: string | null; direction?: string | null }>,
+  fetchedRows: Array<{ id: string; rfc_message_id?: string | null; direction?: string | null; body_text?: string | null }>,
 ): Promise<{ rekeyed: number; failed: number }> {
   const realIdByRfc = new Map<string, string>();
+  const fetchedByRealId = new Map<string, { body_text?: string | null }>();
   for (const r of fetchedRows) {
     const key = normalizeRfcMessageId(r.rfc_message_id);
-    if (key && r.direction === "out" && !r.id.startsWith(SMTP_SENT_ID_PREFIX)) realIdByRfc.set(key, r.id);
+    if (key && r.direction === "out" && !r.id.startsWith(SMTP_SENT_ID_PREFIX)) {
+      realIdByRfc.set(key, r.id);
+      fetchedByRealId.set(r.id, r);
+    }
   }
   if (realIdByRfc.size === 0) return { rekeyed: 0, failed: 0 };
 
   const { data: existing, error } = await supabase
     .from("gmail_messages")
-    .select("id, rfc_message_id, labels")
+    .select("id, rfc_message_id, labels, body_text")
     .eq("org_id", orgId)
     .in("rfc_message_id", [...realIdByRfc.keys()]);
   if (error) {
@@ -124,10 +138,15 @@ export async function reconcileSmtpSentRows(
 
   let rekeyed = 0;
   let failed = 0;
-  for (const row of (existing ?? []) as Array<{ id: string; rfc_message_id: string; labels?: string[] | null }>) {
+  for (const row of (existing ?? []) as Array<{ id: string; rfc_message_id: string; labels?: string[] | null; body_text?: string | null }>) {
     const realId = realIdByRfc.get(row.rfc_message_id);
     const isTempOutbound = row.id.startsWith(SMTP_SENT_ID_PREFIX) && Array.isArray(row.labels) && row.labels.includes("SENT");
     if (!realId || row.id === realId || !isTempOutbound) continue;
+    // The batch's upsert (gmail-sync.ts) rewrites body_text from Gmail. If Gmail
+    // yielded no text for this message, keep the text we stored at send time
+    // instead of overwriting it with an empty value.
+    const incoming = fetchedByRealId.get(realId);
+    if (incoming && !incoming.body_text && row.body_text) incoming.body_text = row.body_text;
     const { error: updErr } = await supabase
       .from("gmail_messages")
       .update({ id: realId })
