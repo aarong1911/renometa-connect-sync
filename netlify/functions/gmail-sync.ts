@@ -55,16 +55,43 @@ const CORS = {
 
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
 // RenoMeta Connect is a CRM inbox, not a general Gmail client — normal
-// sync/refresh should be lightweight: the last 7 days, max 10 messages.
-// Both are provider-side filters (Gmail's own `q=newer_than:7d` search
-// operator + `maxResults`), not a client-side fetch-everything-then-filter
-// — this avoids pulling months of unrelated mailbox history on every sync.
+// sync/refresh should be lightweight: max 10 messages, newest first.
+// Bounded by `maxResults` alone (see buildGmailListPath) — this avoids
+// pulling months of unrelated mailbox history on every sync.
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 100;
 const DEFAULT_WINDOW_DAYS = 7;
 const DETAIL_FETCH_CONCURRENCY = 8;
 
 // ── Gmail API helpers ────────────────────────────────────────────────────
+
+/**
+ * Root cause of "inbound reply doesn't appear until a manual sync, minutes
+ * later" (2026-09-27 live retest of PR #12): the routine sync used Gmail's
+ * `q=newer_than:Nd` SEARCH filter for every call, including the automatic
+ * ~45s refresh. `q=` runs against Gmail's full-text search index, which has
+ * a documented propagation lag after a message arrives (commonly seconds,
+ * sometimes low minutes) — a message can be genuinely NEW and fetchable by
+ * plain `messages.list()` while `q=newer_than:...` still doesn't return it.
+ * The automatic sync legitimately ran and succeeded (hence "Last synced
+ * now" being truthful — a sync did complete), it just found nothing yet;
+ * whichever later sync happened to land after the index caught up is the
+ * one that "worked", making it look like only manual sync surfaces mail.
+ *
+ * Fix: routine syncs (every automatic and manual call with no explicit
+ * `windowDays`) now list with NO `q` param — `maxResults` alone, which reads
+ * directly off the mailbox and reflects a brand-new message immediately.
+ * `windowDays` (currently unused by any caller — reserved for a future
+ * "Load more history" action) still opts into the `q=newer_than:` search
+ * filter, since that action legitimately wants an older window than
+ * `maxResults` newest-first could bound.
+ */
+export function buildGmailListPath(limit: number, windowDays?: number): string {
+  if (windowDays !== undefined) {
+    return `/messages?maxResults=${limit}&q=${encodeURIComponent(`newer_than:${windowDays}d`)}`;
+  }
+  return `/messages?maxResults=${limit}`;
+}
 
 type GmailListResponse = { messages?: { id: string; threadId: string }[]; resultSizeEstimate?: number };
 
@@ -167,12 +194,12 @@ export const handler: Handler = async (event) => {
   let reqBody: { limit?: number; windowDays?: number; silent?: boolean } = {};
   try { reqBody = event.body ? JSON.parse(event.body) : {}; } catch { /* default to {} */ }
   const limit = Math.min(Math.max(1, Number(reqBody.limit) || DEFAULT_LIMIT), MAX_LIMIT);
-  // Gmail search-syntax date filter, not a client-side post-filter — keeps
-  // "ordinary Conversations loading" from ever pulling months of history in
-  // the first place. windowDays is only overridable by a future explicit
-  // "Load more history" action; every normal call uses the 7-day default.
-  const windowDays = Math.max(1, Number(reqBody.windowDays) || DEFAULT_WINDOW_DAYS);
-  const gmailQuery = encodeURIComponent(`newer_than:${windowDays}d`);
+  // Routine syncs (every automatic and manual call) pass no windowDays and get
+  // the plain, index-lag-free listing bounded by `limit` alone — see
+  // buildGmailListPath's doc comment for why. windowDays stays reserved for a
+  // future explicit "Load more history" action (no current caller sets it).
+  const windowDays = reqBody.windowDays !== undefined ? Math.max(1, Number(reqBody.windowDays) || DEFAULT_WINDOW_DAYS) : undefined;
+  const listPath = buildGmailListPath(limit, windowDays);
 
   // `silent` = the Conversations auto-refresh (see src/lib/gmail-auto-sync.ts):
   // same sync, but a no-change run does not write an integration_sync_logs row
@@ -227,7 +254,7 @@ export const handler: Handler = async (event) => {
   // Attempt the call with the current token first — token_expires_at on
   // some rows is null/unreliable, so a live 401 is the source of truth for
   // "this token no longer works", not the stored expiry timestamp.
-  let listRes = await gmailFetch(`/messages?maxResults=${limit}&q=${gmailQuery}`, accessToken);
+  let listRes = await gmailFetch(listPath, accessToken);
 
   if (listRes.status === 401) {
     if (!integration.refresh_token_encrypted) {
@@ -245,7 +272,7 @@ export const handler: Handler = async (event) => {
         .from("integrations")
         .update({ access_token_encrypted: encryptToBytea(newToken), token_expires_at: expiresAt })
         .eq("id", integration.id);
-      listRes = await gmailFetch(`/messages?maxResults=${limit}&q=${gmailQuery}`, accessToken);
+      listRes = await gmailFetch(listPath, accessToken);
     } catch (error: any) {
       console.error("[gmail-sync] token refresh failed:", error.message);
       const msg = "Gmail connection has expired and could not be renewed automatically. Reconnect Gmail for this organization to continue syncing.";
