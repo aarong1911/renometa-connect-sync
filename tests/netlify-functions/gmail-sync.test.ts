@@ -1,6 +1,6 @@
-// netlify/functions/gmail-sync.test.ts
+// tests/netlify-functions/gmail-sync.test.ts
 //
-// Run:  node --test netlify/functions/gmail-sync.test.ts
+// Run: node --test tests/netlify-functions/gmail-sync.test.ts
 // Covers the fix for the 2026-09-27 live-retest bug: routine Gmail syncs (every
 // automatic and manual call) must list mail WITHOUT the `q=newer_than:` search
 // filter, because that filter runs against Gmail's search index, which lags
@@ -28,7 +28,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = "test-key";
 
 const esbuild = createRequire(createRequire(import.meta.url).resolve("vite/package.json"))("esbuild");
 await esbuild.build({
-  entryPoints: [path.join(here, "gmail-sync.ts")],
+  entryPoints: [path.join(here, "../../netlify/functions/gmail-sync.ts")],
   outfile: path.join(outDir, "gmail-sync.mjs"),
   bundle: true,
   platform: "node",
