@@ -1,13 +1,19 @@
 // netlify/functions/gmail-sync.ts
 //
-// Manual Gmail synchronization: reads the calling org's real Gmail OAuth
-// connection from the `integrations` table (provider = 'gmail'), refreshes
-// the access token if needed, fetches recent messages via the Gmail API,
-// and upserts them into gmail_messages.
+// Gmail synchronization: reads the calling org's real Gmail OAuth connection
+// from the `integrations` table (provider = 'gmail'), refreshes the access
+// token if needed, and syncs messages into gmail_messages.
 //
 // This is READ via the Gmail API OAuth connection — NOT the SMTP_USER/
 // SMTP_PASSWORD app-password credentials used for sending in
 // send-inbox-message.ts. Those are unrelated and are never touched here.
+//
+// INCREMENTAL SYNC (2026-09-27): the actual list/history/bootstrap/cursor
+// orchestration lives in lib/gmail-history-sync.ts, injectable and unit-tested
+// there with a fake Gmail API — this file only does auth/org-resolution/token
+// management and wires a REAL GmailApi (via gmailFetch below) into it. See
+// that module's header for the full incremental-sync design (why History API,
+// cursor storage/safety, bootstrap bounds, invalid-cursor recovery).
 //
 // Token format (verified against live data before writing this file):
 // `integrations.access_token_encrypted`/`refresh_token_encrypted` are bytea
@@ -38,8 +44,17 @@ import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { decryptBytea, encryptToBytea } from "./lib/gmail-token-crypto";
 import { getAppConfigs } from "./lib/app-config-store";
-import { reconcileSmtpSentRows } from "./lib/gmail-sent-reconcile";
-import { extractGmailBody, type GmailPayloadPart } from "./lib/gmail-mime";
+import {
+  buildGmailHistoryPath,
+  buildGmailListPath,
+  GmailHistoryInvalidError,
+  parseHistoryResponse,
+  runGmailMessageSync,
+  type GmailApi,
+  type GmailListPage,
+  type GmailMessageDetail,
+  type GmailProfile,
+} from "./lib/gmail-history-sync";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -54,67 +69,11 @@ const CORS = {
 };
 
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
-// RenoMeta Connect is a CRM inbox, not a general Gmail client — normal
-// sync/refresh should be lightweight: max 10 messages, newest first.
-// Bounded by `maxResults` alone (see buildGmailListPath) — this avoids
-// pulling months of unrelated mailbox history on every sync.
+// Bootstrap-only bound (see lib/gmail-history-sync.ts for the incremental
+// path, which has no fixed message limit — it processes whatever History
+// reports). A routine sync with a usable cursor never uses this at all.
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 100;
-const DEFAULT_WINDOW_DAYS = 7;
-const DETAIL_FETCH_CONCURRENCY = 8;
-
-// ── Gmail API helpers ────────────────────────────────────────────────────
-
-/**
- * Root cause of "inbound reply doesn't appear until a manual sync, minutes
- * later" (2026-09-27 live retest of PR #12): the routine sync used Gmail's
- * `q=newer_than:Nd` SEARCH filter for every call, including the automatic
- * ~45s refresh. `q=` runs against Gmail's full-text search index, which has
- * a documented propagation lag after a message arrives (commonly seconds,
- * sometimes low minutes) — a message can be genuinely NEW and fetchable by
- * plain `messages.list()` while `q=newer_than:...` still doesn't return it.
- * The automatic sync legitimately ran and succeeded (hence "Last synced
- * now" being truthful — a sync did complete), it just found nothing yet;
- * whichever later sync happened to land after the index caught up is the
- * one that "worked", making it look like only manual sync surfaces mail.
- *
- * Fix: routine syncs (every automatic and manual call with no explicit
- * `windowDays`) now list with NO `q` param — `maxResults` alone, which reads
- * directly off the mailbox and reflects a brand-new message immediately.
- * `windowDays` (currently unused by any caller — reserved for a future
- * "Load more history" action) still opts into the `q=newer_than:` search
- * filter, since that action legitimately wants an older window than
- * `maxResults` newest-first could bound.
- */
-export function buildGmailListPath(limit: number, windowDays?: number): string {
-  if (windowDays !== undefined) {
-    return `/messages?maxResults=${limit}&q=${encodeURIComponent(`newer_than:${windowDays}d`)}`;
-  }
-  return `/messages?maxResults=${limit}`;
-}
-
-type GmailListResponse = { messages?: { id: string; threadId: string }[]; resultSizeEstimate?: number };
-
-type GmailMessageDetail = {
-  id: string;
-  threadId: string;
-  labelIds?: string[];
-  snippet?: string;
-  internalDate?: string;
-  // format=full: headers plus the MIME tree (see lib/gmail-mime.ts).
-  payload?: GmailPayloadPart;
-};
-
-function headerValue(detail: GmailMessageDetail, name: string): string | null {
-  const h = detail.payload?.headers?.find((x: { name: string; value: string }) => x.name.toLowerCase() === name.toLowerCase());
-  return h?.value ?? null;
-}
-
-function splitAddressList(raw: string | null): string[] | null {
-  if (!raw) return null;
-  const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
-  return parts.length > 0 ? parts : null;
-}
 
 async function refreshAccessToken(refreshToken: string): Promise<{ accessToken: string; expiresAt: string }> {
   // Env-footprint reduction (2026-09) — see google-ads-config.ts's header
@@ -151,6 +110,40 @@ async function gmailFetch(path: string, accessToken: string): Promise<Response> 
   return fetch(`${GMAIL_API}${path}`, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
+}
+
+/** The real GmailApi (network) — everything in lib/gmail-history-sync.ts is otherwise pure/DB-only. */
+function createRealGmailApi(accessToken: string, bootstrapPageSize: number, windowDays?: number): GmailApi {
+  return {
+    async listMessages(pageToken): Promise<GmailListPage> {
+      const res = await gmailFetch(buildGmailListPath(bootstrapPageSize, windowDays, pageToken), accessToken);
+      if (!res.ok) throw new Error(`Gmail API list request failed (${res.status})`);
+      const json: any = await res.json();
+      return { ids: (json.messages ?? []).map((m: any) => m.id), nextPageToken: json.nextPageToken };
+    },
+    async listHistory(startHistoryId, pageToken) {
+      const res = await gmailFetch(buildGmailHistoryPath(startHistoryId, pageToken), accessToken);
+      if (res.status === 404) {
+        // Gmail's documented response for a startHistoryId that has aged out
+        // of its retained history window — see lib/gmail-history-sync.ts's
+        // "ACCOUNT SAFETY"/invalid-cursor recovery design.
+        throw new GmailHistoryInvalidError(`Gmail history endpoint returned 404 for startHistoryId=${startHistoryId}`);
+      }
+      if (!res.ok) throw new Error(`Gmail API history request failed (${res.status})`);
+      return parseHistoryResponse(await res.json());
+    },
+    async getMessage(id): Promise<GmailMessageDetail | null> {
+      const res = await gmailFetch(`/messages/${id}?format=full`, accessToken);
+      if (!res.ok) return null;
+      return (await res.json()) as GmailMessageDetail;
+    },
+    async getProfile(): Promise<GmailProfile> {
+      const res = await gmailFetch("/profile", accessToken);
+      if (!res.ok) throw new Error(`Gmail API profile request failed (${res.status})`);
+      const json: any = await res.json();
+      return { historyId: String(json.historyId), emailAddress: typeof json.emailAddress === "string" ? json.emailAddress : null };
+    },
+  };
 }
 
 // ── Handler ──────────────────────────────────────────────────────────────
@@ -193,13 +186,10 @@ export const handler: Handler = async (event) => {
 
   let reqBody: { limit?: number; windowDays?: number; silent?: boolean } = {};
   try { reqBody = event.body ? JSON.parse(event.body) : {}; } catch { /* default to {} */ }
-  const limit = Math.min(Math.max(1, Number(reqBody.limit) || DEFAULT_LIMIT), MAX_LIMIT);
-  // Routine syncs (every automatic and manual call) pass no windowDays and get
-  // the plain, index-lag-free listing bounded by `limit` alone — see
-  // buildGmailListPath's doc comment for why. windowDays stays reserved for a
-  // future explicit "Load more history" action (no current caller sets it).
-  const windowDays = reqBody.windowDays !== undefined ? Math.max(1, Number(reqBody.windowDays) || DEFAULT_WINDOW_DAYS) : undefined;
-  const listPath = buildGmailListPath(limit, windowDays);
+  const bootstrapPageSize = Math.min(Math.max(1, Number(reqBody.limit) || DEFAULT_LIMIT), MAX_LIMIT);
+  // windowDays stays reserved for a future explicit "Load more history"
+  // action (no current caller sets it) — see buildGmailListPath.
+  const windowDays = reqBody.windowDays !== undefined ? Math.max(1, Number(reqBody.windowDays)) || undefined : undefined;
 
   // `silent` = the Conversations auto-refresh (see src/lib/gmail-auto-sync.ts):
   // same sync, but a no-change run does not write an integration_sync_logs row
@@ -208,7 +198,7 @@ export const handler: Handler = async (event) => {
 
   const startedAt = new Date().toISOString();
 
-  const logResult = async (status: "success" | "error", message: string, stats: Record<string, number>) => {
+  const logResult = async (status: "success" | "error", message: string, stats: Record<string, unknown>) => {
     await supabaseAdmin.from("integration_sync_logs").insert({
       org_id: orgId,
       provider: "gmail",
@@ -221,19 +211,40 @@ export const handler: Handler = async (event) => {
   };
 
   // ── Load the org's Gmail connection ───────────────────────────────────
-  const { data: integration, error: integrationErr } = await supabaseAdmin
+  const { data: integrationData, error: integrationErr } = await supabaseAdmin
     .from("integrations")
-    .select("id, status, access_token_encrypted, refresh_token_encrypted, token_expires_at")
+    .select("id, status, access_token_encrypted, refresh_token_encrypted, token_expires_at, provider_account_email, gmail_history_id, gmail_history_id_account_email")
     .eq("org_id", orgId)
     .eq("provider", "gmail")
     .maybeSingle();
 
   if (integrationErr) {
-    console.error("[gmail-sync] failed to load integration row:", integrationErr.message);
-    return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: "Failed to load Gmail connection" }) };
+    // A pre-migration database (gmail_history_id column not applied yet)
+    // fails the select with 42703 — degrade to bootstrap-only behavior
+    // (never advances a cursor) rather than breaking sync entirely.
+    if ((integrationErr as any).code === "42703") {
+      console.warn("[gmail-sync] gmail_history_id column not present yet — falling back to bootstrap-only sync until the migration is applied.");
+    } else {
+      console.error("[gmail-sync] failed to load integration row:", integrationErr.message);
+      return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: "Failed to load Gmail connection" }) };
+    }
+  }
+  let integrationRow = integrationData;
+  if (!integrationRow && integrationErr && (integrationErr as any).code === "42703") {
+    const { data: legacyRow, error: legacyErr } = await supabaseAdmin
+      .from("integrations")
+      .select("id, status, access_token_encrypted, refresh_token_encrypted, token_expires_at, provider_account_email")
+      .eq("org_id", orgId)
+      .eq("provider", "gmail")
+      .maybeSingle();
+    if (legacyErr) {
+      console.error("[gmail-sync] failed to load integration row (legacy select):", legacyErr.message);
+      return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: "Failed to load Gmail connection" }) };
+    }
+    integrationRow = legacyRow ? { ...legacyRow, gmail_history_id: null, gmail_history_id_account_email: null } : null;
   }
 
-  if (!integration || integration.status !== "connected" || !integration.access_token_encrypted) {
+  if (!integrationRow || integrationRow.status !== "connected" || !integrationRow.access_token_encrypted) {
     return {
       statusCode: 400,
       headers: CORS,
@@ -242,6 +253,7 @@ export const handler: Handler = async (event) => {
       }),
     };
   }
+  const integration = integrationRow;
 
   let accessToken: string;
   try {
@@ -251,144 +263,50 @@ export const handler: Handler = async (event) => {
     return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: "Failed to read the stored Gmail token" }) };
   }
 
-  // Attempt the call with the current token first — token_expires_at on
-  // some rows is null/unreliable, so a live 401 is the source of truth for
-  // "this token no longer works", not the stored expiry timestamp.
-  let listRes = await gmailFetch(listPath, accessToken);
+  const errorOut = async (statusCode: number, msg: string) => {
+    await logResult("error", msg, {});
+    await supabaseAdmin.from("integrations").update({ last_sync_at: new Date().toISOString(), last_sync_status: "error", sync_error: msg }).eq("id", integration.id);
+    return { statusCode, headers: CORS, body: JSON.stringify({ error: msg }) };
+  };
 
-  if (listRes.status === 401) {
+  // Verify the token still works with one cheap call before running the full
+  // sync — same "a live 401 is the source of truth" reasoning as before.
+  let probeRes = await gmailFetch("/profile", accessToken);
+  if (probeRes.status === 401) {
     if (!integration.refresh_token_encrypted) {
-      const msg = "This Gmail connection's access token has expired and there is no refresh token on file, so it cannot be renewed automatically. Reconnect Gmail for this organization to continue syncing.";
-      await logResult("error", msg, { fetched: 0, inserted: 0, updated: 0, skipped: 0 });
-      await supabaseAdmin.from("integrations").update({ last_sync_at: new Date().toISOString(), last_sync_status: "error", sync_error: msg }).eq("id", integration.id);
-      return { statusCode: 409, headers: CORS, body: JSON.stringify({ error: msg }) };
+      return errorOut(409, "This Gmail connection's access token has expired and there is no refresh token on file, so it cannot be renewed automatically. Reconnect Gmail for this organization to continue syncing.");
     }
-
     try {
       const refreshTokenPlain = decryptBytea(integration.refresh_token_encrypted);
       const { accessToken: newToken, expiresAt } = await refreshAccessToken(refreshTokenPlain);
       accessToken = newToken;
-      await supabaseAdmin
-        .from("integrations")
-        .update({ access_token_encrypted: encryptToBytea(newToken), token_expires_at: expiresAt })
-        .eq("id", integration.id);
-      listRes = await gmailFetch(listPath, accessToken);
+      await supabaseAdmin.from("integrations").update({ access_token_encrypted: encryptToBytea(newToken), token_expires_at: expiresAt }).eq("id", integration.id);
+      probeRes = await gmailFetch("/profile", accessToken);
     } catch (error: any) {
       console.error("[gmail-sync] token refresh failed:", error.message);
-      const msg = "Gmail connection has expired and could not be renewed automatically. Reconnect Gmail for this organization to continue syncing.";
-      await logResult("error", msg, { fetched: 0, inserted: 0, updated: 0, skipped: 0 });
-      await supabaseAdmin.from("integrations").update({ last_sync_at: new Date().toISOString(), last_sync_status: "error", sync_error: msg }).eq("id", integration.id);
-      return { statusCode: 409, headers: CORS, body: JSON.stringify({ error: msg }) };
+      return errorOut(409, "Gmail connection has expired and could not be renewed automatically. Reconnect Gmail for this organization to continue syncing.");
     }
   }
-
-  if (!listRes.ok) {
-    const msg = `Gmail API list request failed (${listRes.status})`;
-    console.error("[gmail-sync]", msg);
-    await logResult("error", msg, { fetched: 0, inserted: 0, updated: 0, skipped: 0 });
-    await supabaseAdmin.from("integrations").update({ last_sync_at: new Date().toISOString(), last_sync_status: "error", sync_error: msg }).eq("id", integration.id);
-    return { statusCode: 502, headers: CORS, body: JSON.stringify({ error: msg }) };
+  if (!probeRes.ok) {
+    return errorOut(502, `Gmail API request failed (${probeRes.status})`);
   }
 
-  const listJson: GmailListResponse = await listRes.json();
-  const fetchedIds = (listJson.messages ?? []).map((m) => m.id);
+  const gmail = createRealGmailApi(accessToken, bootstrapPageSize, windowDays);
 
-  if (fetchedIds.length === 0) {
-    if (!silent) await logResult("success", "No messages returned by Gmail", { fetched: 0, inserted: 0, updated: 0, skipped: 0 });
-    await supabaseAdmin.from("integrations").update({ last_sync_at: new Date().toISOString(), last_sync_status: "ok", sync_error: null }).eq("id", integration.id);
-    return { statusCode: 200, headers: CORS, body: JSON.stringify({ ok: true, fetched: 0, inserted: 0, updated: 0, skipped: 0 }) };
-  }
-
-  // Which of these ids already exist for this org — used to report
-  // inserted vs updated counts. Duplicates themselves are prevented by the
-  // upsert below (gmail_messages.id, the Gmail message id, is the primary
-  // key), independent of this lookup.
-  const { data: existingRows } = await supabaseAdmin
-    .from("gmail_messages")
-    .select("id, body_text")
-    .eq("org_id", orgId)
-    .in("id", fetchedIds);
-  const existingIds = new Set((existingRows ?? []).map((r: any) => r.id));
-  // A message already stored WITH a body (body_text is a string, "" included =
-  // "looked, nothing to show") never needs another detail fetch. Steady state
-  // for an auto-refresh with nothing new is therefore ONE list call and zero
-  // detail calls; new messages and legacy snippet-only rows (body_text null)
-  // are fetched in full, which also backfills their bodies.
-  const hasBody = new Set((existingRows ?? []).filter((r: any) => typeof r.body_text === "string").map((r: any) => r.id));
-  const idsToFetch = fetchedIds.filter((id) => !hasBody.has(id));
-  const unchanged = fetchedIds.length - idsToFetch.length;
-
-  // Message-ID/In-Reply-To/References are RFC 5322 threading headers — NOT
-  // the same thing as Gmail's own thread_id (already captured separately
-  // below via detail.threadId). Needed so send-inbox-message.ts can build
-  // real inReplyTo/references values for outbound replies.
-  // format=full returns every header plus the MIME tree; the body is extracted
-  // by lib/gmail-mime.ts and stored as gmail_messages.body_text.
-  const rows: any[] = [];
-  let skipped = 0;
-
-  for (let i = 0; i < idsToFetch.length; i += DETAIL_FETCH_CONCURRENCY) {
-    const batch = idsToFetch.slice(i, i + DETAIL_FETCH_CONCURRENCY);
-    const results = await Promise.all(
-      batch.map(async (id) => {
-        try {
-          const res = await gmailFetch(`/messages/${id}?format=full`, accessToken);
-          if (!res.ok) return null;
-          return (await res.json()) as GmailMessageDetail;
-        } catch {
-          return null;
-        }
-      }),
+  let result;
+  try {
+    result = await runGmailMessageSync(
+      supabaseAdmin,
+      orgId,
+      integration.id,
+      { historyId: integration.gmail_history_id ?? null, accountEmail: integration.gmail_history_id_account_email ?? null },
+      integration.provider_account_email ?? null,
+      gmail,
     );
-    for (const detail of results) {
-      if (!detail) { skipped++; continue; }
-      rows.push({
-        id: detail.id,
-        org_id: orgId,
-        thread_id: detail.threadId,
-        internal_date: detail.internalDate ? new Date(Number(detail.internalDate)).toISOString() : null,
-        snippet: detail.snippet ?? null,
-        // "" (not null) when the message has no text content, so it is not
-        // re-fetched on every sync; the UI falls back to the snippet.
-        body_text: extractGmailBody(detail.payload).text,
-        from_email: headerValue(detail, "From"),
-        to_emails: splitAddressList(headerValue(detail, "To")),
-        cc_emails: splitAddressList(headerValue(detail, "Cc")),
-        bcc_emails: splitAddressList(headerValue(detail, "Bcc")),
-        subject: headerValue(detail, "Subject"),
-        labels: detail.labelIds ?? null,
-        // RFC 5322 identity — distinct from `thread_id` (Gmail's own
-        // grouping id, already stored above). Direction is derived the same
-        // way the client currently does (labels.includes("SENT")), just
-        // computed once here server-side so it's a stored, queryable fact
-        // instead of being re-derived ad hoc on every read.
-        rfc_message_id: headerValue(detail, "Message-ID"),
-        in_reply_to: headerValue(detail, "In-Reply-To"),
-        references_header: headerValue(detail, "References"),
-        direction: (detail.labelIds ?? []).includes("SENT") ? "out" : "in",
-      });
-    }
+  } catch (err: any) {
+    console.error("[gmail-sync] sync failed:", err.message);
+    return errorOut(502, `Gmail sync failed: ${err.message}`);
   }
-
-  if (rows.length > 0) {
-    // Re-key any temporary "smtp:" row (persisted at send time by
-    // send-inbox-message.ts) to the real Gmail id BEFORE the upsert, so the
-    // upsert updates that row in place instead of inserting a second row with
-    // the same (org_id, rfc_message_id) — which the unique index would reject,
-    // failing the whole batch. Best-effort: never throws.
-    await reconcileSmtpSentRows(supabaseAdmin, orgId, rows);
-    const { error: upsertErr } = await supabaseAdmin.from("gmail_messages").upsert(rows, { onConflict: "id" });
-    if (upsertErr) {
-      const msg = `Failed to save fetched messages: ${upsertErr.message}`;
-      console.error("[gmail-sync]", msg);
-      await logResult("error", msg, { fetched: fetchedIds.length, inserted: 0, updated: 0, skipped: fetchedIds.length });
-      await supabaseAdmin.from("integrations").update({ last_sync_at: new Date().toISOString(), last_sync_status: "error", sync_error: msg }).eq("id", integration.id);
-      return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: msg }) };
-    }
-  }
-
-  const inserted = rows.filter((r) => !existingIds.has(r.id)).length;
-  const updated = rows.filter((r) => existingIds.has(r.id)).length;
 
   await supabaseAdmin
     .from("gmail_sync_state")
@@ -399,21 +317,35 @@ export const handler: Handler = async (event) => {
     .update({ last_sync_at: new Date().toISOString(), last_sync_status: "ok", sync_error: null })
     .eq("id", integration.id);
 
-  if (!(silent && rows.length === 0)) {
-    await logResult("success", `Synced ${rows.length} of ${fetchedIds.length} fetched messages (${unchanged} unchanged)`, {
-      fetched: fetchedIds.length,
-      inserted,
-      updated,
-      skipped,
-      unchanged,
+  if (!(silent && result.changed === 0)) {
+    await logResult("success", `Gmail sync (${result.mode}${result.recoveredFromInvalidCursor ? ", recovered from invalid cursor" : ""}): ${result.changed} of ${result.fetched} fetched messages written (${result.unchanged} unchanged)`, {
+      mode: result.mode,
+      fetched: result.fetched,
+      inserted: result.inserted,
+      updated: result.updated,
+      skipped: result.skipped,
+      unchanged: result.unchanged,
+      pages: result.pages,
+      cursorAdvanced: result.cursorAdvanced,
+      recovered: result.recoveredFromInvalidCursor,
     });
   }
 
   return {
     statusCode: 200,
     headers: CORS,
-    // `changed` = rows actually written (new messages + body backfills). The
-    // client refetches its conversation data only when this is > 0.
-    body: JSON.stringify({ ok: true, fetched: fetchedIds.length, inserted, updated, skipped, unchanged, changed: rows.length }),
+    body: JSON.stringify({
+      ok: true,
+      fetched: result.fetched,
+      inserted: result.inserted,
+      updated: result.updated,
+      skipped: result.skipped,
+      unchanged: result.unchanged,
+      // `changed` = rows actually written (new messages + body backfills). The
+      // client refetches its conversation data only when this is > 0.
+      changed: result.changed,
+      mode: result.mode,
+      recovered: result.recoveredFromInvalidCursor,
+    }),
   };
 };

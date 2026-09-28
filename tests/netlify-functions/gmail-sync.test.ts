@@ -7,10 +7,11 @@
 // filter, because that filter runs against Gmail's search index, which lags
 // behind brand-new mail — the exact cause of "inbound reply only shows up after
 // a manual sync". `buildGmailListPath` is the one pure function that decides the
-// list URL; it is bundled with esbuild (same convention as the other
-// netlify/functions/lib/*.test.ts files) purely because gmail-sync.ts itself has
-// module-level side effects (a live createClient/env var read) — nothing here
-// executes the handler or touches Gmail/Supabase.
+// list URL; it moved to netlify/functions/lib/gmail-history-sync.ts as part of
+// the incremental-sync rewrite (2026-09-27) — see that module's own tests
+// (gmail-history-sync.test.ts) for the bootstrap/incremental orchestration this
+// URL builder now feeds. Bundled with esbuild (same convention as the other
+// netlify/functions/lib/*.test.ts files); nothing here touches Gmail/Supabase.
 
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
@@ -24,21 +25,16 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const outDir = mkdtempSync(path.join(tmpdir(), "gmail-sync-test-"));
 after(() => rmSync(outDir, { recursive: true, force: true }));
 
-process.env.SUPABASE_URL = "http://127.0.0.1:1";
-process.env.SUPABASE_SERVICE_ROLE_KEY = "test-key";
-
 const esbuild = createRequire(createRequire(import.meta.url).resolve("vite/package.json"))("esbuild");
 await esbuild.build({
-  entryPoints: [path.join(here, "../../netlify/functions/gmail-sync.ts")],
-  outfile: path.join(outDir, "gmail-sync.mjs"),
+  entryPoints: [path.join(here, "../../netlify/functions/lib/gmail-history-sync.ts")],
+  outfile: path.join(outDir, "gmail-history-sync.mjs"),
   bundle: true,
   platform: "node",
   format: "esm",
   logLevel: "error",
-  external: ["@netlify/functions"],
-  banner: { js: "import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);" },
 });
-const { buildGmailListPath }: any = await import(pathToFileURL(path.join(outDir, "gmail-sync.mjs")).href);
+const { buildGmailListPath }: any = await import(pathToFileURL(path.join(outDir, "gmail-history-sync.mjs")).href);
 
 test("5. a routine sync (no windowDays — every automatic and manual call) lists with NO q= filter", () => {
   assert.equal(buildGmailListPath(10), "/messages?maxResults=10");
@@ -49,4 +45,9 @@ test("5. a routine sync (no windowDays — every automatic and manual call) list
 test("an explicit windowDays (reserved for a future 'Load more history' action) still opts into the search filter", () => {
   assert.equal(buildGmailListPath(50, 30), "/messages?maxResults=50&q=newer_than%3A30d");
   assert.equal(buildGmailListPath(10, 1), "/messages?maxResults=10&q=newer_than%3A1d");
+});
+
+test("bootstrap pagination: a pageToken is appended so multiple bootstrap pages can be followed", () => {
+  assert.equal(buildGmailListPath(100, undefined, "tok123"), "/messages?maxResults=100&pageToken=tok123");
+  assert.equal(buildGmailListPath(100, 7, "tok123"), "/messages?maxResults=100&q=newer_than%3A7d&pageToken=tok123");
 });
