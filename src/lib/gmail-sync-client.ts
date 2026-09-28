@@ -11,10 +11,13 @@
 import { supabase } from "@/lib/supabase";
 
 export type GmailSyncResult =
-  | { ok: true; fetched: number; inserted: number; updated: number; skipped: number }
+  // `changed` = rows the server actually wrote (new messages + body backfills).
+  | { ok: true; fetched: number; inserted: number; updated: number; skipped: number; changed?: number }
   | { ok: false; error: string };
 
-export async function triggerGmailSync(): Promise<GmailSyncResult> {
+// `silent` marks the Conversations auto-refresh: same server sync, but a
+// no-change run is not written to integration_sync_logs (see gmail-sync.ts).
+export async function triggerGmailSync(opts: { silent?: boolean } = {}): Promise<GmailSyncResult> {
   const { data: { session } } = await supabase.auth.getSession();
   if (!session) return { ok: false, error: "You must be signed in to sync Gmail" };
 
@@ -22,7 +25,7 @@ export async function triggerGmailSync(): Promise<GmailSyncResult> {
     const res = await fetch("/.netlify/functions/gmail-sync", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
-      body: JSON.stringify({}),
+      body: JSON.stringify(opts.silent ? { silent: true } : {}),
     });
     const result = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -34,6 +37,7 @@ export async function triggerGmailSync(): Promise<GmailSyncResult> {
       inserted: result.inserted ?? 0,
       updated: result.updated ?? 0,
       skipped: result.skipped ?? 0,
+      changed: typeof result.changed === "number" ? result.changed : undefined,
     };
   } catch {
     return { ok: false, error: "Network error — Gmail sync did not complete" };

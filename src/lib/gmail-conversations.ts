@@ -8,9 +8,12 @@
 // contacts → group into Conversation/Message entries.
 //
 // Two things make this table different from sms_meta_messages:
-//  - No body/body_html column, only `snippet` (a short preview). We never
-//    fabricate a longer body — `snippet` (optionally prefixed with the
-//    subject) is genuinely all there is to show.
+//  - The full readable body lives in `body_text` (added by
+//    20260926_gmail_messages_body_text.sql, filled by gmail-sync.ts). It is
+//    NOT selected by the list query below (2000 rows x full bodies would be a
+//    heavy payload); useGmailBodies() loads it for the OPEN thread only. Rows
+//    that predate the column (body_text NULL) keep showing `snippet`. The
+//    subject is always its own field and is never concatenated into the body.
 //  - No direction column — direction is derived from `labels`: a row with
 //    the "SENT" label was sent by this org, anything else is inbound.
 //  - No org-scoped "our own address" to compare against (organizations.
@@ -47,7 +50,7 @@
 // which Conversation object its Message entries get attached to.
 
 import { useCallback } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
 import type { Conversation, Message } from "@/lib/mock-data";
 import { useOrgId } from "@/lib/org-id";
@@ -207,12 +210,15 @@ function firstToAddressRaw(toEmails: unknown): string {
 // hook instance. Throws on error (react-query's own error state) instead
 // of the old console.error-and-swallow, matching the sms-meta-conversations.ts
 // adapter's shape.
-async function fetchGmailConversations(orgId: string): Promise<{ conversations: Conversation[]; messages: Message[] }> {
+export async function fetchGmailConversations(orgId: string): Promise<{ conversations: Conversation[]; messages: Message[] }> {
     const { data, error } = await supabase
       .from("gmail_messages")
       .select("id, thread_id, internal_date, snippet, from_email, to_emails, subject, labels, created_at, rfc_message_id")
       .eq("org_id", orgId)
-      .order("internal_date", { ascending: true })
+      // Newest 2000 (descending). It used to be ascending + limit, which
+      // returns the OLDEST 2000 rows: once an org passed 2000 messages, new mail
+      // silently stopped appearing. Order within threads is re-sorted below.
+      .order("internal_date", { ascending: false })
       .limit(2000);
 
     if (error) throw error;
@@ -344,17 +350,19 @@ async function fetchGmailConversations(orgId: string): Promise<{ conversations: 
     // there is" logic exists in exactly one place.
     function pushMessagesForRows(rows: any[], convId: string) {
       for (const row of rows) {
-        const subject = row.subject ? decodeHtmlEntities(row.subject) : row.subject;
-        const snippet = row.snippet ? decodeHtmlEntities(row.snippet) : row.snippet;
-        const body = subject && snippet && !snippet.startsWith(subject)
-          ? `${subject}\n\n${snippet}`
-          : (snippet ?? subject ?? "");
+        const subject = row.subject ? decodeHtmlEntities(row.subject) : undefined;
+        // Legacy/fallback body = the snippet only. The subject is a separate
+        // field (Message.subject) — it is never prepended to the body. The
+        // full text replaces this for the open thread (useGmailBodies).
+        const body = row.snippet ? decodeHtmlEntities(row.snippet) : "";
 
         msgs.push({
           id: `gm-msg-${row.id}`,
+          emailRowId: row.id,
           conversationId: convId,
           channel: "email",
           direction: isOutbound(row) ? "out" : "in",
+          subject,
           body,
           at: parseGmailTimestamp(row.internal_date, row.created_at),
           rfcMessageId: row.rfc_message_id ?? undefined,
@@ -456,10 +464,46 @@ export function useGmailConversations(): {
   const messages = query.data?.messages ?? [];
   const loading = !orgId || query.isPending;
 
+  const queryClient = useQueryClient();
   const refresh = useCallback(() => {
-    query.refetch();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [orgId]);
+    // Invalidates the conversation list AND any loaded thread bodies (they share
+    // the gmail key prefix), so a sync that wrote new messages / bodies updates
+    // the open thread, not just the list.
+    if (orgId) void queryClient.invalidateQueries({ queryKey: queryKeys.conversations.gmail(orgId) });
+  }, [orgId, queryClient]);
 
   return { conversations, messages, loading, refresh };
+}
+
+/**
+ * Full email bodies (gmail_messages.body_text) for the messages of the thread
+ * that is currently open. Returns a map of gmail row id -> body text, containing
+ * only rows that actually have a body; everything else keeps its snippet.
+ * Keeps the previous result while a new set loads, so a new message arriving
+ * does not flash the open thread back to snippets.
+ */
+export function useGmailBodies(rowIds: string[]): Record<string, string> {
+  const orgId = useOrgId();
+  const ids = [...new Set(rowIds)].sort();
+  const query = useQuery({
+    queryKey: orgId ? [...queryKeys.conversations.gmail(orgId), "bodies", ids.join(",")] : ["conversations", "gmail", "bodies", "pending"],
+    queryFn: async () => {
+      const out: Record<string, string> = {};
+      for (let i = 0; i < ids.length; i += 100) {
+        const { data, error } = await supabase
+          .from("gmail_messages")
+          .select("id, body_text")
+          .eq("org_id", orgId as string)
+          .in("id", ids.slice(i, i + 100));
+        if (error) throw error;
+        for (const r of (data ?? []) as Array<{ id: string; body_text: string | null }>) {
+          if (typeof r.body_text === "string" && r.body_text.trim() !== "") out[r.id] = r.body_text;
+        }
+      }
+      return out;
+    },
+    enabled: !!orgId && ids.length > 0,
+    placeholderData: (prev) => prev,
+  });
+  return query.data ?? {};
 }

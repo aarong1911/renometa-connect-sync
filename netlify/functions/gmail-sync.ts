@@ -39,6 +39,7 @@ import { createClient } from "@supabase/supabase-js";
 import { decryptBytea, encryptToBytea } from "./lib/gmail-token-crypto";
 import { getAppConfigs } from "./lib/app-config-store";
 import { reconcileSmtpSentRows } from "./lib/gmail-sent-reconcile";
+import { extractGmailBody, type GmailPayloadPart } from "./lib/gmail-mime";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -54,16 +55,43 @@ const CORS = {
 
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
 // RenoMeta Connect is a CRM inbox, not a general Gmail client — normal
-// sync/refresh should be lightweight: the last 7 days, max 10 messages.
-// Both are provider-side filters (Gmail's own `q=newer_than:7d` search
-// operator + `maxResults`), not a client-side fetch-everything-then-filter
-// — this avoids pulling months of unrelated mailbox history on every sync.
+// sync/refresh should be lightweight: max 10 messages, newest first.
+// Bounded by `maxResults` alone (see buildGmailListPath) — this avoids
+// pulling months of unrelated mailbox history on every sync.
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 100;
 const DEFAULT_WINDOW_DAYS = 7;
 const DETAIL_FETCH_CONCURRENCY = 8;
 
 // ── Gmail API helpers ────────────────────────────────────────────────────
+
+/**
+ * Root cause of "inbound reply doesn't appear until a manual sync, minutes
+ * later" (2026-09-27 live retest of PR #12): the routine sync used Gmail's
+ * `q=newer_than:Nd` SEARCH filter for every call, including the automatic
+ * ~45s refresh. `q=` runs against Gmail's full-text search index, which has
+ * a documented propagation lag after a message arrives (commonly seconds,
+ * sometimes low minutes) — a message can be genuinely NEW and fetchable by
+ * plain `messages.list()` while `q=newer_than:...` still doesn't return it.
+ * The automatic sync legitimately ran and succeeded (hence "Last synced
+ * now" being truthful — a sync did complete), it just found nothing yet;
+ * whichever later sync happened to land after the index caught up is the
+ * one that "worked", making it look like only manual sync surfaces mail.
+ *
+ * Fix: routine syncs (every automatic and manual call with no explicit
+ * `windowDays`) now list with NO `q` param — `maxResults` alone, which reads
+ * directly off the mailbox and reflects a brand-new message immediately.
+ * `windowDays` (currently unused by any caller — reserved for a future
+ * "Load more history" action) still opts into the `q=newer_than:` search
+ * filter, since that action legitimately wants an older window than
+ * `maxResults` newest-first could bound.
+ */
+export function buildGmailListPath(limit: number, windowDays?: number): string {
+  if (windowDays !== undefined) {
+    return `/messages?maxResults=${limit}&q=${encodeURIComponent(`newer_than:${windowDays}d`)}`;
+  }
+  return `/messages?maxResults=${limit}`;
+}
 
 type GmailListResponse = { messages?: { id: string; threadId: string }[]; resultSizeEstimate?: number };
 
@@ -73,11 +101,12 @@ type GmailMessageDetail = {
   labelIds?: string[];
   snippet?: string;
   internalDate?: string;
-  payload?: { headers?: { name: string; value: string }[] };
+  // format=full: headers plus the MIME tree (see lib/gmail-mime.ts).
+  payload?: GmailPayloadPart;
 };
 
 function headerValue(detail: GmailMessageDetail, name: string): string | null {
-  const h = detail.payload?.headers?.find((x) => x.name.toLowerCase() === name.toLowerCase());
+  const h = detail.payload?.headers?.find((x: { name: string; value: string }) => x.name.toLowerCase() === name.toLowerCase());
   return h?.value ?? null;
 }
 
@@ -162,15 +191,20 @@ export const handler: Handler = async (event) => {
     return { statusCode: 403, headers: CORS, body: JSON.stringify({ error: "No organization found for this user" }) };
   }
 
-  let reqBody: { limit?: number; windowDays?: number } = {};
+  let reqBody: { limit?: number; windowDays?: number; silent?: boolean } = {};
   try { reqBody = event.body ? JSON.parse(event.body) : {}; } catch { /* default to {} */ }
   const limit = Math.min(Math.max(1, Number(reqBody.limit) || DEFAULT_LIMIT), MAX_LIMIT);
-  // Gmail search-syntax date filter, not a client-side post-filter — keeps
-  // "ordinary Conversations loading" from ever pulling months of history in
-  // the first place. windowDays is only overridable by a future explicit
-  // "Load more history" action; every normal call uses the 7-day default.
-  const windowDays = Math.max(1, Number(reqBody.windowDays) || DEFAULT_WINDOW_DAYS);
-  const gmailQuery = encodeURIComponent(`newer_than:${windowDays}d`);
+  // Routine syncs (every automatic and manual call) pass no windowDays and get
+  // the plain, index-lag-free listing bounded by `limit` alone — see
+  // buildGmailListPath's doc comment for why. windowDays stays reserved for a
+  // future explicit "Load more history" action (no current caller sets it).
+  const windowDays = reqBody.windowDays !== undefined ? Math.max(1, Number(reqBody.windowDays) || DEFAULT_WINDOW_DAYS) : undefined;
+  const listPath = buildGmailListPath(limit, windowDays);
+
+  // `silent` = the Conversations auto-refresh (see src/lib/gmail-auto-sync.ts):
+  // same sync, but a no-change run does not write an integration_sync_logs row
+  // (that would be one log row every ~45 s per open Inbox).
+  const silent = reqBody.silent === true;
 
   const startedAt = new Date().toISOString();
 
@@ -220,7 +254,7 @@ export const handler: Handler = async (event) => {
   // Attempt the call with the current token first — token_expires_at on
   // some rows is null/unreliable, so a live 401 is the source of truth for
   // "this token no longer works", not the stored expiry timestamp.
-  let listRes = await gmailFetch(`/messages?maxResults=${limit}&q=${gmailQuery}`, accessToken);
+  let listRes = await gmailFetch(listPath, accessToken);
 
   if (listRes.status === 401) {
     if (!integration.refresh_token_encrypted) {
@@ -238,7 +272,7 @@ export const handler: Handler = async (event) => {
         .from("integrations")
         .update({ access_token_encrypted: encryptToBytea(newToken), token_expires_at: expiresAt })
         .eq("id", integration.id);
-      listRes = await gmailFetch(`/messages?maxResults=${limit}&q=${gmailQuery}`, accessToken);
+      listRes = await gmailFetch(listPath, accessToken);
     } catch (error: any) {
       console.error("[gmail-sync] token refresh failed:", error.message);
       const msg = "Gmail connection has expired and could not be renewed automatically. Reconnect Gmail for this organization to continue syncing.";
@@ -260,7 +294,7 @@ export const handler: Handler = async (event) => {
   const fetchedIds = (listJson.messages ?? []).map((m) => m.id);
 
   if (fetchedIds.length === 0) {
-    await logResult("success", "No messages returned by Gmail", { fetched: 0, inserted: 0, updated: 0, skipped: 0 });
+    if (!silent) await logResult("success", "No messages returned by Gmail", { fetched: 0, inserted: 0, updated: 0, skipped: 0 });
     await supabaseAdmin.from("integrations").update({ last_sync_at: new Date().toISOString(), last_sync_status: "ok", sync_error: null }).eq("id", integration.id);
     return { statusCode: 200, headers: CORS, body: JSON.stringify({ ok: true, fetched: 0, inserted: 0, updated: 0, skipped: 0 }) };
   }
@@ -271,25 +305,34 @@ export const handler: Handler = async (event) => {
   // key), independent of this lookup.
   const { data: existingRows } = await supabaseAdmin
     .from("gmail_messages")
-    .select("id")
+    .select("id, body_text")
     .eq("org_id", orgId)
     .in("id", fetchedIds);
   const existingIds = new Set((existingRows ?? []).map((r: any) => r.id));
+  // A message already stored WITH a body (body_text is a string, "" included =
+  // "looked, nothing to show") never needs another detail fetch. Steady state
+  // for an auto-refresh with nothing new is therefore ONE list call and zero
+  // detail calls; new messages and legacy snippet-only rows (body_text null)
+  // are fetched in full, which also backfills their bodies.
+  const hasBody = new Set((existingRows ?? []).filter((r: any) => typeof r.body_text === "string").map((r: any) => r.id));
+  const idsToFetch = fetchedIds.filter((id) => !hasBody.has(id));
+  const unchanged = fetchedIds.length - idsToFetch.length;
 
   // Message-ID/In-Reply-To/References are RFC 5322 threading headers — NOT
   // the same thing as Gmail's own thread_id (already captured separately
   // below via detail.threadId). Needed so send-inbox-message.ts can build
   // real inReplyTo/references values for outbound replies.
-  const detailHeaders = "&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Bcc&metadataHeaders=Message-ID&metadataHeaders=In-Reply-To&metadataHeaders=References";
+  // format=full returns every header plus the MIME tree; the body is extracted
+  // by lib/gmail-mime.ts and stored as gmail_messages.body_text.
   const rows: any[] = [];
   let skipped = 0;
 
-  for (let i = 0; i < fetchedIds.length; i += DETAIL_FETCH_CONCURRENCY) {
-    const batch = fetchedIds.slice(i, i + DETAIL_FETCH_CONCURRENCY);
+  for (let i = 0; i < idsToFetch.length; i += DETAIL_FETCH_CONCURRENCY) {
+    const batch = idsToFetch.slice(i, i + DETAIL_FETCH_CONCURRENCY);
     const results = await Promise.all(
       batch.map(async (id) => {
         try {
-          const res = await gmailFetch(`/messages/${id}?format=metadata${detailHeaders}`, accessToken);
+          const res = await gmailFetch(`/messages/${id}?format=full`, accessToken);
           if (!res.ok) return null;
           return (await res.json()) as GmailMessageDetail;
         } catch {
@@ -305,6 +348,9 @@ export const handler: Handler = async (event) => {
         thread_id: detail.threadId,
         internal_date: detail.internalDate ? new Date(Number(detail.internalDate)).toISOString() : null,
         snippet: detail.snippet ?? null,
+        // "" (not null) when the message has no text content, so it is not
+        // re-fetched on every sync; the UI falls back to the snippet.
+        body_text: extractGmailBody(detail.payload).text,
         from_email: headerValue(detail, "From"),
         to_emails: splitAddressList(headerValue(detail, "To")),
         cc_emails: splitAddressList(headerValue(detail, "Cc")),
@@ -353,16 +399,21 @@ export const handler: Handler = async (event) => {
     .update({ last_sync_at: new Date().toISOString(), last_sync_status: "ok", sync_error: null })
     .eq("id", integration.id);
 
-  await logResult("success", `Synced ${rows.length} of ${fetchedIds.length} fetched messages`, {
-    fetched: fetchedIds.length,
-    inserted,
-    updated,
-    skipped,
-  });
+  if (!(silent && rows.length === 0)) {
+    await logResult("success", `Synced ${rows.length} of ${fetchedIds.length} fetched messages (${unchanged} unchanged)`, {
+      fetched: fetchedIds.length,
+      inserted,
+      updated,
+      skipped,
+      unchanged,
+    });
+  }
 
   return {
     statusCode: 200,
     headers: CORS,
-    body: JSON.stringify({ ok: true, fetched: fetchedIds.length, inserted, updated, skipped }),
+    // `changed` = rows actually written (new messages + body backfills). The
+    // client refetches its conversation data only when this is > 0.
+    body: JSON.stringify({ ok: true, fetched: fetchedIds.length, inserted, updated, skipped, unchanged, changed: rows.length }),
   };
 };
