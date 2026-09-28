@@ -1,3 +1,4 @@
+/// <reference types="node" />
 // tests/netlify-functions/gmail-sync.test.ts
 //
 // Run: node --test tests/netlify-functions/gmail-sync.test.ts
