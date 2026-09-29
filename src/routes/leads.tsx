@@ -46,6 +46,7 @@ import { formatDistanceToNow } from "date-fns";
 import { toast } from "sonner";
 import { useTeam, type TeamMember } from "@/lib/organization";
 import { runLeadQualification } from "@/lib/lead-qualification-client";
+import { LEAD_QUALIFICATION_TOAST_MESSAGE, buildLeadQualificationSuccessToastOptions } from "@/lib/lead-qualification-toast";
 import {
   useLeads, addLead as storeAddLead, updateLeadStatus as storeUpdateStatus,
   updateLeadsStatusBulk, updateLead as storeUpdateLead,
@@ -2246,12 +2247,16 @@ function LeadDetailDrawer({
         // shows up is Test Console → Recent Executions (see
         // ai-run-inspector.tsx). Navigate the person there directly rather
         // than making them hunt for a tab that isn't real.
-        toast.success("Lead Qualification ran. View it in AI Center → Test Console.", {
-          action: {
-            label: "View",
-            onClick: () => void navigateToAiCenter({ to: "/ai-center", search: { tab: "console" } }),
-          },
-        });
+        //
+        // Explicit longer duration (see lead-qualification-toast.ts's own
+        // header comment for the audited root cause) — sonner's 4s default
+        // was the actual reason the "View" action felt unreliable: the
+        // toast was gone before a person could react, not an overlay or
+        // pointer-events conflict with the open Sheet.
+        toast.success(
+          LEAD_QUALIFICATION_TOAST_MESSAGE,
+          buildLeadQualificationSuccessToastOptions((destination) => void navigateToAiCenter(destination)),
+        );
       }
     } finally {
       setRunningAI(false);
