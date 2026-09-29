@@ -45,6 +45,7 @@ import { formatMoney, formatDateShort, formatPhone } from "@/lib/format";
 import { formatDistanceToNow } from "date-fns";
 import { toast } from "sonner";
 import { useTeam, type TeamMember } from "@/lib/organization";
+import { runLeadQualification } from "@/lib/lead-qualification-client";
 import {
   useLeads, addLead as storeAddLead, updateLeadStatus as storeUpdateStatus,
   updateLeadsStatusBulk, updateLead as storeUpdateLead,
@@ -2209,8 +2210,39 @@ function LeadDetailDrawer({
   teamMembers: TeamMember[];
 }) {
   const allDeals = useDeals();
+  const [runningAI, setRunningAI] = useState(false);
 
   if (!lead) return <Sheet open={false} onOpenChange={onOpenChange}><SheetContent className="hidden" /></Sheet>;
+
+  const handleRunLeadQualification = async () => {
+    // Synchronous re-entrancy guard, independent of React's render cycle —
+    // the button's own `disabled={runningAI}` prop only takes effect after
+    // a re-render, which is not fast enough to rule out two clicks in the
+    // same tick. This check makes it structurally impossible for a second
+    // invocationId to even be generated while one is in flight.
+    if (runningAI) return;
+    setRunningAI(true);
+    // One id for this exact click; a real retry of this SAME click (none
+    // exist client-side today — this is future-proofing) would reuse it,
+    // never generate a new one mid-flight. A brand-new click only happens
+    // after this handler returns and runningAI resets, at which point a
+    // fresh id is generated below.
+    const invocationId = crypto.randomUUID();
+    try {
+      const result = await runLeadQualification(lead.id, invocationId);
+      if (result.status === "error") {
+        toast.error(result.error);
+      } else if (result.status === "skipped") {
+        toast.info(result.message ?? "Lead Qualification did not run.");
+      } else if (result.status === "awaiting_approval") {
+        toast.success("Lead Qualification drafted a reply — awaiting approval in AI Center.");
+      } else {
+        toast.success("Lead Qualification ran. See the recommendation in AI Center → Activity.");
+      }
+    } finally {
+      setRunningAI(false);
+    }
+  };
 
   const convertedDeal = lead.convertedDealId ? allDeals.find((d) => d.id === lead.convertedDealId) ?? null : null;
   const { Icon: ScoreIcon, className: scoreCls } = scoreIcon(lead.score);
@@ -2297,6 +2329,10 @@ function LeadDetailDrawer({
               <FileText className="mr-1.5 h-3.5 w-3.5" />
               Create estimate from template
             </Link>
+          </Button>
+          <Button size="sm" variant="outline" className="w-full" onClick={handleRunLeadQualification} disabled={runningAI}>
+            {runningAI ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Sparkles className="mr-1.5 h-3.5 w-3.5 text-violet-600" />}
+            Run Lead Qualification
           </Button>
           <Button size="sm" variant="ghost" className="w-full text-destructive hover:text-destructive" onClick={() => onDelete(lead)}>
             <Trash2 className="mr-1.5 h-3.5 w-3.5" /> Delete lead

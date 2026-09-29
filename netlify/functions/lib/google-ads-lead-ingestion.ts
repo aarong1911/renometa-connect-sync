@@ -9,8 +9,15 @@
 // google-ads-lead-sync.ts (Phase 3, Step 6C.1) — no business-rule change.
 //
 // Never calls the Google Ads API. Never logs/returns PII beyond safe IDs.
+//
+// AI-3C: live Lead Qualification's lead_created trigger fires from HERE
+// (ingestGoogleAdsSubmission, after a successful lead insert) — but ONLY for
+// a real Google Ads submission, never the synthetic test harness. See
+// isSyntheticGoogleAdsSubmission()'s own doc comment for the exact signal
+// used and why it's trustworthy, not a guess.
 
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { fireLeadCreatedTrigger } from "./ai/lead-created-hook";
 
 export interface GoogleAdsSubmissionInsertPayload {
   organization_id: string;
@@ -40,6 +47,12 @@ export interface GoogleAdsSubmissionForCrmLinking {
   normalized_phone: string | null;
   normalized_full_name: string | null;
   campaign_name: string | null;
+  /** AI-3C: the same parsed field array google-ads-lead-test-inject.ts
+   * deliberately writes its `__renometa_test_fixture` marker into — see
+   * isSyntheticGoogleAdsSubmission()'s own doc comment for why this is the
+   * one trustworthy, server-authored signal used to decide whether a
+   * lead_created AI trigger fires for this submission. */
+  raw_fields?: unknown;
 }
 
 // Atomically insert-or-skip, deduped by the DB unique constraint on
@@ -58,9 +71,32 @@ export async function insertGoogleAdsLeadSubmissions(
   const { data, error } = await supabaseAdmin
     .from("google_ads_lead_submissions")
     .upsert(payloads, { onConflict: "organization_id,google_ads_customer_id,google_submission_id", ignoreDuplicates: true })
-    .select("id, normalized_email, normalized_phone, normalized_full_name, campaign_name");
+    .select("id, normalized_email, normalized_phone, normalized_full_name, campaign_name, raw_fields");
   if (error) throw error;
   return data ?? [];
+}
+
+/**
+ * AI-3C: distinguishes a real Google Ads lead from the dev-only synthetic
+ * test harness (google-ads-lead-test-inject.ts). That harness deliberately
+ * writes `{ fieldType: "__renometa_test_fixture", fieldValue: "true" }`
+ * into the SAME raw_fields array a real Google row's fields live in (its
+ * own comment: "clearly marks this as a test fixture without changing
+ * schema") — this is a genuine, server-authored signal, not a guess: only
+ * the test-inject endpoint (itself a real Netlify function, never client
+ * payload-controlled) ever writes that literal fieldType, and Google's own
+ * Lead Form field types are a fixed, documented vocabulary
+ * (FULL_NAME/EMAIL/PHONE_NUMBER/...) that could never coincidentally
+ * collide with it. Fails safe toward "synthetic" (no AI trigger) only when
+ * `rawFields` isn't even an array — the one shape a real submission's parsed
+ * fields are always guaranteed to have. An odd-looking individual item
+ * inside an otherwise well-formed array is not itself grounds to suppress
+ * AI (a real Google row could plausibly carry a field type this app doesn't
+ * recognize) — only the exact marker does that.
+ */
+export function isSyntheticGoogleAdsSubmission(rawFields: unknown): boolean {
+  if (!Array.isArray(rawFields)) return true;
+  return rawFields.some((f) => f && typeof f === "object" && (f as any).fieldType === "__renometa_test_fixture");
 }
 
 interface ContactMatch {
@@ -183,6 +219,13 @@ export async function ingestGoogleAdsSubmission(
       .single();
     if (leadErr || !newLead) throw new Error("lead_insert_failed");
     const leadId = newLead.id;
+
+    // AI-3C: a real Google Ads submission gets a best-effort, non-blocking
+    // live Lead Qualification trigger; the dev-only synthetic test harness
+    // never does — see isSyntheticGoogleAdsSubmission()'s own doc comment.
+    if (!isSyntheticGoogleAdsSubmission(submission.raw_fields)) {
+      await fireLeadCreatedTrigger(orgId, leadId, { contactId, actorId: "google_ads" });
+    }
 
     // Only contact_id/lead_id/ingestion_status/ingestion_error/updated_at
     // are ever touched here — google_submission_id, gclid, campaign

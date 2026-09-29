@@ -220,6 +220,17 @@ async function fetchLeadSummary(
     typeof customFields.service === "string" && customFields.service.trim().length > 0
       ? customFields.service.trim()
       : undefined;
+  // AI-3A: same custom_fields convention as `service` above — reused, not
+  // invented — see AILeadSummary.timeline/location's own doc comments for
+  // where this shape comes from (vapi-webhook.ts's save_lead tool).
+  const timeline =
+    typeof customFields.timeline === "string" && customFields.timeline.trim().length > 0
+      ? customFields.timeline.trim()
+      : undefined;
+  const location =
+    typeof customFields.address === "string" && customFields.address.trim().length > 0
+      ? customFields.address.trim()
+      : undefined;
 
   return {
     id: data.id,
@@ -229,6 +240,8 @@ async function fetchLeadSummary(
     name: data.name ?? undefined,
     estimatedBudget,
     projectType,
+    timeline,
+    location,
   };
 }
 
