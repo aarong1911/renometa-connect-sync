@@ -44,6 +44,7 @@ import { cn } from "@/lib/utils";
 import { supabase } from "@/lib/supabase";
 import { getOrgId } from "@/lib/contacts-store";
 import { formatEstimatedCostUsd } from "@/lib/agentic/usage";
+import { RUN_INSPECTOR_SOURCES, isRunInspectorRuntimeRow } from "@/lib/agentic/run-inspector-predicate";
 
 // ── Local mirror types for the jsonb columns (see file header) ─────────
 
@@ -273,15 +274,28 @@ export function AIRunInspector({ refreshSignal }: { refreshSignal?: number }) {
         //
         // AI-2E addition: "whatsapp_inbound" is the real WhatsApp channel
         // adapter (ai-whatsapp-orchestrate-background.ts) — same reasoning.
-        // Forgetting to add a new channel's actor.source value here is a
-        // silent-omission failure mode (executions would simply never
-        // appear, no error) — see this pass's own report.
-        .in("source", ["ai_orchestrate_http", "twilio_inbound_sms", "whatsapp_inbound"])
+        //
+        // AI-3D addition: "manual_run" / "lead_created" /
+        // "inbound_lead_message" are live Lead Qualification's sources
+        // (lead-qualification-dispatch.ts). These are the ONE case where a
+        // source can also be written by an internal claim/idempotency row
+        // (claimTrigger()), not just a real runtime row — excluded below via
+        // isRunInspectorRuntimeRow(), see run-inspector-predicate.ts for the
+        // full reasoning. Forgetting to add a new channel's actor.source
+        // value here is a silent-omission failure mode (executions would
+        // simply never appear, no error) — see this pass's own report.
+        .in("source", RUN_INSPECTOR_SOURCES)
+        .not("started_at", "is", null)
         .eq("org_id", orgId)
         .order("created_at", { ascending: false })
         .limit(RECENT_EXECUTIONS_LIMIT);
 
-      const rows = (executionRows ?? []) as ExecutionRow[];
+      // Defense in depth: the query above already excludes claim rows via
+      // `.not("started_at", "is", null)`, but re-apply the same pure
+      // predicate client-side so this view can never regress into showing a
+      // claim row even if the query above is ever loosened without noticing
+      // this constraint.
+      const rows = ((executionRows ?? []) as ExecutionRow[]).filter(isRunInspectorRuntimeRow);
       setExecutions(rows);
 
       const ids = rows.map((r) => r.id);

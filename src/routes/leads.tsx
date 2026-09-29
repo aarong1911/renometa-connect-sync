@@ -2211,6 +2211,11 @@ function LeadDetailDrawer({
 }) {
   const allDeals = useDeals();
   const [runningAI, setRunningAI] = useState(false);
+  // Plain useNavigate() (no `from`) — this drawer isn't guaranteed to be
+  // rendered strictly under "/leads" in every usage, and the only
+  // destination it navigates to (AI Center) is a different route entirely,
+  // so no route-relative typing benefit would apply here anyway.
+  const navigateToAiCenter = useNavigate();
 
   if (!lead) return <Sheet open={false} onOpenChange={onOpenChange}><SheetContent className="hidden" /></Sheet>;
 
@@ -2237,7 +2242,16 @@ function LeadDetailDrawer({
       } else if (result.status === "awaiting_approval") {
         toast.success("Lead Qualification drafted a reply — awaiting approval in AI Center.");
       } else {
-        toast.success("Lead Qualification ran. See the recommendation in AI Center → Activity.");
+        // No "Activity" tab exists in AI Center — the real place this run
+        // shows up is Test Console → Recent Executions (see
+        // ai-run-inspector.tsx). Navigate the person there directly rather
+        // than making them hunt for a tab that isn't real.
+        toast.success("Lead Qualification ran. View it in AI Center → Test Console.", {
+          action: {
+            label: "View",
+            onClick: () => void navigateToAiCenter({ to: "/ai-center", search: { tab: "console" } }),
+          },
+        });
       }
     } finally {
       setRunningAI(false);
