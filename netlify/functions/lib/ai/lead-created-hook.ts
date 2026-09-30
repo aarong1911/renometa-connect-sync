@@ -66,7 +66,19 @@ export async function dispatchLeadQualificationBackground(payload: LeadQualifica
     console.error("[lead-created-hook] AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET is not set — cannot dispatch.");
     return false;
   }
-  const siteUrl = process.env.URL || process.env.DEPLOY_URL;
+  // Deploy-preview safety: on Netlify, `URL` is always the canonical
+  // PRODUCTION site URL, while `DEPLOY_URL` is the current deploy's own
+  // unique URL. `DEPLOY_URL` must take precedence — otherwise a Deploy
+  // Preview or branch deploy's lead-created event would dispatch its Lead
+  // Qualification background work to PRODUCTION instead of staying on the
+  // same deployment that triggered it, silently crossing a deployment
+  // boundary and making preview validation misleading (and, worse, running
+  // real AI/SMS/WhatsApp side effects against production data from a
+  // preview test). Fallback order once DEPLOY_URL is preferred:
+  //   - Deploy Preview / branch deploy -> DEPLOY_URL (its own deployment)
+  //   - production, when DEPLOY_URL is unavailable -> URL
+  //   - neither present -> fail closed, exactly as before
+  const siteUrl = process.env.DEPLOY_URL || process.env.URL;
   if (!siteUrl) {
     console.error("[lead-created-hook] No site URL available (URL/DEPLOY_URL env var) — cannot dispatch.");
     return false;
