@@ -5,32 +5,53 @@
 // leads.tsx so its copy, duration, and navigation target are unit-testable
 // without mounting the Leads route.
 //
-// ROOT CAUSE (audited, not guessed): sonner@2.0.7 (the version actually
-// installed — see package.json/pnpm-lock) defaults every toast to its
-// internal `TOAST_LIFETIME = 4000` (4 seconds) when no `duration` is passed
-// — confirmed by reading node_modules/sonner's own bundled source, not
-// assumed from docs. The previous toast call passed no `duration`, so it
-// used that 4s default. That fully explains BOTH reported symptoms as the
-// SAME root cause: the toast disappearing "too quickly" IS the reason the
-// action was "not reliably clickable" — the user was racing a 4s window
-// from the moment the toast appeared.
+// ROOT CAUSE #1, duration (audited, not guessed): sonner@2.0.7 (the version
+// actually installed — see package.json/pnpm-lock) defaults every toast to
+// its internal `TOAST_LIFETIME = 4000` (4 seconds) when no `duration` is
+// passed — confirmed by reading node_modules/sonner's own bundled source,
+// not assumed from docs. The previous toast call passed no `duration`, so
+// it used that 4s default. Fixed by passing an explicit longer duration
+// below. This alone was NOT sufficient, though — see #2.
 //
-// This was NOT a Sheet-overlay/pointer-events/z-index bug — that was
-// investigated and ruled out, not assumed away:
-//   - sonner's own CSS sets `[data-sonner-toaster]{z-index:999999999}`,
-//     versus the Sheet's overlay/content at `z-50` (sheet.tsx) — the toast
-//     always renders visually and interactively above the Sheet.
-//   - @radix-ui/react-dialog (the Sheet's underlying primitive) hides other
-//     DOM content while open via aria-hidden's `hideOthers()` (confirmed by
-//     reading node_modules/@radix-ui/react-dialog's own source — it calls
-//     `hideOthers(content)`, not `suppressOthers`/`inertOthers`), which only
-//     sets `aria-hidden="true"` on siblings, never the native `inert`
-//     attribute. `aria-hidden` alone does not disable pointer events or
-//     click handling in a standard browser — it is a screen-reader signal
-//     only. There is no CSS rule anywhere in this repo that maps
-//     `[aria-hidden]` to `pointer-events: none` (also confirmed).
-// So the real, sole fix is a longer explicit `duration` — not any overlay
-// masking or Sheet/Toaster remounting change.
+// ROOT CAUSE #2, the actual click-blocking mechanism (found on re-audit,
+// after duration alone did not fix it — read from the installed packages'
+// own source, not assumed):
+//   - z-index was checked and ruled out: sonner's own CSS sets
+//     `[data-sonner-toaster]{z-index:999999999}` vs. the Sheet's
+//     overlay/content at `z-50` (sheet.tsx) — the toast always renders
+//     visually above the Sheet.
+//   - aria-hidden was checked and ruled out: @radix-ui/react-dialog hides
+//     sibling DOM content while open via aria-hidden's `hideOthers()`
+//     (confirmed in its own source — it calls `hideOthers(content)`, never
+//     `suppressOthers`/`inertOthers`), which only sets `aria-hidden="true"`,
+//     never the native `inert` attribute — that alone never blocks clicks.
+//   - THE REAL MECHANISM: @radix-ui/react-dialog's `DialogContentModal` —
+//     used whenever a Dialog/Sheet is `modal` (the default; sheet.tsx never
+//     overrides it) — renders its `DismissableLayer` with
+//     `disableOutsidePointerEvents: true`. Reading
+//     @radix-ui/react-dismissable-layer's own source: when that prop is
+//     true, it sets `document.body.style.pointerEvents = "none"` for as
+//     long as the layer is mounted, and re-enables `pointer-events: auto`
+//     ONLY on its own layer's DOM node (the Sheet's content) via an inline
+//     style — no other element gets that opt-back-in unless it registers
+//     itself as a `DismissableLayerBranch`. Sonner's toaster is a completely
+//     separate portal that never does this, and its own CSS never sets
+//     `pointer-events: auto` on the visible toast (only on a
+//     `[data-visible=false]` — i.e. already-dismissed — toast). So the
+//     toast inherits `pointer-events: none` from `body` and is genuinely,
+//     structurally unclickable for as long as ANY modal Sheet/Dialog is
+//     open anywhere in the app — not a timing race, not a z-index/aria
+//     issue, a real CSS-inheritance consequence of Radix's own modal
+//     pointer-event isolation.
+//
+// FIX: per product preference, the Leads page now closes the Lead Sheet
+// (via `onOpenChange(false)`) on a true successful run BEFORE calling
+// `toast.success(...)` — once the Sheet unmounts, DismissableLayer's own
+// cleanup effect restores `body.style.pointerEvents`, so the toast becomes
+// fully interactive. This is Option A from the fix priority list: closing
+// the modal that was disabling pointer events, rather than touching sonner,
+// Radix, or any other Sheet/Dialog's behavior globally (Option C, the
+// explicitly least-preferred and un-done option here).
 
 export const LEAD_QUALIFICATION_TOAST_MESSAGE =
   "Lead Qualification ran. View it in AI Center → Test Console.";
@@ -69,4 +90,29 @@ export function buildLeadQualificationSuccessToastOptions(
       },
     },
   };
+}
+
+/** The subset of runLeadQualification()'s real result statuses this
+ * decision cares about — kept narrow rather than importing the client's
+ * full result union, so this file stays dependency-free. */
+export type LeadQualificationResultStatusForDrawerClose = "error" | "skipped" | "awaiting_approval" | "recommendation";
+
+/**
+ * Whether the Lead drawer (Sheet) should be closed for a given
+ * runLeadQualification() outcome. Pure so the exact close/no-close decision
+ * per status is unit-testable without mounting the Leads route or a Sheet.
+ *
+ * Only a true, non-approval-gated success ("recommendation") closes the
+ * drawer — this is both the requested product behavior (the operation is
+ * genuinely complete, nothing more to see in the drawer) and the fix for
+ * the toast's "View" action being unclickable while the Sheet stays open
+ * (see this file's header for the confirmed root cause). error/skipped
+ * never close (nothing completed, or the person may want to retry/fix
+ * something without losing their place). awaiting_approval never closes
+ * either — its toast has no "View" action to unblock, and the approval
+ * step itself still happens later elsewhere, so there is no "fully done"
+ * moment here the way there is for a plain recommendation.
+ */
+export function shouldCloseLeadDrawerForResult(status: LeadQualificationResultStatusForDrawerClose): boolean {
+  return status === "recommendation";
 }
