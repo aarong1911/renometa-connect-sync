@@ -253,17 +253,20 @@ test("a non-202/200 response, a network error, or a missing secret are all repor
   }
 });
 
-// ── AI-3H: deploy-preview URL precedence (DEPLOY_URL over URL) ─────────────
+// ── AI-3J: explicit request-origin dispatch (CORRECTED architecture) ───────
 //
-// Netlify env var semantics: `URL` is always the canonical PRODUCTION site
-// URL; `DEPLOY_URL` is the CURRENT deploy's own unique URL (a Deploy Preview
-// or branch deploy). DEPLOY_URL must win whenever both are set, or a preview
-// build's lead-created dispatch would cross a deployment boundary and hit
-// production instead of staying on its own preview deployment. Each test
-// below saves and restores both env vars so it can never leak state into a
-// sibling test in this same file (node --test runs a file's tests
-// sequentially, in-process, so an unrestored env var here would otherwise
-// silently change what the tests above/below this block observe).
+// REPLACES the previous "AI-3H: deploy-preview URL precedence (DEPLOY_URL
+// over URL)" test block, which encoded an INCORRECT assumption. DEPLOY_URL
+// is Netlify BUILD-TIME deploy metadata, not a guaranteed Function-runtime
+// environment variable — confirmed by a real Deploy Preview failure (a
+// PR's inbound-SMS webhook dispatched to production and got a 404, because
+// `process.env.DEPLOY_URL` was undefined at runtime and the code fell
+// through to `process.env.URL`, which is always the canonical PRODUCTION
+// site). See lead-created-hook.ts's own AI-3J correction comment for the
+// full story. The real fix: dispatchLeadQualificationBackground() now
+// accepts an explicit `opts.baseUrl` — the CALLER's own trusted,
+// externally-visible request origin — which always wins over any
+// environment-variable fallback. These tests prove that contract instead.
 function withEnv<T>(vars: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
   const saved: Record<string, string | undefined> = {};
   for (const key of Object.keys(vars)) saved[key] = process.env[key];
@@ -279,7 +282,7 @@ function withEnv<T>(vars: Record<string, string | undefined>, fn: () => Promise<
   });
 }
 
-test("1. when both DEPLOY_URL and URL are set, dispatch uses DEPLOY_URL (stays on the current deployment, not production)", async () => {
+test("A. an explicit request origin (opts.baseUrl) always wins over any env var", async () => {
   const realFetch = globalThis.fetch;
   let captured: any;
   globalThis.fetch = (async (url: any, init: any) => {
@@ -287,20 +290,17 @@ test("1. when both DEPLOY_URL and URL are set, dispatch uses DEPLOY_URL (stays o
     return new Response("", { status: 202 });
   }) as typeof fetch;
   try {
-    await withEnv(
-      { AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret", URL: "https://production.example.com", DEPLOY_URL: "https://deploy-preview-42--example.netlify.app" },
-      async () => {
-        const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 });
-        assert.equal(ok, true);
-        assert.equal(captured.url, "https://deploy-preview-42--example.netlify.app/.netlify/functions/lead-qualification-background", "must dispatch to the preview's own deployment, never to production");
-      },
-    );
+    await withEnv({ AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret", URL: "https://renoconnect.netlify.app" }, async () => {
+      const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 }, { baseUrl: "https://deploy-preview-15--renoconnect.netlify.app" });
+      assert.equal(ok, true);
+      assert.equal(captured.url, "https://deploy-preview-15--renoconnect.netlify.app/.netlify/functions/lead-qualification-background", "must stay on the SAME deployment that made the original request, never fall back to production's URL env var");
+    });
   } finally {
     globalThis.fetch = realFetch;
   }
 });
 
-test("2. when only URL is set (production, no active deploy preview), dispatch uses URL", async () => {
+test("B. the production request origin works the same way (no Deploy Preview involved)", async () => {
   const realFetch = globalThis.fetch;
   let captured: any;
   globalThis.fetch = (async (url: any, init: any) => {
@@ -308,109 +308,145 @@ test("2. when only URL is set (production, no active deploy preview), dispatch u
     return new Response("", { status: 202 });
   }) as typeof fetch;
   try {
-    await withEnv(
-      { AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret", URL: "https://production.example.com", DEPLOY_URL: undefined },
-      async () => {
-        const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 });
-        assert.equal(ok, true);
-        assert.equal(captured.url, "https://production.example.com/.netlify/functions/lead-qualification-background");
-      },
-    );
+    await withEnv({ AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret" }, async () => {
+      const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 }, { baseUrl: "https://renoconnect.netlify.app" });
+      assert.equal(ok, true);
+      assert.equal(captured.url, "https://renoconnect.netlify.app/.netlify/functions/lead-qualification-background");
+    });
   } finally {
     globalThis.fetch = realFetch;
   }
 });
 
-test("3. when only DEPLOY_URL is set, dispatch uses DEPLOY_URL", async () => {
-  const realFetch = globalThis.fetch;
-  let captured: any;
-  globalThis.fetch = (async (url: any, init: any) => {
-    captured = { url: String(url), init };
-    return new Response("", { status: 202 });
-  }) as typeof fetch;
-  try {
-    await withEnv(
-      { AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret", URL: undefined, DEPLOY_URL: "https://deploy-preview-7--example.netlify.app" },
-      async () => {
-        const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 });
-        assert.equal(ok, true);
-        assert.equal(captured.url, "https://deploy-preview-7--example.netlify.app/.netlify/functions/lead-qualification-background");
-      },
-    );
-  } finally {
-    globalThis.fetch = realFetch;
-  }
-});
-
-test("4. when neither URL nor DEPLOY_URL is set, dispatch returns false and no fetch is attempted", async () => {
+test("C. a malformed explicit origin fails safely — no fetch attempted", async () => {
   const realFetch = globalThis.fetch;
   let fetchCalled = false;
-  globalThis.fetch = (async () => {
-    fetchCalled = true;
-    throw new Error("must never be called");
-  }) as typeof fetch;
+  globalThis.fetch = (async () => { fetchCalled = true; throw new Error("must never be called"); }) as typeof fetch;
   try {
-    await withEnv(
-      { AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret", URL: undefined, DEPLOY_URL: undefined },
-      async () => {
-        const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 });
-        assert.equal(ok, false);
-      },
-    );
-    assert.equal(fetchCalled, false, "fail-closed must happen before any fetch is attempted");
+    await withEnv({ AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret" }, async () => {
+      for (const bad of ["not a url", "", "   ", "/relative/path/only"]) {
+        const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 }, { baseUrl: bad });
+        assert.equal(ok, false, JSON.stringify(bad));
+      }
+    });
   } finally {
     globalThis.fetch = realFetch;
+    assert.equal(fetchCalled, false, "fail-closed must happen before any fetch is attempted for a malformed origin");
   }
 });
 
-test("5+6. the request still targets /.netlify/functions/lead-qualification-background and still includes X-Internal-Secret, regardless of which env var supplied the site URL", async () => {
+test("origin normalization: a baseUrl with a path/query/trailing slash is reduced to just its origin", async () => {
   const realFetch = globalThis.fetch;
   let captured: any;
-  globalThis.fetch = (async (url: any, init: any) => {
-    captured = { url: String(url), init };
-    return new Response("", { status: 202 });
-  }) as typeof fetch;
+  globalThis.fetch = (async (url: any) => { captured = String(url); return new Response("", { status: 202 }); }) as typeof fetch;
   try {
-    await withEnv(
-      { AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret", URL: "https://production.example.com", DEPLOY_URL: "https://deploy-preview-42--example.netlify.app" },
-      async () => {
-        await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 });
-        assert.ok(captured.url.endsWith("/.netlify/functions/lead-qualification-background"), "endpoint path must be unchanged");
-        assert.equal(captured.init.headers["X-Internal-Secret"], "s3cret", "internal secret header must still be sent");
-      },
-    );
+    await withEnv({ AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret" }, async () => {
+      const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 }, { baseUrl: "https://deploy-preview-15--renoconnect.netlify.app/.netlify/functions/ai-twilio-sms-inbound?foo=bar" });
+      assert.equal(ok, true);
+      assert.equal(captured, "https://deploy-preview-15--renoconnect.netlify.app/.netlify/functions/lead-qualification-background", "the supplied URL's own path/query must be discarded — only its origin is used");
+    });
   } finally {
     globalThis.fetch = realFetch;
   }
 });
 
-test("7. a non-202/200 response still fails safely (false, never thrown) with DEPLOY_URL set", async () => {
+test("G. the payload sent to the background endpoint is unchanged by the baseUrl option", async () => {
   const realFetch = globalThis.fetch;
-  globalThis.fetch = (async () => new Response("", { status: 500 })) as typeof fetch;
+  let captured: any;
+  globalThis.fetch = (async (_url: any, init: any) => { captured = JSON.parse(init.body); return new Response("", { status: 202 }); }) as typeof fetch;
   try {
-    await withEnv(
-      { AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret", URL: "https://production.example.com", DEPLOY_URL: "https://deploy-preview-42--example.netlify.app" },
-      async () => {
-        const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 });
-        assert.equal(ok, false);
-      },
-    );
+    await withEnv({ AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret" }, async () => {
+      await Hook.dispatchLeadQualificationBackground(
+        { orgId: ORG_A, leadId: LEAD_1, contactId: CONTACT_1, source: "inbound_lead_message", inboundEvent: { channel: "sms", messageRowId: "m-1", text: "hi", externalMessageId: "SM1", candidate: { channel: "sms", direction: "in", syncOrigin: "live" } } },
+        { baseUrl: "https://deploy-preview-15--renoconnect.netlify.app" },
+      );
+      assert.deepEqual(captured, { orgId: ORG_A, leadId: LEAD_1, contactId: CONTACT_1, source: "inbound_lead_message", inboundEvent: { channel: "sms", messageRowId: "m-1", text: "hi", externalMessageId: "SM1", candidate: { channel: "sms", direction: "in", syncOrigin: "live" } } });
+    });
   } finally {
     globalThis.fetch = realFetch;
   }
 });
 
-test("8. a network failure still fails safely (false, never thrown) with DEPLOY_URL set", async () => {
+test("F. the X-Internal-Secret header is still sent when baseUrl is supplied", async () => {
+  const realFetch = globalThis.fetch;
+  let captured: any;
+  globalThis.fetch = (async (_url: any, init: any) => { captured = init; return new Response("", { status: 202 }); }) as typeof fetch;
+  try {
+    await withEnv({ AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret" }, async () => {
+      await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 }, { baseUrl: "https://deploy-preview-15--renoconnect.netlify.app" });
+      assert.equal(captured.headers["X-Internal-Secret"], "s3cret");
+      assert.equal(captured.method, "POST");
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("H. a 202 or 200 response is accepted, with baseUrl supplied", async () => {
+  const realFetch = globalThis.fetch;
+  try {
+    await withEnv({ AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret" }, async () => {
+      globalThis.fetch = (async () => new Response("", { status: 202 })) as typeof fetch;
+      assert.equal(await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 }, { baseUrl: "https://example.netlify.app" }), true);
+      globalThis.fetch = (async () => new Response("", { status: 200 })) as typeof fetch;
+      assert.equal(await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 }, { baseUrl: "https://example.netlify.app" }), true);
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("I. a non-202/200 response (e.g. the observed 404) fails safely with baseUrl supplied", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("", { status: 404 })) as typeof fetch;
+  try {
+    await withEnv({ AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret" }, async () => {
+      const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 }, { baseUrl: "https://deploy-preview-15--renoconnect.netlify.app" });
+      assert.equal(ok, false, "a 404 (the exact failure observed live) must be reported as not-accepted, never thrown");
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("J. a network failure fails safely with baseUrl supplied", async () => {
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => { throw new Error("network down"); }) as typeof fetch;
   try {
-    await withEnv(
-      { AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret", URL: "https://production.example.com", DEPLOY_URL: "https://deploy-preview-42--example.netlify.app" },
-      async () => {
-        const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 });
-        assert.equal(ok, false);
-      },
-    );
+    await withEnv({ AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret" }, async () => {
+      const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 }, { baseUrl: "https://deploy-preview-15--renoconnect.netlify.app" });
+      assert.equal(ok, false);
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("K. an existing lead-created caller with NO explicit baseUrl retains the documented env-var fallback (process.env.URL — NOT Deploy-Preview-safe, documented as such)", async () => {
+  const realFetch = globalThis.fetch;
+  let captured: any;
+  globalThis.fetch = (async (url: any) => { captured = String(url); return new Response("", { status: 202 }); }) as typeof fetch;
+  try {
+    await withEnv({ AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret", URL: "https://renoconnect.netlify.app" }, async () => {
+      const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 });
+      assert.equal(ok, true);
+      assert.equal(captured, "https://renoconnect.netlify.app/.netlify/functions/lead-qualification-background", "with no baseUrl, falls back to process.env.URL exactly as every existing fireLeadCreatedTrigger() caller (Meta Lead Ads/Google Ads/Vapi/Instagram/Messenger) already relies on");
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("K. with no baseUrl and no URL env var at all, dispatch fails closed with no fetch attempted", async () => {
+  const realFetch = globalThis.fetch;
+  let fetchCalled = false;
+  globalThis.fetch = (async () => { fetchCalled = true; throw new Error("must never be called"); }) as typeof fetch;
+  try {
+    await withEnv({ AI_LEAD_QUALIFICATION_INTERNAL_DISPATCH_SECRET: "s3cret", URL: undefined }, async () => {
+      const ok = await Hook.dispatchLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 });
+      assert.equal(ok, false);
+    });
+    assert.equal(fetchCalled, false);
   } finally {
     globalThis.fetch = realFetch;
   }

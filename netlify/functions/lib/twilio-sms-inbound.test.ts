@@ -317,3 +317,43 @@ test("F. a malformed/non-Twilio payload (missing MessageSid) is ignored safely, 
 test("F. no real network call is ever made by this module under test (global fetch is a throwing stub for this whole file)", () => {
   assert.throws(() => (globalThis.fetch as any)());
 });
+
+// ── D/E (AI-3J): the trusted request origin comes ONLY from
+// reconstructRequestUrl(event), never from Twilio form/body data ─────────
+//
+// processTwilioInboundSms() (this file's own core) never receives or
+// computes an "origin" at all — by design. The dispatch function it calls
+// is injected as a FULLY BOUND closure by the real handler
+// (ai-twilio-sms-inbound.ts), which derives the origin from `fullUrl`
+// (itself `reconstructRequestUrl(event)` — the same trusted value
+// signature verification already depends on) BEFORE calling this core at
+// all. The tests above already prove this structurally: every test in
+// this file passes a FIXED `fullUrl` (FULL_URL) into the core regardless
+// of what From/To/Body values are in the request — an attacker who puts
+// an origin-shaped string in the SMS Body, or spoofs a different From/To,
+// has no path to influence it, because the core doesn't accept an origin
+// parameter from the payload at all. These two tests make that contract
+// explicit via a source check on the real handler file — the smallest
+// reliable way to pin "derives origin from reconstructRequestUrl(event),
+// never from form data" without duplicating a full handler-level
+// integration harness (mocking the Supabase client's OWN internal fetch
+// calls inside the same global fetch mock as the dispatch call would add
+// a lot of fragile test-only wiring for no additional real coverage over
+// what the core's own tests above already establish).
+
+import { readFileSync } from "node:fs";
+const handlerSource = readFileSync(path.join(here, "..", "ai-twilio-sms-inbound.ts"), "utf8");
+
+test("E. the Twilio handler derives its dispatch origin from reconstructRequestUrl(event), not from any Twilio form field", () => {
+  assert.ok(handlerSource.includes('const fullUrl = reconstructRequestUrl(event as any);'), "fullUrl must come from reconstructRequestUrl(event)");
+  assert.ok(/const requestOrigin = new URL\(fullUrl\)\.origin;/.test(handlerSource), "requestOrigin must be derived from fullUrl, not from event.body/From/To/Body");
+});
+
+test("D. the derived origin is passed as dispatchLeadQualificationBackground's baseUrl, and the body (event.body) is never referenced anywhere near that derivation", () => {
+  assert.ok(handlerSource.includes("dispatchLeadQualificationBackground(payload, { baseUrl: requestOrigin })"), "the bound dispatch closure must pass requestOrigin as baseUrl");
+  // The only use of event.body in this file is the one, early, raw-form
+  // parse handed to the core (`rawBody: event.body`) — never re-read to
+  // compute requestOrigin.
+  const originLine = handlerSource.split("\n").find((l) => l.includes("const requestOrigin ="));
+  assert.ok(originLine && !originLine.includes("event.body"), "requestOrigin must never be derived from event.body");
+});

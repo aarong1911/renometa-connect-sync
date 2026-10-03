@@ -29,12 +29,35 @@
 // RESPONSE: always returns promptly. AI work (when dispatched) runs in the
 // EXISTING background function, never synchronously in this request — see
 // lib/twilio-sms-inbound.ts's header for why.
+//
+// ── AI-3J: SAME-DEPLOYMENT INTERNAL DISPATCH ────────────────────────────
+//
+// A real Deploy Preview run exposed a bug: dispatchLeadQualificationBackground()
+// previously fell back to a Netlify deploy-identity ENV VAR to build the
+// internal background-function URL, which resolved to PRODUCTION even
+// while this webhook itself was running inside a Deploy Preview (see
+// lead-created-hook.ts's own AI-3J correction comment for the full,
+// confirmed root cause — `DEPLOY_URL` is build-time-only, not a
+// Function-runtime variable; `URL` is always the canonical production
+// site). The fix here: this handler already reconstructs the EXACT
+// externally-visible URL Twilio just called (`fullUrl`, required for
+// signature verification regardless) — `new URL(fullUrl).origin` IS this
+// deployment's own true origin, independent of any environment variable.
+// That origin is passed explicitly as `dispatchLeadQualificationBackground`'s
+// `opts.baseUrl`, so the internal dispatch request always lands on the
+// SAME deployment that received the original Twilio request: Deploy
+// Preview -> that same preview, branch deploy -> that same branch deploy,
+// production -> production. The core (lib/twilio-sms-inbound.ts) stays
+// decoupled from HandlerEvent entirely — it only ever sees the already-
+// bound `(payload) => Promise<boolean>` function below, the same shape it
+// always expected.
 
 import type { Handler, HandlerEvent } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { reconstructRequestUrl } from "./lib/twilio-signature";
 import { processTwilioInboundSms } from "./lib/twilio-sms-inbound";
 import { dispatchLeadQualificationBackground } from "./lib/ai/lead-created-hook";
+import type { LeadQualificationBackgroundPayload } from "./lib/ai/lead-qualification-background";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -52,9 +75,16 @@ export const handler: Handler = async (event: HandlerEvent) => {
     const fullUrl = reconstructRequestUrl(event as any);
     const signatureHeader = event.headers["x-twilio-signature"] ?? event.headers["X-Twilio-Signature"];
 
+    // The trusted request origin — derived ONLY from the already-
+    // reconstructed, signature-verification-grade URL above, never from
+    // any Twilio form/query/body field. See this file's AI-3J header.
+    const requestOrigin = new URL(fullUrl).origin;
+    const dispatchOnThisDeployment = (payload: LeadQualificationBackgroundPayload) =>
+      dispatchLeadQualificationBackground(payload, { baseUrl: requestOrigin });
+
     const result = await processTwilioInboundSms(
       { rawBody: event.body, signatureHeader, fullUrl },
-      { supabase: supabaseAdmin, dispatchLeadQualificationBackground },
+      { supabase: supabaseAdmin, dispatchLeadQualificationBackground: dispatchOnThisDeployment },
     );
 
     switch (result.outcome) {
