@@ -290,7 +290,23 @@ export async function dispatchLeadQualification(params: DispatchLeadQualificatio
       targetEntityType: "lead",
       targetEntityId: leadId,
       approvalSummary: `Lead Qualification drafted a reply to ${source === "inbound_lead_message" ? "an inbound message from" : "a new lead,"} this lead.`,
-      approvalMetadata: { agentKey: AGENT_KEY, source, leadId, channel },
+      // AI-3K: carries the canonical linkage back to the persisted inbound
+      // message row (sms_meta_messages.id, via inboundEvent.messageRowId)
+      // so the Approvals UI can display the ACTUAL inbound customer
+      // message, not just a fallback. Only present for
+      // source: "inbound_lead_message" (the only case with a real inbound
+      // row to link to) — ai-approvals-list.ts reads this as the NEW,
+      // direct, org-scoped lookup path, falling back to its existing
+      // sms_meta_messages.meta->>execution_id matching (still used by
+      // WhatsApp's own background dispatcher) when absent. Stores a row
+      // ID, never the customer's message text itself — no duplication.
+      approvalMetadata: {
+        agentKey: AGENT_KEY,
+        source,
+        leadId,
+        channel,
+        ...(source === "inbound_lead_message" && inboundEvent?.messageRowId ? { messageRowId: inboundEvent.messageRowId } : {}),
+      },
     });
 
     if (proposeResult.status === "awaiting_approval" && proposeResult.approvalRequestId) {

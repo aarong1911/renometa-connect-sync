@@ -81,10 +81,15 @@ function makeDb(overrides: Record<string, any[]> = {}) {
       contacts: [{ id: CONTACT_1, org_id: ORG_A, phone: TEST_LEAD_CONTACT_PHONE }],
       leads: [{ id: LEAD_1, org_id: ORG_A, contact_id: CONTACT_1, status: "new", created_at: "2026-01-01T00:00:00Z" }],
       sms_meta_messages: [],
+      marketing_contact_preferences: [],
       ...overrides,
     },
     {},
-    { uniqueConstraints: { sms_meta_messages: [["org_id", "provider_message_id"]] } },
+    // Matches supabase/migrations/20260915_sms_meta_messages_dedupe.sql's
+    // CORRECTED scope (AI-3K audit: channel added — see that migration's
+    // own comment for why (org_id, provider_message_id) alone was wrong
+    // for a table shared across SMS/WhatsApp/Messenger/Instagram).
+    { uniqueConstraints: { sms_meta_messages: [["org_id", "channel", "provider_message_id"]] } },
   );
 }
 
@@ -207,6 +212,21 @@ test("C. the inbound SMS is persisted exactly once", async () => {
   assert.equal(row.channel, "sms");
   assert.equal(row.direction, "in");
   assert.equal(row.from_address, TEST_LEAD_CONTACT_PHONE);
+});
+
+test("C. (dedupe migration audit) two inbound rows with a NULL provider_message_id never collide — matches the migration's partial index (where provider_message_id is not null)", async () => {
+  const db = makeDb();
+  const first = await S.persistInboundSms(db, { orgId: ORG_A, contactId: CONTACT_1, body: "no provider id, row 1", from: TEST_LEAD_CONTACT_PHONE, messageSid: undefined as any });
+  // persistInboundSms always passes a real messageSid in the live webhook
+  // (Twilio always sends MessageSid) — this test exercises the dedupe
+  // INDEX's own NULL semantics directly, at the persistence layer, since
+  // no real inbound-SMS code path produces a null provider_message_id
+  // today; it is still a real constraint property worth pinning given the
+  // task's own request to verify NULL behavior is correct.
+  const withNull = { orgId: ORG_A, contactId: CONTACT_1, body: "no provider id, row 2", from: TEST_LEAD_CONTACT_PHONE, messageSid: null as any };
+  const second = await S.persistInboundSms(db, withNull);
+  assert.equal(first.status, "inserted");
+  assert.equal(second.status, "inserted", "a second row with provider_message_id null must NOT be treated as a duplicate of the first");
 });
 
 test("C. a Twilio retry of the SAME delivery (identical MessageSid) does not duplicate the message or dispatch AI a second time", async () => {
@@ -356,4 +376,79 @@ test("D. the derived origin is passed as dispatchLeadQualificationBackground's b
   // compute requestOrigin.
   const originLine = handlerSource.split("\n").find((l) => l.includes("const requestOrigin ="));
   assert.ok(originLine && !originLine.includes("event.body"), "requestOrigin must never be derived from event.body");
+});
+
+// ── AI-3K: STOP/START/HELP compliance, wired into this canonical webhook ──
+
+test("STOP: updates sms_status to opted_out, never dispatches Lead Qualification, never creates an approval", async () => {
+  const db = makeDb();
+  const dispatch = fakeDispatch();
+  for (const body of ["STOP", "stop", " STOP "]) {
+    const req = validRequestFor(ORG_A_PHONE, TEST_LEAD_CONTACT_PHONE, body, `SM_stop_${Math.random()}`, "org-a-token");
+    const r = await S.processTwilioInboundSms(req, { supabase: db, dispatchLeadQualificationBackground: dispatch.fn });
+    assert.equal(r.outcome, "stop", JSON.stringify(body));
+  }
+  assert.equal(dispatch.calls.length, 0, "STOP must never dispatch Lead Qualification");
+  const { data: pref } = await db.from("marketing_contact_preferences").select("sms_status").eq("contact_id", CONTACT_1).maybeSingle();
+  assert.equal(pref.sms_status, "opted_out");
+});
+
+test("STOP from an unmatched sender is a safe no-op (no contact row to update) — never dispatches AI", async () => {
+  const db = makeDb();
+  const dispatch = fakeDispatch();
+  const req = validRequestFor(ORG_A_PHONE, UNMATCHED_PHONE, "STOP", "SM_stop_unmatched_1", "org-a-token");
+  const r = await S.processTwilioInboundSms(req, { supabase: db, dispatchLeadQualificationBackground: dispatch.fn });
+  assert.equal(r.outcome, "stop");
+  assert.equal(r.contactId, null);
+  assert.equal(dispatch.calls.length, 0);
+});
+
+test("START: restores eligibility (opted_out -> eligible), never dispatches Lead Qualification", async () => {
+  const db = makeDb({ marketing_contact_preferences: [{ org_id: ORG_A, contact_id: CONTACT_1, sms_status: "opted_out" }] });
+  const dispatch = fakeDispatch();
+  const req = validRequestFor(ORG_A_PHONE, TEST_LEAD_CONTACT_PHONE, "START", "SM_start_1", "org-a-token");
+  const r = await S.processTwilioInboundSms(req, { supabase: db, dispatchLeadQualificationBackground: dispatch.fn });
+  assert.equal(r.outcome, "start");
+  assert.equal(dispatch.calls.length, 0);
+  const { data: pref } = await db.from("marketing_contact_preferences").select("sms_status").eq("contact_id", CONTACT_1).maybeSingle();
+  assert.equal(pref.sms_status, "eligible");
+});
+
+test("HELP: sends the deterministic configured reply, never dispatches Lead Qualification, never creates an approval", async () => {
+  const db = makeDb({
+    organizations: [{ id: ORG_A, integration_settings: { twilio: { phoneNumber: ORG_A_PHONE, authToken: "org-a-token", accountSid: "ACxxx" } }, ai_center_settings: { smsCompliance: { helpReply: "Call us at (555) 555-0100." } } }],
+  });
+  const dispatch = fakeDispatch();
+  const realFetchForThisTest = globalThis.fetch;
+  let sendCaptured: any;
+  globalThis.fetch = (async (url: any, init: any) => {
+    const asString = String(url);
+    if (asString.includes("api.twilio.com")) { sendCaptured = { url: asString, init }; return new Response(JSON.stringify({ sid: "SM_reply_1" }), { status: 201 }); }
+    throw new Error("no other network calls expected: " + asString);
+  }) as typeof fetch;
+  try {
+    const req = validRequestFor(ORG_A_PHONE, TEST_LEAD_CONTACT_PHONE, "HELP", "SM_help_1", "org-a-token");
+    const r = await S.processTwilioInboundSms(req, { supabase: db, dispatchLeadQualificationBackground: dispatch.fn });
+    assert.equal(r.outcome, "help");
+    assert.equal(dispatch.calls.length, 0, "HELP must never dispatch Lead Qualification");
+    assert.ok(sendCaptured, "expected a deterministic Twilio send for the configured HELP reply");
+  } finally {
+    globalThis.fetch = realFetchForThisTest;
+  }
+});
+
+test("NORMAL SMS (not a compliance keyword): still persists, still dispatches Lead Qualification, still reaches Level 2 approval behavior unchanged", async () => {
+  const db = makeDb();
+  const dispatch = fakeDispatch();
+  const req = validRequestFor(ORG_A_PHONE, TEST_LEAD_CONTACT_PHONE, "Hi, I'm interested in remodeling my kitchen.", "SM_normal_1", "org-a-token");
+  const r = await S.processTwilioInboundSms(req, { supabase: db, dispatchLeadQualificationBackground: dispatch.fn });
+  assert.equal(r.outcome, "dispatched");
+  assert.equal(dispatch.calls.length, 1);
+  assert.equal(dispatch.calls[0].source, "inbound_lead_message");
+  assert.equal(dispatch.calls[0].inboundEvent.text, "Hi, I'm interested in remodeling my kitchen.");
+  // Level 2 -> send_sms -> approval is covered end-to-end against the
+  // real dispatchLeadQualification() in lead-qualification-dispatch.test.ts
+  // (not re-tested here) — this test only proves this webhook still
+  // reaches that unchanged dispatcher with the normal payload shape for a
+  // non-compliance message.
 });

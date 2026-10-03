@@ -42,12 +42,12 @@
 // handlers.ts) already exists UNCHANGED on this branch — nothing about
 // the actual send/approval path needed porting at all.
 //
-// Also NOT ported in this pass: lib/sms-compliance.ts's STOP/START/HELP
-// handling. The task's required flow does not include compliance-keyword
-// processing, and this is reported as an explicit, known gap (not a
-// silent omission) — see this file's own report. Before any REAL Twilio
-// number (as opposed to a Deploy Preview validation number) is pointed at
-// this endpoint, that compliance layer should be ported too.
+// AI-3K addition (final hardening pass, after live PR #15 validation):
+// lib/sms-compliance.ts's STOP/START/HELP handling IS now ported and
+// wired in — see the new COMPLIANCE section below. It runs BEFORE the
+// no_contact/no_open_lead/dispatch decision, and structurally never
+// reaches dispatchLeadQualificationBackground() for a recognized
+// compliance keyword (see processTwilioInboundSms() below).
 //
 // ── FLOW ──────────────────────────────────────────────────────────────
 //
@@ -59,12 +59,28 @@
 //     -> resolve one open/active lead for that contact, org-scoped
 //     -> persist the inbound message (sms_meta_messages) — this is also
 //        the Twilio-retry dedupe guard (see DEDUPE below)
-//     -> if a contact AND an open lead were resolved: dispatch the
-//        EXISTING live Lead Qualification background pipeline with
+//     -> compliance-keyword check (STOP/START/HELP) — if matched, handled
+//        deterministically here and returned; AI is NEVER reached
+//     -> otherwise, if a contact AND an open lead were resolved: dispatch
+//        the EXISTING live Lead Qualification background pipeline with
 //        source "inbound_lead_message" / channel "sms"
 //     -> otherwise: message is still persisted, no AI dispatch, success
 //        returned to Twilio (per this task's explicit scope — no
 //        auto-creation of contacts/leads here)
+//
+// ── COMPLIANCE (AI-3K) ──────────────────────────────────────────────────
+//
+// classifySmsComplianceMessage() (lib/sms-compliance.ts) is checked
+// immediately after persistence, before ANY contact/lead-based dispatch
+// decision. STOP/START act even for an UNMATCHED sender's number is
+// logged and the message still just returns success — there is no
+// contact row to update preferences on, matching the ported original's
+// own behavior (never invented here). HELP's deterministic reply CAN
+// still be sent to an unmatched sender (see sms-compliance.ts's own
+// doc comment on why a compliance/support reply isn't gated by CRM
+// identity). None of the three branches ever calls
+// dispatchLeadQualificationBackground() — structurally, not by
+// convention: each one returns before reaching that call.
 //
 // ── DEDUPE ────────────────────────────────────────────────────────────
 //
@@ -110,6 +126,7 @@ import { normalizePhone } from "../../../src/lib/phone";
 import { verifyTwilioSignature } from "./twilio-signature";
 import { isLiveTriggerEligible, type InboundTriggerCandidate } from "./ai/lead-trigger";
 import type { LeadQualificationBackgroundPayload } from "./ai/lead-qualification-background";
+import { classifySmsComplianceMessage, processStopKeyword, processStartKeyword, sendHelpReplyIfConfigured } from "./sms-compliance";
 
 /** Matches router.ts's own ACTIVE_LEAD_STATUSES exactly (inlined here, same
  * reasoning as that file and the other branch's own ported original: keep
@@ -273,6 +290,9 @@ export type ProcessTwilioInboundSmsResult =
   | { outcome: "invalid_signature"; orgId: string }
   | { outcome: "duplicate_delivery" }
   | { outcome: "persist_failed" }
+  | { outcome: "stop"; orgId: string; contactId: string | null }
+  | { outcome: "start"; orgId: string; contactId: string | null }
+  | { outcome: "help"; orgId: string; contactId: string | null }
   | { outcome: "no_contact" }
   | { outcome: "no_open_lead"; contactId: string }
   | { outcome: "dispatched"; orgId: string; contactId: string; leadId: string; messageRowId: string };
@@ -306,6 +326,37 @@ export async function processTwilioInboundSms(
   const persistResult = await persistInboundSms(deps.supabase, { orgId, contactId, body: form.body, from: form.from, messageSid: form.messageSid });
   if (persistResult.status === "duplicate") return { outcome: "duplicate_delivery" };
   if (persistResult.status === "error") return { outcome: "persist_failed" };
+
+  // ── Compliance keyword (AI-3K) — checked BEFORE any contact/lead-based
+  // AI dispatch decision. Never reaches dispatchLeadQualificationBackground()
+  // for any of the three outcomes below — see this file's header. ───────
+  const complianceIntent = classifySmsComplianceMessage(form.body);
+  if (complianceIntent === "stop") {
+    if (contactId) {
+      await processStopKeyword(deps.supabase, orgId, contactId);
+    } else {
+      console.warn("[twilio-sms-inbound] STOP from unmatched number for org", orgId);
+    }
+    return { outcome: "stop", orgId, contactId };
+  }
+  if (complianceIntent === "start") {
+    if (contactId) {
+      await processStartKeyword(deps.supabase, orgId, contactId);
+    } else {
+      console.warn("[twilio-sms-inbound] START from unmatched number for org", orgId);
+    }
+    // No confirmation SMS is sent — matches STOP's existing silent
+    // behavior (no outbound reply for either), same as the ported
+    // original.
+    return { outcome: "start", orgId, contactId };
+  }
+  if (complianceIntent === "help") {
+    if (!contactId) {
+      console.warn("[twilio-sms-inbound] HELP from unmatched number for org", orgId);
+    }
+    await sendHelpReplyIfConfigured(deps.supabase, orgId, persistResult.id, form.from, contactId);
+    return { outcome: "help", orgId, contactId };
+  }
 
   if (!contactId) {
     console.warn("[twilio-sms-inbound] no CRM contact matched sender for org", orgId, "— message persisted, AI not dispatched.");

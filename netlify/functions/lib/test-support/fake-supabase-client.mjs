@@ -227,6 +227,21 @@ class FakeQueryBuilder {
       // than a fake that silently allows an unbounded number of
       // "duplicate" rows a real DB would have rejected.
       for (const cols of this.uniqueConstraints) {
+        // AI-3K fix: NULL never participates in a real Postgres unique-
+        // constraint conflict — two rows that both have NULL in a
+        // constrained column are never "duplicates" of each other,
+        // whether the index is a plain multi-column unique index or (as
+        // with sms_meta_messages' partial index on provider_message_id)
+        // explicitly scoped with `where col is not null`. Found while
+        // auditing that exact migration: this fake previously treated
+        // `null === null` as a match, which would have made a correct
+        // test of "two NULL provider_message_id rows never collide" FAIL
+        // against this fake even though real Postgres allows it — a
+        // fake-only false negative, not a real bug in the inbound
+        // webhook. If the inserted row has NULL in ANY of this
+        // constraint's columns, it can never conflict with anything.
+        const insertedHasNull = cols.some((c) => (this.payload[c] === undefined ? null : this.payload[c]) === null);
+        if (insertedHasNull) continue;
         const conflict = rows.find((r) => cols.every((c) => (this.payload[c] === undefined ? null : this.payload[c]) === (r[c] === undefined ? null : r[c])));
         if (conflict) {
           return {
