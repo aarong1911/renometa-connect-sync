@@ -129,6 +129,51 @@ test("isValidLeadQualificationBackgroundPayload rejects malformed shapes", async
   assert.equal(Core.isValidLeadQualificationBackgroundPayload({ orgId: "x", leadId: "y", contactId: "z", associatedWithInboundMessage: true, actorId: "a" }), true);
 });
 
+// ── AI-3I: source/inboundEvent extension (live inbound-SMS Lead Qualification) ──
+
+const VALID_INBOUND_EVENT = { channel: "sms", messageRowId: "m-1", text: "hi", externalMessageId: "SM1", candidate: { channel: "sms", direction: "in", syncOrigin: "live" } };
+
+test("isValidLeadQualificationBackgroundPayload accepts source:'inbound_lead_message' with a well-shaped inboundEvent", () => {
+  assert.equal(Core.isValidLeadQualificationBackgroundPayload({ orgId: "x", leadId: "y", source: "inbound_lead_message", inboundEvent: VALID_INBOUND_EVENT }), true);
+});
+
+test("isValidLeadQualificationBackgroundPayload rejects source:'inbound_lead_message' with a missing or malformed inboundEvent", () => {
+  assert.equal(Core.isValidLeadQualificationBackgroundPayload({ orgId: "x", leadId: "y", source: "inbound_lead_message" }), false, "missing inboundEvent");
+  assert.equal(Core.isValidLeadQualificationBackgroundPayload({ orgId: "x", leadId: "y", source: "inbound_lead_message", inboundEvent: { channel: "sms" } }), false, "incomplete inboundEvent");
+  assert.equal(Core.isValidLeadQualificationBackgroundPayload({ orgId: "x", leadId: "y", source: "inbound_lead_message", inboundEvent: { ...VALID_INBOUND_EVENT, candidate: { channel: "sms" } } }), false, "malformed candidate (missing direction/syncOrigin)");
+});
+
+test("isValidLeadQualificationBackgroundPayload rejects an inboundEvent carried alongside a non-inbound_lead_message source", () => {
+  assert.equal(Core.isValidLeadQualificationBackgroundPayload({ orgId: "x", leadId: "y", inboundEvent: VALID_INBOUND_EVENT }), false, "default source is lead_created — must not carry inboundEvent");
+  assert.equal(Core.isValidLeadQualificationBackgroundPayload({ orgId: "x", leadId: "y", source: "lead_created", inboundEvent: VALID_INBOUND_EVENT }), false);
+  assert.equal(Core.isValidLeadQualificationBackgroundPayload({ orgId: "x", leadId: "y", source: "manual_run", inboundEvent: VALID_INBOUND_EVENT }), false);
+});
+
+test("isValidLeadQualificationBackgroundPayload rejects an unrecognized source value", () => {
+  assert.equal(Core.isValidLeadQualificationBackgroundPayload({ orgId: "x", leadId: "y", source: "something_else" }), false);
+});
+
+test("processLeadQualificationBackground passes source:'inbound_lead_message' and inboundEvent through to dispatchLeadQualification() unchanged — default source stays 'lead_created' for every existing caller", async () => {
+  const db = makeDb();
+  const orchestrate = fakeOrchestrate();
+
+  // Existing lead_created caller shape — completely unaffected by the extension.
+  const legacy = await Core.processLeadQualificationBackground({ orgId: ORG_A, leadId: LEAD_1 }, { supabase: db, orchestrate });
+  assert.equal(legacy.dispatch?.status, "recommendation");
+
+  // New inbound_lead_message shape reaches the SAME dispatcher with the
+  // correct source/inboundEvent — proven by it producing its OWN distinct
+  // idempotency claim (not colliding with the lead_created run above for
+  // the same lead) rather than by inspecting dispatchLeadQualification's
+  // internals directly.
+  const inbound = await Core.processLeadQualificationBackground(
+    { orgId: ORG_A, leadId: LEAD_1, source: "inbound_lead_message", inboundEvent: VALID_INBOUND_EVENT },
+    { supabase: db, orchestrate },
+  );
+  assert.equal(inbound.revalidated, true);
+  assert.equal(inbound.dispatch?.status, "recommendation", "a distinct run for the SAME lead under a different trigger source is not treated as a duplicate of the lead_created run");
+});
+
 // ── The real handler: internal-secret gate, network denied by default ──────
 
 test("4. the real handler rejects an invalid/missing internal secret BEFORE touching Supabase (network denied by default proves no DB call was attempted)", async () => {

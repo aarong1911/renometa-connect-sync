@@ -35,8 +35,23 @@
 // mechanism; it only moves WHERE the existing one runs.
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { dispatchLeadQualification, type DispatchLeadQualificationResult } from "./lead-qualification-dispatch";
+import { dispatchLeadQualification, type DispatchLeadQualificationResult, type LeadQualificationTriggerSource } from "./lead-qualification-dispatch";
 import type { orchestrateAI } from "./orchestrator";
+import { LIVE_TRIGGER_CHANNELS, type InboundTriggerCandidate } from "./lead-trigger";
+import type { AIChannel } from "./types";
+
+/** AI-3I addition (live inbound-SMS Lead Qualification). The SAME shape
+ * DispatchLeadQualificationParams.inboundEvent already defines in
+ * lead-qualification-dispatch.ts — mirrored here field-for-field (not
+ * imported as a re-export, since that file's param type isn't exported
+ * standalone) rather than introducing a second, divergent shape. */
+export type LeadQualificationBackgroundInboundEvent = {
+  channel: AIChannel;
+  messageRowId: string;
+  text: string;
+  externalMessageId?: string;
+  candidate: InboundTriggerCandidate;
+};
 
 export type LeadQualificationBackgroundPayload = {
   orgId: string;
@@ -44,7 +59,42 @@ export type LeadQualificationBackgroundPayload = {
   contactId?: string;
   associatedWithInboundMessage?: boolean;
   actorId?: string;
+  /** AI-3I addition. Defaults to "lead_created" when omitted — every
+   * existing caller (lead-created-hook.ts's fireLeadCreatedTrigger, used by
+   * Meta Lead Ads/Google Ads/Vapi/Instagram/Messenger) never sets this and
+   * is completely unaffected by its addition. Only a caller that explicitly
+   * sets `source: "inbound_lead_message"` (ai-twilio-sms-inbound.ts) needs
+   * `inboundEvent` populated too — see below. */
+  source?: LeadQualificationTriggerSource;
+  /** AI-3I addition. REQUIRED when source is "inbound_lead_message";
+   * ignored (and must be absent) otherwise. Passed straight through to
+   * dispatchLeadQualification()'s own `inboundEvent` param — no new
+   * eligibility/candidate logic is introduced here; the EXISTING
+   * isLiveTriggerEligible() gate inside lead-qualification-dispatch.ts
+   * still applies unchanged. */
+  inboundEvent?: LeadQualificationBackgroundInboundEvent;
 };
+
+function isValidInboundTriggerCandidate(value: unknown): value is InboundTriggerCandidate {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  if (typeof v.channel !== "string" || !(LIVE_TRIGGER_CHANNELS as ReadonlySet<string>).has(v.channel)) return false;
+  if (v.direction !== "in" && v.direction !== "out") return false;
+  if (v.authoredByBusiness !== undefined && typeof v.authoredByBusiness !== "boolean") return false;
+  if (v.syncOrigin !== "live" && v.syncOrigin !== "backfill" && v.syncOrigin !== undefined) return false;
+  return true;
+}
+
+function isValidInboundEvent(value: unknown): value is LeadQualificationBackgroundInboundEvent {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  if (typeof v.channel !== "string") return false;
+  if (typeof v.messageRowId !== "string" || !v.messageRowId) return false;
+  if (typeof v.text !== "string") return false;
+  if (v.externalMessageId !== undefined && typeof v.externalMessageId !== "string") return false;
+  if (!isValidInboundTriggerCandidate(v.candidate)) return false;
+  return true;
+}
 
 export function isValidLeadQualificationBackgroundPayload(value: unknown): value is LeadQualificationBackgroundPayload {
   if (typeof value !== "object" || value === null) return false;
@@ -54,6 +104,16 @@ export function isValidLeadQualificationBackgroundPayload(value: unknown): value
   if (v.contactId !== undefined && typeof v.contactId !== "string") return false;
   if (v.associatedWithInboundMessage !== undefined && typeof v.associatedWithInboundMessage !== "boolean") return false;
   if (v.actorId !== undefined && typeof v.actorId !== "string") return false;
+  if (v.source !== undefined && v.source !== "lead_created" && v.source !== "inbound_lead_message" && v.source !== "manual_run") return false;
+  // inbound_lead_message REQUIRES a well-shaped inboundEvent — a malformed
+  // or missing one for this source is rejected here (400), never silently
+  // downgraded to a lead_created-shaped dispatch. Every other source must
+  // NOT carry one (keeps the two shapes from being accidentally mixed).
+  if (v.source === "inbound_lead_message") {
+    if (!isValidInboundEvent(v.inboundEvent)) return false;
+  } else if (v.inboundEvent !== undefined) {
+    return false;
+  }
   return true;
 }
 
@@ -98,9 +158,12 @@ export async function processLeadQualificationBackground(
   const result = await dispatchLeadQualification({
     supabase,
     orgId,
-    source: "lead_created",
+    // AI-3I: defaults to "lead_created" — unchanged for every existing
+    // caller, which never sets payload.source at all.
+    source: payload.source ?? "lead_created",
     leadId,
     contactId,
+    inboundEvent: payload.inboundEvent,
     associatedWithInboundMessage: payload.associatedWithInboundMessage,
     actorId: payload.actorId,
     orchestrate: deps.orchestrate,
