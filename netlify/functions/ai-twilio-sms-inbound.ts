@@ -92,6 +92,7 @@ export const handler: Handler = async (event: HandlerEvent) => {
       case "org_not_found":
       case "duplicate_delivery":
       case "persist_failed":
+      case "provider_echo_skipped":
       case "stop":
       case "start":
       case "help":

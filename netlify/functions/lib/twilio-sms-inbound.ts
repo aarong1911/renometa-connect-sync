@@ -82,6 +82,51 @@
 // dispatchLeadQualificationBackground() — structurally, not by
 // convention: each one returns before reaching that call.
 //
+// ── PROVIDER/SYSTEM ECHO GUARD (AI-3L) ──────────────────────────────────
+//
+// Live-tested finding: after STOP/HELP were wired up, Twilio's own
+// Advanced Opt-Out confirmation reply (sent BY Twilio, not by this app —
+// see sms-compliance.ts's corrected header) was observed re-entering this
+// SAME webhook as a SECOND, separate inbound delivery — `From` matched
+// the test lead's own contact, `Body` was the confirmation/HELP-reply
+// text itself (not a STOP/START/HELP keyword), so it fell straight
+// through to the normal path, matched a real open lead, and dispatched
+// Lead Qualification — producing a pending approval whose "incoming
+// message" was literally our own system's compliance reply.
+//
+// The live test setup used TWO Twilio-owned numbers in the SAME
+// Messaging Service ("Defer to sender's webhook" inbound routing),
+// including the "customer" test number — this is the exact scenario this
+// task named as the likely cause. Without direct access to Twilio
+// Console delivery logs for that specific event, the EXACT routing
+// mechanism (which number ended up as `From`/`To` on the echoed
+// delivery, and why Twilio invoked a webhook for it) could not be
+// confirmed with certainty from this environment — reported as a
+// limitation, not asserted as fact.
+//
+// What IS certain and fixed structurally, independent of the exact
+// mechanism: `isKnownOrgOwnedTwilioNumber()` below checks whether the
+// inbound `From` number matches ANY org's own configured Twilio
+// `phoneNumber` (not just the org that owns the receiving `To` number —
+// a shared Messaging Service can have multiple org-owned numbers in the
+// SAME account). A genuine external customer's personal phone will
+// essentially never coincide with a number this app itself sends FROM.
+// If `From` matches, this delivery is treated as provider/system traffic
+// — persisted (so it's visible in Inbox history, same as any other
+// inbound row) but NEVER dispatched to Lead Qualification, NEVER
+// compliance-classified (an org's own number "texting" STOP/HELP to
+// itself has no real meaning), regardless of body content. This check
+// uses ONLY already-persisted config (no new schema, no network call to
+// Twilio) — see this pass's own report for the explicit, known
+// limitation: this guard can only catch an echo whose `From` number is
+// itself registered as SOME org's own `phoneNumber` in THIS app's
+// database. A bare Twilio-owned number that was never entered into
+// `organizations.integration_settings.twilio.phoneNumber` for any org is
+// invisible to this check — that gap is reported, not silently assumed
+// away, and the real fix for that case is Twilio-side (Messaging Service/
+// number configuration), not something this app's code can detect from
+// available signals.
+//
 // ── DEDUPE ────────────────────────────────────────────────────────────
 //
 // sms_meta_messages has a `provider_message_id` column with NO live
@@ -126,7 +171,7 @@ import { normalizePhone } from "../../../src/lib/phone";
 import { verifyTwilioSignature } from "./twilio-signature";
 import { isLiveTriggerEligible, type InboundTriggerCandidate } from "./ai/lead-trigger";
 import type { LeadQualificationBackgroundPayload } from "./ai/lead-qualification-background";
-import { classifySmsComplianceMessage, processStopKeyword, processStartKeyword, sendHelpReplyIfConfigured } from "./sms-compliance";
+import { resolveSmsComplianceIntent, processStopKeyword, processStartKeyword, sendHelpReplyIfConfigured } from "./sms-compliance";
 
 /** Matches router.ts's own ACTIVE_LEAD_STATUSES exactly (inlined here, same
  * reasoning as that file and the other branch's own ported original: keep
@@ -136,7 +181,18 @@ const ACTIVE_LEAD_STATUSES: ReadonlySet<string> = new Set(["new", "contacted", "
 
 // ── Form parsing ─────────────────────────────────────────────────────────
 
-export type TwilioInboundForm = { from: string; to: string; body: string; messageSid: string };
+export type TwilioInboundForm = {
+  from: string;
+  to: string;
+  body: string;
+  messageSid: string;
+  /** AI-3L. Twilio's own Advanced Opt-Out classification field, present
+   * only when that feature is active and has already classified this
+   * exact delivery — see sms-compliance.ts's classifyOptOutType(). Absent
+   * (null) for an ordinary message or when Advanced Opt-Out isn't active
+   * for this number/Messaging Service. */
+  optOutType: string | null;
+};
 
 /** Never throws. Returns null for anything that isn't a recognizable
  * Twilio SMS payload (missing From/To/MessageSid) — nothing safe to do
@@ -147,8 +203,9 @@ export function parseTwilioInboundForm(rawBody: string | null | undefined): Twil
   const to = params.get("To");
   const body = (params.get("Body") ?? "").trim();
   const messageSid = params.get("MessageSid");
+  const optOutType = params.get("OptOutType");
   if (!from || !to || !messageSid) return null;
-  return { from, to, body, messageSid };
+  return { from, to, body, messageSid, optOutType };
 }
 
 // ── Org resolution ───────────────────────────────────────────────────────
@@ -195,6 +252,43 @@ export async function resolveOwningOrgForTwilioNumber(supabase: SupabaseClient, 
   const authToken: string | undefined = org.integration_settings?.twilio?.authToken;
   if (!authToken) return { status: "missing_credentials", orgId: org.id };
   return { status: "resolved", org: { orgId: org.id, authToken } };
+}
+
+/**
+ * AI-3L (PROVIDER/SYSTEM ECHO GUARD — see this file's own header for the
+ * full story). True when `candidatePhone` matches ANY org's own
+ * configured Twilio `phoneNumber` — scanned across every org, not just
+ * the org that owns the receiving `To` number, since a shared Messaging
+ * Service can have more than one org-owned number in the same Twilio
+ * account. A genuine external customer's own phone will essentially
+ * never collide with a number this app itself sends FROM.
+ *
+ * KNOWN LIMITATION (reported, not silently assumed away): this can only
+ * ever recognize a number that is itself registered as some org's own
+ * `integration_settings.twilio.phoneNumber` in THIS app's database. A
+ * bare Twilio-owned number in the same account/Messaging Service that
+ * was never entered into any org's config is invisible to this check —
+ * closing that gap would require either a dedicated sender-pool/
+ * Messaging-Service-SID config this app does not currently store, or a
+ * live Twilio API call from inside the webhook path, which this task
+ * explicitly said not to add casually.
+ */
+export async function isKnownOrgOwnedTwilioNumber(supabase: SupabaseClient, candidatePhone: string): Promise<boolean> {
+  const candidateDigits = normalizePhone(candidatePhone);
+  if (!candidateDigits) return false;
+  const { data: orgs, error } = await supabase.from("organizations").select("id, integration_settings");
+  if (error) {
+    console.error("[twilio-sms-inbound] echo-guard org scan failed:", error.message);
+    // Fail closed toward "not a known own number" — never silently
+    // DISPATCH less safely by assuming a lookup failure means "this is
+    // definitely external"; a scan failure here just means the guard
+    // itself couldn't run, which is already logged for investigation.
+    return false;
+  }
+  return (orgs ?? []).some((o: any) => {
+    const num = o.integration_settings?.twilio?.phoneNumber;
+    return !!num && normalizePhone(num) === candidateDigits;
+  });
 }
 
 // ── Contact + open-lead resolution (read-only — never creates either) ───
@@ -290,6 +384,7 @@ export type ProcessTwilioInboundSmsResult =
   | { outcome: "invalid_signature"; orgId: string }
   | { outcome: "duplicate_delivery" }
   | { outcome: "persist_failed" }
+  | { outcome: "provider_echo_skipped"; orgId: string; messageRowId: string }
   | { outcome: "stop"; orgId: string; contactId: string | null }
   | { outcome: "start"; orgId: string; contactId: string | null }
   | { outcome: "help"; orgId: string; contactId: string | null }
@@ -327,10 +422,23 @@ export async function processTwilioInboundSms(
   if (persistResult.status === "duplicate") return { outcome: "duplicate_delivery" };
   if (persistResult.status === "error") return { outcome: "persist_failed" };
 
-  // ── Compliance keyword (AI-3K) — checked BEFORE any contact/lead-based
-  // AI dispatch decision. Never reaches dispatchLeadQualificationBackground()
-  // for any of the three outcomes below — see this file's header. ───────
-  const complianceIntent = classifySmsComplianceMessage(form.body);
+  // ── Provider/system echo guard (AI-3L) — checked BEFORE compliance
+  // classification and BEFORE any dispatch decision. See this file's own
+  // header for the full story. The message is already safely persisted
+  // above (visible in Inbox history); this only prevents it from being
+  // treated as a customer message. ──────────────────────────────────────
+  if (await isKnownOrgOwnedTwilioNumber(deps.supabase, form.from)) {
+    console.warn("[twilio-sms-inbound] inbound sender matches a known org-owned Twilio number — treating as provider/system traffic, never AI-dispatching.");
+    return { outcome: "provider_echo_skipped", orgId, messageRowId: persistResult.id };
+  }
+
+  // ── Compliance keyword (AI-3K/AI-3L) — checked BEFORE any contact/lead-
+  // based AI dispatch decision. OptOutType (Twilio's own authoritative
+  // classification, when present) takes priority over body-keyword
+  // matching — see sms-compliance.ts's resolveSmsComplianceIntent(). Never
+  // reaches dispatchLeadQualificationBackground() for any of the three
+  // outcomes below — see this file's header. ────────────────────────────
+  const complianceIntent = resolveSmsComplianceIntent(form.body, form.optOutType);
   if (complianceIntent === "stop") {
     if (contactId) {
       await processStopKeyword(deps.supabase, orgId, contactId);

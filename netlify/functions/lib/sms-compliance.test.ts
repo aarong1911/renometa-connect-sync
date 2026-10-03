@@ -87,6 +87,29 @@ test("isStopKeyword is equivalent to classifySmsComplianceMessage === 'stop'", (
   assert.equal(S.isStopKeyword("hello"), false);
 });
 
+// ── AI-3L: classifyOptOutType / resolveSmsComplianceIntent ──────────────
+
+test("classifyOptOutType recognizes STOP/START/HELP case-insensitively, null/unrecognized -> null", () => {
+  assert.equal(S.classifyOptOutType("STOP"), "stop");
+  assert.equal(S.classifyOptOutType("stop"), "stop");
+  assert.equal(S.classifyOptOutType("Start"), "start");
+  assert.equal(S.classifyOptOutType("HELP"), "help");
+  assert.equal(S.classifyOptOutType(null), null);
+  assert.equal(S.classifyOptOutType(undefined), null);
+  assert.equal(S.classifyOptOutType(""), null);
+  assert.equal(S.classifyOptOutType("something-else"), null);
+});
+
+test("resolveSmsComplianceIntent: OptOutType (provider-authoritative) wins over body text, even when they disagree", () => {
+  assert.equal(S.resolveSmsComplianceIntent("this is definitely not a stop keyword", "STOP"), "stop");
+  assert.equal(S.resolveSmsComplianceIntent("STOP", "HELP"), "help");
+});
+
+test("resolveSmsComplianceIntent: falls back to body classification when OptOutType is absent", () => {
+  assert.equal(S.resolveSmsComplianceIntent("STOP", null), "stop");
+  assert.equal(S.resolveSmsComplianceIntent("hello", null), null);
+});
+
 // ── processStopKeyword / processStartKeyword — authoritative consent writes ──
 
 function makeDb(prefs: any[] = []) {

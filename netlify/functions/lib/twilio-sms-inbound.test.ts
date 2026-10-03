@@ -172,8 +172,8 @@ function computeRealSignature(authToken: string, fullUrl: string, params: URLSea
   return createHmac("sha1", authToken).update(data, "utf8").digest("base64");
 }
 
-function validRequestFor(orgPhone: string, from: string, body: string, messageSid: string, authToken: string) {
-  const fields = { From: from, To: orgPhone, Body: body, MessageSid: messageSid };
+function validRequestFor(orgPhone: string, from: string, body: string, messageSid: string, authToken: string, extraFields: Record<string, string> = {}) {
+  const fields = { From: from, To: orgPhone, Body: body, MessageSid: messageSid, ...extraFields };
   const raw = rawBody(fields);
   const sig = computeRealSignature(authToken, FULL_URL, new URLSearchParams(raw));
   return { rawBody: raw, signatureHeader: sig, fullUrl: FULL_URL };
@@ -451,4 +451,98 @@ test("NORMAL SMS (not a compliance keyword): still persists, still dispatches Le
   // (not re-tested here) — this test only proves this webhook still
   // reaches that unchanged dispatcher with the normal payload shape for a
   // non-compliance message.
+});
+
+// ── AI-3L: provider OptOutType (authoritative, platform-classified) ────
+
+test("provider OptOutType=STOP is authoritative even if the body text doesn't look like a keyword — no AI dispatch", async () => {
+  const db = makeDb();
+  const dispatch = fakeDispatch();
+  const req = validRequestFor(ORG_A_PHONE, TEST_LEAD_CONTACT_PHONE, "some longer message Twilio itself classified as an opt-out", "SM_opttype_stop_1", "org-a-token", { OptOutType: "STOP" });
+  const r = await S.processTwilioInboundSms(req, { supabase: db, dispatchLeadQualificationBackground: dispatch.fn });
+  assert.equal(r.outcome, "stop");
+  assert.equal(dispatch.calls.length, 0);
+  const { data: pref } = await db.from("marketing_contact_preferences").select("sms_status").eq("contact_id", CONTACT_1).maybeSingle();
+  assert.equal(pref.sms_status, "opted_out");
+});
+
+test("provider OptOutType=START is authoritative — no AI dispatch", async () => {
+  const db = makeDb({ marketing_contact_preferences: [{ org_id: ORG_A, contact_id: CONTACT_1, sms_status: "opted_out" }] });
+  const dispatch = fakeDispatch();
+  const req = validRequestFor(ORG_A_PHONE, TEST_LEAD_CONTACT_PHONE, "unstop please", "SM_opttype_start_1", "org-a-token", { OptOutType: "START" });
+  const r = await S.processTwilioInboundSms(req, { supabase: db, dispatchLeadQualificationBackground: dispatch.fn });
+  assert.equal(r.outcome, "start");
+  assert.equal(dispatch.calls.length, 0);
+});
+
+test("provider OptOutType=HELP is authoritative — deterministic reply, no AI dispatch", async () => {
+  const db = makeDb({
+    organizations: [{ id: ORG_A, integration_settings: { twilio: { phoneNumber: ORG_A_PHONE, authToken: "org-a-token", accountSid: "ACxxx" } }, ai_center_settings: { smsCompliance: { helpReply: "Call us." } } }],
+  });
+  const dispatch = fakeDispatch();
+  const realFetchForThisTest = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ sid: "SM_reply_x" }), { status: 201 })) as typeof fetch;
+  try {
+    const req = validRequestFor(ORG_A_PHONE, TEST_LEAD_CONTACT_PHONE, "need assistance", "SM_opttype_help_1", "org-a-token", { OptOutType: "HELP" });
+    const r = await S.processTwilioInboundSms(req, { supabase: db, dispatchLeadQualificationBackground: dispatch.fn });
+    assert.equal(r.outcome, "help");
+    assert.equal(dispatch.calls.length, 0);
+  } finally {
+    globalThis.fetch = realFetchForThisTest;
+  }
+});
+
+// ── AI-3L: provider/system echo guard (the live PR #15 bug) ────────────
+
+test("a compliance reply/system message sent FROM this org's own Twilio number can never recursively trigger AI, regardless of body content", async () => {
+  const db = makeDb();
+  const dispatch = fakeDispatch();
+  // Simulates the exact live bug: the inbound `From` is RenoMeta's OWN
+  // Twilio number (ORG_A_PHONE) — e.g. an echoed delivery of Twilio's own
+  // Advanced Opt-Out confirmation reply — with a body that is NOT a
+  // compliance keyword and would otherwise look like ordinary customer
+  // conversation.
+  const req = validRequestFor(ORG_A_PHONE, ORG_A_PHONE, "RenoMeta: You have been unsubscribed and will no longer receive SMS messages from this number. Reply START to resubscribe.", "SM_echo_1", "org-a-token");
+  const r = await S.processTwilioInboundSms(req, { supabase: db, dispatchLeadQualificationBackground: dispatch.fn });
+  assert.equal(r.outcome, "provider_echo_skipped");
+  assert.equal(dispatch.calls.length, 0, "a provider/system echo must never dispatch Lead Qualification");
+  const { data: row } = await db.from("sms_meta_messages").select("id").eq("provider_message_id", "SM_echo_1").maybeSingle();
+  assert.ok(row, "the echo is still persisted for Inbox history visibility");
+});
+
+test("self-origin/org-owned sender loop: a sender number registered as a DIFFERENT org's own Twilio number is also recognized and never dispatched", async () => {
+  const db = makeDb({
+    organizations: [
+      { id: ORG_A, integration_settings: { twilio: { phoneNumber: ORG_A_PHONE, authToken: "org-a-token" } } },
+      { id: ORG_B, integration_settings: { twilio: { phoneNumber: "+19998887777", authToken: "org-b-token" } } },
+    ],
+  });
+  const dispatch = fakeDispatch();
+  // From = ORG_B's own number, To = ORG_A's number — a cross-org sender
+  // echo within the same shared Twilio account/Messaging Service.
+  const req = validRequestFor(ORG_A_PHONE, "+19998887777", "some system/provider text", "SM_echo_2", "org-a-token");
+  const r = await S.processTwilioInboundSms(req, { supabase: db, dispatchLeadQualificationBackground: dispatch.fn });
+  assert.equal(r.outcome, "provider_echo_skipped");
+  assert.equal(dispatch.calls.length, 0);
+});
+
+test("a genuine external customer number (not registered as any org's own Twilio number) is never mistaken for a provider echo", async () => {
+  const db = makeDb();
+  const dispatch = fakeDispatch();
+  const req = validRequestFor(ORG_A_PHONE, TEST_LEAD_CONTACT_PHONE, "a perfectly normal customer reply", "SM_not_echo_1", "org-a-token");
+  const r = await S.processTwilioInboundSms(req, { supabase: db, dispatchLeadQualificationBackground: dispatch.fn });
+  assert.equal(r.outcome, "dispatched", "a legitimate external customer number must never be blocked by the echo guard");
+  assert.equal(dispatch.calls.length, 1);
+});
+
+test("isKnownOrgOwnedTwilioNumber matches across ALL orgs, not just the receiving org, and fails closed (false) on a lookup error", async () => {
+  const db = makeDb({
+    organizations: [
+      { id: ORG_A, integration_settings: { twilio: { phoneNumber: ORG_A_PHONE, authToken: "org-a-token" } } },
+      { id: ORG_B, integration_settings: { twilio: { phoneNumber: "+19998887777", authToken: "org-b-token" } } },
+    ],
+  });
+  assert.equal(await S.isKnownOrgOwnedTwilioNumber(db, "+19998887777"), true, "must match a DIFFERENT org's own number, not just the receiving org's");
+  assert.equal(await S.isKnownOrgOwnedTwilioNumber(db, TEST_LEAD_CONTACT_PHONE), false, "a genuine customer number must not match");
+  assert.equal(await S.isKnownOrgOwnedTwilioNumber(db, ""), false, "an empty candidate never matches");
 });

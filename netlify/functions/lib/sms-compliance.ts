@@ -32,20 +32,35 @@
 // backward-compatibility reasoning the ported original already
 // documented, not a new decision made here).
 //
-// ── PROVIDER-LEVEL COMPLIANCE: NOT CONFIRMED ACTIVE ──────────────────────
+// ── PROVIDER-LEVEL COMPLIANCE: CONFIRMED ACTIVE (AI-3L correction) ───────
 //
-// Inspected before this pass: no reference anywhere in this repo to a
-// Twilio Messaging Service, Advanced Opt-Out configuration, or any other
-// provider-level compliance automation (grepped for "Messaging Service",
-// "Advanced Opt-Out", "messagingServiceSid" — zero hits outside this
-// skill's own documentation). Organizations' Twilio config
-// (organizations.integration_settings.twilio) is a bare
-// {accountSid, authToken, phoneNumber} — a plain phone number, not a
-// Messaging Service SID. This app is the only thing enforcing STOP/START/
-// HELP semantics for a number pointed at its webhook — if RenoMeta ever
-// moves to a Twilio Messaging Service with Advanced Opt-Out enabled, this
-// reasoning no longer holds and must be re-verified, not assumed to still
-// be true.
+// UPDATED after live testing (2026-09) — this section previously said
+// provider-level compliance automation was "NOT CONFIRMED ACTIVE," based
+// on a repo-wide grep finding no reference to a Twilio Messaging Service
+// or Advanced Opt-Out configuration. That conclusion was WRONG for the
+// live Twilio Messaging Service actually in use: a live STOP test
+// received Twilio's own default unsubscribe-confirmation auto-reply text
+// ("You have been unsubscribed and will no longer receive SMS
+// messages...") — a reply ONLY Twilio's Advanced Opt-Out feature sends,
+// never this application's own code (STOP never sends a reply here —
+// see processStopKeyword()). Advanced Opt-Out IS active for this
+// Messaging Service/number, confirmed by direct observation, not by
+// config auditing (organizations.integration_settings.twilio remains a
+// bare {accountSid, authToken, phoneNumber} in this app's OWN config —
+// Advanced Opt-Out is a TWILIO-SIDE setting this app's database has no
+// visibility into at all). Do not re-assume "not active" for a
+// DIFFERENT number/Messaging Service without re-verifying directly —
+// this app cannot read that setting from Twilio, only infer it from
+// behavior (an auto-reply arriving, or an `OptOutType` field appearing
+// on an inbound webhook — see classifyOptOutType() below).
+//
+// This also means Twilio's Advanced Opt-Out auto-reply traffic can
+// itself become a SECOND inbound webhook delivery under certain Twilio
+// Messaging Service configurations (e.g. two org/test-owned numbers
+// sharing one Messaging Service with "Defer to sender's webhook") — see
+// twilio-sms-inbound.ts's own "PROVIDER/SYSTEM ECHO GUARD" section for
+// the structural fix, and this pass's own report for what was confirmed
+// vs. what remains a known limitation.
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { sendTwilioSms } from "../../../src/lib/agentic/sms-transport";
@@ -104,6 +119,45 @@ export function classifySmsComplianceMessage(body: string): SmsComplianceIntent 
  * `classifySmsComplianceMessage(body) === "stop"`. */
 export function isStopKeyword(body: string): boolean {
   return classifySmsComplianceMessage(body) === "stop";
+}
+
+/**
+ * AI-3L. Classifies Twilio's own `OptOutType` webhook field, present when
+ * Twilio's Advanced Opt-Out feature has ALREADY classified an inbound
+ * message as a compliance command at the platform level, before this
+ * webhook ever ran its own body-keyword check. Confirmed live (2026-09):
+ * this Messaging Service's Advanced Opt-Out IS active (a live STOP test
+ * received Twilio's own default unsubscribe-confirmation auto-reply,
+ * which only Advanced Opt-Out sends) — the prior "NOT CONFIRMED ACTIVE"
+ * assumption documented at the top of this file was wrong for this
+ * Messaging Service and must not be relied on again without re-verifying
+ * per-number/per-service configuration.
+ *
+ * Case-insensitive (Twilio's own docs show "STOP"/"START"/"HELP", but
+ * this does not assume exact casing is guaranteed forever). Null/missing/
+ * unrecognized returns null — never guessed, never defaulted to a
+ * particular intent.
+ */
+export function classifyOptOutType(value: string | null | undefined): SmsComplianceIntent {
+  if (!value) return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "stop") return "stop";
+  if (normalized === "start") return "start";
+  if (normalized === "help") return "help";
+  return null;
+}
+
+/**
+ * AI-3L. The ONE place compliance intent is decided — `OptOutType` (the
+ * authoritative, provider-classified signal, when Twilio supplies it)
+ * takes priority over body-keyword classification, which remains as
+ * fallback/defense-in-depth for any inbound message Twilio's own
+ * Advanced Opt-Out did not tag (e.g. a Messaging Service / number where
+ * Advanced Opt-Out is not enabled). Never the reverse — body text is only
+ * consulted when the provider gave no verdict at all.
+ */
+export function resolveSmsComplianceIntent(body: string, optOutType: string | null | undefined): SmsComplianceIntent {
+  return classifyOptOutType(optOutType) ?? classifySmsComplianceMessage(body);
 }
 
 /**
