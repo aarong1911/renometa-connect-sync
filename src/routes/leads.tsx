@@ -45,6 +45,8 @@ import { formatMoney, formatDateShort, formatPhone } from "@/lib/format";
 import { formatDistanceToNow } from "date-fns";
 import { toast } from "sonner";
 import { useTeam, type TeamMember } from "@/lib/organization";
+import { runLeadQualification } from "@/lib/lead-qualification-client";
+import { LEAD_QUALIFICATION_TOAST_MESSAGE, buildLeadQualificationSuccessToastOptions, shouldCloseLeadDrawerForResult } from "@/lib/lead-qualification-toast";
 import {
   useLeads, addLead as storeAddLead, updateLeadStatus as storeUpdateStatus,
   updateLeadsStatusBulk, updateLead as storeUpdateLead,
@@ -2209,8 +2211,91 @@ function LeadDetailDrawer({
   teamMembers: TeamMember[];
 }) {
   const allDeals = useDeals();
+  const [runningAI, setRunningAI] = useState(false);
+  // Plain useNavigate() (no `from`) — this drawer isn't guaranteed to be
+  // rendered strictly under "/leads" in every usage, and the only
+  // destination it navigates to (AI Center) is a different route entirely,
+  // so no route-relative typing benefit would apply here anyway.
+  const navigateToAiCenter = useNavigate();
 
   if (!lead) return <Sheet open={false} onOpenChange={onOpenChange}><SheetContent className="hidden" /></Sheet>;
+
+  const handleRunLeadQualification = async () => {
+    // Synchronous re-entrancy guard, independent of React's render cycle —
+    // the button's own `disabled={runningAI}` prop only takes effect after
+    // a re-render, which is not fast enough to rule out two clicks in the
+    // same tick. This check makes it structurally impossible for a second
+    // invocationId to even be generated while one is in flight.
+    if (runningAI) return;
+    setRunningAI(true);
+    // One id for this exact click; a real retry of this SAME click (none
+    // exist client-side today — this is future-proofing) would reuse it,
+    // never generate a new one mid-flight. A brand-new click only happens
+    // after this handler returns and runningAI resets, at which point a
+    // fresh id is generated below.
+    const invocationId = crypto.randomUUID();
+    try {
+      const result = await runLeadQualification(lead.id, invocationId);
+      if (result.status === "error") {
+        // Never close the drawer on error — the person may want to retry or
+        // fix something in the lead without losing their place.
+        toast.error(result.error);
+      } else if (result.status === "skipped") {
+        // Never close on a skip either — nothing actually ran (duplicate
+        // click, policy disabled, etc.), so there is no "completed
+        // operation" to leave the drawer for, and no strong reason to
+        // disrupt the person's flow.
+        toast.info(result.message ?? "Lead Qualification did not run.");
+      } else if (result.status === "awaiting_approval") {
+        // Deliberately handled separately from the plain-recommendation
+        // branch below, and does NOT close the drawer: this toast has no
+        // "View" action (there is nothing to click, so the
+        // DismissableLayer/pointer-events issue documented below doesn't
+        // apply to it), and the actual approval step still happens
+        // elsewhere (AI Center → Approvals) after this toast — there is no
+        // "operation fully complete" moment here the way there is for a
+        // plain recommendation.
+        toast.success("Lead Qualification drafted a reply — awaiting approval in AI Center.");
+      } else {
+        // No "Activity" tab exists in AI Center — the real place this run
+        // shows up is Test Console → Recent Executions (see
+        // ai-run-inspector.tsx). Navigate the person there directly rather
+        // than making them hunt for a tab that isn't real.
+        //
+        // CONFIRMED root cause of the toast's "View" action being
+        // unclickable while this Sheet is open (see
+        // lead-qualification-toast.ts's own header comment for the full,
+        // source-verified chain): @radix-ui/react-dialog's DialogContentModal
+        // (used whenever a Dialog/Sheet is `modal` — the default, never
+        // overridden by sheet.tsx) renders its DismissableLayer with
+        // `disableOutsidePointerEvents: true` while open, which sets
+        // `document.body.style.pointerEvents = "none"` and re-enables
+        // `pointer-events: auto` ONLY on the dialog's own content node — not
+        // on Sonner's separately-portalled toaster, which never opts itself
+        // back in (no `pointer-events: auto` anywhere in its own CSS) and
+        // isn't registered as a DismissableLayerBranch. The toast inherits
+        // `pointer-events: none` from body and is genuinely unclickable for
+        // as long as this Sheet stays open — this was never a z-index or
+        // aria-hidden issue (both were checked and correctly ruled out
+        // earlier; this is one layer deeper).
+        //
+        // FIX (per product preference): close this Sheet on a true
+        // successful run, THEN show the toast — once the Sheet unmounts,
+        // DismissableLayer's own cleanup restores body's pointer-events,
+        // and the toast (now the only thing on screen) is fully
+        // interactive. shouldCloseLeadDrawerForResult() is the actual
+        // pure decision (see lead-qualification-toast.ts) — only a real,
+        // non-approval-gated "recommendation" result closes the drawer.
+        if (shouldCloseLeadDrawerForResult(result.status)) onOpenChange(false);
+        toast.success(
+          LEAD_QUALIFICATION_TOAST_MESSAGE,
+          buildLeadQualificationSuccessToastOptions((destination) => void navigateToAiCenter(destination)),
+        );
+      }
+    } finally {
+      setRunningAI(false);
+    }
+  };
 
   const convertedDeal = lead.convertedDealId ? allDeals.find((d) => d.id === lead.convertedDealId) ?? null : null;
   const { Icon: ScoreIcon, className: scoreCls } = scoreIcon(lead.score);
@@ -2297,6 +2382,10 @@ function LeadDetailDrawer({
               <FileText className="mr-1.5 h-3.5 w-3.5" />
               Create estimate from template
             </Link>
+          </Button>
+          <Button size="sm" variant="outline" className="w-full" onClick={handleRunLeadQualification} disabled={runningAI}>
+            {runningAI ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Sparkles className="mr-1.5 h-3.5 w-3.5 text-violet-600" />}
+            Run Lead Qualification
           </Button>
           <Button size="sm" variant="ghost" className="w-full text-destructive hover:text-destructive" onClick={() => onDelete(lead)}>
             <Trash2 className="mr-1.5 h-3.5 w-3.5" /> Delete lead

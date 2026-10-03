@@ -17,6 +17,7 @@ import { metaGraphRequest, MetaGraphApiError } from "./meta-graph-api";
 import { getMetaPageAccessToken } from "./meta-page-access";
 import { decryptMetaAccessToken } from "./meta-token-crypto";
 import { shouldRefreshMetaAvatar } from "./meta-avatar-url";
+import { fireLeadCreatedTrigger } from "./ai/lead-created-hook";
 
 const FALLBACK_CONTACT_NAME = "Messenger Contact";
 
@@ -268,15 +269,26 @@ export async function resolveMessengerContactAndLead(
     // this check before either INSERT commits, creating two Leads. This is
     // the strongest safe approach available without a schema change, not a
     // hidden gap.
-    const { error: leadCreateErr } = await supabaseAdmin.from("leads").insert({
-      org_id: orgId,
-      contact_id: contactId,
-      name: contactFullName || FALLBACK_CONTACT_NAME,
-      source: "messenger",
-      status: "new",
-    });
+    const { data: createdLead, error: leadCreateErr } = await supabaseAdmin
+      .from("leads")
+      .insert({
+        org_id: orgId,
+        contact_id: contactId,
+        name: contactFullName || FALLBACK_CONTACT_NAME,
+        source: "messenger",
+        status: "new",
+      })
+      .select("id")
+      .single();
     if (leadCreateErr) {
       console.error("[meta-messenger-crm] lead_create_failed", { orgId, contactId, code: leadCreateErr.code });
+    } else if (createdLead?.id) {
+      // AI-3B: same reasoning as meta-instagram-crm.ts — this lead was
+      // created as a byproduct of the inbound DM being processed right now;
+      // associatedWithInboundMessage:true is a structural no-op today (no
+      // live inbound_lead_message trigger exists yet for Messenger). See
+      // lib/ai/lead-created-hook.ts.
+      await fireLeadCreatedTrigger(orgId, createdLead.id, { contactId, associatedWithInboundMessage: true, actorId: "meta_messenger_inbound" });
     }
   }
 

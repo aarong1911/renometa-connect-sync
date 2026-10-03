@@ -41,6 +41,7 @@ import { z } from "zod";
 import type { AIAgentHandoff, AIChannel, AIChannelEvent, AIResolvedContext } from "../types";
 import type { ModelRequest } from "../providers/model-provider";
 import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines, channelGuidance } from "../prompting";
+import { describeKnownQualificationFields, resolveKnownQualificationFields } from "../lead-trigger";
 
 // ── AI-1K: optional handoff continuity (see orchestrator.ts's "Reception
 // turn") ─────────────────────────────────────────────────────────────────
@@ -218,11 +219,28 @@ export function summarizeToolSuccess(tool: LeadQualificationToolDecision["tool"]
 
 // ── Prompt builders ───────────────────────────────────────────────────────
 
-function buildDecisionSystemInstructions(agentInstructions: string, organizationName: string, channel: AIChannel): string {
+// AI-3A: deterministic "known qualification fields" block — see
+// lib/ai/lead-trigger.ts's own header for why this is computed in code
+// rather than left for the model to infer from raw conversation text.
+// Returns "" (nothing appended) when no fields are known yet, so a
+// brand-new lead's prompt is unchanged from before this pass.
+function buildKnownFieldsBlock(context: AIResolvedContext): string {
+  const known = resolveKnownQualificationFields(context.lead, context.contact);
+  const lines = describeKnownQualificationFields(known);
+  if (lines.length === 0) return "";
+  return [
+    "",
+    "Already known about this lead (from CRM records) — do NOT ask for any of the following again; acknowledge or use it naturally instead:",
+    ...lines.map((l) => `- ${l}`),
+  ].join("\n");
+}
+
+function buildDecisionSystemInstructions(agentInstructions: string, organizationName: string, channel: AIChannel, context: AIResolvedContext): string {
   const guidance = channelGuidance(channel);
   return [
     agentInstructions,
     ...(guidance ? ["", guidance] : []),
+    buildKnownFieldsBlock(context),
     "",
     "You may optionally use ONE of the following tools, or simply respond directly — most turns should simply respond:",
     "- get_lead_context: re-reads the current lead's CRM record, if you need to confirm details beyond what's already provided below.",
@@ -251,7 +269,7 @@ export function buildLeadQualificationDecisionRequest(
   event: AIChannelEvent,
   handoff?: AIAgentHandoff,
 ): ModelRequest {
-  const baseSystem = buildDecisionSystemInstructions(agentInstructions, context.organization.name, context.channel);
+  const baseSystem = buildDecisionSystemInstructions(agentInstructions, context.organization.name, context.channel, context);
   const system = handoff ? `${baseSystem}\n\n${HANDOFF_CONTINUITY_INSTRUCTION}` : baseSystem;
   const contextLines = buildContextLines(context);
   const inboundText = event.content.text?.trim() || "(no message text provided)";
@@ -285,6 +303,7 @@ export function buildLeadQualificationFinalRequest(
   const systemParts = [
     agentInstructions,
     ...(guidance ? ["", guidance] : []),
+    buildKnownFieldsBlock(context),
     "",
     "You just completed an internal action. Do not mention internal tools, notes, or CRM systems to the customer — respond naturally based on what you now know.",
     `Organization: ${context.organization.name}.`,

@@ -118,12 +118,14 @@ function makeDb(rows: any[] = []) {
 }
 
 let seq = 0;
-type Orch = { calls: string[]; fn: any };
+type Orch = { calls: string[]; fn: any; contexts: any[] };
 function makeOrchestrator(opts: { fail?: boolean; onRun?: (db: any) => Promise<void>; throwOnce?: boolean } = {}): Orch {
   const calls: string[] = [];
+  const contexts: any[] = [];
   let threw = false;
   const fn = async (a: any) => {
     calls.push(a.event.content.text);
+    contexts.push(a.trustedContext);
     if (opts.throwOnce && !threw) {
       threw = true;
       throw new Error("simulated orchestrator crash");
@@ -134,7 +136,7 @@ function makeOrchestrator(opts: { fail?: boolean; onRun?: (db: any) => Promise<v
     if (opts.fail) return { status: "failed", executionId, error: "model unavailable" };
     return { status: "completed", executionId, responseText: `reply to: ${a.event.content.text}` };
   };
-  return { calls, fn };
+  return { calls, fn, contexts };
 }
 
 const payload = (org: string, contact: string, id: string) => ({ orgId: org, contactId: contact, phone: "+1", body: id, providerMessageId: `pm-${id}`, inboundMessageId: id });
@@ -634,4 +636,44 @@ test("30. lease reclaim keeps the one-current-pending convergence", async () => 
   assert.equal(pend.length, 1);
   assert.equal(pend[0].metadata.inbound_message_id, "u2");
   assert.equal((await approvals(db, "cancelled")).length, 1);
+});
+
+// ── AI-3B: leadId resolution (best-effort, additive) ────────────────────────
+
+test("17. inbound WhatsApp from a contact with an open lead resolves leadId into trustedContext, so the router can route to Lead Qualification", async () => {
+  const db = makeDb([msg(ORG_A, C1, "wl1", 1)]);
+  await db.from("leads").insert({ id: "lead-open-1", org_id: ORG_A, contact_id: C1, status: "new", created_at: new Date().toISOString() });
+  const orch = makeOrchestrator();
+  await run(db, orch, ORG_A, C1, "wl1");
+  assert.equal(orch.contexts[0].leadId, "lead-open-1");
+});
+
+test("a converted/lost lead is not resolved as 'open' — only new/contacted/qualified count", async () => {
+  const db = makeDb([msg(ORG_A, C1, "wl2", 1)]);
+  await db.from("leads").insert({ id: "lead-closed-1", org_id: ORG_A, contact_id: C1, status: "converted", created_at: new Date().toISOString() });
+  const orch = makeOrchestrator();
+  await run(db, orch, ORG_A, C1, "wl2");
+  assert.equal(orch.contexts[0].leadId, undefined);
+});
+
+test("a lead lookup failure never breaks the existing inbound WhatsApp flow (best-effort only) — still creates exactly one approval", async () => {
+  const inner = makeDb([msg(ORG_A, C1, "wl3", 1)]);
+  const db = { ...inner, from: (t: string) => { if (t === "leads") throw new Error("boom"); return inner.from(t); } };
+  const orch = makeOrchestrator();
+  await run(db, orch, ORG_A, C1, "wl3");
+  assert.equal(orch.contexts[0].leadId, undefined);
+  assert.equal((await pending(db)).length, 1, "the normal WhatsApp reply/approval flow still completes");
+});
+
+test("18+19. leadId resolution does not change coalescing/idempotency: a duplicate provider message and a recovery-style replay still produce exactly one run/approval", async () => {
+  const db = makeDb([msg(ORG_A, C1, "wl4", 1)]);
+  await db.from("leads").insert({ id: "lead-open-2", org_id: ORG_A, contact_id: C1, status: "new", created_at: new Date().toISOString() });
+  const orch = makeOrchestrator();
+  // Duplicate delivery of the same message (webhook retry).
+  await Promise.all([run(db, orch, ORG_A, C1, "wl4"), run(db, orch, ORG_A, C1, "wl4")]);
+  assert.equal(orch.calls.length, 1);
+  // A later "recovery" style redelivery of the SAME already-completed message.
+  await run(db, orch, ORG_A, C1, "wl4");
+  assert.equal(orch.calls.length, 1, "no second run from a replay of an already-completed message");
+  assert.equal((await pending(db)).length, 1);
 });

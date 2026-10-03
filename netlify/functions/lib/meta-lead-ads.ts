@@ -25,6 +25,7 @@ import {
   ensureMetaPageFieldsSubscribed,
 } from "./meta-page-access";
 import { decryptMetaAccessToken } from "./meta-token-crypto";
+import { fireLeadCreatedTrigger } from "./ai/lead-created-hook";
 import {
   parseMetaFieldData,
   normalizeMetaLeadFields,
@@ -600,6 +601,11 @@ export async function processMetaLeadgenEvent(
     return { ok: false, errorCode: "crm_lead_create_failed" };
   }
   const leadId = newLead.id as string;
+
+  // AI-3B: best-effort live Lead Qualification trigger for a genuine ad-form
+  // lead — never blocks or fails this webhook's own processing; see
+  // lib/ai/lead-created-hook.ts for the full contract.
+  await fireLeadCreatedTrigger(orgId, leadId, { contactId, actorId: "meta_lead_ads" });
 
   // Only marked completed AFTER the CRM lead insert above has actually
   // succeeded (Part N: "do not mark processed before CRM writes succeed").

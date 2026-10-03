@@ -13,6 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { AgenticPreviewPanel } from "@/components/ai-center/agentic-preview-panel";
 import { AITestConsole } from "@/components/ai-center/ai-test-console";
 import { AIEmergencyPauseControl } from "@/components/ai-center/ai-emergency-pause-control";
+import { LeadQualificationSettingsControl } from "@/components/ai-center/lead-qualification-settings-control";
 import { AIApprovalsTab } from "@/components/ai-center/ai-approvals-tab";
 import { supabase } from "@/lib/supabase";
 import { useOrgId } from "@/lib/org-id";
@@ -391,6 +392,7 @@ function AgentsPage() {
         </TabsList>
 
         <TabsContent value="agents" className="mt-3 space-y-3">
+          <LeadQualificationSettingsControl />
           {/* KPI cards — honest, real operational counts only */}
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4 mb-3">
             <MetricCard layout="row" className="px-3.5 py-2.5" label="Active agents" value={loading ? "…" : stats.active} icon={Activity} tone="success" />

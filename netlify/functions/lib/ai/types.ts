@@ -255,6 +255,17 @@ export type AILeadSummary = {
    * one string is ever surfaced — the rest of custom_fields is never
    * read into this type. */
   projectType?: string;
+  /** From leads.custom_fields->>'timeline' — the same convention
+   * vapi-webhook.ts's save_lead tool already writes
+   * (`{ service, budget, timeline, address, called_from }`), reused here
+   * rather than inventing a second timeline field. Added for AI-3A so
+   * Lead Qualification can see (and not re-ask) a desired start date
+   * captured by any prior channel, not just its own conversation. */
+  timeline?: string;
+  /** From leads.custom_fields->>'address' — same vapi-webhook.ts
+   * convention as `timeline` above. Service-area/location text, not a
+   * verified/geocoded address. */
+  location?: string;
 };
 
 export type AIProjectSummary = {
