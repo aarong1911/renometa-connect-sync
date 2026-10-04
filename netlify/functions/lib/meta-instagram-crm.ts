@@ -22,6 +22,7 @@ import { metaGraphRequest, MetaGraphApiError } from "./meta-graph-api";
 import { getMetaPageAccessToken } from "./meta-page-access";
 import { decryptMetaAccessToken } from "./meta-token-crypto";
 import { shouldRefreshMetaAvatar } from "./meta-avatar-url";
+import { fireLeadCreatedTrigger } from "./ai/lead-created-hook";
 
 const FALLBACK_CONTACT_NAME = "Instagram Contact";
 
@@ -274,15 +275,26 @@ export async function resolveInstagramContactAndLead(
     // Two genuinely simultaneous first-ever Instagram DMs from the same
     // brand-new sender could both pass this check before either INSERT
     // commits, creating two Leads.
-    const { error: leadCreateErr } = await supabaseAdmin.from("leads").insert({
-      org_id: orgId,
-      contact_id: contactId,
-      name: contactFullName || FALLBACK_CONTACT_NAME,
-      source: "instagram",
-      status: "new",
-    });
+    const { data: createdLead, error: leadCreateErr } = await supabaseAdmin
+      .from("leads")
+      .insert({
+        org_id: orgId,
+        contact_id: contactId,
+        name: contactFullName || FALLBACK_CONTACT_NAME,
+        source: "instagram",
+        status: "new",
+      })
+      .select("id")
+      .single();
     if (leadCreateErr) {
       console.error("[meta-instagram-crm] lead_create_failed", { orgId, contactId, code: leadCreateErr.code });
+    } else if (createdLead?.id) {
+      // AI-3B: this lead was created as a direct byproduct of the inbound DM
+      // being processed right now — associatedWithInboundMessage:true makes
+      // this a structural no-op today (Instagram has no live
+      // inbound_lead_message trigger yet) rather than a second, competing
+      // run once one exists. See lib/ai/lead-created-hook.ts.
+      await fireLeadCreatedTrigger(orgId, createdLead.id, { contactId, associatedWithInboundMessage: true, actorId: "meta_instagram_inbound" });
     }
   }
 

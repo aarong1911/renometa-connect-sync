@@ -62,6 +62,35 @@ async function contactBelongsToOrg(supabase: SupabaseClient, contactId: string, 
   return !!data;
 }
 
+/**
+ * AI-3A. Best-effort: the most recent still-open lead linked to this
+ * contact, if any — populated onto AITrustedContext.leadId below so
+ * ai/router.ts's routeByCrmContext tier can actually route to Lead
+ * Qualification for a WhatsApp contact who has an open lead. Before this
+ * pass, trustedContext.leadId was never set here, so EVERY WhatsApp inbound
+ * message routed to Reception regardless of lead status — see this
+ * module's own report for that finding. Never blocks or fails the existing
+ * flow: any lookup error is swallowed and treated the same as "no lead",
+ * which is exactly today's pre-existing behavior.
+ */
+async function findOpenLeadId(supabase: SupabaseClient, orgId: string, contactId: string): Promise<string | undefined> {
+  try {
+    const { data } = await supabase
+      .from("leads")
+      .select("id")
+      .eq("org_id", orgId)
+      .eq("contact_id", contactId)
+      .in("status", ["new", "contacted", "qualified"])
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    return data?.id ?? undefined;
+  } catch (err) {
+    console.warn("[meta-whatsapp-background] open-lead lookup failed (continuing without leadId):", err);
+    return undefined;
+  }
+}
+
 export type ProcessWhatsAppBackgroundDeps = {
   /** Server-side Supabase client. Production: the real service-role admin
    * client. Tests: scripts/fake-supabase-client.mjs. */
@@ -192,10 +221,13 @@ export async function processWhatsAppBackground(
     // branch via `trustedProposal`, not via this level.
     const EXECUTION_AUTONOMY_LEVEL = 2;
 
+    const leadId = await findOpenLeadId(supabase, orgId, contactId);
+
     const trustedContext: AITrustedContext = {
       orgId,
       actor: { actorType: "workflow", actorId: "whatsapp_inbound", source: "whatsapp_inbound" },
       contactId,
+      leadId,
       conversationKey: `${contactId}::whatsapp`,
       autonomyLevel: EXECUTION_AUTONOMY_LEVEL,
     };

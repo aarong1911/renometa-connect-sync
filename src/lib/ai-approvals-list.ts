@@ -35,6 +35,12 @@ export type ApprovalRow = {
   reviewed_at: string | null;
   expires_at: string | null;
   rejection_reason: string | null;
+  /** AI-3K addition. jsonb — may carry `messageRowId` (the canonical,
+   * direct linkage to the persisted inbound sms_meta_messages row a live
+   * Lead Qualification SMS/WhatsApp approval was created from; see
+   * lead-qualification-dispatch.ts's own approvalMetadata comment).
+   * Older approval rows predating this linkage simply don't have it. */
+  metadata: unknown;
 };
 
 export type ContactSummary = { id: string; name: string; phone: string | null };
@@ -55,6 +61,18 @@ export function readContactId(proposedInput: unknown): string | undefined {
 export function readSmsBody(proposedInput: unknown): string | undefined {
   if (proposedInput && typeof proposedInput === "object") {
     const v = (proposedInput as Record<string, unknown>).body;
+    return typeof v === "string" ? v : undefined;
+  }
+  return undefined;
+}
+
+/** AI-3K. Reads the canonical inbound-message row linkage
+ * (sms_meta_messages.id) from an approval row's `metadata`, when present.
+ * See lead-qualification-dispatch.ts's own approvalMetadata comment for
+ * where this is written. */
+export function readMessageRowId(metadata: unknown): string | undefined {
+  if (metadata && typeof metadata === "object") {
+    const v = (metadata as Record<string, unknown>).messageRowId;
     return typeof v === "string" ? v : undefined;
   }
   return undefined;
@@ -102,7 +120,7 @@ export async function fetchAiApprovalsList(
 ): Promise<ApprovalListResult> {
   let query = client
     .from("agent_approval_requests")
-    .select("id, execution_id, action_key, target_entity_type, target_entity_id, proposed_input, summary, risk_level, status, requested_at, reviewed_at, expires_at, rejection_reason")
+    .select("id, execution_id, action_key, target_entity_type, target_entity_id, proposed_input, summary, risk_level, status, requested_at, reviewed_at, expires_at, rejection_reason, metadata")
     .eq("org_id", orgId)
     .order("requested_at", { ascending: false })
     .limit(RECENT_LIMIT);
@@ -143,12 +161,36 @@ export async function fetchAiApprovalsList(
     }
   }
 
-  // Inbound-message linkage — see ai-twilio-sms-orchestrate-
-  // background.ts's AI-2B addition: sms_meta_messages.meta->>
-  // 'execution_id' is an exact match to the approval's own
-  // execution_id, never a heuristic (timestamp/text) match.
-  const executionIds = new Set(smsRows.map((a) => a.execution_id));
-  const inboundByApproval = new Map<string, InboundMessage | null>();
+  // Inbound-message linkage. TWO resolution paths, checked per-approval —
+  // the new, direct one first, falling back to the existing, indirect one
+  // so neither an older approval row nor WhatsApp's own background
+  // dispatcher (which still only ever sets the OLD linkage, not the new
+  // one) loses its existing display behavior (see this function's own
+  // "preserve backward compatibility" requirement):
+  //
+  //  (a) AI-3K, NEW/canonical: `a.metadata.messageRowId` — set directly by
+  //      lead-qualification-dispatch.ts's approvalMetadata for a live
+  //      Lead Qualification inbound_lead_message SMS approval — a plain,
+  //      org-scoped `sms_meta_messages.id` lookup, no heuristic involved.
+  //  (b) Pre-existing fallback: sms_meta_messages.meta->>'execution_id'
+  //      matched against the approval's own execution_id — see
+  //      meta-whatsapp-background.ts's own linkage write for WhatsApp,
+  //      still the ONLY linkage mechanism that channel's approvals use.
+  const messageRowIds = Array.from(new Set(smsRows.map((a) => readMessageRowId(a.metadata)).filter((x): x is string => !!x)));
+  const byRowId = new Map<string, InboundMessage>();
+  if (messageRowIds.length > 0) {
+    const { data: directRows } = await client
+      .from("sms_meta_messages")
+      .select("id, body, from_address, created_at")
+      .eq("org_id", orgId)
+      .in("id", messageRowIds);
+    for (const row of directRows ?? []) {
+      byRowId.set((row as any).id as string, { body: row.body, from_address: row.from_address, created_at: row.created_at });
+    }
+  }
+
+  const executionIds = new Set(smsRows.filter((a) => !readMessageRowId(a.metadata)).map((a) => a.execution_id));
+  const byExecutionId = new Map<string, InboundMessage>();
   if (executionIds.size > 0) {
     // Filtered in-memory by meta->>execution_id rather than a
     // PostgREST jsonb-arrow `.in()` filter (uncertain cross-version
@@ -163,16 +205,19 @@ export async function fetchAiApprovalsList(
       .in("channel", ["sms", "whatsapp"])
       .order("created_at", { ascending: false })
       .limit(200);
-    const byExecutionId = new Map<string, InboundMessage>();
     for (const row of inboundRows ?? []) {
       const execId = (row as any).meta?.execution_id as string | undefined;
       if (execId && executionIds.has(execId) && !byExecutionId.has(execId)) {
         byExecutionId.set(execId, { body: row.body, from_address: row.from_address, created_at: row.created_at });
       }
     }
-    for (const a of smsRows) {
-      inboundByApproval.set(a.id, byExecutionId.get(a.execution_id) ?? null);
-    }
+  }
+
+  const inboundByApproval = new Map<string, InboundMessage | null>();
+  for (const a of smsRows) {
+    const rowId = readMessageRowId(a.metadata);
+    const resolved = (rowId ? byRowId.get(rowId) : undefined) ?? byExecutionId.get(a.execution_id) ?? null;
+    inboundByApproval.set(a.id, resolved);
   }
 
   const pendingCount = filter === "pending"

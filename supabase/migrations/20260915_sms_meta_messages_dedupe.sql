@@ -11,39 +11,88 @@
 -- produce a second AI run/reply for a retried delivery of the same
 -- inbound message.
 --
--- This adds a unique index on (org_id, provider_message_id) — scoped by
--- org, not global, since provider_message_id (a Twilio MessageSid) is only
--- guaranteed unique within Twilio, and different orgs could in principle
--- use different Twilio (sub)accounts. The webhook inserts the inbound row
--- with provider_message_id = the inbound MessageSid BEFORE doing anything
--- else (dispatching AI orchestration, etc.); a unique-violation on that
--- insert (Postgres error 23505) is treated as "already processed this
--- exact delivery" and the webhook returns success immediately without
--- re-dispatching.
+-- AI-3K AUDIT CORRECTION (pre-apply review, this pass): the original
+-- version of this migration scoped the unique index to (org_id,
+-- provider_message_id) only. sms_meta_messages is NOT a single-provider
+-- table — its own comment in 20260904_meta_schema_baseline.sql says so
+-- explicitly: "Shared inbound/outbound message log for WhatsApp,
+-- Messenger, Instagram Direct, and SMS." provider_message_id is populated
+-- by whichever channel's own ingest path wrote the row — a Twilio
+-- MessageSid for SMS, Meta's own message id for WhatsApp/Messenger/
+-- Instagram. Those are two entirely independent id namespaces with no
+-- guarantee against an accidental format collision (e.g. a test fixture,
+-- a future provider, or a currently-unforeseen id-format change). Without
+-- `channel` in the uniqueness scope, an SMS message and a WhatsApp
+-- message for the SAME org that happened to share a provider_message_id
+-- string would incorrectly collide — the WhatsApp (or SMS) insert would
+-- be rejected as "already processed" when it is a genuinely different
+-- message on a different channel. Corrected to (org_id, channel,
+-- provider_message_id): this is STRICTLY MORE PERMISSIVE than the
+-- original (it only ever allows a combination the original would have
+-- rejected; it never rejects anything the original would have allowed),
+-- so it cannot break any existing behavior that depends on the original
+-- scope — Twilio's own retry-dedupe (always channel = 'sms' on insert,
+-- per ai-twilio-sms-inbound.ts) gets the exact same protection it needed,
+-- scoped correctly instead of coincidentally.
+--
+-- This adds a unique index on (org_id, channel, provider_message_id) —
+-- scoped by org (provider_message_id is only guaranteed unique within a
+-- single provider account, and different orgs could in principle use
+-- different Twilio/Meta (sub)accounts) AND by channel (see correction
+-- above). The webhook inserts the inbound row with provider_message_id =
+-- the inbound MessageSid BEFORE doing anything else (dispatching AI
+-- orchestration, etc.); a unique-violation on that insert (Postgres error
+-- 23505) is treated as "already processed this exact delivery" and the
+-- webhook returns success immediately without re-dispatching.
 --
 -- Partial (`where provider_message_id is not null`): existing/future rows
 -- with no provider_message_id (e.g. a channel or path that doesn't have
 -- one) are never constrained by this index — only rows that do carry one
--- must be unique per org.
+-- must be unique per org+channel. NULL is never considered equal to NULL
+-- by a unique index regardless, but the partial clause documents the
+-- intent explicitly and keeps the index smaller.
 --
 -- Does not touch any other constraint, column, or RLS policy on this
 -- table — see 20260904_meta_schema_baseline.sql for the table's existing
 -- shape, untouched here.
+--
+-- PRE-APPLY PREFLIGHT (run this FIRST, separately, before applying the
+-- CREATE UNIQUE INDEX statement below): if sms_meta_messages already has
+-- duplicate (org_id, channel, provider_message_id) rows today — from
+-- before this dedupe guard existed — `CREATE UNIQUE INDEX` will fail
+-- outright with a unique-violation error rather than silently applying
+-- (a safe failure mode — it will never corrupt data or silently drop
+-- rows — but it DOES mean the migration won't apply until those existing
+-- duplicates are investigated and resolved). Run this query first and
+-- confirm it returns zero rows:
+--
+--   select org_id, channel, provider_message_id, count(*)
+--   from public.sms_meta_messages
+--   where provider_message_id is not null
+--   group by org_id, channel, provider_message_id
+--   having count(*) > 1;
+--
+-- If it returns any rows, do NOT apply the index yet — decide (with the
+-- person who owns this data) which duplicate row(s) to keep/remove before
+-- applying, rather than letting the index creation fail and re-trying
+-- blindly.
 
-create unique index if not exists uq_sms_meta_messages_org_provider_message_id
-  on public.sms_meta_messages (org_id, provider_message_id)
+create unique index if not exists uq_sms_meta_messages_org_channel_provider_message_id
+  on public.sms_meta_messages (org_id, channel, provider_message_id)
   where provider_message_id is not null;
 
-comment on index public.uq_sms_meta_messages_org_provider_message_id is
-  'AI-2A dedupe guard: prevents a retried Twilio webhook delivery (same MessageSid) from producing a second inbound message row / AI run. Partial — only applies to rows with a non-null provider_message_id.';
+comment on index public.uq_sms_meta_messages_org_channel_provider_message_id is
+  'AI-2A/AI-3K dedupe guard: prevents a retried provider webhook delivery (same provider_message_id, e.g. a Twilio MessageSid or a Meta message id) from producing a second inbound message row / AI run. Scoped to (org_id, channel, provider_message_id) — NOT just (org_id, provider_message_id) — because this table is shared across SMS/WhatsApp/Messenger/Instagram, and provider_message_id is only unique WITHIN one channel''s own provider id namespace. Partial — only applies to rows with a non-null provider_message_id.';
 
 -- ── Verification (run after applying) ──────────────────────────────────
 -- 1. Index exists:
 -- select indexname, indexdef from pg_indexes
---   where schemaname = 'public' and tablename = 'sms_meta_messages' and indexname = 'uq_sms_meta_messages_org_provider_message_id';
+--   where schemaname = 'public' and tablename = 'sms_meta_messages' and indexname = 'uq_sms_meta_messages_org_channel_provider_message_id';
 --
 -- 2. No existing rows already violate it (should be empty — if this
---    returns rows, investigate before relying on the index for dedupe):
--- select org_id, provider_message_id, count(*) from public.sms_meta_messages
+--    returns rows, investigate before relying on the index for dedupe;
+--    this is the SAME query as the pre-apply preflight above, safe to
+--    re-run after applying too):
+-- select org_id, channel, provider_message_id, count(*) from public.sms_meta_messages
 --   where provider_message_id is not null
---   group by org_id, provider_message_id having count(*) > 1;
+--   group by org_id, channel, provider_message_id having count(*) > 1;

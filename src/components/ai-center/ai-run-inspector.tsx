@@ -35,7 +35,7 @@
 // visible here, without a new table, a step/approval list, or any other
 // redesign of this file.
 
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -44,6 +44,8 @@ import { cn } from "@/lib/utils";
 import { supabase } from "@/lib/supabase";
 import { getOrgId } from "@/lib/contacts-store";
 import { formatEstimatedCostUsd } from "@/lib/agentic/usage";
+import { RUN_INSPECTOR_SOURCES, isRunInspectorRuntimeRow } from "@/lib/agentic/run-inspector-predicate";
+import { toggleExecutionSelection, isRowExpanded } from "@/components/ai-center/run-inspector-selection";
 
 // ── Local mirror types for the jsonb columns (see file header) ─────────
 
@@ -273,15 +275,28 @@ export function AIRunInspector({ refreshSignal }: { refreshSignal?: number }) {
         //
         // AI-2E addition: "whatsapp_inbound" is the real WhatsApp channel
         // adapter (ai-whatsapp-orchestrate-background.ts) — same reasoning.
-        // Forgetting to add a new channel's actor.source value here is a
-        // silent-omission failure mode (executions would simply never
-        // appear, no error) — see this pass's own report.
-        .in("source", ["ai_orchestrate_http", "twilio_inbound_sms", "whatsapp_inbound"])
+        //
+        // AI-3D addition: "manual_run" / "lead_created" /
+        // "inbound_lead_message" are live Lead Qualification's sources
+        // (lead-qualification-dispatch.ts). These are the ONE case where a
+        // source can also be written by an internal claim/idempotency row
+        // (claimTrigger()), not just a real runtime row — excluded below via
+        // isRunInspectorRuntimeRow(), see run-inspector-predicate.ts for the
+        // full reasoning. Forgetting to add a new channel's actor.source
+        // value here is a silent-omission failure mode (executions would
+        // simply never appear, no error) — see this pass's own report.
+        .in("source", RUN_INSPECTOR_SOURCES)
+        .not("started_at", "is", null)
         .eq("org_id", orgId)
         .order("created_at", { ascending: false })
         .limit(RECENT_EXECUTIONS_LIMIT);
 
-      const rows = (executionRows ?? []) as ExecutionRow[];
+      // Defense in depth: the query above already excludes claim rows via
+      // `.not("started_at", "is", null)`, but re-apply the same pure
+      // predicate client-side so this view can never regress into showing a
+      // claim row even if the query above is ever loosened without noticing
+      // this constraint.
+      const rows = ((executionRows ?? []) as ExecutionRow[]).filter(isRunInspectorRuntimeRow);
       setExecutions(rows);
 
       const ids = rows.map((r) => r.id);
@@ -314,8 +329,6 @@ export function AIRunInspector({ refreshSignal }: { refreshSignal?: number }) {
 
   useEffect(() => { void load(); }, [load, refreshSignal]);
 
-  const selected = executions.find((e) => e.id === selectedId) ?? null;
-
   return (
     <div className="space-y-3">
       <Card className="p-4">
@@ -337,38 +350,56 @@ export function AIRunInspector({ refreshSignal }: { refreshSignal?: number }) {
           <div className="space-y-1.5">
             {executions.map((row) => {
               const input = asRunInputSummary(row.input_summary);
+              const isExpanded = isRowExpanded(selectedId, row.id);
+              const detailId = `execution-detail-${row.id}`;
               return (
-                <button
-                  type="button"
-                  key={row.id}
-                  onClick={() => setSelectedId(row.id === selectedId ? null : row.id)}
-                  className={cn(
-                    "flex w-full items-center justify-between gap-2 rounded-md border border-border p-2.5 text-left transition-colors hover:bg-secondary/40",
-                    "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-                    row.id === selectedId && "border-primary/40 bg-primary-soft",
+                // A Fragment, not a single <button>, so the expanded detail
+                // renders as a SIBLING immediately after this row's own
+                // button — never nested inside it. ExecutionDetail has no
+                // interactive controls today, but nesting a whole detail
+                // card inside a <button> would still be invalid/fragile
+                // markup (a button's content should be simple, and any
+                // future interactive addition inside ExecutionDetail would
+                // produce actual invalid nested-button/nested-interactive
+                // HTML) — sibling placement avoids that risk entirely while
+                // still visually reading as "attached to this row."
+                <Fragment key={row.id}>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedId((current) => toggleExecutionSelection(current, row.id))}
+                    aria-expanded={isExpanded}
+                    aria-controls={detailId}
+                    className={cn(
+                      "flex w-full items-center justify-between gap-2 rounded-md border border-border p-2.5 text-left transition-colors hover:bg-secondary/40",
+                      "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                      isExpanded && "rounded-b-none border-primary/40 bg-primary-soft",
+                    )}
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <StatusBadge status={row.status} />
+                        <span className="truncate text-xs font-medium capitalize">{formatAgentKey(row.agent_key)}</span>
+                      </div>
+                      <div className="mt-1 text-[10.5px] text-muted-foreground">
+                        {formatDateTime(row.started_at)}
+                        {input.channel && <> · {input.channel}</>}
+                      </div>
+                    </div>
+                    <div className="shrink-0 text-[10.5px] tabular-nums text-muted-foreground">
+                      {formatEstimatedCostUsd(row.cost_usd_estimated ?? 0)}
+                    </div>
+                  </button>
+                  {isExpanded && (
+                    <div id={detailId} className="-mt-1.5 rounded-b-md border border-t-0 border-primary/40 bg-primary-soft/40 p-2.5">
+                      <ExecutionDetail row={row} usage={usageByExecution.get(row.id)} />
+                    </div>
                   )}
-                >
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <StatusBadge status={row.status} />
-                      <span className="truncate text-xs font-medium capitalize">{formatAgentKey(row.agent_key)}</span>
-                    </div>
-                    <div className="mt-1 text-[10.5px] text-muted-foreground">
-                      {formatDateTime(row.started_at)}
-                      {input.channel && <> · {input.channel}</>}
-                    </div>
-                  </div>
-                  <div className="shrink-0 text-[10.5px] tabular-nums text-muted-foreground">
-                    {formatEstimatedCostUsd(row.cost_usd_estimated ?? 0)}
-                  </div>
-                </button>
+                </Fragment>
               );
             })}
           </div>
         )}
       </Card>
-
-      {selected && <ExecutionDetail row={selected} usage={usageByExecution.get(selected.id)} />}
     </div>
   );
 }
@@ -381,7 +412,11 @@ function ExecutionDetail({ row, usage }: { row: ExecutionRow; usage?: UsageInfo 
   const handoff = getValidHandoff(input.handoff);
 
   return (
-    <Card className="space-y-4 p-4">
+    // No outer Card here — this now renders inline directly beneath its own
+    // execution row (see the Fragment wrapper in AIRunInspector's list),
+    // which already supplies the surrounding border/background. Rendering
+    // another Card here would double up the border/shadow.
+    <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-semibold">Execution Details</h3>
         <StatusBadge status={row.status} />
@@ -496,6 +531,6 @@ function ExecutionDetail({ row, usage }: { row: ExecutionRow; usage?: UsageInfo 
           </p>
         </div>
       )}
-    </Card>
+    </div>
   );
 }

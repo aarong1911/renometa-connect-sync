@@ -28,10 +28,21 @@
 // it was removed cleanly rather than kept as a second, competing source —
 // this file no longer reads `integration_settings` at all.
 //
-// This is deliberately ORG-LEVEL ONLY today — `agentKey` is accepted in
-// this file's params for forward compatibility with a future per-agent
-// policy source (a small dedicated table keyed by (org_id, agent_key)
-// would be the right shape for that), but nothing reads it yet.
+// AI-3A UPDATE: `agentKey` is no longer inert. Rather than adding the
+// "small dedicated table keyed by (org_id, agent_key)" this comment used
+// to defer to, a per-agent override is stored as a nested object on the
+// SAME jsonb column — `ai_center_settings.agents.<agentKey>` — a partial
+// AgentPolicy merged OVER the org-wide settings, which are themselves
+// merged over DEFAULT_AGENT_POLICY (see resolveAgentPolicy). No migration:
+// `ai_center_settings` already exists and already stores arbitrary keys.
+// `emergencyPaused` and `enforceOptOut` are NEVER read from the per-agent
+// block — those stay org-wide-only safety switches; a per-agent override
+// can only narrow behavior for that agent (a lower autonomy level, a
+// smaller channel list, disabling it outright via `agentsEnabled: false`),
+// never re-enable something the org-wide settings or the emergency pause
+// already turned off. Existing callers that never pass `agentKey`
+// (action-executor.ts's own two call sites) are completely unaffected —
+// this is additive, not a behavior change to the org-wide-only path.
 //
 // ── DEPLOYMENT ORDERING (read before deploying) ──────────────────────────
 //
@@ -63,8 +74,10 @@ export type ResolveExecutionPolicyParams = {
    * verified source (e.g. resolve-org.ts). NEVER derived from a model,
    * tool argument, or request body. */
   orgId: string;
-  /** Reserved for a future per-agent policy source — not read from
-   * anywhere today; see this file's header. */
+  /** When supplied, an `ai_center_settings.agents.<agentKey>` override (if
+   * present) is merged over the org-wide policy — see this file's header.
+   * Omitted (or a key with no stored override): identical to today's
+   * org-wide-only behavior. */
   agentKey?: string;
 };
 
@@ -95,7 +108,7 @@ export type ResolveExecutionPolicyParams = {
  * resolveAgentPolicy()'s own `=== true` check.
  */
 export async function resolveExecutionPolicy(params: ResolveExecutionPolicyParams): Promise<AgentPolicy> {
-  const { supabase, orgId } = params;
+  const { supabase, orgId, agentKey } = params;
 
   const { data, error } = await supabase
     .from("organizations")
@@ -111,6 +124,19 @@ export async function resolveExecutionPolicy(params: ResolveExecutionPolicyParam
     return resolveAgentPolicy({ emergencyPaused: true });
   }
 
-  const aiCenterSettings = (data?.ai_center_settings ?? {}) as Partial<AgentPolicy>;
-  return resolveAgentPolicy(aiCenterSettings);
+  const aiCenterSettings = (data?.ai_center_settings ?? {}) as Partial<AgentPolicy> & {
+    agents?: Record<string, Partial<AgentPolicy>>;
+  };
+  const orgPolicy = resolveAgentPolicy(aiCenterSettings);
+  if (!agentKey) return orgPolicy;
+
+  const agentOverride = aiCenterSettings.agents?.[agentKey];
+  if (!agentOverride || typeof agentOverride !== "object") return orgPolicy;
+
+  // Merge the per-agent override over the org-wide policy — never the
+  // reverse, and never allowed to touch the two safety-critical fields
+  // (resolveAgentPolicy's own `=== true`/hardcoded-true handling already
+  // guarantees this for `emergencyPaused`/`enforceOptOut` even if a stored
+  // agent override tried to include them).
+  return resolveAgentPolicy({ ...orgPolicy, ...agentOverride });
 }

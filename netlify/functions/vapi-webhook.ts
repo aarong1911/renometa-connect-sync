@@ -36,6 +36,7 @@ import {
 } from './lib/voice-call-audit';
 import { normalizeServiceTitle } from './lib/voice-crm';
 import { getAppConfig } from './lib/app-config-store';
+import { fireLeadCreatedTrigger } from './lib/ai/lead-created-hook';
 
 // ─────────────────────────────────────────────
 // Supabase client — service role bypasses RLS
@@ -766,6 +767,12 @@ async function upsertLead(params: {
     .single();
 
   if (error) logError('upsertLead', 'insert failed', error);
+  // AI-3B: best-effort live Lead Qualification trigger for a genuine new
+  // lead just created from a completed voice call — a real, standalone
+  // creation event (voice is not one of the live inbound-message channels,
+  // so there is no competing inbound_lead_message trigger to suppress
+  // this for). Never blocks or fails this webhook's own processing.
+  if (newLead?.id) await fireLeadCreatedTrigger(tenantId, newLead.id, { contactId, actorId: 'vapi_voice' });
   return newLead?.id ?? null;
 }
 
