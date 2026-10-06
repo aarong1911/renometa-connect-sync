@@ -42,7 +42,11 @@ await esbuild.build({
   format: "esm",
   logLevel: "error",
   alias: { "@": path.join(repoRoot, "src") },
-  external: ["nodemailer", "@supabase/supabase-js"],
+  // Scheduling foundation: see meta-whatsapp-coalesce.test.ts's identical
+  // comment — this chain now transitively reaches nodemailer via
+  // handlers.ts's schedule_appointment post-booking lifecycle call.
+  external: ["@supabase/supabase-js"],
+  banner: { js: "import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);" },
   define: {
     "import.meta.env.VITE_SUPABASE_URL": '"https://fake.supabase.co"',
     "import.meta.env.VITE_SUPABASE_ANON_KEY": '"fake"',
@@ -400,7 +404,8 @@ test("R16e. the real handler answers 403 before any DB or network work unless th
     format: "esm",
     logLevel: "error",
     alias: { "@": path.join(repoRoot, "src") },
-    external: ["nodemailer"],
+    // nodemailer bundled directly here too now (see this file's other
+    // esbuild.build call for the full comment) — no longer external.
     banner: { js: "import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);" },
   });
   const { handler }: any = await import(pathToFileURL(path.join(handlerDir, "handler.mjs")).href);

@@ -37,7 +37,16 @@ async function bundle(entry: string, outfile: string, extraExternal: string[] = 
     format: "esm",
     logLevel: "error",
     alias: { "@": path.join(repoRoot, "src") },
-    external: ["nodemailer", "@supabase/supabase-js", ...extraExternal],
+    // Scheduling foundation: lead-qualification-background.ts ->
+    // lead-qualification-dispatch.ts -> action-executor.ts -> handlers.ts
+    // now transitively imports appointment-post-booking.ts -> nodemailer
+    // (the schedule_appointment handler's post-booking lifecycle call).
+    // No longer marked external (this outDir has no node_modules to
+    // resolve it from) — bundled directly, with the banner below as
+    // nodemailer's own CJS `require("events")` escape hatch under
+    // esbuild's ESM output format.
+    external: ["@supabase/supabase-js", ...extraExternal],
+    banner: { js: "import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);" },
   });
   return import(pathToFileURL(path.join(outDir, outfile)).href);
 }
@@ -190,7 +199,8 @@ test("4. the real handler rejects an invalid/missing internal secret BEFORE touc
     format: "esm",
     logLevel: "error",
     alias: { "@": path.join(repoRoot, "src") },
-    external: ["nodemailer"],
+    // nodemailer is bundled directly here too now (see the shared
+    // bundle() helper's own comment above) — no longer external.
     banner: { js: "import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);" },
   });
   const { handler }: any = await import(pathToFileURL(path.join(handlerDir, "handler.mjs")).href);

@@ -28,6 +28,7 @@ import { z } from "zod";
 import type { ActionDefinition } from "./types";
 import {
   getLeadContext, createFollowUpTask, addInternalNote, draftCustomerReply, sendSms, sendWhatsapp,
+  scheduleAppointment, getAvailability, getAppointmentTypes,
 } from "./handlers";
 
 // ── Zod input schemas ────────────────────────────────────────────────────
@@ -93,12 +94,48 @@ const sendEmailInput = z.object({
   body: z.string().min(1).max(20000),
 });
 
+// Scheduling foundation — Phase 3. Widened from the original placeholder
+// ({contactId, startsAt, durationMinutes, title}) to match the real
+// appointments schema (Phase 10.3) and the full safety requirements of
+// handlers.ts's scheduleAppointment(). appointmentType is now REQUIRED
+// (no silent "consultation" default at the action-input level — the
+// Calendar UI's own default-to-consultation behavior for a legacy null
+// row is a DISPLAY fallback, not something a new AI-proposed booking
+// should inherit implicitly). orgId is never a field here — it is always
+// ctx.orgId, server-resolved, exactly like every other action.
+//
+// CODE-REVIEW CORRECTION: this schema previously also accepted an
+// optional `timeZone` override field, intended as "explicit override
+// only, validated by the handler" — but nothing actually prevented a
+// model-controlled caller from supplying ANY valid IANA zone, silently
+// overriding the one authoritative source (organizations.timezone) the
+// architecture decision for this slice requires. There is no legitimate
+// need for a per-booking timezone override in this product today (every
+// appointment, across every existing creation path — Voice, Calendar,
+// manual — resolves to the SAME org-wide timezone) — removed entirely
+// rather than gated, per the explicit "the model should not be able to
+// override org timezone" safety posture. The handler now ALWAYS resolves
+// organizations.timezone itself, with no override path of any kind.
 const scheduleAppointmentInput = z.object({
   contactId: z.string().uuid(),
   startsAt: z.string().datetime(),
   durationMinutes: z.number().int().positive().max(480),
+  appointmentType: z.enum(["consultation", "estimate", "site_visit", "service", "follow_up", "internal", "other"]),
   title: z.string().min(1).max(200),
+  assignedTo: z.string().uuid().nullable().optional(),
+  entityType: z.enum(["lead", "contact", "company", "deal", "project"]).nullable().optional(),
+  entityId: z.string().uuid().nullable().optional(),
+  location: z.string().max(500).nullable().optional(),
 });
+
+const getAvailabilityInput = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected YYYY-MM-DD"),
+  durationMinutes: z.number().int().positive().max(480),
+  assignedTo: z.string().uuid().nullable().optional(),
+  appointmentType: z.enum(["consultation", "estimate", "site_visit", "service", "follow_up", "internal", "other"]).nullable().optional(),
+});
+
+const getAppointmentTypesInput = z.object({});
 
 // ── Registry ─────────────────────────────────────────────────────────────
 
@@ -343,17 +380,61 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition<any, any>> = {
   schedule_appointment: {
     key: "schedule_appointment",
     displayName: "Schedule appointment",
-    description: "Proposes booking an appointment with a contact.",
+    description: "Proposes booking an appointment with a contact. Availability is re-validated immediately before the appointment is actually created — never trusted from proposal time.",
     category: "scheduling",
     riskLevel: "high",
     supportedActorTypes: ["user", "agent", "workflow"],
     inputSchema: scheduleAppointmentInput,
     requiresApproval: true,
-    minimumAutonomyLevel: 3,
+    // Scheduling foundation: lowered from 3 to 2 — this slice uses Level 2
+    // (propose, human-approved) as the mutation floor, matching
+    // send_sms/send_whatsapp's own "requires approval regardless of
+    // autonomy level" posture. requiresApproval is unconditionally true
+    // above regardless of this value, so lowering it does NOT enable any
+    // auto-booking — Level 3 (deterministic auto-booking, no approval) is
+    // explicitly NOT implemented this phase; see handlers.ts's
+    // scheduleAppointment() for why human approval remains mandatory.
+    minimumAutonomyLevel: 2,
     idempotent: true,
     timeoutMs: 8000,
     retryPolicy: DEFAULT_RETRY,
-    isExecutable: false,
+    // Scheduling foundation — Phase 3: now a real, wired handler. Reuses
+    // the EXISTING agent_action_idempotency mechanism (action-executor.ts)
+    // for duplicate-execution protection — no new idempotency framework.
+    isExecutable: true,
+    handler: scheduleAppointment,
+  },
+  get_availability: {
+    key: "get_availability",
+    displayName: "Get availability",
+    description: "Reads candidate open appointment slots for a given day. Read-only — never mutates, never contacts the customer.",
+    category: "scheduling",
+    riskLevel: "read",
+    supportedActorTypes: ["user", "agent", "workflow", "system"],
+    inputSchema: getAvailabilityInput,
+    requiresApproval: false,
+    minimumAutonomyLevel: 1,
+    idempotent: true,
+    timeoutMs: 8000,
+    retryPolicy: DEFAULT_RETRY,
+    isExecutable: true,
+    handler: getAvailability,
+  },
+  get_appointment_types: {
+    key: "get_appointment_types",
+    displayName: "Get appointment types",
+    description: "Reads the organization's canonical set of appointment types. Read-only.",
+    category: "scheduling",
+    riskLevel: "read",
+    supportedActorTypes: ["user", "agent", "workflow", "system"],
+    inputSchema: getAppointmentTypesInput,
+    requiresApproval: false,
+    minimumAutonomyLevel: 1,
+    idempotent: true,
+    timeoutMs: 8000,
+    retryPolicy: DEFAULT_RETRY,
+    isExecutable: true,
+    handler: getAppointmentTypes,
   },
   send_sms: {
     key: "send_sms",
