@@ -1,6 +1,16 @@
-// netlify/functions/agent-approve-action.test.ts
+// tests/netlify-functions/agent-approve-action.test.ts
 //
-// Run:  node --test netlify/functions/agent-approve-action.test.ts
+// Run:  node --test tests/netlify-functions/agent-approve-action.test.ts
+//
+// Moved here from netlify/functions/agent-approve-action.test.ts (PR #16
+// deploy-failure fix): Netlify was treating that root-level *.test.ts file
+// as a deployable function entrypoint, and its top-level await/import.meta
+// test harness failed Netlify's own function bundling. Netlify's functions
+// directory holds deployable root function entrypoints only — test files
+// for those functions belong in tests/netlify-functions/ instead, matching
+// this repo's existing precedent (see gmail-sync.test.ts in this same
+// directory). Production source is now referenced explicitly from
+// repoRoot rather than assumed to live beside this file.
 //
 // Scheduling foundation — code-review pass. This file previously had ZERO
 // test coverage. Added here specifically to cover the two real findings
@@ -38,13 +48,17 @@ process.env.SUPABASE_URL = process.env.SUPABASE_URL || "http://127.0.0.1:1";
 process.env.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "test-key";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+// tests/netlify-functions/ -> repo root is two levels up (verified, not
+// assumed — see this file's own test run above and the repoRoot-based
+// path assertions below, all of which pass against the real repo layout).
 const repoRoot = path.resolve(here, "..", "..");
+const productionSourcePath = path.join(repoRoot, "netlify/functions/agent-approve-action.ts");
 const outDir = mkdtempSync(path.join(tmpdir(), "agent-approve-action-"));
 after(() => rmSync(outDir, { recursive: true, force: true }));
 
 const esbuild = createRequire(createRequire(import.meta.url).resolve("vite/package.json"))("esbuild");
 await esbuild.build({
-  entryPoints: [path.join(here, "agent-approve-action.ts")],
+  entryPoints: [productionSourcePath],
   outfile: path.join(outDir, "subject.mjs"),
   bundle: true,
   platform: "node",
@@ -79,7 +93,7 @@ test("an unrecognized action key still fails closed with the generic message (un
 // ── source wiring: the post-booking lifecycle is called from THIS file ──
 
 test("the post-booking lifecycle is invoked from agent-approve-action.ts (not from handlers.ts), gated on actionKey === 'schedule_appointment', and only after verification", () => {
-  const source = readFileSync(path.join(here, "agent-approve-action.ts"), "utf8");
+  const source = readFileSync(productionSourcePath, "utf8");
   assert.ok(source.includes('import { runAppointmentPostBookingLifecycle } from "./lib/appointment-post-booking"'), "expected a direct import of the real lifecycle function");
   assert.ok(source.includes('if (approval.action_key === "schedule_appointment")'), "expected the lifecycle call to be gated on this exact action key");
   assert.ok(source.includes("runAppointmentPostBookingLifecycle(supabaseAdmin, { appointmentId, orgId })"), "expected the real call with the real appointmentId/orgId");
@@ -94,7 +108,7 @@ test("the post-booking lifecycle is invoked from agent-approve-action.ts (not fr
 });
 
 test("a post-booking lifecycle failure can never prevent the approval from being marked executed (Section 12: lifecycle failure must not un-verify an already-proven booking)", () => {
-  const source = readFileSync(path.join(here, "agent-approve-action.ts"), "utf8");
+  const source = readFileSync(productionSourcePath, "utf8");
 
   // The lifecycle call must be wrapped in its own .catch(...) — any
   // rejection is swallowed (logged) right there, so it can never
