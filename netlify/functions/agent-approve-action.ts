@@ -84,7 +84,7 @@ function logCheckpoint(checkpoint: string, fields: Record<string, unknown>) {
 // (and, structurally, any future approval-required action) now gets its
 // own correct treatment instead of silently falling through
 // create_follow_up_task's assumptions.
-export function idempotencyKeyFor(actionKey: string, approval: { target_entity_id?: string | null; requested_at: string; execution_id: string }): string | undefined {
+export function idempotencyKeyFor(actionKey: string, approval: { id: string; target_entity_id?: string | null; requested_at: string; execution_id: string }): string | undefined {
   if (actionKey === "create_follow_up_task") {
     return `create_follow_up_task:v2:${approval.target_entity_id}:${new Date(approval.requested_at).toISOString().slice(0, 10)}`;
   }
@@ -107,6 +107,33 @@ export function idempotencyKeyFor(actionKey: string, approval: { target_entity_i
     // approve click had no protection against sending the same WhatsApp
     // message twice via the Meta Cloud API.
     return `whatsapp_reply:${approval.execution_id}`;
+  }
+  if (actionKey === "schedule_appointment") {
+    // Scheduling foundation — hardening pass. Same-approval double-click
+    // is already protected independently by approveRequest()'s own atomic
+    // `pending -> approved` conditional UPDATE (a second decision on the
+    // same approvalId can never reach executeApprovedStep() at all — see
+    // src/lib/agentic/approvals.ts). This case exists so schedule_
+    // appointment uses the SAME agent_action_idempotency mechanism every
+    // other approval-required executable action uses, consistently,
+    // before any future second trigger path for this action key exists
+    // (e.g. a Scheduling Agent handoff) — belt-and-suspenders, not a fix
+    // for a currently-exploitable duplicate-booking bug.
+    //
+    // Keyed on the approval's own id, NOT on appointment content
+    // (contactId/startsAt/title/duration): two DISTINCT approvals can
+    // legitimately propose identical appointment details (e.g. the same
+    // slot re-offered after a prior one expired) and must remain two
+    // separate, independently decidable proposals — collapsing on content
+    // would silently merge them. The approval id is already the exact
+    // identity this decision is being made about, is stable across any
+    // HTTP retry/response-loss retry of the SAME decision (the client
+    // retries with the same approvalId, never a new one), and the
+    // agent_action_idempotency table's own `unique(org_id, action_key,
+    // idempotency_key)` constraint already provides cross-org/cross-action
+    // collision safety — nothing further needs to be embedded in the key
+    // itself.
+    return `schedule_appointment:${approval.id}`;
   }
   return undefined;
 }
