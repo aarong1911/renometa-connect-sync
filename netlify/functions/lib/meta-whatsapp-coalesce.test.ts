@@ -45,7 +45,15 @@ await esbuild.build({
   format: "esm",
   logLevel: "error",
   alias: { "@": path.join(repoRoot, "src") },
-  external: ["nodemailer", "@supabase/supabase-js"],
+  // Scheduling foundation: this chain reaches action-executor.ts ->
+  // handlers.ts, which now transitively imports appointment-post-
+  // booking.ts -> nodemailer (the schedule_appointment handler's
+  // post-booking lifecycle call). No longer marked external (this outDir
+  // has no node_modules to resolve it from) — bundled directly, with the
+  // banner below as nodemailer's own CJS `require("events")` escape hatch
+  // under esbuild's ESM output format.
+  external: ["@supabase/supabase-js"],
+  banner: { js: "import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);" },
   define: {
     "import.meta.env.VITE_SUPABASE_URL": '"https://fake.supabase.co"',
     "import.meta.env.VITE_SUPABASE_ANON_KEY": '"fake"',

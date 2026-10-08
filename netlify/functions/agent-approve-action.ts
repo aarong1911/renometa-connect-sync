@@ -20,6 +20,15 @@ import { approveRequest, rejectRequest, markApprovalExecuted } from "../../src/l
 import { executeApprovedStep } from "../../src/lib/agentic/action-executor";
 import type { Actor } from "../../src/lib/agentic/types";
 import { resolveOrgAndAuthority } from "./lib/resolve-org";
+// Scheduling foundation (code-review correction): the post-booking
+// lifecycle (confirmation email + owner/assignee notification) for a
+// newly-created appointment is invoked HERE, not from inside
+// src/lib/agentic/handlers.ts's scheduleAppointment() — see that file's
+// own header for why (keeps src/lib/agentic free of a Node-only
+// nodemailer dependency). This file already lives on the
+// netlify/functions/ side, the same side appointment-post-booking.ts
+// lives on — a normal, same-direction import.
+import { runAppointmentPostBookingLifecycle } from "./lib/appointment-post-booking";
 
 const DEBUG_VERSION = "agentic-task-linkage-v1";
 const serviceRoleConfigured = !!process.env.SUPABASE_URL && !!process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -75,7 +84,7 @@ function logCheckpoint(checkpoint: string, fields: Record<string, unknown>) {
 // (and, structurally, any future approval-required action) now gets its
 // own correct treatment instead of silently falling through
 // create_follow_up_task's assumptions.
-export function idempotencyKeyFor(actionKey: string, approval: { target_entity_id?: string | null; requested_at: string; execution_id: string }): string | undefined {
+export function idempotencyKeyFor(actionKey: string, approval: { id: string; target_entity_id?: string | null; requested_at: string; execution_id: string }): string | undefined {
   if (actionKey === "create_follow_up_task") {
     return `create_follow_up_task:v2:${approval.target_entity_id}:${new Date(approval.requested_at).toISOString().slice(0, 10)}`;
   }
@@ -98,6 +107,33 @@ export function idempotencyKeyFor(actionKey: string, approval: { target_entity_i
     // approve click had no protection against sending the same WhatsApp
     // message twice via the Meta Cloud API.
     return `whatsapp_reply:${approval.execution_id}`;
+  }
+  if (actionKey === "schedule_appointment") {
+    // Scheduling foundation — hardening pass. Same-approval double-click
+    // is already protected independently by approveRequest()'s own atomic
+    // `pending -> approved` conditional UPDATE (a second decision on the
+    // same approvalId can never reach executeApprovedStep() at all — see
+    // src/lib/agentic/approvals.ts). This case exists so schedule_
+    // appointment uses the SAME agent_action_idempotency mechanism every
+    // other approval-required executable action uses, consistently,
+    // before any future second trigger path for this action key exists
+    // (e.g. a Scheduling Agent handoff) — belt-and-suspenders, not a fix
+    // for a currently-exploitable duplicate-booking bug.
+    //
+    // Keyed on the approval's own id, NOT on appointment content
+    // (contactId/startsAt/title/duration): two DISTINCT approvals can
+    // legitimately propose identical appointment details (e.g. the same
+    // slot re-offered after a prior one expired) and must remain two
+    // separate, independently decidable proposals — collapsing on content
+    // would silently merge them. The approval id is already the exact
+    // identity this decision is being made about, is stable across any
+    // HTTP retry/response-loss retry of the SAME decision (the client
+    // retries with the same approvalId, never a new one), and the
+    // agent_action_idempotency table's own `unique(org_id, action_key,
+    // idempotency_key)` constraint already provides cross-org/cross-action
+    // collision safety — nothing further needs to be embedded in the key
+    // itself.
+    return `schedule_appointment:${approval.id}`;
   }
   return undefined;
 }
@@ -162,6 +198,27 @@ export function verifyActionSuccess(actionKey: string, realResult: Record<string
       verified: false,
       reason: "Handler completed without a verifiable WhatsApp provider message id.",
       publicError: "Could not verify the message was sent. Please try again.",
+    };
+  }
+
+  if (actionKey === "schedule_appointment") {
+    // Scheduling foundation — the real appointments.id returned by
+    // handlers.ts's scheduleAppointment(), the same proof-of-success
+    // pattern as create_follow_up_task's taskId above. A "succeeded"
+    // status with no id is never trusted.
+    //
+    // CODE-REVIEW FINDING: before this case existed, every schedule_
+    // appointment approval would have fallen through to the "unknown
+    // action key" fail-closed branch below and been reported as a FAILED
+    // approval despite the appointment having actually been created —
+    // this case was missing from the original implementation, found and
+    // fixed in this same pass, before anything was committed.
+    const appointmentId = realResult?.appointmentId;
+    if (typeof appointmentId === "string" && appointmentId.length > 0) return { verified: true };
+    return {
+      verified: false,
+      reason: "Handler completed without a verifiable appointment id.",
+      publicError: "Could not verify the appointment was created. Please try again.",
     };
   }
 
@@ -304,6 +361,26 @@ export const handler: Handler = async (event) => {
       approvalId: reqBody.approvalId, executionId: approval.execution_id, stepId: approval.execution_step_id,
       actionKey: approval.action_key, alreadyExecuted: isDuplicateOfRealExecution,
     });
+
+    // Scheduling foundation: post-booking lifecycle (confirmation email +
+    // owner/assignee notification) for a newly-verified schedule_appointment
+    // execution. Safe to call on BOTH a real first execution and a
+    // duplicate-suppressed replay (isDuplicateOfRealExecution) — the
+    // lifecycle is itself idempotent (appointments.metadata.
+    // confirmation_email_sent_at / owner_notified guards — see that
+    // module's own header), so a retry here can never send a second
+    // confirmation email or a second notification. Awaited but never
+    // allowed to turn an already-verified booking into a reported
+    // failure — the appointment row is already proven to exist by
+    // verification above.
+    if (approval.action_key === "schedule_appointment") {
+      const appointmentId = (realResult as { appointmentId?: string } | undefined)?.appointmentId;
+      if (appointmentId) {
+        await runAppointmentPostBookingLifecycle(supabaseAdmin, { appointmentId, orgId }).catch((err) => {
+          console.error("[agent-approve-action] post-booking lifecycle failed:", err instanceof Error ? err.message : err);
+        });
+      }
+    }
 
     await markApprovalExecuted(supabaseAdmin, reqBody.approvalId, orgId);
     logCheckpoint("approval_marked_executed", { approvalId: reqBody.approvalId, executionId: approval.execution_id });

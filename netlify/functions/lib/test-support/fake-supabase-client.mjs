@@ -54,6 +54,13 @@ function evalCondition(row, f) {
   // at insert time) behaves as SQL NULL, same as a real Postgres row.
   const val = columnValue(row, f.col);
   if (f.op === "eq") return val === f.val;
+  // Scheduling foundation addition: .neq() — a real, standard Supabase
+  // method (used live by voice-scheduling.ts's own appointments queries)
+  // that this fake simply never implemented yet, not something
+  // deliberately unsupported. SQL semantics: NULL is never <> anything,
+  // same "comparison with NULL is never true" rule the gt/lt/gte/lte
+  // cases already follow.
+  if (f.op === "neq") return val !== null && val !== f.val;
   if (f.op === "is") return val === (f.val === "null" ? null : f.val);
   // SQL comparison with NULL is never true.
   if (f.op === "gt") return val !== null && val > f.val;
@@ -110,6 +117,7 @@ class FakeQueryBuilder {
   }
 
   eq(col, val) { this.filters.push({ col, op: "eq", val }); return this; }
+  neq(col, val) { this.filters.push({ col, op: "neq", val }); return this; }
   is(col, val) { this.filters.push({ col, op: "is", val }); return this; }
   gt(col, val) { this.filters.push({ col, op: "gt", val }); return this; }
   lt(col, val) { this.filters.push({ col, op: "lt", val }); return this; }
