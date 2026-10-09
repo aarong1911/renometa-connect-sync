@@ -34,6 +34,12 @@ import type {
   AIProjectSummary,
   AIResolvedContext,
 } from "./types";
+// Lead-Qualification-to-Scheduling handoff phase. Both files already live
+// on the netlify/functions/lib/ side — same-side import, no boundary
+// crossing (compare to scheduling-offer-state.ts's own import of
+// src/lib/agentic/scheduling-availability.ts's SlotCandidate type, which
+// IS a cross-boundary import; this one is not).
+import { readOfferedSlots, SCHEDULING_OFFER_CHANNELS, type SchedulingOfferChannel } from "../scheduling-offer-state";
 
 /** Channels backed today by sms_meta_messages (per the AI-1 audit: there is
  * no canonical `conversations` table; SMS/WhatsApp/Messenger/Instagram
@@ -98,6 +104,10 @@ export type BuildAIContextParams = {
    * AIConversationSummary.externalConversationId as a label for whatever
    * called this function to recognize later. */
   conversationKey?: string;
+  /** Injectable for deterministic TTL testing (resolveSchedulingOfferActive's
+   * 24-hour window) — defaults to the real current time. Not used for
+   * anything else in this file. */
+  now?: Date;
 };
 
 // ── Organization ─────────────────────────────────────────────────────────
@@ -333,6 +343,56 @@ async function fetchConversationSummary(
   };
 }
 
+// ── Scheduling offer routing signal ─────────────────────────────────────
+//
+// Lead-Qualification-to-Scheduling handoff phase. Deliberately NOT built
+// the same way every other section of this file is (a genuine query
+// failure is fatal to the whole buildAIContext() call) — see this file's
+// own "every genuine Supabase error throws" convention above. router.ts's
+// own task explicitly requires the OPPOSITE behavior here: "malformed or
+// unavailable scheduling state: fail safely and preserve current routing
+// behavior" — a read failure must never break the entire AI turn, it must
+// just resolve to "no active offer" and let routing fall through exactly
+// as it did before this feature existed. readOfferedSlots() already
+// returns a typed `{status:"error"}` rather than throwing, which is what
+// makes this safe-by-construction: both "none" and "error" collapse to
+// `false` below, with no try/catch needed.
+//
+// 24-HOUR TTL: the one freshness rule this phase's router instructions
+// specify. Lives HERE, not in router.ts, because router.ts is an
+// explicitly pure/synchronous file (see its own header: "no database
+// access... safe to call repeatedly with the same inputs") — moving the DB
+// read and the TTL math into this already-async, already-Supabase-aware
+// layer keeps that purity guarantee intact. router.ts ends up consuming
+// one already-resolved boolean, exactly the same way it already consumes
+// context.lead.status for its Tier 3 rule.
+const SCHEDULING_OFFER_TTL_MS = 24 * 60 * 60 * 1000;
+
+async function resolveSchedulingOfferActive(
+  supabase: SupabaseClient,
+  orgId: string,
+  channel: AIChannel,
+  contactId: string | undefined,
+  now: Date,
+): Promise<boolean> {
+  if (!contactId) return false;
+  if (!(SCHEDULING_OFFER_CHANNELS as readonly string[]).includes(channel)) return false;
+
+  const result = await readOfferedSlots(
+    { supabase },
+    { orgId, contactId, channel: channel as SchedulingOfferChannel },
+  );
+  // "none" (no offer, or an offer with a malformed stored shape — see
+  // readOfferedSlots()'s own fail-safe handling) and "error" (a genuine
+  // query failure) both collapse to "no active offer" here — neither is
+  // ever treated as "offer active" by omission.
+  if (result.status !== "found") return false;
+
+  const offeredAtMs = new Date(result.offeredAt).getTime();
+  if (isNaN(offeredAtMs)) return false; // defensive only; readOfferedSlots() already validates shape
+  return now.getTime() - offeredAtMs <= SCHEDULING_OFFER_TTL_MS;
+}
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 /**
@@ -356,14 +416,27 @@ async function fetchConversationSummary(
  */
 export async function buildAIContext(params: BuildAIContextParams): Promise<AIResolvedContext> {
   const { supabase, orgId, channel, contactId, leadId, projectId, conversationKey } = params;
+  const now = params.now ?? new Date();
 
-  const [organization, contact, lead, project, conversation] = await Promise.all([
+  const [organization, contact, lead, project, conversation, schedulingOfferActive] = await Promise.all([
     fetchOrganizationSummary(supabase, orgId),
     contactId ? fetchContactSummary(supabase, orgId, contactId) : Promise.resolve(undefined),
     leadId ? fetchLeadSummary(supabase, orgId, leadId) : Promise.resolve(undefined),
     projectId ? fetchProjectSummary(supabase, orgId, projectId) : Promise.resolve(undefined),
     fetchConversationSummary(supabase, orgId, channel, contactId, conversationKey),
+    resolveSchedulingOfferActive(supabase, orgId, channel, contactId, now),
   ]);
 
-  return { organization, contact, lead, project, conversation, channel };
+  // schedulingOfferActive is supported on a slightly WIDER channel set
+  // (SCHEDULING_OFFER_CHANNELS includes "voice"; MESSAGE_BACKED_CHANNELS,
+  // which gates `conversation` above, does not) — so `conversation` can be
+  // undefined even when a real offer exists (e.g. a voice channel today).
+  // Attach the flag onto whatever conversation summary already exists, or
+  // synthesize the minimal shape (just `channel`) when one doesn't, rather
+  // than silently dropping a real, trusted routing signal.
+  const finalConversation: AIConversationSummary | undefined = schedulingOfferActive
+    ? { ...(conversation ?? { channel }), schedulingOfferActive: true }
+    : conversation;
+
+  return { organization, contact, lead, project, conversation: finalConversation, channel };
 }

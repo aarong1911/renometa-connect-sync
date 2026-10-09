@@ -116,7 +116,7 @@ function makeDb(opts: { enabled?: boolean; defaultAutonomyLevel?: 1 | 2; emergen
   )) as any;
 }
 
-function fakeOrchestrate(result: Partial<{ status: string; responseText: string; executionId: string; error: string }> = {}) {
+function fakeOrchestrate(result: Partial<{ status: string; responseText: string; executionId: string; error: string; agentKey: string }> = {}) {
   let calls = 0;
   const fn = async () => {
     calls++;
@@ -214,6 +214,27 @@ test("27+28. Level 2 creates a real approval via the EXISTING approval system (a
   assert.equal(pend[0].target_entity_id, LEAD_1);
   assert.equal(pend[0].proposed_input.contactId, CONTACT_1);
   assert.equal(pend[0].proposed_input.body, "Hi John, thanks for reaching out about your kitchen remodel!");
+});
+
+// Lead-Qualification-to-Scheduling handoff phase (Section I verification):
+// this dispatcher must stay agent-agnostic about which agent actually
+// produced the final responseText — a Scheduling-produced reply (reached
+// via an in-process Lead-Qualification-to-Scheduling handoff, same
+// agent_executions row) must propose a send exactly like a plain Lead
+// Qualification reply does, with NO code change required here. Confirmed
+// by directly faking orchestrate() to return agentKey: "scheduling" and
+// checking the send proposal still gets created.
+test("Lead-Qualification-to-Scheduling handoff phase: a Scheduling-produced responseText (result.agentKey === 'scheduling') still proposes send_sms through this SAME, unmodified dispatch path — this file requires no agentKey-specific change", async () => {
+  const db = makeDb({ enabled: true, defaultAutonomyLevel: 2 });
+  const orch = fakeOrchestrate({ agentKey: "scheduling", responseText: "Here are some times: Wed 10am or 2pm — which works?" });
+  const r = await S.dispatchLeadQualification(
+    baseParams(db, orch, { source: "inbound_lead_message", inboundEvent: { channel: "sms", messageRowId: "m-sched-1", text: "when can I come in?", candidate: { channel: "sms", direction: "in", syncOrigin: "live" } } }),
+  );
+  assert.equal(r.status, "awaiting_approval");
+  const pend = pendingApprovals(db);
+  assert.equal(pend.length, 1);
+  assert.equal(pend[0].action_key, "send_sms");
+  assert.equal(pend[0].proposed_input.body, "Here are some times: Wed 10am or 2pm — which works?");
 });
 
 test("30. an unsupported execution channel (messenger/instagram/email) falls back to a recommendation, never a broken/failed proposal", async () => {

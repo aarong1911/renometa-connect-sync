@@ -31,11 +31,17 @@
 //
 // One tool maximum: this contract has no field or path for the model to
 // request a second tool call, a follow-up decision, or any multi-step
-// plan. It expresses exactly one of: respond, or request one of two
-// specific tools. Enforcing "at most one tool call per run" is
+// plan. It expresses exactly one of: respond, request one of two specific
+// tools, or (Lead-Qualification-to-Scheduling handoff phase) hand off to
+// Scheduling. Enforcing "at most one tool call per run" is
 // orchestrator.ts's job (it only ever asks this contract for a decision
 // once per run) — this file simply never gives the model a way to ask
-// for more than one action in a single decision.
+// for more than one action in a single decision. The new `handoff`
+// variant is terminal exactly like Reception's own handoff: Scheduling's
+// own decision schema (agents/scheduling.ts) has no `handoff` variant at
+// all, so control can never bounce onward to a third agent or back to
+// Lead Qualification — same structural (not conventional) loop
+// prevention Reception -> Lead Qualification already relies on.
 
 import { z } from "zod";
 import type { AIAgentHandoff, AIChannel, AIChannelEvent, AIResolvedContext } from "../types";
@@ -74,6 +80,15 @@ function buildHandoffContextBlock(handoff: AIAgentHandoff): string {
   return lines.join("\n");
 }
 
+// ── Handoff allowlist (Lead-Qualification-to-Scheduling handoff phase) ──
+//
+// Mirrors reception.ts's RECEPTION_HANDOFF_ALLOWLIST exactly: the Zod
+// schema below already restricts `toAgent` to the single literal
+// "scheduling", but per that file's own "do not rely only on type
+// literals" reasoning, orchestrator.ts checks this allowlist too before
+// ever building an AIAgentHandoff or invoking Scheduling.
+export const LEAD_QUALIFICATION_HANDOFF_ALLOWLIST: ReadonlySet<string> = new Set(["scheduling"]);
+
 // ── Per-agent tool allowlist (AI-1J) ─────────────────────────────────────
 //
 // Deliberately separate from, and narrower than, the AI Tool Registry's
@@ -96,14 +111,16 @@ export const GENERIC_FALLBACK_RESPONSE =
 
 // ── Decision schema ───────────────────────────────────────────────────────
 //
-// Three fully-.strict() variants (not z.discriminatedUnion — two of the
-// three variants would share the same "type" literal ("tool"), which
+// Four fully-.strict() variants (not z.discriminatedUnion — two of the
+// four variants share the same "type" literal ("tool"), which
 // discriminatedUnion doesn't support; a plain z.union of strict schemas is
 // unambiguous here because each variant's literal fields fully determine
 // which one a given object can match). `.strict()` on every variant means
 // an unexpected extra field (e.g. a model trying to sneak in a
 // `targetEntityId` or `leadId`) makes the WHOLE object fail every variant,
-// never partially matches one.
+// never partially matches one. The fourth variant (Lead-Qualification-to-
+// Scheduling handoff phase) is `handoff` — see
+// LEAD_QUALIFICATION_HANDOFF_ALLOWLIST below.
 
 const respondDecisionSchema = z
   .object({
@@ -133,14 +150,43 @@ const addInternalNoteDecisionSchema = z
   })
   .strict();
 
+// Lead-Qualification-to-Scheduling handoff phase. Mirrors reception.ts's
+// own handoffDecisionSchema exactly (same MAX_KNOWN_FACTS/MAX_OPEN_
+// QUESTIONS bounds, same knownFacts shape matching AIAgentHandoff.
+// knownFacts so no reshaping is needed) — the only difference is the
+// fixed destination literal. Qualification readiness has no deterministic
+// CRM signal (see this file's own report on leads.status) — this is a
+// per-turn MODEL judgment call, gated only by this schema + the prompt
+// instructions below, never by a status field this code reads or writes.
+const MAX_HANDOFF_KNOWN_FACTS = 6;
+const MAX_HANDOFF_OPEN_QUESTIONS = 6;
+
+const handoffDecisionSchema = z
+  .object({
+    type: z.literal("handoff"),
+    toAgent: z.literal("scheduling"),
+    reason: z.string().min(1).max(300),
+    summary: z.string().min(1).max(1000),
+    knownFacts: z
+      .record(z.string().min(1).max(60), z.string().min(1).max(300))
+      .refine((facts) => Object.keys(facts).length <= MAX_HANDOFF_KNOWN_FACTS, {
+        message: `knownFacts must have at most ${MAX_HANDOFF_KNOWN_FACTS} entries`,
+      })
+      .optional(),
+    openQuestions: z.array(z.string().min(1).max(200)).max(MAX_HANDOFF_OPEN_QUESTIONS).optional(),
+  })
+  .strict();
+
 const leadQualificationDecisionSchema = z.union([
   respondDecisionSchema,
   getLeadContextDecisionSchema,
   addInternalNoteDecisionSchema,
+  handoffDecisionSchema,
 ]);
 
 export type LeadQualificationDecision = z.infer<typeof leadQualificationDecisionSchema>;
 export type LeadQualificationToolDecision = Extract<LeadQualificationDecision, { type: "tool" }>;
+export type LeadQualificationHandoffDecision = Extract<LeadQualificationDecision, { type: "handoff" }>;
 
 export type ParsedLeadQualificationDecision =
   | { kind: "decision"; decision: LeadQualificationDecision }
@@ -247,7 +293,11 @@ function buildDecisionSystemInstructions(agentInstructions: string, organization
     "- add_internal_note: adds a short, factual, staff-only note to the current lead's record. Never customer-facing. Only use this when there is genuinely useful, factual information worth preserving — never speculative conclusions, guesses, or unconfirmed details.",
     "Do not request any tool other than these two.",
     "Never claim that an action (such as adding a note) has already happened — this decision does not perform the action itself; you will be told the result afterward.",
-    "Never request, imply, or promise sending an SMS, email, or any customer message, and never book or schedule an appointment.",
+    "Never request, imply, or promise sending an SMS or email yourself, and never claim to have booked or scheduled anything — you do not have the ability to book an appointment. If scheduling comes up, hand off to Scheduling instead of attempting it yourself (see below).",
+    "",
+    "Instead of responding, you may also hand this conversation off to Scheduling — a specialist on the same team who will continue naturally as part of the same business conversation (the customer will not be told about a hand-off).",
+    "Hand off to Scheduling when BOTH of these are true: (1) you have enough information to reasonably proceed (you don't need every possible detail — just enough that a next appointment makes sense), AND (2) the customer has indicated readiness or interest in scheduling, booking, or taking the next appointment step (e.g. \"when can someone come out?\", \"let's set something up\", \"I'd like to book a consultation\", or a clear yes to your own suggestion of a next step).",
+    "Do NOT hand off just because a project was mentioned — wait until the customer is actually ready to move toward an appointment. Do NOT hand off while a genuinely important qualification question is still clearly unanswered and the customer hasn't signaled readiness.",
     "",
     `Organization: ${organizationName}.`,
     "",
@@ -255,6 +305,8 @@ function buildDecisionSystemInstructions(agentInstructions: string, organization
     '{"type":"respond","response":"<your natural-language reply to the customer>"}',
     '{"type":"tool","tool":"get_lead_context","reason":"<short optional reason>"}',
     '{"type":"tool","tool":"add_internal_note","arguments":{"content":"<concise, factual note text>"},"reason":"<short optional reason>"}',
+    '{"type":"handoff","toAgent":"scheduling","reason":"<short reason the customer is ready to schedule>","summary":"<one or two sentence summary of the project/opportunity for Scheduling>","knownFacts":{"<short fact label>":"<short value>"},"openQuestions":["<short open question, if any>"]}',
+    '"knownFacts" and "openQuestions" are optional on the handoff shape — include them only when you actually have something to note; do not invent facts that weren\'t said.',
   ].join("\n");
 }
 

@@ -80,6 +80,26 @@ import {
   buildReceptionDecisionRequest,
   parseReceptionDecision,
 } from "./agents/reception";
+// Lead-Qualification-to-Scheduling handoff phase.
+import { LEAD_QUALIFICATION_HANDOFF_ALLOWLIST, type LeadQualificationHandoffDecision } from "./agents/lead-qualification";
+import {
+  GENERIC_FALLBACK_RESPONSE as SCHEDULING_GENERIC_FALLBACK_RESPONSE,
+  buildSchedulingDecisionRequest,
+  buildSchedulingFinalRequest,
+  formatOfferedSlotOptions,
+  parseSchedulingDecision,
+  type SchedulingDecision,
+  type SchedulingSlotReferenceDecision,
+} from "./agents/scheduling";
+import { executeStep, type ExecuteStepResult } from "../../../../src/lib/agentic/action-executor";
+import {
+  SCHEDULING_OFFER_CHANNELS,
+  clearOfferedSlots,
+  readOfferedSlots,
+  writeOfferedSlots,
+  type PersistedSlotOffer,
+  type SchedulingOfferChannel,
+} from "../scheduling-offer-state";
 
 // ── OBSERVABILITY SCOPE (why no agent_execution_steps / agent_events) ───
 //
@@ -163,11 +183,23 @@ import {
 // parameters (`handoff`, `seedUsage`) rather than duplicated into a
 // second function — see its own updated doc comment. Loop prevention is
 // structural, not a runtime counter: agents/reception.ts's decision
-// schema has no "tool" variant (Reception can't call a tool) and
-// agents/lead-qualification.ts's decision schema has no "handoff" variant
-// (Lead Qualification can't hand off again, including back to
-// Reception) — a second hop is not merely disallowed by convention, there
-// is no JSON shape either agent could produce that would parse into one.
+// schema has no "tool" variant (Reception can't call a tool), so Reception
+// cannot both hand off AND call a tool in one decision.
+//
+// LEAD-QUALIFICATION-TO-SCHEDULING HANDOFF PHASE (second agent-to-agent
+// handoff): agents/lead-qualification.ts's decision schema now ALSO has a
+// "handoff" variant (destination fixed to "scheduling" — see
+// LEAD_QUALIFICATION_HANDOFF_ALLOWLIST), handled by runSchedulingTurn()
+// below exactly the way runReceptionTurn() already calls into
+// runLeadQualificationTurn(): same executionId, same unmodified
+// trustedContext, no second execution row. Loop prevention remains
+// structural: agents/scheduling.ts's decision schema has no "handoff"
+// variant at all, so control can never bounce onward to a third agent or
+// back to Lead Qualification/Reception — there is no JSON shape
+// Scheduling could produce that would parse into a handoff. (Reception's
+// own handoff is still exactly one hop, as before — this paragraph only
+// adds a second, independent one-hop handoff later in the same pipeline,
+// not a second hop for the same one.)
 
 /**
  * Placeholder value written to agent_executions.agent_key at INSERT time.
@@ -254,7 +286,23 @@ const SYSTEM_AGENTS: Partial<Record<AIAgentKey, SystemAgentConfig>> = {
       "Respond briefly and naturally, as if speaking directly to the customer.",
     ].join(" "),
   },
-  // "scheduling" intentionally has no entry — it must not run in AI-1F.
+  // Lead-Qualification-to-Scheduling handoff phase: "scheduling" now has a
+  // real entry, reached either via a Lead Qualification handoff or
+  // directly by router.ts's Tier 2 (an outstanding, still-fresh offer).
+  // This instructions string is the one `agentInstructions` param
+  // agents/scheduling.ts's prompt builders take — the rest of each
+  // prompt (offered-slot list, JSON contract, action descriptions) is
+  // built by that file, not duplicated here.
+  scheduling: {
+    agentKey: "scheduling",
+    instructions: [
+      "You are Scheduling, responsible for helping a customer book an appointment with a home improvement contractor.",
+      "The business using RenoMeta Connect is the contractor/service provider the customer is contacting — you represent THAT business, not a marketplace, referral service, or neutral third party.",
+      "When the customer's first name is known from the trusted CRM context below, use it naturally where it fits — but do not repeat it in every sentence. Never guess a name that wasn't provided.",
+      "Use ONLY the CRM context and the specific offered appointment options provided below — never invent a project detail, budget, timeline, or appointment time.",
+      "Respond briefly and naturally, as if speaking directly to the customer — this conversation is a continuation of the same business relationship Lead Qualification was already having with them, not a new introduction.",
+    ].join(" "),
+  },
 };
 
 // ── Observability summaries (AI-1I-A) ────────────────────────────────────
@@ -426,12 +474,24 @@ export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunR
     }
 
     // AI-1K: Reception gets its own structured-decision flow (may hand off
-    // to Lead Qualification exactly once — see runReceptionTurn()). Any
-    // OTHER future SYSTEM_AGENTS entry (none exist today besides these
-    // two) falls through to the original AI-1F plain-response flow below,
-    // unchanged.
+    // to Lead Qualification exactly once — see runReceptionTurn()).
     if (route.agentKey === "reception") {
       return await runReceptionTurn({
+        supabase, trustedContext, event, context, modelProvider, executionId, agentConfig, inputSummary,
+      });
+    }
+
+    // Lead-Qualification-to-Scheduling handoff phase: Scheduling gets its
+    // own structured-decision flow too, reached here DIRECTLY when
+    // router.ts's Tier 2 already placed this turn with Scheduling (an
+    // outstanding, still-fresh offer) — as opposed to being reached via a
+    // Lead Qualification handoff mid-turn (see runLeadQualificationTurn()
+    // below, which calls runSchedulingTurn() the same way runReceptionTurn()
+    // already calls runLeadQualificationTurn()). Any OTHER future
+    // SYSTEM_AGENTS entry (none exist today besides these three) falls
+    // through to the original AI-1F plain-response flow below, unchanged.
+    if (route.agentKey === "scheduling") {
+      return await runSchedulingTurn({
         supabase, trustedContext, event, context, modelProvider, executionId, agentConfig, inputSummary,
       });
     }
@@ -623,6 +683,81 @@ async function runLeadQualificationTurn(params: {
       costUsd: totalCostUsd,
       inputSummary,
     });
+  }
+
+  if (decision.type === "handoff") {
+    // Lead-Qualification-to-Scheduling handoff phase. Same defense-in-depth
+    // pattern as Reception's own handoff check (LEAD_QUALIFICATION_TOOL_
+    // ALLOWLIST one layer up from this): even though the Zod schema
+    // already restricts `toAgent` to the single literal "scheduling", this
+    // file applies a SECOND, explicit allowlist check before ever building
+    // an AIAgentHandoff or invoking Scheduling. Should be unreachable given
+    // the schema, but never trusted to be unreachable.
+    if (!LEAD_QUALIFICATION_HANDOFF_ALLOWLIST.has(decision.toAgent)) {
+      return await finalizeLeadQualificationRun(supabase, executionId, activeAgentKey, {
+        status: "succeeded",
+        responseText: GENERIC_FALLBACK_RESPONSE_LOCAL,
+        inputTokens: totalInputTokens,
+        outputTokens: totalOutputTokens,
+        costUsd: totalCostUsd,
+        inputSummary,
+      });
+    }
+
+    // Same CONTENT-decision-only reasoning as Reception's own handoff
+    // (see this file's AI-1K header addendum and the Lead-Qualification-
+    // to-Scheduling addendum above): nothing here comes from or widens
+    // trustedContext. The handoff's only job is to carry WHY Lead
+    // Qualification thinks this is ready, not to grant Scheduling any
+    // capability it wouldn't otherwise have.
+    const handoff: AIAgentHandoff = {
+      fromAgent: "lead_qualification",
+      toAgent: decision.toAgent,
+      reason: decision.reason,
+      summary: decision.summary,
+      knownFacts: decision.knownFacts,
+      openQuestions: decision.openQuestions,
+    };
+    const handoffSummary: AIHandoffSummary = { fromAgent: "lead_qualification", toAgent: decision.toAgent, reason: decision.reason };
+
+    const schedulingConfig = SYSTEM_AGENTS.scheduling;
+    if (!schedulingConfig) {
+      // Defensive only — both agents are defined together in SYSTEM_AGENTS;
+      // this should never actually happen.
+      const message = "Scheduling is not available right now.";
+      await finalizeExecution(supabase, executionId, {
+        agentKey: activeAgentKey,
+        status: "failed",
+        error: message,
+        inputTokens: totalInputTokens,
+        outputTokens: totalOutputTokens,
+        costUsd: totalCostUsd,
+        inputSummary: { ...inputSummary, handoff: handoffSummary },
+      });
+      return { executionId, status: "failed", agentKey: activeAgentKey, error: message, handoff };
+    }
+
+    // SAME execution row, SAME unmodified trustedContext — exactly the
+    // Reception -> Lead Qualification precedent. Lead Qualification's own
+    // usage so far is folded in via seedUsage so the execution's totals
+    // cover the entire run.
+    const result = await runSchedulingTurn({
+      supabase,
+      trustedContext,
+      event,
+      context,
+      modelProvider,
+      executionId,
+      agentConfig: schedulingConfig,
+      inputSummary: { ...inputSummary, handoff: handoffSummary },
+      handoff,
+      seedUsage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens, costUsd: totalCostUsd },
+    });
+
+    // Attach the full validated handoff regardless of how the Scheduling
+    // turn concluded — same "never lose the fact a handoff occurred"
+    // requirement as Reception's own handoff.
+    return { ...result, handoff };
   }
 
   // decision.type === "tool" from here on.
@@ -1031,6 +1166,409 @@ async function finalizeReceptionRun(
   }
 
   return { executionId, status: "completed", agentKey: "reception", responseText: params.responseText };
+}
+
+// ── Scheduling turn (Lead-Qualification-to-Scheduling handoff phase) ────
+//
+// Reached two ways, both ending up here with the SAME executionId/
+// trustedContext, never a second execution row:
+//   1. router.ts's Tier 2 placed this turn directly with Scheduling (an
+//      outstanding, still-fresh offer) — called from orchestrateAI()'s
+//      main dispatch, no `handoff`/`seedUsage`.
+//   2. Lead Qualification just handed off mid-turn — called from
+//      runLeadQualificationTurn()'s own `handoff` branch, with `handoff`
+//      carrying the validated AIAgentHandoff and `seedUsage` folding in
+//      Lead Qualification's own decision-call usage so far.
+//
+// Sequence (mirrors Lead Qualification's own two-model-call, at-most-one-
+// action shape):
+//
+//   model call (structured decision)
+//     -> "respond"              -> finalize (clearOfferedSlots() first if declineScheduling)
+//     -> "get_availability"     -> executeStep("get_availability") -> on
+//                                   real, trusted slots: writeOfferedSlots()
+//                                   -> one more model call (response only) -> finalize
+//     -> "select_offered_slot"  -> validate selectedOptionNumber against
+//                                   the REAL persisted offer (never the
+//                                   model's own words) -> one more model
+//                                   call -> finalize. Never calls
+//                                   executeStep() — this type only
+//                                   confirms/clarifies, it never books.
+//     -> "propose_appointment"  -> same validation, then (only on a real
+//                                   match, with a real contactId)
+//                                   executeStep("schedule_appointment") ->
+//                                   one more model call -> finalize
+//
+// At most one action per run, no loops: this function has no path that
+// asks for a second decision or performs a second action. Scheduling
+// cannot hand off to anything — agents/scheduling.ts's decision schema
+// has no "handoff" variant at all (structural, not conventional, per
+// this file's own header).
+//
+// A DELIBERATE deviation from Lead Qualification's own tool-failure
+// convention: Lead Qualification marks the whole run "failed" (with no
+// responseText) when its tool call fails, which means the customer gets
+// NO reply at all for that turn (see dispatchLeadQualification()'s
+// `!result.responseText` check). For Scheduling, every path below always
+// produces a real, safe, customer-facing responseText and a "succeeded"
+// (or "awaiting_approval") run status — even an availability-lookup
+// failure, a stale/ambiguous/unmatched selection, or a blocked proposal
+// gets a safe apology/clarification message, never silence. This matches
+// the task's own edge-case list (no availability, a provider/DB failure,
+// an unmatched selection) implying the customer should always hear
+// something back, and does not change Lead Qualification's own, separate
+// convention at all.
+async function runSchedulingTurn(params: {
+  supabase: SupabaseClient;
+  trustedContext: AITrustedContext;
+  event: AIChannelEvent;
+  context: AIResolvedContext;
+  modelProvider: ModelProvider;
+  executionId: string;
+  agentConfig: SystemAgentConfig;
+  inputSummary: AIExecutionInputSummary;
+  handoff?: AIAgentHandoff;
+  seedUsage?: { inputTokens: number; outputTokens: number; costUsd: number };
+}): Promise<AIRunResult> {
+  const { supabase, trustedContext, event, context, modelProvider, executionId, agentConfig, inputSummary, handoff, seedUsage } = params;
+  const channel = event.channel;
+  const contactId = trustedContext.contactId;
+  const orgId = trustedContext.orgId;
+
+  const schedulingChannel: SchedulingOfferChannel | undefined =
+    (SCHEDULING_OFFER_CHANNELS as readonly string[]).includes(channel) ? (channel as SchedulingOfferChannel) : undefined;
+
+  // Read the CURRENTLY persisted offer, if any, BEFORE the decision call —
+  // this is the exact list agents/scheduling.ts's prompt shows the model
+  // as numbered options, and the exact list `selectedOptionNumber` is
+  // validated against below. Absent contactId or an unsupported channel
+  // simply means "no offer possible" (scheduling-offer-state.ts's own
+  // identity requirement) — never an error.
+  let offeredSlots: PersistedSlotOffer[] | undefined;
+  if (contactId && schedulingChannel) {
+    const offerResult = await readOfferedSlots({ supabase }, { orgId, contactId, channel: schedulingChannel });
+    if (offerResult.status === "found") offeredSlots = offerResult.slots;
+  }
+
+  // ── Model call: structured decision ──────────────────────────────────
+  const decisionRequest = buildSchedulingDecisionRequest(agentConfig.instructions, context, event, offeredSlots, handoff);
+
+  let decisionResponse;
+  try {
+    decisionResponse = await modelProvider.run(decisionRequest);
+  } catch (err) {
+    console.error(`[ai/orchestrator] scheduling decision call failed (execution ${executionId}):`, err);
+    const message = "The AI model could not generate a response.";
+    await finalizeExecution(supabase, executionId, { agentKey: "scheduling", status: "failed", error: message, inputSummary });
+    return { executionId, status: "failed", agentKey: "scheduling", error: message };
+  }
+
+  let totalInputTokens = (seedUsage?.inputTokens ?? 0) + decisionResponse.usage.inputTokens;
+  let totalOutputTokens = (seedUsage?.outputTokens ?? 0) + decisionResponse.usage.outputTokens;
+  let totalCostUsd =
+    (seedUsage?.costUsd ?? 0) +
+    (await recordUsageEvent(supabase, {
+      orgId, executionId, provider: decisionResponse.provider, model: decisionResponse.model,
+      inputTokens: decisionResponse.usage.inputTokens, outputTokens: decisionResponse.usage.outputTokens,
+    }));
+
+  const parsed = parseSchedulingDecision(decisionResponse.text);
+
+  if (parsed.kind === "fallback") {
+    return await finalizeSchedulingRun(supabase, executionId, {
+      status: "succeeded", responseText: parsed.responseText,
+      inputTokens: totalInputTokens, outputTokens: totalOutputTokens, costUsd: totalCostUsd, inputSummary,
+    });
+  }
+
+  const decision: SchedulingDecision = parsed.decision;
+
+  if (decision.type === "respond") {
+    // A deterministic SIGNAL the model sets, never free text the
+    // orchestrator string-matches — see scheduling.ts's own header.
+    if (decision.declineScheduling && contactId && schedulingChannel) {
+      const cleared = await clearOfferedSlots({ supabase }, { orgId, contactId, channel: schedulingChannel });
+      if (!cleared.ok) console.error("[ai/orchestrator] clearOfferedSlots failed on decline:", cleared.reason);
+    }
+    return await finalizeSchedulingRun(supabase, executionId, {
+      status: "succeeded", responseText: decision.response,
+      inputTokens: totalInputTokens, outputTokens: totalOutputTokens, costUsd: totalCostUsd, inputSummary,
+    });
+  }
+
+  // ── get_availability ──────────────────────────────────────────────────
+  if (decision.type === "get_availability") {
+    const toolingSummary: AIToolingSummary = { attempted: true, toolName: "get_availability" };
+    const availabilityResult: ExecuteStepResult = await executeStep({
+      supabase, orgId, actor: trustedContext.actor, executionId, sequence: 1,
+      actionKey: "get_availability",
+      // DEFAULT_DURATION_MINUTES equivalent (60) — matches
+      // scheduling-availability.ts's own default; this phase does not ask
+      // the model to choose a duration.
+      rawInput: { date: decision.date, durationMinutes: 60 },
+      autonomyLevel: trustedContext.autonomyLevel ?? 1,
+      targetEntityType: contactId ? "contact" : trustedContext.leadId ? "lead" : undefined,
+      targetEntityId: contactId ?? trustedContext.leadId,
+    });
+
+    let outcomeSummary: string;
+    let nextOfferedSlots = offeredSlots;
+
+    if (availabilityResult.status !== "succeeded") {
+      // FAIL SAFE for the conversation (never silence), even though the
+      // underlying lookup fails CLOSED (scheduling-availability.ts's own
+      // invariant, unmodified and untouched by this phase) — see this
+      // function's own header on why this deviates from Lead
+      // Qualification's "tool failure -> no reply" convention.
+      outcomeSummary = "The availability lookup failed (a system/database issue) — apologize briefly and let the customer know a teammate will follow up to get a time confirmed. Do not guess a time.";
+    } else {
+      const output = availabilityResult.output as { slots: PersistedSlotOffer[]; timeZone: string } | undefined;
+      const allSlots = output?.slots ?? [];
+      // Capped for a short, readable SMS/WhatsApp list — see
+      // scheduling.ts's own formatOfferedSlotOptions() header. Still real,
+      // trusted candidates straight from the authoritative availability
+      // core — never truncated in a way that invents or reorders anything.
+      const offeredNow = allSlots.slice(0, 4);
+
+      if (offeredNow.length === 0) {
+        outcomeSummary = `No open appointment slots were found for ${decision.date}. Ask the customer if a different day would work, or suggest one.`;
+      } else if (contactId && schedulingChannel) {
+        const writeResult = await writeOfferedSlots({ supabase }, { orgId, contactId, channel: schedulingChannel, slots: offeredNow });
+        if (!writeResult.ok) {
+          // Persisting failed, but the READ itself succeeded and these are
+          // still real, trusted slots — tell the customer anyway rather
+          // than discarding a genuine answer; just note (server-side only,
+          // never customer-facing) that a later reply may not resolve
+          // against them.
+          console.error("[ai/orchestrator] writeOfferedSlots failed:", writeResult.reason);
+        } else {
+          nextOfferedSlots = offeredNow;
+        }
+        outcomeSummary = `These real, available slots were just found for ${decision.date}: ${formatOfferedSlotOptions(offeredNow).join("; ")}. Present them to the customer by their natural time (never "option 1") and ask which works.`;
+      } else {
+        // No contactId/unsupported channel — can't persist an offer to
+        // resolve a later reply against, but the lookup itself is still a
+        // real answer worth giving.
+        outcomeSummary = `These real, available slots were just found for ${decision.date}: ${formatOfferedSlotOptions(offeredNow).join("; ")}. Present them to the customer by their natural time and ask which works, and ask them to confirm their choice clearly in their next message.`;
+      }
+    }
+
+    return await finalizeAfterSchedulingAction(supabase, executionId, {
+      agentConfig, context, event, handoff, outcomeSummary,
+      offeredSlots: nextOfferedSlots,
+      modelProvider, totalInputTokens, totalOutputTokens, totalCostUsd,
+      inputSummary: { ...inputSummary, tooling: toolingSummary },
+      orgId, executionIdForUsage: executionId,
+    });
+  }
+
+  // ── select_offered_slot / propose_appointment (shared matching) ──────
+  const slotDecision = decision as SchedulingSlotReferenceDecision;
+  const match = resolveSelectedSlot(offeredSlots, slotDecision.selectedOptionNumber);
+  const toolingSummary: AIToolingSummary = { attempted: slotDecision.type === "propose_appointment", toolName: slotDecision.type };
+
+  let outcomeSummary: string;
+
+  if (match.status === "no_offer") {
+    outcomeSummary = "The customer referenced a specific option, but there is no current list of offered times to match it against. Ask what day/time works, or offer to check availability.";
+  } else if (match.status === "out_of_range") {
+    outcomeSummary = "The customer referenced an option number that does not correspond to any currently offered time. Do not guess — ask them to clarify which specific time they mean, or offer to check availability again.";
+  } else if (slotDecision.type === "select_offered_slot") {
+    const label = formatOfferedSlotOptions([match.slot])[0];
+    outcomeSummary = `The customer's reply matches this specific offered time: ${label}. Confirm that this is the right time and ask if they'd like you to go ahead and book it — do not book it yet.`;
+  } else if (!contactId) {
+    outcomeSummary = "A specific offered time was matched, but there is no linked contact record yet to actually submit the appointment. Let the customer know a teammate will follow up to confirm their details and get this booked.";
+  } else {
+    // propose_appointment, matched, contactId present — the ONLY path in
+    // this function that calls executeStep("schedule_appointment"). Never
+    // a direct INSERT, never a direct agent_approval_requests write, never
+    // executeApprovedStep()/agent-approve-action.ts (a human still clicks
+    // Approve — PR #16's semantics, completely unchanged). minimumAutonomyLevel
+    // 2 / requiresApproval: true on this action are untouched; this call
+    // ALWAYS produces a pending approval (or a failure before one is
+    // created — e.g. emergency pause), never an immediate booking.
+    const slot = match.slot;
+    const contactName = context.contact?.name ?? context.lead?.name ?? "the customer";
+    const durationMinutes = Math.round((new Date(slot.end).getTime() - new Date(slot.start).getTime()) / 60_000);
+
+    const proposeResult: ExecuteStepResult = await executeStep({
+      supabase, orgId, actor: trustedContext.actor, executionId, sequence: 1,
+      actionKey: "schedule_appointment",
+      rawInput: {
+        contactId,
+        startsAt: slot.start,
+        durationMinutes: durationMinutes > 0 ? durationMinutes : 60,
+        // Hardcoded, not model-supplied — see this file's own header on
+        // "never let a model choose a risk/approval-relevant field." A
+        // future phase could let the customer's stated project type drive
+        // this; out of scope here (see this phase's own report).
+        appointmentType: "consultation",
+        title: `Consultation — ${contactName}`,
+        assignedTo: slot.assignedTo ?? undefined,
+      },
+      autonomyLevel: trustedContext.autonomyLevel ?? 2,
+      targetEntityType: trustedContext.leadId ? "lead" : "contact",
+      targetEntityId: trustedContext.leadId ?? contactId,
+      approvalSummary: `Schedule appointment: ${formatOfferedSlotOptions([slot])[0]} for ${contactName}.`,
+    });
+
+    if (proposeResult.status === "awaiting_approval") {
+      const label = formatOfferedSlotOptions([slot])[0];
+      outcomeSummary = `An appointment request for ${label} has been submitted and is now pending confirmation from our team. Let the customer know it's been submitted and someone will confirm shortly — do not say it is already booked.`;
+      // Offer-clearing deliberately deferred — see this file's own
+      // "Offer clearing" section below finalizeSchedulingRun() for the
+      // full reasoning (the approval can still fail later; clearing now
+      // would strand the customer with nothing to retry against if it
+      // does, and the existing fresh-availability re-check at actual
+      // approval time already prevents any double-booking regardless).
+      return await finalizeAfterSchedulingAction(supabase, executionId, {
+        agentConfig, context, event, handoff, outcomeSummary, offeredSlots,
+        modelProvider, totalInputTokens, totalOutputTokens, totalCostUsd,
+        inputSummary: { ...inputSummary, tooling: toolingSummary },
+        orgId, executionIdForUsage: executionId, approvalRequestId: proposeResult.approvalRequestId,
+      });
+    }
+
+    outcomeSummary = "The appointment request could not be submitted right now (e.g. a policy restriction). Apologize briefly and let the customer know a teammate will follow up to get this scheduled — do not say it is booked, and do not guess why.";
+  }
+
+  return await finalizeAfterSchedulingAction(supabase, executionId, {
+    agentConfig, context, event, handoff, outcomeSummary, offeredSlots,
+    modelProvider, totalInputTokens, totalOutputTokens, totalCostUsd,
+    inputSummary: { ...inputSummary, tooling: toolingSummary },
+    orgId, executionIdForUsage: executionId,
+  });
+}
+
+/** Matches a model-chosen 1-indexed option number against the REAL
+ * persisted offer — the one and only place this file trusts a
+ * `selectedOptionNumber` for anything. An out-of-range or missing-offer
+ * result is always "unmatched," never coerced to the nearest real slot. */
+type SlotMatchResult =
+  | { status: "matched"; slot: PersistedSlotOffer }
+  | { status: "no_offer" }
+  | { status: "out_of_range" };
+
+function resolveSelectedSlot(offeredSlots: PersistedSlotOffer[] | undefined, selectedOptionNumber: number): SlotMatchResult {
+  if (!offeredSlots || offeredSlots.length === 0) return { status: "no_offer" };
+  const index = selectedOptionNumber - 1;
+  if (index < 0 || index >= offeredSlots.length) return { status: "out_of_range" };
+  return { status: "matched", slot: offeredSlots[index] };
+}
+
+/** Shared "make the second, final model call, then finalize" tail for
+ * every Scheduling action path (get_availability, select_offered_slot,
+ * propose_appointment) — mirrors runLeadQualificationTurn()'s own
+ * tool-success-then-final-call shape. Not used for "respond", which never
+ * needs a second call. */
+async function finalizeAfterSchedulingAction(
+  supabase: SupabaseClient,
+  executionId: string,
+  params: {
+    agentConfig: SystemAgentConfig;
+    context: AIResolvedContext;
+    event: AIChannelEvent;
+    handoff?: AIAgentHandoff;
+    outcomeSummary: string;
+    offeredSlots: PersistedSlotOffer[] | undefined;
+    modelProvider: ModelProvider;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    totalCostUsd: number;
+    inputSummary: AIExecutionInputSummary;
+    orgId: string;
+    executionIdForUsage: string;
+    approvalRequestId?: string;
+  },
+): Promise<AIRunResult> {
+  const { agentConfig, context, event, handoff, outcomeSummary, offeredSlots, modelProvider, inputSummary, orgId, executionIdForUsage, approvalRequestId } = params;
+  let { totalInputTokens, totalOutputTokens, totalCostUsd } = params;
+
+  const finalRequest = buildSchedulingFinalRequest(agentConfig.instructions, context, event, outcomeSummary, offeredSlots, handoff);
+
+  let finalResponse;
+  try {
+    finalResponse = await modelProvider.run(finalRequest);
+  } catch (err) {
+    console.error(`[ai/orchestrator] scheduling final response call failed (execution ${executionId}):`, err);
+    // The internal step (if any) already happened — never conceal that by
+    // claiming nothing happened, but a customer-facing response cannot be
+    // fabricated either. Reported as failed, same reasoning as Lead
+    // Qualification's analogous final-call-failure branch.
+    const message = "The AI model could not generate a final response.";
+    return await finalizeSchedulingRun(supabase, executionId, {
+      status: "failed", errorMessage: message,
+      inputTokens: totalInputTokens, outputTokens: totalOutputTokens, costUsd: totalCostUsd, inputSummary,
+    });
+  }
+
+  totalInputTokens += finalResponse.usage.inputTokens;
+  totalOutputTokens += finalResponse.usage.outputTokens;
+  totalCostUsd += await recordUsageEvent(supabase, {
+    orgId, executionId: executionIdForUsage, provider: finalResponse.provider, model: finalResponse.model,
+    inputTokens: finalResponse.usage.inputTokens, outputTokens: finalResponse.usage.outputTokens,
+  });
+
+  if (approvalRequestId) {
+    // Mirrors Lead Qualification's own "awaiting_approval" exit (via
+    // orchestrateAI()'s tool branch) — AIRunResult's existing status
+    // covers this exactly; no new status invented. A human still clicks
+    // Approve (agent-approve-action.ts, completely untouched by this
+    // phase) before any appointment actually exists.
+    await finalizeExecution(supabase, executionId, {
+      agentKey: "scheduling", status: "awaiting_approval",
+      outputSummary: { responseText: finalResponse.text },
+      inputTokens: totalInputTokens, outputTokens: totalOutputTokens, costUsd: totalCostUsd,
+      inputSummary,
+    });
+    return { executionId, status: "awaiting_approval", agentKey: "scheduling", responseText: finalResponse.text };
+  }
+
+  return await finalizeSchedulingRun(supabase, executionId, {
+    status: "succeeded", responseText: finalResponse.text,
+    inputTokens: totalInputTokens, outputTokens: totalOutputTokens, costUsd: totalCostUsd, inputSummary,
+  });
+}
+
+/** Shared finalize+return helper for every Scheduling exit path that
+ * reaches a terminal ("succeeded"/"failed") status — mirrors
+ * finalizeLeadQualificationRun()'s role. Not used for the
+ * "awaiting_approval" exit (see finalizeAfterSchedulingAction() above),
+ * for the same reason Lead Qualification's own helper excludes it. */
+async function finalizeSchedulingRun(
+  supabase: SupabaseClient,
+  executionId: string,
+  params: {
+    status: "succeeded" | "failed";
+    responseText?: string;
+    errorMessage?: string;
+    inputTokens: number;
+    outputTokens: number;
+    costUsd: number;
+    inputSummary: AIExecutionInputSummary;
+  },
+): Promise<AIRunResult> {
+  const finalized = await finalizeExecution(supabase, executionId, {
+    agentKey: "scheduling",
+    status: params.status,
+    error: params.errorMessage,
+    outputSummary: params.responseText !== undefined ? { responseText: params.responseText } : undefined,
+    inputTokens: params.inputTokens,
+    outputTokens: params.outputTokens,
+    costUsd: params.costUsd,
+    inputSummary: params.inputSummary,
+  });
+  if (!finalized) {
+    console.error(`[ai/orchestrator] scheduling execution ${executionId} (${params.status}) could not be finalized in the database.`);
+  }
+
+  return {
+    executionId,
+    status: params.status === "succeeded" ? "completed" : "failed",
+    agentKey: "scheduling",
+    responseText: params.responseText,
+    error: params.errorMessage,
+  };
 }
 
 // ── agent_executions lifecycle ──────────────────────────────────────────
