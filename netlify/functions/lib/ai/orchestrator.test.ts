@@ -228,6 +228,142 @@ test("an offer from one orchestrateAI() call is still active for a SECOND, separ
   assert.equal(second.agentKey, "scheduling", "the second, separate call must still land on scheduling, not fall back to lead_qualification");
 });
 
+// ── LIVE VALIDATION FIX (PR #17 deploy-preview finding): Scheduling must
+// be preference-led, not calendar-led ────────────────────────────────────
+
+test("1. initial handoff with no requested date/time: Scheduling must NOT call get_availability, must ask for a preferred day/time, and must write no offer at all", async () => {
+  const db = makeDb();
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "ready", summary: "Within 3 months, wants to schedule a consultation." }),
+    // The customer gave no day/time at all — per the rewritten prompt, the
+    // correct decision is "respond", never an arbitrary get_availability.
+    JSON.stringify({ type: "respond", response: "What day and time works best for you?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("I'd like to schedule a consultation"), trustedContext: trustedContext(), modelProvider });
+
+  assert.equal(result.agentKey, "scheduling");
+  assert.equal(result.status, "completed");
+  assert.equal(result.responseText, "What day and time works best for you?");
+
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.ok(!row || !row.scheduling_offered_slots, "no scheduling offer must ever be written when no availability lookup happened");
+  // Confirms the model was never even in a position where get_availability
+  // could run unprompted for this turn — only 2 model calls were scripted
+  // and both were consumed by (handoff decision + respond), proving no
+  // get_availability/final-response round trip occurred.
+});
+
+/** Forces router.ts's Tier 2 to place this turn directly with Scheduling
+ * (bypassing Lead Qualification entirely for this turn) by seeding a
+ * throwaway, still-fresh offer — the same mechanism a real prior
+ * Scheduling turn would have left behind. Tests 2-5 below are about
+ * availability-filtering behavior ONCE already in a Scheduling turn, not
+ * about the handoff itself (test 1 covers that), so this is the correct,
+ * minimal way to reach runSchedulingTurn() directly without re-scripting
+ * a handoff decision every time. */
+async function seedThrowawayOfferToReachScheduling(db: any) {
+  await db.from("conversation_states").insert({
+    org_id: ORG_A, contact_id: CONTACT_1, channel: "sms",
+    scheduling_offered_slots: [{ start: "2020-01-01T12:00:00.000Z", end: "2020-01-01T13:00:00.000Z", timeZone: TZ }],
+    scheduling_offered_at: new Date().toISOString(),
+  });
+}
+
+test("2. customer supplies an exact date/time that IS available: get_availability is called for the correct date with preferredTime, and the exact real slot is the persisted primary option", async () => {
+  const db = makeDb(); // no blocking appointments — 10:00 ET is genuinely open
+  await seedThrowawayOfferToReachScheduling(db);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredTime: "10:00" }),
+    JSON.stringify({ type: "respond", response: "Wednesday at 10:00 AM is available. Would you like me to schedule that?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Tuesday at 10 works for me"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.status, "completed");
+
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.ok(Array.isArray(row.scheduling_offered_slots) && row.scheduling_offered_slots.length > 0);
+  // 10:00 ET on 2027-03-17 is 14:00:00.000Z (EDT, UTC-4) — the exact
+  // requested time must be a REAL persisted slot, not merely "some slot".
+  assert.ok(row.scheduling_offered_slots.some((s: any) => s.start === "2027-03-17T14:00:00.000Z"), "the exact requested, genuinely-available time must be among the persisted slots");
+});
+
+test("3. requested exact time is unavailable: the nearest appropriate REAL alternatives are offered, and the unavailable (nonexistent-as-a-candidate) time is never itself invented/persisted", async () => {
+  // Block exactly 10:00-11:00 ET (14:00-15:00Z) with a real, org-wide (unassigned) appointment.
+  // With 60-minute appointment slots, this also genuinely overlaps (and
+  // therefore blocks) the 9:30 and 10:30 candidates — their own 60-minute
+  // windows both reach into [10:00, 11:00). The TRUE nearest surviving
+  // real candidates are therefore 9:00 and 11:00, not 9:30/10:30 — this
+  // test asserts the REAL conflict semantics (scheduling-availability.ts's
+  // own interval-overlap rule, unmodified by this phase), not a naive
+  // "30 minutes away" assumption.
+  const db = makeDb({
+    appointments: [{ id: "blocker", org_id: ORG_A, scheduled_at: "2027-03-17T14:00:00.000Z", ends_at: "2027-03-17T15:00:00.000Z", duration_min: 60, assigned_to: null, status: "scheduled" }],
+  });
+  await seedThrowawayOfferToReachScheduling(db);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredTime: "10:00" }),
+    JSON.stringify({ type: "respond", response: "10:00 AM isn't available, but I have 9:00 AM or 11:00 AM. Would either work?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Tuesday at 10 works for me"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.status, "completed");
+
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.ok(Array.isArray(row.scheduling_offered_slots) && row.scheduling_offered_slots.length > 0);
+  assert.ok(!row.scheduling_offered_slots.some((s: any) => s.start === "2027-03-17T14:00:00.000Z"), "the blocked/unavailable requested time must never be persisted as if it were real");
+  assert.ok(!row.scheduling_offered_slots.some((s: any) => s.start === "2027-03-17T13:30:00.000Z"), "9:30 ET genuinely overlaps the blocker too and must not be persisted as if it were free");
+  // The nearest genuinely-open candidates (9:00 and 11:00 ET) must be the
+  // ones actually offered — not whatever happened to be chronologically
+  // first on the day.
+  assert.ok(row.scheduling_offered_slots.some((s: any) => s.start === "2027-03-17T13:00:00.000Z"), "9:00 ET must be offered as a nearest real alternative");
+  assert.ok(row.scheduling_offered_slots.some((s: any) => s.start === "2027-03-17T15:00:00.000Z"), "11:00 ET must be offered as a nearest real alternative");
+});
+
+test("4. customer asks for an afternoon slot: real afternoon candidates are prioritized — morning slots are not blindly selected just because they are chronologically first", async () => {
+  const db = makeDb(); // no blockers — both morning and afternoon slots are genuinely open
+  await seedThrowawayOfferToReachScheduling(db);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredDaypart: "afternoon" }),
+    JSON.stringify({ type: "respond", response: "I have a few afternoon openings — which works?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Any time Friday afternoon"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.status, "completed");
+
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.ok(Array.isArray(row.scheduling_offered_slots) && row.scheduling_offered_slots.length > 0);
+  for (const slot of row.scheduling_offered_slots) {
+    const localHour = new Date(slot.start).getUTCHours() - 4; // EDT offset, matching every other test's own convention in this file
+    assert.ok(localHour >= 12 && localHour < 17, `expected an afternoon slot, got local hour ${localHour} for ${slot.start}`);
+  }
+});
+
+test("5. customer provides a date but no time: a small, bounded list of real slots may still be offered (unchanged default behavior)", async () => {
+  const db = makeDb();
+  await seedThrowawayOfferToReachScheduling(db);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "get_availability", date: "2027-03-17" }),
+    JSON.stringify({ type: "respond", response: "Here are a few openings on Wednesday — which works?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Does Wednesday work?"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.status, "completed");
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.ok(Array.isArray(row.scheduling_offered_slots) && row.scheduling_offered_slots.length > 0 && row.scheduling_offered_slots.length <= 4);
+});
+
+test("6. customer gives only a time, with no resolvable day: Scheduling must ask which day — get_availability's own schema requires a date, so there is no way for a day-less decision to reach it at all", async () => {
+  const db = makeDb();
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "ready", summary: "Ready to schedule." }),
+    // The model correctly recognizes it has no day to check and asks,
+    // rather than inventing one just to satisfy get_availability's
+    // required `date` field.
+    JSON.stringify({ type: "respond", response: "Happy to help — what day did you have in mind?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("10am works for me"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.status, "completed");
+  assert.equal(result.responseText, "Happy to help — what day did you have in mind?");
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.ok(!row || !row.scheduling_offered_slots, "no availability lookup, no offer, when no day could be resolved");
+});
+
 // ── Slot selection: matched / ambiguous / unmatched ──────────────────────
 
 async function seedOffer(db: any, slots: Array<{ start: string; end: string; timeZone: string }>) {

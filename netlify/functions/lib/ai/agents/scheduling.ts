@@ -22,7 +22,15 @@
 //     string-matching the model's own prose.
 //   - get_availability: a single structured ISO date (validated by this
 //     schema's own regex before anything else ever sees it) — never a
-//     natural-language date string.
+//     natural-language date string — plus two OPTIONAL structured
+//     preference hints (preferredTime "HH:MM", preferredDaypart). LIVE
+//     VALIDATION FIX: these two hints are used ONLY to rank/filter the
+//     REAL slots get_availability's own handler returns (see
+//     selectCandidateSlots() below) — they never assert that a slot at
+//     that time exists, and the prompt (see buildDecisionSystemInstructions)
+//     now requires the model to have an actual day-signal from the
+//     customer before it may call this action at all, closing the
+//     original defect where Scheduling picked an arbitrary date itself.
 //   - select_offered_slot / propose_appointment: an integer
 //     `selectedOptionNumber` referencing ONE of the slots most recently
 //     offered to this customer (1-indexed, matching the numbered list the
@@ -97,14 +105,46 @@ const respondDecisionSchema = z
   })
   .strict();
 
+// LIVE VALIDATION FIX (PR #17 deploy-preview finding): Scheduling was
+// calendar-led, not preference-led — it called get_availability on its
+// own initiative (an arbitrary near-term date) before the customer had
+// ever named a day, then presented the first four chronological slots
+// regardless of any time-of-day the customer actually asked for. Two
+// changes close this: (1) the prompt (below) now requires a real
+// day-signal from the customer before get_availability is ever called at
+// all — see buildDecisionSystemInstructions()'s rewritten description;
+// (2) these two NEW optional fields let the model carry forward a
+// structured (never raw-text, never a timestamp) time-of-day preference
+// it genuinely heard, so the orchestrator can rank/filter the REAL
+// returned slots against it (see selectCandidateSlots() below) instead of
+// always taking the chronologically-first four. Neither field is ever
+// used to invent a slot — they only ever narrow/reorder what
+// get_availability's trusted output actually contains.
 const getAvailabilityDecisionSchema = z
   .object({
     type: z.literal("get_availability"),
     /** Plain "YYYY-MM-DD" — structured, never natural language (see this
      * file's header). The prompt tells the model today's real date in the
      * org's timezone so it can compute "tomorrow"/"next Tuesday" itself;
-     * this field is still independently validated here regardless. */
+     * this field is still independently validated here regardless. Per
+     * the prompt rewrite above, the model must only ever set this from a
+     * day the CUSTOMER actually indicated — never arbitrarily. */
     date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected YYYY-MM-DD"),
+    /** An exact clock time the customer mentioned for this date (e.g.
+     * "10 works", "around 2"), rounded to the nearest half hour —
+     * "HH:MM" 24-hour, local to the organization's timezone. Used ONLY to
+     * rank the real returned candidates by closeness; a slot at this
+     * exact time is never assumed to exist just because this field is
+     * set. Omit when the customer gave no specific time. */
+    preferredTime: z.string().regex(/^([01]\d|2[0-3]):([0-5]\d)$/, "Expected 24-hour HH:MM").optional(),
+    /** A rough part of day the customer mentioned (e.g. "Friday
+     * afternoon") when no exact time was given. Used ONLY to prefer real
+     * candidates that fall in that window; if none of the real returned
+     * slots fall in it, the ordinary bounded list is still shown rather
+     * than inventing one. Omit when the customer gave neither a time nor
+     * a daypart — morning/afternoon/evening match this file's own prompt
+     * description of each window exactly (see buildDecisionSystemInstructions). */
+    preferredDaypart: z.enum(["morning", "afternoon", "evening"]).optional(),
     reason: z.string().max(300).optional(),
   })
   .strict();
@@ -204,6 +244,125 @@ export function formatOfferedSlotOptions(slots: PersistedSlotOffer[]): string[] 
   });
 }
 
+// ── Preference-aware candidate selection ─────────────────────────────────
+//
+// LIVE VALIDATION FIX. Replaces the previous unconditional "take the
+// chronologically-first N" behavior with preference-aware ranking, while
+// changing NOTHING about where the candidates themselves come from: every
+// slot this function can possibly return was already present in the
+// trusted `allSlots` array get_availability's real handler returned.
+// This function only reorders/filters that array — it never constructs,
+// mutates, or invents a slot. Pure and dependency-free (no Supabase, no
+// model) so it's directly unit-testable.
+
+export type SlotPreference = {
+  /** "HH:MM", 24-hour, local to the slot's own timeZone — same format as
+   * getAvailabilityDecisionSchema's preferredTime. */
+  time?: string;
+  daypart?: "morning" | "afternoon" | "evening";
+};
+
+export type SlotSelectionResult = {
+  slots: PersistedSlotOffer[];
+  /** True only when the customer's exact preferredTime matches a REAL
+   * returned slot's own start time precisely (0-minute distance) — the
+   * one signal the orchestrator uses to phrase "that time is available"
+   * vs. "that time isn't available, but here are the closest real
+   * alternatives" without re-deriving the time math itself. */
+  exactMatch: boolean;
+};
+
+/** Local-timezone minutes-since-midnight of a slot's own start — same
+ * Intl.DateTimeFormat approach scheduling-availability.ts already uses
+ * for its own local-time math, kept independent here (this file has no
+ * dependency on that module beyond the PersistedSlotOffer TYPE) since
+ * this is presentation/ranking only, never an availability/authority
+ * decision. */
+function localMinutesOfDay(slot: PersistedSlotOffer): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: slot.timeZone, hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(new Date(slot.start));
+  const get = (t: string) => parseInt(parts.find((p) => p.type === t)?.value ?? "0", 10);
+  let hour = get("hour");
+  if (hour === 24) hour = 0;
+  return hour * 60 + get("minute");
+}
+
+function parseHHMM(value: string): number | null {
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(value);
+  if (!m) return null;
+  return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+}
+
+/** morning: before noon. afternoon: noon up to (not including) 5 PM.
+ * evening: 5 PM onward. Matches this file's own prompt description of
+ * each window exactly — the model's semantic understanding and this
+ * function's literal ranges must stay in agreement, or "afternoon" could
+ * mean two different things in the same conversation. */
+const DAYPART_RANGES: Record<"morning" | "afternoon" | "evening", [number, number]> = {
+  morning: [0, 12 * 60],
+  afternoon: [12 * 60, 17 * 60],
+  evening: [17 * 60, 24 * 60],
+};
+
+const DEFAULT_CANDIDATE_LIMIT = 4;
+
+/**
+ * Picks which of the REAL, trusted `allSlots` candidates to present/
+ * persist, honoring a customer's structured time-of-day preference when
+ * one exists. With no preference at all, behavior is unchanged from
+ * before this fix: the first `limit` candidates in their original
+ * (chronological) order.
+ *
+ * With `preference.time` set: ranks every real candidate by absolute
+ * distance (in minutes, local to each slot's own timeZone) from the
+ * requested time, picks the closest `limit`, and re-sorts that picked set
+ * back into chronological order for presentation. `exactMatch` is true
+ * only when the single closest candidate is an exact (0-minute) match —
+ * i.e. the customer's requested time genuinely exists in the real
+ * availability data, never assumed.
+ *
+ * With `preference.daypart` set (and no `time`): filters to real
+ * candidates whose local start time falls in that daypart's window; if
+ * NONE do, falls back to the ordinary unconditional first-`limit` list
+ * (still real data — never fabricated just to fill the daypart) rather
+ * than returning nothing.
+ */
+export function selectCandidateSlots(
+  allSlots: PersistedSlotOffer[],
+  preference: SlotPreference | undefined,
+  limit: number = DEFAULT_CANDIDATE_LIMIT,
+): SlotSelectionResult {
+  if (!preference?.time && !preference?.daypart) {
+    return { slots: allSlots.slice(0, limit), exactMatch: false };
+  }
+
+  if (preference.time) {
+    const target = parseHHMM(preference.time);
+    if (target === null) return { slots: allSlots.slice(0, limit), exactMatch: false };
+
+    const ranked = allSlots
+      .map((slot) => ({ slot, distance: Math.abs(localMinutesOfDay(slot) - target) }))
+      .sort((a, b) => a.distance - b.distance || new Date(a.slot.start).getTime() - new Date(b.slot.start).getTime());
+
+    const exactMatch = ranked.length > 0 && ranked[0].distance === 0;
+    const picked = ranked
+      .slice(0, limit)
+      .map((r) => r.slot)
+      .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+    return { slots: picked, exactMatch };
+  }
+
+  // preference.daypart, no preference.time
+  const [lo, hi] = DAYPART_RANGES[preference.daypart!];
+  const matching = allSlots.filter((slot) => {
+    const minutes = localMinutesOfDay(slot);
+    return minutes >= lo && minutes < hi;
+  });
+  if (matching.length > 0) return { slots: matching.slice(0, limit), exactMatch: false };
+  return { slots: allSlots.slice(0, limit), exactMatch: false };
+}
+
 // ── Prompt builders ───────────────────────────────────────────────────────
 
 function buildKnownFieldsBlock(context: AIResolvedContext): string {
@@ -267,14 +426,19 @@ function buildDecisionSystemInstructions(
     "",
     ...(todayLine ? [todayLine] : []),
     "You may choose exactly one of the following actions:",
-    "- get_availability: looks up real, currently-open appointment slots for a specific date you choose (YYYY-MM-DD). Use this when you don't yet have a current offer to work with, or when the customer wants a different day than what was last offered.",
+    // LIVE VALIDATION FIX: this is the exact line that let the model pick
+    // an arbitrary date on its own initiative. Rewritten to require a
+    // real day-signal from the CUSTOMER before this action may be used at
+    // all — see this phase's own report for the live defect this closes.
+    "- get_availability: looks up real, currently-open appointment slots for a specific date. ONLY use this when the customer has given you SOME indication of which day they mean (an exact date, a weekday like \"Tuesday\", a relative day like \"tomorrow\"/\"next week\", or a day they want to switch to from what was last offered). Set preferredTime (24-hour HH:MM) when the customer also gave a specific clock time for that day (e.g. \"around 10\" -> \"10:00\"); set preferredDaypart (morning = before noon, afternoon = noon-5pm, evening = 5pm or later) when they gave a rough part of day instead (e.g. \"Friday afternoon\"). Omit both when the customer named only a day with no time preference at all.",
+    "- NEVER call get_availability, and NEVER pick a day yourself, when the customer has not told you ANY day or time preference yet — use respond instead and ask a short, concrete question such as \"What day and time works best for you?\". The same applies if the customer gave only a time with no day at all (e.g. just \"10am\") — ask which day, do not guess one.",
     offeredSlots && offeredSlots.length > 0
       ? "- select_offered_slot: use when the customer's reply clearly references ONE of the numbered options above, but you want to confirm it back to them before actually booking (e.g. they mentioned a time but haven't explicitly said to book it yet)."
       : "- select_offered_slot: only usable when options were just offered above — not available right now.",
     offeredSlots && offeredSlots.length > 0
       ? "- propose_appointment: use when the customer's reply clearly and unambiguously identifies ONE of the numbered options above AND confirms they want it booked (e.g. \"yes, 11 works\", \"book the second one\", \"that works, let's do it\")."
       : "- propose_appointment: only usable when options were just offered above — not available right now.",
-    "- respond: use for anything else — greeting, asking what day works, answering a question using the CRM context above, asking for clarification when you cannot tell which numbered option the customer means, or acknowledging a clear decline (set declineScheduling:true only when the customer clearly does not want to schedule right now, e.g. \"not now\" or \"no thanks\").",
+    "- respond: use for anything else — greeting, asking what day and time works (the correct choice when nothing has been specified yet), answering a question using the CRM context above, asking for clarification when you cannot tell which numbered option the customer means, or acknowledging a clear decline (set declineScheduling:true only when the customer clearly does not want to schedule right now, e.g. \"not now\" or \"no thanks\").",
     "If the customer's reply could match more than one numbered option, or doesn't clearly match any of them, use respond and ask a short clarifying question — never guess which option they meant.",
     "Never state a specific appointment time yourself unless it is one of the exact numbered options you were just given above, or one just returned by get_availability.",
     "You have not booked anything yet, and selecting or proposing an option here does not mean it is confirmed — you will be told the real outcome afterward.",
@@ -283,7 +447,7 @@ function buildDecisionSystemInstructions(
     "",
     "Respond with ONLY a single JSON object — no markdown, no code fences, no text outside the JSON — matching exactly one of these shapes:",
     '{"type":"respond","response":"<your natural-language reply to the customer>","declineScheduling":false}',
-    '{"type":"get_availability","date":"<YYYY-MM-DD>","reason":"<short optional reason>"}',
+    '{"type":"get_availability","date":"<YYYY-MM-DD>","preferredTime":"<HH:MM, optional>","preferredDaypart":"<morning|afternoon|evening, optional>","reason":"<short optional reason>"}',
     '{"type":"select_offered_slot","selectedOptionNumber":<the option number>,"reason":"<short optional reason>"}',
     '{"type":"propose_appointment","selectedOptionNumber":<the option number>,"reason":"<short optional reason>"}',
   ].join("\n");

@@ -156,6 +156,105 @@ test("without a handoff, no handoff context block or continuity instruction appe
   assert.ok(!req.system.includes("has handed this conversation to you"));
 });
 
+// ── LIVE VALIDATION FIX: get_availability schema now carries optional
+// preference hints, and the prompt requires a real day-signal first ────
+
+test("get_availability decision accepts optional preferredTime (24-hour HH:MM) and preferredDaypart", () => {
+  const withTime = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredTime: "10:00" }));
+  assert.equal(withTime.kind, "decision");
+  assert.equal(withTime.decision.preferredTime, "10:00");
+
+  const withDaypart = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredDaypart: "afternoon" }));
+  assert.equal(withDaypart.kind, "decision");
+  assert.equal(withDaypart.decision.preferredDaypart, "afternoon");
+
+  const withNeither = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", date: "2027-03-17" }));
+  assert.equal(withNeither.kind, "decision");
+  assert.equal(withNeither.decision.preferredTime, undefined);
+});
+
+test("preferredTime must be 24-hour HH:MM — a 12-hour or malformed value falls back safely, never silently coerced", () => {
+  for (const bad of ["10:00am", "25:00", "10:60", "10", "10:0"]) {
+    const parsed = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredTime: bad }));
+    assert.equal(parsed.kind, "fallback", bad);
+  }
+});
+
+test("preferredDaypart only accepts the three known literal values", () => {
+  const parsed = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredDaypart: "late_night" }));
+  assert.equal(parsed.kind, "fallback");
+});
+
+test("the prompt now REQUIRES a real day-signal from the customer before get_availability may be used — the root cause of the live defect (an unconditional 'use this when you don't have a current offer' invitation) is gone", () => {
+  const req = S.buildSchedulingDecisionRequest(AGENT_INSTRUCTIONS, baseContext(), baseEvent, undefined);
+  assert.match(req.system, /ONLY use this when the customer has given you SOME indication of which day they mean/);
+  assert.match(req.system, /NEVER call get_availability, and NEVER pick a day yourself, when the customer has not told you ANY day or time preference yet/);
+  assert.ok(!req.system.includes("Use this when you don't yet have a current offer to work with"), "the old unconditional invitation line must be gone");
+});
+
+test("the prompt describes preferredTime/preferredDaypart and defines the exact daypart boundaries selectCandidateSlots() itself uses", () => {
+  const req = S.buildSchedulingDecisionRequest(AGENT_INSTRUCTIONS, baseContext(), baseEvent, undefined);
+  assert.match(req.system, /morning = before noon, afternoon = noon-5pm, evening = 5pm or later/);
+});
+
+test("the prompt tells the model to ask which day when only a time was given, with no day at all", () => {
+  const req = S.buildSchedulingDecisionRequest(AGENT_INSTRUCTIONS, baseContext(), baseEvent, undefined);
+  assert.match(req.system, /The same applies if the customer gave only a time with no day at all.*ask which day, do not guess one/);
+});
+
+// ── selectCandidateSlots() — preference-aware ranking, pure function ────
+
+const TZ = "America/New_York";
+const MORNING_1 = { start: "2027-03-17T12:00:00.000Z", end: "2027-03-17T13:00:00.000Z", timeZone: TZ }; // 8:00 AM ET
+const MORNING_2 = { start: "2027-03-17T12:30:00.000Z", end: "2027-03-17T13:30:00.000Z", timeZone: TZ }; // 8:30 AM ET
+const MORNING_3 = { start: "2027-03-17T13:00:00.000Z", end: "2027-03-17T14:00:00.000Z", timeZone: TZ }; // 9:00 AM ET
+const MORNING_4 = { start: "2027-03-17T13:30:00.000Z", end: "2027-03-17T14:30:00.000Z", timeZone: TZ }; // 9:30 AM ET
+const TEN_AM = { start: "2027-03-17T14:00:00.000Z", end: "2027-03-17T15:00:00.000Z", timeZone: TZ }; // 10:00 AM ET
+const NINE_THIRTY = MORNING_4; // 9:30 AM ET
+const TEN_THIRTY = { start: "2027-03-17T14:30:00.000Z", end: "2027-03-17T15:30:00.000Z", timeZone: TZ }; // 10:30 AM ET
+const TWO_PM = { start: "2027-03-17T18:00:00.000Z", end: "2027-03-17T19:00:00.000Z", timeZone: TZ }; // 2:00 PM ET
+const FIVE_PM = { start: "2027-03-17T21:00:00.000Z", end: "2027-03-17T22:00:00.000Z", timeZone: TZ }; // 5:00 PM ET
+
+const ALL_MORNING_PLUS_AFTERNOON = [MORNING_1, MORNING_2, MORNING_3, MORNING_4, TWO_PM, FIVE_PM];
+
+test("with no preference at all, returns the first `limit` candidates unchanged — the pre-fix behavior, preserved for the date-only/no-time case", () => {
+  const result = S.selectCandidateSlots(ALL_MORNING_PLUS_AFTERNOON, undefined, 4);
+  assert.deepEqual(result.slots, [MORNING_1, MORNING_2, MORNING_3, MORNING_4]);
+  assert.equal(result.exactMatch, false);
+});
+
+test("an exact preferredTime match is detected and surfaced first — never silently missed just because it wasn't chronologically first", () => {
+  const result = S.selectCandidateSlots([MORNING_1, TEN_AM, TWO_PM], { time: "10:00" }, 4);
+  assert.equal(result.exactMatch, true);
+  assert.ok(result.slots.some((s: any) => s.start === TEN_AM.start));
+});
+
+test("no exact match for the requested time: the nearest REAL alternatives are returned, chronologically ordered, never the requested (nonexistent) time itself", () => {
+  // Real candidates at 9:30 and 10:30 ET; customer asked for 10:00 ET, which does not exist.
+  const result = S.selectCandidateSlots([NINE_THIRTY, TEN_THIRTY, TWO_PM, FIVE_PM], { time: "10:00" }, 2);
+  assert.equal(result.exactMatch, false);
+  assert.equal(result.slots.length, 2);
+  assert.deepEqual(result.slots.map((s: any) => s.start), [NINE_THIRTY.start, TEN_THIRTY.start]);
+});
+
+test("a daypart preference (afternoon) prefers real afternoon candidates — morning slots are not blindly selected just because they are chronologically first", () => {
+  const result = S.selectCandidateSlots(ALL_MORNING_PLUS_AFTERNOON, { daypart: "afternoon" }, 4);
+  assert.deepEqual(result.slots, [TWO_PM]);
+  assert.ok(!result.slots.some((s: any) => s.start === MORNING_1.start));
+});
+
+test("a daypart preference with zero real matches falls back to the ordinary first-N list — never fabricates a slot just to fill the daypart", () => {
+  const result = S.selectCandidateSlots([MORNING_1, MORNING_2], { daypart: "evening" }, 4);
+  assert.deepEqual(result.slots, [MORNING_1, MORNING_2]);
+  assert.equal(result.exactMatch, false);
+});
+
+test("preferredTime takes precedence over preferredDaypart when both are somehow set", () => {
+  const result = S.selectCandidateSlots([NINE_THIRTY, TWO_PM], { time: "09:30", daypart: "afternoon" }, 4);
+  assert.equal(result.exactMatch, true);
+  assert.ok(result.slots.some((s: any) => s.start === NINE_THIRTY.start));
+});
+
 test("the final-response prompt never exposes internal mechanics (option numbers, tool names) to the customer, and tells the model to speak naturally about times", () => {
   const req = S.buildSchedulingFinalRequest(AGENT_INSTRUCTIONS, baseContext(), baseEvent, "These real, available slots were just found: 1) Wed Mar 17 3:00 PM.", [SLOT_A]);
   assert.match(req.system, /Do not mention internal tools, systems, option numbers/);

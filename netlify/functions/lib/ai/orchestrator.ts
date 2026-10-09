@@ -88,7 +88,9 @@ import {
   buildSchedulingFinalRequest,
   formatOfferedSlotOptions,
   parseSchedulingDecision,
+  selectCandidateSlots,
   type SchedulingDecision,
+  type SchedulingGetAvailabilityDecision,
   type SchedulingSlotReferenceDecision,
 } from "./agents/scheduling";
 import { executeStep, type ExecuteStepResult } from "../../../../src/lib/agentic/action-executor";
@@ -1324,11 +1326,20 @@ async function runSchedulingTurn(params: {
     } else {
       const output = availabilityResult.output as { slots: PersistedSlotOffer[]; timeZone: string } | undefined;
       const allSlots = output?.slots ?? [];
-      // Capped for a short, readable SMS/WhatsApp list — see
-      // scheduling.ts's own formatOfferedSlotOptions() header. Still real,
-      // trusted candidates straight from the authoritative availability
-      // core — never truncated in a way that invents or reorders anything.
-      const offeredNow = allSlots.slice(0, 4);
+      // LIVE VALIDATION FIX: previously an unconditional `allSlots.slice(0,
+      // 4)` — the chronologically-first candidates regardless of what the
+      // customer actually asked for, which is part of the live defect this
+      // phase fixes (morning slots were offered even when the customer
+      // asked about Friday afternoon). selectCandidateSlots() still only
+      // ever selects FROM allSlots — every real, trusted candidate
+      // get_availability's own handler returned — it never invents or
+      // reorders anything beyond picking/ranking which of those real
+      // candidates to present.
+      const { slots: offeredNow, exactMatch } = selectCandidateSlots(
+        allSlots,
+        { time: decision.preferredTime, daypart: decision.preferredDaypart },
+      );
+      const hadPreference = !!(decision.preferredTime || decision.preferredDaypart);
 
       if (offeredNow.length === 0) {
         outcomeSummary = `No open appointment slots were found for ${decision.date}. Ask the customer if a different day would work, or suggest one.`;
@@ -1344,12 +1355,12 @@ async function runSchedulingTurn(params: {
         } else {
           nextOfferedSlots = offeredNow;
         }
-        outcomeSummary = `These real, available slots were just found for ${decision.date}: ${formatOfferedSlotOptions(offeredNow).join("; ")}. Present them to the customer by their natural time (never "option 1") and ask which works.`;
+        outcomeSummary = describeAvailabilityOutcome(decision, offeredNow, hadPreference, exactMatch);
       } else {
         // No contactId/unsupported channel — can't persist an offer to
         // resolve a later reply against, but the lookup itself is still a
         // real answer worth giving.
-        outcomeSummary = `These real, available slots were just found for ${decision.date}: ${formatOfferedSlotOptions(offeredNow).join("; ")}. Present them to the customer by their natural time and ask which works, and ask them to confirm their choice clearly in their next message.`;
+        outcomeSummary = `${describeAvailabilityOutcome(decision, offeredNow, hadPreference, exactMatch)} Also ask them to confirm their choice clearly in their next message.`;
       }
     }
 
@@ -1454,6 +1465,29 @@ function resolveSelectedSlot(offeredSlots: PersistedSlotOffer[] | undefined, sel
   const index = selectedOptionNumber - 1;
   if (index < 0 || index >= offeredSlots.length) return { status: "out_of_range" };
   return { status: "matched", slot: offeredSlots[index] };
+}
+
+/** LIVE VALIDATION FIX: builds the factual summary fed to the second
+ * (final-response) model call after a get_availability lookup — phrased
+ * differently depending on whether the customer had expressed a
+ * time/daypart preference at all, and whether that preference turned out
+ * to be an exact real match. Facts only (real slot labels, via
+ * formatOfferedSlotOptions()); the model still does all customer-facing
+ * phrasing — this never writes customer-visible text itself. */
+function describeAvailabilityOutcome(
+  decision: SchedulingGetAvailabilityDecision,
+  offeredNow: PersistedSlotOffer[],
+  hadPreference: boolean,
+  exactMatch: boolean,
+): string {
+  const labels = formatOfferedSlotOptions(offeredNow).join("; ");
+  if (!hadPreference) {
+    return `These real, available slots were just found for ${decision.date}: ${labels}. Present them to the customer by their natural time (never "option 1") and ask which works.`;
+  }
+  if (exactMatch) {
+    return `The customer's requested time is genuinely available: ${labels}. Confirm that exact time clearly and ask if they'd like it booked.`;
+  }
+  return `The customer's requested time is NOT available for ${decision.date}. These are the nearest REAL alternatives: ${labels}. Let the customer know their requested time isn't available and offer these instead, by their natural time (never "option 1").`;
 }
 
 /** Shared "make the second, final model call, then finalize" tail for
