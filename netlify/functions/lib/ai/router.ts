@@ -24,11 +24,13 @@
 //
 // ROUTER VS. HANDOFF: routeAIEvent() decides who takes an event FIRST. It
 // never decides what happens after an agent starts working — an
-// in-progress Lead Qualification run later deciding to hand off to
-// Scheduling is an orchestration-time AIAgentHandoff (AI-1F/AI-2+), not a
-// second call into this router. Conflating the two would make Scheduling
-// reachable from routing rules this file has no trustworthy basis for
-// (see routeByCrmContext's scheduling note below).
+// in-progress Lead Qualification run deciding to hand off to Scheduling
+// is an orchestration-time AIAgentHandoff (orchestrator.ts), not a second
+// call into this router. What THIS file decides, for the very NEXT
+// separate inbound event, is covered by Tier 2 below (an outstanding,
+// still-fresh scheduling offer routes straight back to Scheduling) — see
+// routeByConversationState's own comment. Tier 3 (routeByCrmContext)
+// still never selects Scheduling directly from CRM/entity context alone.
 
 import type {
   AIAgentKey,
@@ -39,15 +41,23 @@ import type {
 
 const RECEPTION: AIAgentKey = "reception";
 const LEAD_QUALIFICATION: AIAgentKey = "lead_qualification";
-// "scheduling" is a valid AIAgentKey (see types.ts's KNOWN_AI_AGENT_KEYS)
-// but is intentionally never returned by this router — see
-// routeByCrmContext's comment.
+const SCHEDULING: AIAgentKey = "scheduling";
+// "scheduling" was a valid AIAgentKey (see types.ts's KNOWN_AI_AGENT_KEYS)
+// that this router intentionally never returned, for every tier EXCEPT
+// Tier 2 below — see routeByConversationState's own comment for why that
+// tier (and only that tier) is now allowed to return it, and
+// routeByCrmContext's comment for why Tier 3 still never does.
 
 // Router confidence is a fixed, hand-assigned score reflecting how
 // deterministic each tier is — NOT a calibrated ML probability. It exists
 // so an audit log / Test Console can show relative certainty without
 // implying statistical meaning it doesn't have.
 const EXPLICIT_EVENT_CONFIDENCE = 1.0;
+// Lead-Qualification-to-Scheduling handoff phase: a real, persisted,
+// deterministic DB signal (a scheduling offer genuinely exists and is
+// still fresh) — arguably MORE certain than Tier 3's heuristic lead-status
+// rule, so it is scored higher, not reused at the same confidence.
+const CONVERSATION_STATE_CONFIDENCE = 0.95;
 const CRM_CONTEXT_CONFIDENCE = 0.9;
 const FALLBACK_CONFIDENCE = 0.5;
 
@@ -174,20 +184,37 @@ function routeByExplicitEvent(event: AIChannelEvent): AIRouteDecision | undefine
   }
 }
 
-// ── Tier 2: conversation ownership (RESERVED, NOT ACTIVE) ───────────────
+// ── Tier 2: conversation ownership ───────────────────────────────────────
 //
-// AIConversationSummary.aiOwned has no backing schema anywhere in the
-// repository yet (confirmed during AI-1D: conversation_states only
-// tracks archive/star, no AI-vs-human-ownership column exists) and is
-// therefore always undefined today. This function exists to hold this
-// tier's place in the priority order the ai-center skill specifies — it
-// deliberately does NOT read context.conversation?.aiOwned or branch on
-// it, because doing so over a field that's always undefined would be
-// dead code dressed up as a real routing tier. It always returns
-// undefined until real conversation-ownership data exists; when it does,
-// this function (not a new tier inserted elsewhere) is where that logic
-// belongs.
+// AIConversationSummary.aiOwned (general AI-vs-human conversation
+// ownership) still has no backing schema anywhere in the repository —
+// that part of this tier remains reserved, exactly as before, and this
+// function still does not read or branch on `aiOwned` for that reason.
+//
+// Lead-Qualification-to-Scheduling handoff phase ADDS one narrow,
+// specific ownership signal this tier CAN now act on:
+// `context.conversation.schedulingOfferActive` — computed by
+// context-builder.ts from the EXISTING conversation_states.
+// scheduling_offered_slots/_at columns (see that file's own
+// resolveSchedulingOfferActive(), including the 24-hour freshness
+// window). When true, an outstanding scheduling offer means Scheduling,
+// not Lead Qualification, should continue owning this turn — otherwise a
+// customer replying "11 works" to an offer Scheduling just sent would
+// route straight back to Lead Qualification (which has no way to resolve
+// that reply) via Tier 3's own lead-status rule. This is intentionally
+// narrower than general conversation ownership: it says nothing about
+// human takeover, and it is never proof the offered slot itself is still
+// available (see scheduling-availability.ts's own re-validation, which
+// this field has no bearing on whatsoever).
 function routeByConversationState(context: AIResolvedContext): AIRouteDecision | undefined {
+  if (context.conversation?.schedulingOfferActive) {
+    return {
+      agentKey: SCHEDULING,
+      reason: "An outstanding, still-fresh (<=24h) scheduling slot offer exists for this conversation — continuing with Scheduling rather than falling back to Lead Qualification.",
+      confidence: CONVERSATION_STATE_CONFIDENCE,
+      source: "conversation_state",
+    };
+  }
   return undefined;
 }
 

@@ -309,6 +309,22 @@ export type AIConversationSummary = {
    * holding conversation content, and AI-1D's context builder needs one.
    */
   recentMessages?: AIConversationMessageSummary[];
+  /**
+   * Lead-Qualification-to-Scheduling handoff phase. Whether an outstanding,
+   * still-fresh (see context-builder.ts's 24-hour window) scheduling slot
+   * offer exists for this (org, contact, channel) conversation — computed
+   * read-only from conversation_states.scheduling_offered_slots/_at via
+   * scheduling-offer-state.ts's readOfferedSlots(). This is a ROUTING
+   * signal only (router.ts's Tier 2 — "which agent continues owning this
+   * conversation"), consumed exactly like context.lead.status already is
+   * by Tier 3: NEVER proof the underlying slot is still actually
+   * available — booking-time re-validation (scheduling-availability.ts)
+   * is completely independent of this field and unaffected by it either
+   * way. Undefined (not false) when not computed/not applicable (e.g. a
+   * channel scheduling-offer-state.ts doesn't support, or no contactId) —
+   * router.ts treats both undefined and false identically (fall through).
+   */
+  schedulingOfferActive?: boolean;
 };
 
 export type AIResolvedContext = {
