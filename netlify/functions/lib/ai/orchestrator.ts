@@ -1481,13 +1481,20 @@ function describeAvailabilityOutcome(
   exactMatch: boolean,
 ): string {
   const labels = formatOfferedSlotOptions(offeredNow).join("; ");
+  // LIVE VALIDATION FIX (PR #17 defect #2): every branch below states the
+  // outcome as AVAILABLE, never booked — this is the one true fact at
+  // this point in the turn (only a read-only get_availability just ran;
+  // no schedule_appointment approval exists yet). The explicit "nothing
+  // is booked yet" reminder is included in the fact string itself, not
+  // left to the model to infer, on top of the standing
+  // NO_PREMATURE_BOOKING_LANGUAGE_RULE in both system prompts.
   if (!hadPreference) {
-    return `These real, available slots were just found for ${decision.date}: ${labels}. Present them to the customer by their natural time (never "option 1") and ask which works.`;
+    return `These real, available slots were just found for ${decision.date}: ${labels}. Nothing is booked yet. Present them to the customer by their natural time (never "option 1") and ask which works.`;
   }
   if (exactMatch) {
-    return `The customer's requested time is genuinely available: ${labels}. Confirm that exact time clearly and ask if they'd like it booked.`;
+    return `The customer's requested time is genuinely AVAILABLE (not yet booked): ${labels}. State clearly that it is available and ask if they'd like you to go ahead and schedule it — do not say it is already booked, scheduled, or confirmed.`;
   }
-  return `The customer's requested time is NOT available for ${decision.date}. These are the nearest REAL alternatives: ${labels}. Let the customer know their requested time isn't available and offer these instead, by their natural time (never "option 1").`;
+  return `The customer's requested time is NOT available for ${decision.date}. Nothing is booked yet. These are the nearest REAL alternatives: ${labels}. Let the customer know their requested time isn't available and offer these instead, by their natural time (never "option 1").`;
 }
 
 /** Shared "make the second, final model call, then finalize" tail for

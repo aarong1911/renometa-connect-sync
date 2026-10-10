@@ -106,9 +106,12 @@ function makeDb(overrides: Record<string, any[]> = {}) {
  * order, one per call — never a real Anthropic call. */
 function scriptedProvider(scripts: string[]) {
   let i = 0;
+  const requests: any[] = [];
   return {
     name: "fake",
-    run: async (_req: unknown) => {
+    requests,
+    run: async (req: unknown) => {
+      requests.push(req);
       const text = scripts[i] ?? scripts[scripts.length - 1];
       i += 1;
       return { text, model: "fake-model", usage: { inputTokens: 10, outputTokens: 10 }, provider: "fake" };
@@ -286,6 +289,28 @@ test("2. customer supplies an exact date/time that IS available: get_availabilit
   assert.ok(row.scheduling_offered_slots.some((s: any) => s.start === "2027-03-17T14:00:00.000Z"), "the exact requested, genuinely-available time must be among the persisted slots");
 });
 
+// ── LIVE VALIDATION FIX (PR #17 defect #2): no premature-booking language ─
+
+test("5+6. the final-response call for an exact-match available time is fed facts stating AVAILABLE/not booked, and never 'already booked' — the exact wording the live defect produced", async () => {
+  const db = makeDb();
+  await seedThrowawayOfferToReachScheduling(db);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredTime: "10:00" }),
+    JSON.stringify({ type: "respond", response: "Tuesday at 10 AM is available. Would you like me to schedule that?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Tuesday at 10 works for me"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.status, "completed");
+
+  assert.equal(modelProvider.requests.length, 2, "exactly a decision call then a final-response call");
+  const finalCallUserContent = modelProvider.requests[1].messages[0].content;
+  assert.match(finalCallUserContent, /AVAILABLE \(not yet booked\)/, "the final call's own facts must state the real state explicitly");
+  assert.match(finalCallUserContent, /do not say it is already booked, scheduled, or confirmed/, "the facts must explicitly negate completed-booking language, not merely omit it");
+  assert.doesNotMatch(finalCallUserContent, /we have you down/i);
+  // The system prompt for that same final call must also carry the
+  // standing language safeguard, not just the per-outcome fact string.
+  assert.match(modelProvider.requests[1].system, /NEVER say or imply that an appointment is already booked/);
+});
+
 test("3. requested exact time is unavailable: the nearest appropriate REAL alternatives are offered, and the unavailable (nonexistent-as-a-candidate) time is never itself invented/persisted", async () => {
   // Block exactly 10:00-11:00 ET (14:00-15:00Z) with a real, org-wide (unassigned) appointment.
   // With 60-minute appointment slots, this also genuinely overlaps (and
@@ -458,6 +483,12 @@ test("a resolved propose_appointment choice creates the schedule_appointment app
   const { data: execRow } = await db.from("agent_executions").select("*").eq("id", result.executionId).maybeSingle();
   assert.equal(execRow.status, "awaiting_approval");
   assert.equal(execRow.completed_at, null, "an awaiting_approval execution is not yet completed, matching the existing convention");
+
+  // 7. LIVE VALIDATION FIX (PR #17 defect #2): a pending approval must
+  // never be represented to the customer as an already-executed booking.
+  const finalCallUserContent = modelProvider.requests[1].messages[0].content;
+  assert.match(finalCallUserContent, /pending confirmation/i);
+  assert.match(finalCallUserContent, /do not say it is already booked/i, "the facts must explicitly negate completed-booking language, not merely omit it");
 });
 
 test("the offer is NOT cleared immediately after a successful propose_appointment — the approval could still fail later, and the existing re-validation at approval time is the real safety net (Section G)", async () => {

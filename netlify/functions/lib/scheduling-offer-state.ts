@@ -64,11 +64,38 @@ function isValidSlotShape(value: unknown): value is PersistedSlotOffer {
  * Persists the EXACT set of slots just offered to this contact on this
  * channel — structured, never label-only (see this file's header).
  * Validates shape before writing (no DB-level CHECK exists for this jsonb
- * column — see the migration's own comment for why). Upserts on the
- * EXISTING (org_id, contact_id, channel) partial unique index
- * (conversation_states_org_contact_channel_uq) — the same index/identity
- * every other conversation_states writer (archive/star) already uses for
- * these channels; no new identity concept introduced.
+ * column — see the migration's own comment for why).
+ *
+ * LIVE VALIDATION FIX (PR #17): this used to be a single `.upsert(...,
+ * {onConflict: "org_id,contact_id,channel"})` call. That silently failed
+ * to persist anything — confirmed against a real execution's own data: a
+ * real get_availability succeeded, but the matching conversation_states
+ * row never existed afterward. Root cause, confirmed from the live DB
+ * schema: `conversation_states_org_contact_channel_uq` is a PARTIAL
+ * unique index (`WHERE contact_id IS NOT NULL AND channel <> 'email'`),
+ * not an ordinary table-wide unique constraint. PostgREST's `onConflict`
+ * option targets a constraint/index by its COLUMN LIST, and has no way to
+ * also specify a partial index's WHERE predicate — so `upsert()` could
+ * not correctly target this index at all (it either silently fails to
+ * find a matching conflict target or raises a Postgres error depending on
+ * version/config; either way, the row was never durably written here).
+ *
+ * Fixed with an explicit UPDATE-then-INSERT strategy that needs no
+ * special onConflict target at all — it uses only the EXISTING
+ * (org_id, contact_id, channel) columns via plain `.eq()` filters, which
+ * work identically whether or not the matching index is partial:
+ *   1. UPDATE the row matching (org_id, contact_id, channel), if one
+ *      exists — `.select().maybeSingle()` on the UPDATE tells us whether
+ *      a row was actually found and updated.
+ *   2. If no row existed, INSERT a new one.
+ *   3. If that INSERT loses a genuine concurrent-create race (two
+ *      executions both saw "no row" and both tried to INSERT — the
+ *      partial unique index itself is what makes this a real 23505, not
+ *      a hypothetical), retry the UPDATE exactly once — by the time the
+ *      INSERT lost the race, a row now genuinely exists for us to update.
+ * No migration, no new/changed index — the existing partial unique index
+ * is exactly what makes step 3's conflict real and worth handling, and
+ * is left completely untouched.
  */
 export async function writeOfferedSlots(deps: AvailabilityDeps, params: WriteOfferedSlotsParams): Promise<WriteOfferedSlotsResult> {
   const { orgId, contactId, channel, slots } = params;
@@ -78,24 +105,57 @@ export async function writeOfferedSlots(deps: AvailabilityDeps, params: WriteOff
   if (!slots.every(isValidSlotShape)) return { ok: false, reason: "every slot must have start/end/timeZone" };
 
   const nowIso = (params.now ?? new Date()).toISOString();
-  const { error } = await deps.supabase
+  const payload = { scheduling_offered_slots: slots, scheduling_offered_at: nowIso, updated_at: nowIso };
+
+  return updateThenInsertOfferedSlots(deps, orgId, contactId, channel, payload, /* allowConflictRetry */ true);
+}
+
+/** Shared by writeOfferedSlots() for both the initial attempt and the
+ * single concurrent-create-race retry (see that function's own header).
+ * `allowConflictRetry` is only ever true on the first call — it exists
+ * purely to cap the retry at exactly one, per the required semantics;
+ * never a loop. */
+async function updateThenInsertOfferedSlots(
+  deps: AvailabilityDeps,
+  orgId: string,
+  contactId: string,
+  channel: SchedulingOfferChannel,
+  payload: { scheduling_offered_slots: PersistedSlotOffer[]; scheduling_offered_at: string; updated_at: string },
+  allowConflictRetry: boolean,
+): Promise<WriteOfferedSlotsResult> {
+  const { data: updatedRow, error: updateError } = await deps.supabase
     .from("conversation_states")
-    .upsert(
-      {
-        org_id: orgId,
-        contact_id: contactId,
-        channel,
-        scheduling_offered_slots: slots,
-        scheduling_offered_at: nowIso,
-        updated_at: nowIso,
-      },
-      { onConflict: "org_id,contact_id,channel" },
-    );
-  if (error) {
-    console.error("[scheduling-offer-state] writeOfferedSlots failed:", error.message);
-    return { ok: false, reason: error.message };
+    .update(payload)
+    .eq("org_id", orgId)
+    .eq("contact_id", contactId)
+    .eq("channel", channel)
+    .select("id")
+    .maybeSingle();
+
+  if (updateError) {
+    console.error("[scheduling-offer-state] writeOfferedSlots UPDATE failed:", updateError.message);
+    return { ok: false, reason: updateError.message };
   }
-  return { ok: true };
+  if (updatedRow) return { ok: true };
+
+  // No existing row matched — this is a genuinely new conversation_states
+  // row for this (org, contact, channel), never written to before.
+  const { error: insertError } = await deps.supabase
+    .from("conversation_states")
+    .insert({ org_id: orgId, contact_id: contactId, channel, ...payload });
+
+  if (!insertError) return { ok: true };
+
+  if (allowConflictRetry && (insertError as { code?: string }).code === "23505") {
+    // Another execution's INSERT won the race between our UPDATE (which
+    // found nothing) and our own INSERT — the partial unique index just
+    // did its job. A row now genuinely exists; retry the UPDATE once,
+    // never recursing again after this.
+    return updateThenInsertOfferedSlots(deps, orgId, contactId, channel, payload, false);
+  }
+
+  console.error("[scheduling-offer-state] writeOfferedSlots INSERT failed:", insertError.message);
+  return { ok: false, reason: insertError.message };
 }
 
 export type ReadOfferedSlotsResult =

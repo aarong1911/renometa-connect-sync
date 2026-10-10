@@ -262,3 +262,25 @@ test("the final-response prompt never exposes internal mechanics (option numbers
   const userContent = req.messages[0].content;
   assert.match(userContent, /Real outcome: These real, available slots were just found/);
 });
+
+// ── LIVE VALIDATION FIX (PR #17 defect #2): no premature-booking language ─
+
+test("5. both the decision prompt and the final-response prompt forbid completed-booking language before an appointment has actually been approved", () => {
+  const decisionReq = S.buildSchedulingDecisionRequest(AGENT_INSTRUCTIONS, baseContext(), baseEvent, undefined);
+  const finalReq = S.buildSchedulingFinalRequest(AGENT_INSTRUCTIONS, baseContext(), baseEvent, "outcome", undefined);
+  for (const req of [decisionReq, finalReq]) {
+    assert.match(req.system, /NEVER say or imply that an appointment is already booked, scheduled, confirmed, or reserved/);
+    assert.match(req.system, /"we have you down"/);
+    assert.match(req.system, /"you're booked"/);
+    assert.match(req.system, /"you're scheduled"/);
+    assert.match(req.system, /"your appointment is confirmed"/);
+    assert.match(req.system, /"I've booked that"/);
+    assert.match(req.system, /"I've scheduled that"/);
+    assert.match(req.system, /"your spot is reserved"/);
+  }
+});
+
+test("6. the prompt's own example for an exact-match available time says 'is available' and asks a scheduling question, never a completed-booking statement", () => {
+  const req = S.buildSchedulingFinalRequest(AGENT_INSTRUCTIONS, baseContext(), baseEvent, "outcome", undefined);
+  assert.match(req.system, /Tuesday at 10 AM is available — would you like me to schedule that\?/);
+});

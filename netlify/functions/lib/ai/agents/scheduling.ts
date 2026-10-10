@@ -398,6 +398,22 @@ function describeTodayInOrgTimezone(timeZone: string | undefined, now: Date): st
   }
 }
 
+// LIVE VALIDATION FIX (PR #17 defect #2): a real SMS turn had Scheduling
+// reply "We have you down for Tuesday at 10 AM... just to confirm — that
+// works for you, right?" immediately after a successful get_availability
+// — at that moment NO schedule_appointment approval existed and NO
+// appointment existed; only a read-only availability check had run. That
+// wording falsely implied an already-completed booking. This rule is
+// included in BOTH prompts (the decision call's own `respond` path can
+// independently generate customer-facing text too, not just the final-
+// response call) rather than relying on outcomeSummary phrasing alone —
+// see orchestrator.ts's describeAvailabilityOutcome() for the factual
+// (never customer-facing) half of this fix. Deliberately NOT a hardcoded
+// exact sentence — the model still phrases things naturally; this only
+// forbids the specific class of false claim that caused the live defect.
+const NO_PREMATURE_BOOKING_LANGUAGE_RULE =
+  "CRITICAL: until a human teammate has actually approved a booking, NEVER say or imply that an appointment is already booked, scheduled, confirmed, or reserved. Do not use phrases like \"we have you down\", \"you're booked\", \"you're scheduled\", \"your appointment is confirmed\", \"I've booked that\", \"I've scheduled that\", \"your spot is reserved\", or anything else implying the booking already exists. A time that was just found to be available is only AVAILABLE, not booked — say it is available and ask if they'd like it scheduled (e.g. \"Tuesday at 10 AM is available — would you like me to schedule that?\"). A request that was just submitted is only PENDING a teammate's approval — say it has been submitted/is pending, never that it is already booked.";
+
 function buildOfferedSlotsBlock(offeredSlots: PersistedSlotOffer[] | undefined): string {
   if (!offeredSlots || offeredSlots.length === 0) return "";
   const options = formatOfferedSlotOptions(offeredSlots);
@@ -442,6 +458,8 @@ function buildDecisionSystemInstructions(
     "If the customer's reply could match more than one numbered option, or doesn't clearly match any of them, use respond and ask a short clarifying question — never guess which option they meant.",
     "Never state a specific appointment time yourself unless it is one of the exact numbered options you were just given above, or one just returned by get_availability.",
     "You have not booked anything yet, and selecting or proposing an option here does not mean it is confirmed — you will be told the real outcome afterward.",
+    "",
+    NO_PREMATURE_BOOKING_LANGUAGE_RULE,
     "",
     `Organization: ${organizationName}.`,
     "",
@@ -508,6 +526,7 @@ export function buildSchedulingFinalRequest(
     ...(todayLine ? [todayLine] : []),
     "You just completed an internal step. Do not mention internal tools, systems, option numbers, or CRM details to the customer — respond naturally based on the real outcome you're told below.",
     "Refer to any specific appointment time only in the natural, human way a person would say it (e.g. \"Tuesday at 2 PM\"), never as an option number or raw timestamp.",
+    NO_PREMATURE_BOOKING_LANGUAGE_RULE,
     `Organization: ${context.organization.name}.`,
   ];
   if (handoff) systemParts.push("", HANDOFF_CONTINUITY_INSTRUCTION);
