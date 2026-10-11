@@ -345,3 +345,173 @@ test("D — a transient pre-insert failure under an idempotencyKeyFor()-derived 
   const { data: rows } = await db.from("appointments").select("id");
   assert.equal(rows.length, 1);
 });
+
+// ── clearStaleSchedulingOfferAfterBooking() — follow-up fix for stale
+// scheduling-offer ownership after a successful booking ────────────────
+//
+// LIVE BUG: the offer persisted in conversation_states.scheduling_
+// offered_slots/_at was never cleared after a schedule_appointment
+// approval actually created a real appointment — router.ts's Tier 2
+// (an offer <=24h old) kept routing the NEXT inbound message back to
+// Scheduling even though the booking was already done. Tested directly
+// here (not via a full HTTP `handler` integration test, which would need
+// auth/resolveOrgAndAuthority scaffolding this file's own header already
+// explains it deliberately avoids) — the same "test the exported logic
+// unit directly, verify wiring/ordering at the source level" split this
+// file already uses for verifyActionSuccess/idempotencyKeyFor and the
+// post-booking lifecycle call above.
+
+const SCHED_CONTACT = "cccccccc-cccc-4ccc-8ccc-ccccccccccc1";
+const SCHED_ORG = "11111111-1111-4111-8111-111111111111";
+
+function makeSchedulingCleanupDb(overrides: Record<string, any[]> = {}) {
+  return createFakeSupabaseClient(
+    {
+      agent_executions: [],
+      conversation_states: [],
+      ...overrides,
+    },
+    {},
+    {},
+  );
+}
+
+test("1. a verified booking clears the offer for the correct org/contact/channel — offer columns become null", async () => {
+  const db = makeSchedulingCleanupDb({
+    agent_executions: [{ id: "exec-1", org_id: SCHED_ORG, input_summary: { channel: "sms" } }],
+    conversation_states: [{
+      id: "cs-1", org_id: SCHED_ORG, contact_id: SCHED_CONTACT, channel: "sms",
+      scheduling_offered_slots: [{ start: "2027-03-17T19:00:00.000Z", end: "2027-03-17T20:00:00.000Z", timeZone: "America/New_York" }],
+      scheduling_offered_at: new Date().toISOString(),
+    }],
+  });
+  await S.clearStaleSchedulingOfferAfterBooking(db, SCHED_ORG, { execution_id: "exec-1", proposed_input: { contactId: SCHED_CONTACT, startsAt: "2027-03-17T19:00:00.000Z" } });
+
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", SCHED_ORG).eq("contact_id", SCHED_CONTACT).eq("channel", "sms").maybeSingle();
+  assert.equal(row.scheduling_offered_slots, null);
+  assert.equal(row.scheduling_offered_at, null);
+});
+
+test("6. channel cannot be resolved (no matching agent_executions row): cleanup is skipped safely — no error thrown, offer left untouched", async () => {
+  const db = makeSchedulingCleanupDb({
+    agent_executions: [], // execution row does not exist / cannot be found
+    conversation_states: [{
+      id: "cs-1", org_id: SCHED_ORG, contact_id: SCHED_CONTACT, channel: "sms",
+      scheduling_offered_slots: [{ start: "2027-03-17T19:00:00.000Z", end: "2027-03-17T20:00:00.000Z", timeZone: "America/New_York" }],
+      scheduling_offered_at: new Date().toISOString(),
+    }],
+  });
+  await assert.doesNotReject(
+    S.clearStaleSchedulingOfferAfterBooking(db, SCHED_ORG, { execution_id: "exec-missing", proposed_input: { contactId: SCHED_CONTACT } }),
+  );
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", SCHED_ORG).eq("contact_id", SCHED_CONTACT).eq("channel", "sms").maybeSingle();
+  assert.ok(Array.isArray(row.scheduling_offered_slots), "an unresolvable channel must never guess — the offer must be left exactly as it was");
+});
+
+test("7. a resolved but UNSUPPORTED channel (e.g. email) is never cleared — do not clear, booking itself is still successful regardless", async () => {
+  const db = makeSchedulingCleanupDb({
+    agent_executions: [{ id: "exec-1", org_id: SCHED_ORG, input_summary: { channel: "email" } }],
+    conversation_states: [{
+      id: "cs-1", org_id: SCHED_ORG, contact_id: SCHED_CONTACT, channel: "sms",
+      scheduling_offered_slots: [{ start: "2027-03-17T19:00:00.000Z", end: "2027-03-17T20:00:00.000Z", timeZone: "America/New_York" }],
+      scheduling_offered_at: new Date().toISOString(),
+    }],
+  });
+  await S.clearStaleSchedulingOfferAfterBooking(db, SCHED_ORG, { execution_id: "exec-1", proposed_input: { contactId: SCHED_CONTACT } });
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", SCHED_ORG).eq("contact_id", SCHED_CONTACT).eq("channel", "sms").maybeSingle();
+  assert.ok(Array.isArray(row.scheduling_offered_slots), "email is not a supported scheduling-offer channel — must never be cleared via a mismatched/unsupported channel");
+});
+
+test("no contactId on the approved input: cleanup is skipped safely, never throws, never guesses a contact", async () => {
+  const db = makeSchedulingCleanupDb({
+    agent_executions: [{ id: "exec-1", org_id: SCHED_ORG, input_summary: { channel: "sms" } }],
+    conversation_states: [{
+      id: "cs-1", org_id: SCHED_ORG, contact_id: SCHED_CONTACT, channel: "sms",
+      scheduling_offered_slots: [{ start: "2027-03-17T19:00:00.000Z", end: "2027-03-17T20:00:00.000Z", timeZone: "America/New_York" }],
+      scheduling_offered_at: new Date().toISOString(),
+    }],
+  });
+  await assert.doesNotReject(S.clearStaleSchedulingOfferAfterBooking(db, SCHED_ORG, { execution_id: "exec-1", proposed_input: {} }));
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", SCHED_ORG).eq("contact_id", SCHED_CONTACT).eq("channel", "sms").maybeSingle();
+  assert.ok(Array.isArray(row.scheduling_offered_slots));
+});
+
+test("8. duplicate-suppressed replay: calling cleanup twice for the same booking is idempotent — no throw, no error, end state stays cleared", async () => {
+  const db = makeSchedulingCleanupDb({
+    agent_executions: [{ id: "exec-1", org_id: SCHED_ORG, input_summary: { channel: "whatsapp" } }],
+    conversation_states: [{
+      id: "cs-1", org_id: SCHED_ORG, contact_id: SCHED_CONTACT, channel: "whatsapp",
+      scheduling_offered_slots: [{ start: "2027-03-17T19:00:00.000Z", end: "2027-03-17T20:00:00.000Z", timeZone: "America/New_York" }],
+      scheduling_offered_at: new Date().toISOString(),
+    }],
+  });
+  const approval = { execution_id: "exec-1", proposed_input: { contactId: SCHED_CONTACT } };
+  await S.clearStaleSchedulingOfferAfterBooking(db, SCHED_ORG, approval);
+  await assert.doesNotReject(S.clearStaleSchedulingOfferAfterBooking(db, SCHED_ORG, approval), "a second (duplicate-suppressed-replay) call must be a harmless no-op");
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", SCHED_ORG).eq("contact_id", SCHED_CONTACT).eq("channel", "whatsapp").maybeSingle();
+  assert.equal(row.scheduling_offered_slots, null);
+});
+
+test("10. clearOfferedSlots() itself erroring is swallowed — logged, never thrown, never surfaced as a booking/approval failure", async () => {
+  const inner = makeSchedulingCleanupDb({
+    agent_executions: [{ id: "exec-1", org_id: SCHED_ORG, input_summary: { channel: "sms" } }],
+    conversation_states: [],
+  });
+  const failingChain: any = {
+    eq: () => failingChain,
+    select: () => failingChain,
+    maybeSingle: async () => ({ data: null, error: { message: "simulated update failure" } }),
+  };
+  const db = {
+    ...inner,
+    from: (t: string) => {
+      if (t !== "conversation_states") return inner.from(t);
+      const builder = inner.from(t);
+      builder.update = (_row: any) => failingChain;
+      return builder;
+    },
+  };
+  await assert.doesNotReject(
+    S.clearStaleSchedulingOfferAfterBooking(db, SCHED_ORG, { execution_id: "exec-1", proposed_input: { contactId: SCHED_CONTACT } }),
+  );
+});
+
+// ── Section G, cases 2-5, 9: call-site gating verified at the source
+// level — the same style this file already uses for lifecycle-call
+// ordering above. A full HTTP `handler` integration test would need to
+// fake resolveOrgAndAuthority/auth.getUser, which this file's own header
+// already explains is out of scope for this narrowly-targeted file.
+
+test("2-5+9. the cleanup call is gated INSIDE the exact same verified-and-schedule_appointment block the post-booking lifecycle call already uses — so a pending, rejected, executeApprovedStep-failed, or unverified approval (or any non-schedule_appointment action) can never reach it", () => {
+  const source = readFileSync(productionSourcePath, "utf8");
+  assert.ok(source.includes("export async function clearStaleSchedulingOfferAfterBooking("), "expected the cleanup function to be defined and exported for direct testing");
+  assert.ok(source.includes("await clearStaleSchedulingOfferAfterBooking(supabaseAdmin, orgId, approval)"), "expected the real call with the real orgId/approval");
+
+  // Same action-key gate AND same "appointmentId must be real" gate the
+  // lifecycle call already relies on — this call sits textually inside
+  // that same `if (approval.action_key === "schedule_appointment") { if
+  // (appointmentId) { ... } }` block.
+  const scheduleGateIdx = source.indexOf('if (approval.action_key === "schedule_appointment")');
+  const appointmentIdGateIdx = source.indexOf("if (appointmentId) {", scheduleGateIdx);
+  const lifecycleIdx = source.indexOf("runAppointmentPostBookingLifecycle(supabaseAdmin", appointmentIdGateIdx);
+  const cleanupIdx = source.indexOf("clearStaleSchedulingOfferAfterBooking(supabaseAdmin", appointmentIdGateIdx);
+  assert.ok(scheduleGateIdx > 0 && appointmentIdGateIdx > scheduleGateIdx && lifecycleIdx > appointmentIdGateIdx && cleanupIdx > lifecycleIdx, "the cleanup call must be inside the same schedule_appointment + real-appointmentId gate as the lifecycle call, after it");
+
+  // That whole block is itself only reached after verification.verified
+  // is true (see the existing "post-booking lifecycle" ordering test
+  // above) — so every one of pending/rejected/executeApprovedStep-failed/
+  // verification-failed/non-schedule_appointment is already structurally
+  // excluded from ever reaching this call.
+  const verifiedIdx = source.indexOf('logCheckpoint("action_verified"');
+  assert.ok(verifiedIdx > 0 && scheduleGateIdx > verifiedIdx, "the schedule_appointment cleanup gate must itself be reached only after verification passed");
+});
+
+test("the cleanup call is wrapped in its own .catch() — a thrown error inside it can never propagate up and affect the approval/execution outcome", () => {
+  const source = readFileSync(productionSourcePath, "utf8");
+  const cleanupCallMatch = source.match(/await clearStaleSchedulingOfferAfterBooking\([^;]*\.catch\(/s);
+  assert.ok(cleanupCallMatch, "the cleanup call must be awaited with its own .catch(), never left to throw up into the main handler flow");
+
+  const cleanupIdx = source.indexOf("clearStaleSchedulingOfferAfterBooking(supabaseAdmin");
+  const markExecutedIdx = source.indexOf("await markApprovalExecuted(supabaseAdmin, reqBody.approvalId, orgId);");
+  assert.ok(cleanupIdx > 0 && markExecutedIdx > cleanupIdx, "markApprovalExecuted must still run after the cleanup call, regardless of whether cleanup succeeded or failed");
+});

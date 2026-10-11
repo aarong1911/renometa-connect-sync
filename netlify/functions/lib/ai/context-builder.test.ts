@@ -39,6 +39,31 @@ const { createFakeSupabaseClient }: any = await import(
   pathToFileURL(path.join(repoRoot, "netlify/functions/lib/test-support/fake-supabase-client.mjs")).href
 );
 
+// Scheduling-offer-cleanup follow-up fix (Section H): proves the FULL
+// routing-consequence loop — writing/clearing a real offer via
+// scheduling-offer-state.ts's own clearOfferedSlots(), fed through THIS
+// file's buildAIContext(), fed through router.ts's real routeAIEvent().
+// Bundled separately (router.ts has no dependency on context-builder.ts,
+// nor vice versa) rather than threading new exports through either file.
+const routerOutDir = mkdtempSync(path.join(tmpdir(), "context-builder-router-"));
+after(() => rmSync(routerOutDir, { recursive: true, force: true }));
+await esbuild.build({
+  entryPoints: [path.join(here, "router.ts")],
+  outfile: path.join(routerOutDir, "router.mjs"),
+  bundle: true, platform: "node", format: "esm", logLevel: "error",
+});
+const Router: any = await import(pathToFileURL(path.join(routerOutDir, "router.mjs")).href);
+
+const offerStateOutDir = mkdtempSync(path.join(tmpdir(), "context-builder-offer-state-"));
+after(() => rmSync(offerStateOutDir, { recursive: true, force: true }));
+await esbuild.build({
+  entryPoints: [path.join(repoRoot, "netlify/functions/lib/scheduling-offer-state.ts")],
+  outfile: path.join(offerStateOutDir, "scheduling-offer-state.mjs"),
+  bundle: true, platform: "node", format: "esm", logLevel: "error",
+  external: ["@supabase/supabase-js"],
+});
+const OfferState: any = await import(pathToFileURL(path.join(offerStateOutDir, "scheduling-offer-state.mjs")).href);
+
 const noisy = ["log", "warn", "error"] as const;
 const saved = noisy.map((k) => (console as any)[k]);
 noisy.forEach((k) => ((console as any)[k] = () => {}));
@@ -148,4 +173,42 @@ test("an active offer still coexists with real recentMessages — the new field 
   const context = await S.buildAIContext({ supabase: db, orgId: ORG_A, channel: "sms", contactId: CONTACT_1, now: NOW });
   assert.equal(context.conversation?.schedulingOfferActive, true);
   assert.equal(context.conversation?.recentMessages?.length, 1);
+});
+
+// ── Section H: the full routing-consequence loop around clearing a
+// stale offer after a successful booking ───────────────────────────────
+
+test("H. before cleanup an active offer routes Tier 2 to scheduling; after clearOfferedSlots() the SAME context no longer reports an active offer and router no longer routes via conversation_state", async () => {
+  const db = makeDb(null);
+  await OfferState.writeOfferedSlots({ supabase: db }, {
+    orgId: ORG_A, contactId: CONTACT_1, channel: "sms",
+    slots: [{ start: "2027-03-17T19:00:00.000Z", end: "2027-03-17T20:00:00.000Z", timeZone: "America/New_York" }],
+    now: new Date(NOW.getTime() - 3600_000),
+  });
+
+  const beforeContext = await S.buildAIContext({ supabase: db, orgId: ORG_A, channel: "sms", contactId: CONTACT_1, now: NOW });
+  assert.equal(beforeContext.conversation?.schedulingOfferActive, true, "the real, just-written offer must be seen as active before cleanup");
+  const beforeRoute = Router.routeAIEvent(
+    { eventId: "e1", channel: "sms", eventType: "message_received", content: { type: "text", text: "the first one" } },
+    beforeContext,
+  );
+  assert.equal(beforeRoute.agentKey, "scheduling");
+  assert.equal(beforeRoute.source, "conversation_state");
+
+  // This is exactly what clearStaleSchedulingOfferAfterBooking() now does
+  // once a schedule_appointment approval is verified — reusing the SAME
+  // exported helper, not a reimplementation.
+  const cleared = await OfferState.clearOfferedSlots({ supabase: db }, { orgId: ORG_A, contactId: CONTACT_1, channel: "sms" });
+  assert.equal(cleared.ok, true);
+
+  const afterContext = await S.buildAIContext({ supabase: db, orgId: ORG_A, channel: "sms", contactId: CONTACT_1, now: NOW });
+  assert.ok(!afterContext.conversation?.schedulingOfferActive, "the context builder must no longer report an active offer after cleanup");
+  const afterRoute = Router.routeAIEvent(
+    { eventId: "e2", channel: "sms", eventType: "message_received", content: { type: "text", text: "hi again" } },
+    afterContext,
+  );
+  // Per this task's own instruction: do not force a specific fallback
+  // agent — the only required assertion is that Tier 2 (conversation_state)
+  // no longer owns this turn purely because of the now-cleared offer.
+  assert.notEqual(afterRoute.source, "conversation_state", "routing must no longer be driven by the stale, now-cleared offer");
 });

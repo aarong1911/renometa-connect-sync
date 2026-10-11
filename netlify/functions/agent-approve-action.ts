@@ -15,7 +15,7 @@
 // depth, not the only gate.
 
 import type { Handler } from "@netlify/functions";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { approveRequest, rejectRequest, markApprovalExecuted } from "../../src/lib/agentic/approvals";
 import { executeApprovedStep } from "../../src/lib/agentic/action-executor";
 import type { Actor } from "../../src/lib/agentic/types";
@@ -29,6 +29,12 @@ import { resolveOrgAndAuthority } from "./lib/resolve-org";
 // netlify/functions/ side, the same side appointment-post-booking.ts
 // lives on — a normal, same-direction import.
 import { runAppointmentPostBookingLifecycle } from "./lib/appointment-post-booking";
+// Lead-Qualification-to-Scheduling handoff follow-up fix: clears a stale
+// scheduling offer once its booking has actually, verifiably succeeded —
+// see clearStaleSchedulingOfferAfterBooking()'s own header below for the
+// full root cause and placement reasoning. Same-side import, same
+// convention as the two imports above.
+import { clearOfferedSlots, SCHEDULING_OFFER_CHANNELS, type SchedulingOfferChannel } from "./lib/scheduling-offer-state";
 
 const DEBUG_VERSION = "agentic-task-linkage-v1";
 const serviceRoleConfigured = !!process.env.SUPABASE_URL && !!process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -234,6 +240,92 @@ export function verifyActionSuccess(actionKey: string, realResult: Record<string
   };
 }
 
+// ── Stale scheduling-offer cleanup (Lead-Qualification-to-Scheduling
+// handoff follow-up fix) ─────────────────────────────────────────────────
+//
+// LIVE BUG: the scheduling flow (Lead Qualification -> Scheduling ->
+// get_availability -> offer persisted -> schedule_appointment approved ->
+// appointment created) worked end to end, but the offer persisted in
+// conversation_states.scheduling_offered_slots/_at was never cleared
+// afterward. Since router.ts's Tier 2 treats any offer younger than 24h
+// as "still active," the NEXT inbound message kept routing back to
+// Scheduling (source: "conversation_state") even though the appointment
+// had already been booked — stale conversation ownership, not a booking
+// defect (the booking itself was and remains correct).
+//
+// PLACEMENT: deliberately HERE, in the approval-execution path, never in
+// the pre-approval Scheduling turn — this is the one place that only
+// ever runs AFTER verifyActionSuccess("schedule_appointment") has proven
+// a real appointment row exists (see the call site below, which sits
+// right after that same verification gate the post-booking lifecycle
+// call already relies on). A pending, rejected, or failed/unverified
+// approval never reaches this function at all.
+//
+// IDENTITY SOURCES (trusted, never guessed):
+//   - orgId: the caller's own already-resolved, trusted org (same value
+//     used for every other write in this handler).
+//   - contactId: approval.proposed_input.contactId — the EXACT contactId
+//     schedule_appointment's own handler already validated as same-org
+//     before creating the approval; never re-derived from anything else.
+//   - channel: agent_executions.input_summary.channel for the approval's
+//     own execution_id — the real inbound channel orchestrator.ts
+//     recorded for this run (see its AIExecutionInputSummary). Validated
+//     against SCHEDULING_OFFER_CHANNELS before use; a channel this
+//     feature doesn't support (e.g. "email") is treated exactly like an
+//     unresolvable one — skip, never guess, never force.
+//
+// FAILURE POSTURE: this function never throws and never affects the
+// approval/execution/appointment outcome in any way — by the time it
+// runs, the booking is already real and already verified. A failure here
+// (a missing contactId, an unresolvable/unsupported channel, or
+// clearOfferedSlots() itself erroring) is logged and swallowed; the
+// customer simply keeps a stale offer a little longer, which is a
+// routing inconvenience, never a data-integrity or duplicate-booking
+// risk (scheduling-availability.ts's own fresh re-check at every future
+// booking attempt is unaffected either way).
+//
+// IDEMPOTENCY: clearOfferedSlots() is already idempotent (see that
+// module's own header) — calling it on both a genuine first success AND
+// a duplicate-suppressed replay of the SAME approval is safe and
+// intentional, exactly mirroring how the post-booking lifecycle call
+// right above this one already handles that same pair of cases.
+export async function clearStaleSchedulingOfferAfterBooking(
+  supabase: SupabaseClient,
+  orgId: string,
+  approval: { execution_id: string; proposed_input: unknown },
+): Promise<void> {
+  const contactId = (approval.proposed_input as { contactId?: unknown } | null)?.contactId;
+  if (typeof contactId !== "string" || contactId.length === 0) {
+    console.warn("[agent-approve-action] scheduling-offer cleanup skipped — no contactId on the approved input.", { orgId, executionId: approval.execution_id });
+    return;
+  }
+
+  const { data: executionRow, error: executionError } = await supabase
+    .from("agent_executions")
+    .select("input_summary")
+    .eq("id", approval.execution_id)
+    .maybeSingle();
+  if (executionError) {
+    console.warn("[agent-approve-action] scheduling-offer cleanup skipped — could not load the execution's recorded channel.", { orgId, executionId: approval.execution_id, error: executionError.message });
+    return;
+  }
+
+  const channel = (executionRow?.input_summary as { channel?: unknown } | null)?.channel;
+  if (typeof channel !== "string" || !(SCHEDULING_OFFER_CHANNELS as readonly string[]).includes(channel)) {
+    // Not a guess, not a failure — this execution's channel is either
+    // unresolvable or simply not one scheduling-offer-state.ts supports
+    // (e.g. "email", "internal", "web_chat"). The booking itself already
+    // succeeded and is completely unaffected.
+    console.warn("[agent-approve-action] scheduling-offer cleanup skipped — execution channel is unresolvable or unsupported.", { orgId, executionId: approval.execution_id, channel });
+    return;
+  }
+
+  const cleared = await clearOfferedSlots({ supabase }, { orgId, contactId, channel: channel as SchedulingOfferChannel });
+  if (!cleared.ok) {
+    console.error("[agent-approve-action] scheduling-offer cleanup failed:", cleared.reason);
+  }
+}
+
 // AI-1M security completion pass: this used to carry its own inline
 // resolveOrgAndAuthority() that treated "profile.organization_id is set"
 // as proof of owner/admin authority. Live data proved that assumption
@@ -378,6 +470,13 @@ export const handler: Handler = async (event) => {
       if (appointmentId) {
         await runAppointmentPostBookingLifecycle(supabaseAdmin, { appointmentId, orgId }).catch((err) => {
           console.error("[agent-approve-action] post-booking lifecycle failed:", err instanceof Error ? err.message : err);
+        });
+        // Lead-Qualification-to-Scheduling handoff follow-up fix — see
+        // clearStaleSchedulingOfferAfterBooking()'s own header. Only
+        // reached once `appointmentId` is a real, verified id (the exact
+        // same gate the lifecycle call above already relies on).
+        await clearStaleSchedulingOfferAfterBooking(supabaseAdmin, orgId, approval).catch((err) => {
+          console.error("[agent-approve-action] scheduling-offer cleanup threw unexpectedly:", err instanceof Error ? err.message : err);
         });
       }
     }
