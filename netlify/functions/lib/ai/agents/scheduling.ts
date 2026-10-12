@@ -20,17 +20,24 @@
 //     declined — a deterministic SIGNAL, not free text, so the
 //     orchestrator's resulting clearOfferedSlots() call is never driven by
 //     string-matching the model's own prose.
-//   - get_availability: a single structured ISO date (validated by this
-//     schema's own regex before anything else ever sees it) — never a
-//     natural-language date string — plus two OPTIONAL structured
-//     preference hints (preferredTime "HH:MM", preferredDaypart). LIVE
-//     VALIDATION FIX: these two hints are used ONLY to rank/filter the
-//     REAL slots get_availability's own handler returns (see
-//     selectCandidateSlots() below) — they never assert that a slot at
-//     that time exists, and the prompt (see buildDecisionSystemInstructions)
-//     now requires the model to have an actual day-signal from the
-//     customer before it may call this action at all, closing the
-//     original defect where Scheduling picked an arbitrary date itself.
+//   - get_availability: a structured, semantic DATE INTENT (see
+//     scheduling-date-intent.ts's DateIntent type) — NEVER a model-
+//     computed relative date. The model may identify an explicit date it
+//     was told outright, or a semantic shape ("today", "tomorrow", a
+//     weekday, "next" + a weekday) — trusted server code
+//     (resolveDateIntent(), called from orchestrator.ts) is the ONLY
+//     thing that ever turns that intent into an authoritative
+//     "YYYY-MM-DD", using organizations.timezone and the real current
+//     server time. A real production-preview bug proved the model
+//     cannot be trusted to do this arithmetic itself — see that module's
+//     own header for the exact live failure this closes. Also carries
+//     two OPTIONAL structured preference hints (preferredTime "HH:MM",
+//     preferredDaypart) used ONLY to rank/filter the REAL slots
+//     get_availability's own handler returns (see selectCandidateSlots()
+//     below) — they never assert that a slot at that time exists, and
+//     the prompt (see buildDecisionSystemInstructions) requires the
+//     model to have an actual day-signal from the customer before it may
+//     call this action at all.
 //   - select_offered_slot / propose_appointment: an integer
 //     `selectedOptionNumber` referencing ONE of the slots most recently
 //     offered to this customer (1-indexed, matching the numbered list the
@@ -59,6 +66,7 @@ import type { ModelRequest } from "../providers/model-provider";
 import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines, channelGuidance } from "../prompting";
 import { describeKnownQualificationFields, resolveKnownQualificationFields } from "../lead-trigger";
 import type { PersistedSlotOffer } from "../../scheduling-offer-state";
+import { WEEKDAYS } from "../scheduling-date-intent";
 
 // ── Handoff continuity (reused pattern from lead-qualification.ts) ──────
 
@@ -120,16 +128,38 @@ const respondDecisionSchema = z
 // always taking the chronologically-first four. Neither field is ever
 // used to invent a slot — they only ever narrow/reorder what
 // get_availability's trusted output actually contains.
+//
+// LIVE BUG FIX (date-intent): a real production-preview turn proved the
+// model cannot be trusted to turn "Thursday afternoon" into an
+// authoritative YYYY-MM-DD itself — given org-local "today" = Saturday
+// 2026-10-11, the model's own calendar arithmetic produced 2026-10-16 (a
+// Friday) instead of the real next Thursday, 2026-10-15. The model may
+// now express only a structured, semantic DATE INTENT (see
+// scheduling-date-intent.ts's DateIntent type) — never a resolved date
+// for anything relative. Only `explicit_date` carries a literal date
+// string, and only for a date the customer stated outright (e.g.
+// "October 22"); it is still independently, strictly validated (a
+// syntactically well-formed but impossible date like "2026-02-30" is
+// rejected, never silently rolled into a different real date) by
+// resolveDateIntent(), which orchestrator.ts calls BEFORE ever reaching
+// get_availability — this schema has no way to let a model skip that
+// resolution step for a relative expression.
+const dateIntentSchema = z.union([
+  z.object({ kind: z.literal("explicit_date"), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected YYYY-MM-DD") }).strict(),
+  z.object({ kind: z.literal("relative_day"), value: z.enum(["today", "tomorrow"]) }).strict(),
+  z.object({ kind: z.literal("weekday"), weekday: z.enum(WEEKDAYS), occurrence: z.enum(["next_occurrence", "next_week"]) }).strict(),
+]);
+
 const getAvailabilityDecisionSchema = z
   .object({
     type: z.literal("get_availability"),
-    /** Plain "YYYY-MM-DD" — structured, never natural language (see this
-     * file's header). The prompt tells the model today's real date in the
-     * org's timezone so it can compute "tomorrow"/"next Tuesday" itself;
-     * this field is still independently validated here regardless. Per
-     * the prompt rewrite above, the model must only ever set this from a
-     * day the CUSTOMER actually indicated — never arbitrarily. */
-    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected YYYY-MM-DD"),
+    /** Semantic date INTENT only — see this schema's own header. Trusted
+     * server code (scheduling-date-intent.ts's resolveDateIntent(),
+     * called from orchestrator.ts) turns this into the actual
+     * authoritative "YYYY-MM-DD" using organizations.timezone and the
+     * real current server time; the model never computes a relative date
+     * itself. */
+    dateIntent: dateIntentSchema,
     /** An exact clock time the customer mentioned for this date (e.g.
      * "10 works", "around 2"), rounded to the nearest half hour —
      * "HH:MM" 24-hour, local to the organization's timezone. Used ONLY to
@@ -184,6 +214,7 @@ const schedulingDecisionSchema = z.union([
   proposeAppointmentDecisionSchema,
 ]);
 
+export type DateIntent = z.infer<typeof dateIntentSchema>;
 export type SchedulingDecision = z.infer<typeof schedulingDecisionSchema>;
 export type SchedulingRespondDecision = Extract<SchedulingDecision, { type: "respond" }>;
 export type SchedulingGetAvailabilityDecision = Extract<SchedulingDecision, { type: "get_availability" }>;
@@ -376,23 +407,21 @@ function buildKnownFieldsBlock(context: AIResolvedContext): string {
   ].join("\n");
 }
 
-/** Today's calendar date in the organization's own timezone, as a plain
- * "YYYY-MM-DD" + friendly day name — informational only, so the model can
- * compute "tomorrow"/"next Tuesday" into a real structured date for
- * get_availability. Never itself trusted for anything — get_availability's
- * own `date` field is independently validated and the real booking/
- * availability math always re-resolves organizations.timezone server-side
- * regardless of what this string says. */
+/** LIVE BUG FIX: this used to tell the model today's date specifically so
+ * it could "compute tomorrow/next Tuesday into a real structured date" —
+ * that instruction was the root cause of the live date-arithmetic defect
+ * (see scheduling-date-intent.ts's own header) and has been removed.
+ * Today's weekday NAME is still surfaced (purely so the model can
+ * sanity-check something like "customer said Thursday, that's a weekday
+ * name, express it as a weekday intent" — it carries no date/number the
+ * model could do arithmetic on), but the actual calendar date is
+ * deliberately withheld from this prompt entirely; resolveDateIntent()
+ * is the only place "today" ever becomes a real YYYY-MM-DD. */
 function describeTodayInOrgTimezone(timeZone: string | undefined, now: Date): string {
   if (!timeZone) return "";
   try {
-    const parts = new Intl.DateTimeFormat("en-US", {
-      timeZone, year: "numeric", month: "2-digit", day: "2-digit", weekday: "long",
-    }).formatToParts(now);
-    const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
-    const weekday = get("weekday");
-    const ymd = `${get("year")}-${get("month")}-${get("day")}`;
-    return `Today's date where this business is located: ${ymd} (${weekday}).`;
+    const weekday = new Intl.DateTimeFormat("en-US", { timeZone, weekday: "long" }).format(now);
+    return `Today where this business is located is a ${weekday}. Do not state or rely on a specific calendar date — express any relative day (today/tomorrow/a weekday/"next" + a weekday) as a dateIntent; trusted server code resolves the actual date.`;
   } catch {
     return "";
   }
@@ -446,7 +475,10 @@ function buildDecisionSystemInstructions(
     // an arbitrary date on its own initiative. Rewritten to require a
     // real day-signal from the CUSTOMER before this action may be used at
     // all — see this phase's own report for the live defect this closes.
-    "- get_availability: looks up real, currently-open appointment slots for a specific date. ONLY use this when the customer has given you SOME indication of which day they mean (an exact date, a weekday like \"Tuesday\", a relative day like \"tomorrow\"/\"next week\", or a day they want to switch to from what was last offered). Set preferredTime (24-hour HH:MM) when the customer also gave a specific clock time for that day (e.g. \"around 10\" -> \"10:00\"); set preferredDaypart (morning = before noon, afternoon = noon-5pm, evening = 5pm or later) when they gave a rough part of day instead (e.g. \"Friday afternoon\"). Omit both when the customer named only a day with no time preference at all.",
+    //
+    // LIVE BUG FIX (date-intent): rewritten again — the model must now
+    // express a dateIntent SHAPE, never compute the actual date itself.
+    "- get_availability: looks up real, currently-open appointment slots for a date you express as a dateIntent (NEVER as a date you calculated yourself). Use it ONLY when the customer has given you SOME indication of which day they mean. Express what they said as exactly one of: {\"kind\":\"explicit_date\",\"date\":\"YYYY-MM-DD\"} ONLY when the customer stated an actual calendar date outright (e.g. \"October 22\"); {\"kind\":\"relative_day\",\"value\":\"today\"} or \"tomorrow\" for those exact words; {\"kind\":\"weekday\",\"weekday\":\"<monday..sunday>\",\"occurrence\":\"next_occurrence\"} for a bare weekday name (e.g. \"Thursday\"); {\"kind\":\"weekday\",\"weekday\":\"<monday..sunday>\",\"occurrence\":\"next_week\"} when the customer said \"next\" before the weekday (e.g. \"next Thursday\"). Do NOT calculate what calendar date 'tomorrow' or 'Thursday' actually falls on — that is resolved for you from the real date. Set preferredTime (24-hour HH:MM) when the customer also gave a specific clock time for that day (e.g. \"around 10\" -> \"10:00\"); set preferredDaypart (morning = before noon, afternoon = noon-5pm, evening = 5pm or later) when they gave a rough part of day instead (e.g. \"Friday afternoon\"). Omit both when the customer named only a day with no time preference at all.",
     "- NEVER call get_availability, and NEVER pick a day yourself, when the customer has not told you ANY day or time preference yet — use respond instead and ask a short, concrete question such as \"What day and time works best for you?\". The same applies if the customer gave only a time with no day at all (e.g. just \"10am\") — ask which day, do not guess one.",
     offeredSlots && offeredSlots.length > 0
       ? "- select_offered_slot: use when the customer's reply clearly references ONE of the numbered options above, but you want to confirm it back to them before actually booking (e.g. they mentioned a time but haven't explicitly said to book it yet)."
@@ -465,7 +497,7 @@ function buildDecisionSystemInstructions(
     "",
     "Respond with ONLY a single JSON object — no markdown, no code fences, no text outside the JSON — matching exactly one of these shapes:",
     '{"type":"respond","response":"<your natural-language reply to the customer>","declineScheduling":false}',
-    '{"type":"get_availability","date":"<YYYY-MM-DD>","preferredTime":"<HH:MM, optional>","preferredDaypart":"<morning|afternoon|evening, optional>","reason":"<short optional reason>"}',
+    '{"type":"get_availability","dateIntent":{"kind":"explicit_date","date":"<YYYY-MM-DD>"} | {"kind":"relative_day","value":"today"|"tomorrow"} | {"kind":"weekday","weekday":"<monday..sunday>","occurrence":"next_occurrence"|"next_week"},"preferredTime":"<HH:MM, optional>","preferredDaypart":"<morning|afternoon|evening, optional>","reason":"<short optional reason>"}',
     '{"type":"select_offered_slot","selectedOptionNumber":<the option number>,"reason":"<short optional reason>"}',
     '{"type":"propose_appointment","selectedOptionNumber":<the option number>,"reason":"<short optional reason>"}',
   ].join("\n");

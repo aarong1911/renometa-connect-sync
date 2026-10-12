@@ -163,7 +163,7 @@ test("Scheduling can fetch availability: get_availability runs through the real 
   const db = makeDb();
   const modelProvider = scriptedProvider([
     JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "ready", summary: "Ready to schedule." }),
-    JSON.stringify({ type: "get_availability", date: "2027-03-17" }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "explicit_date", date: "2027-03-17" } }),
     JSON.stringify({ type: "respond", response: "Here are some times: Wednesday 10am, 11am, or 2pm. Which works?" }),
   ]);
 
@@ -193,7 +193,7 @@ test("no availability found for the requested date: no offer is written (writeOf
     appointments: [{ id: "blocker", org_id: ORG_A, scheduled_at: "2027-03-17T12:00:00.000Z", ends_at: "2027-03-17T23:59:00.000Z", duration_min: 660, assigned_to: null, status: "scheduled" }],
   });
   const modelProvider = scriptedProvider([
-    JSON.stringify({ type: "get_availability", date: "2027-03-17" }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "explicit_date", date: "2027-03-17" } }),
     JSON.stringify({ type: "respond", response: "That day is fully booked — would another day work?" }),
   ]);
 
@@ -214,7 +214,7 @@ test("an offer from one orchestrateAI() call is still active for a SECOND, separ
   const db = makeDb();
   const firstProvider = scriptedProvider([
     JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "ready", summary: "Ready to schedule." }),
-    JSON.stringify({ type: "get_availability", date: "2027-03-17" }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "explicit_date", date: "2027-03-17" } }),
     JSON.stringify({ type: "respond", response: "Here are some times — which works?" }),
   ]);
   const first = await S.orchestrateAI({ supabase: db, event: smsEvent("When can I come in?"), trustedContext: trustedContext(), modelProvider: firstProvider });
@@ -276,7 +276,7 @@ test("2. customer supplies an exact date/time that IS available: get_availabilit
   const db = makeDb(); // no blocking appointments — 10:00 ET is genuinely open
   await seedThrowawayOfferToReachScheduling(db);
   const modelProvider = scriptedProvider([
-    JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredTime: "10:00" }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "explicit_date", date: "2027-03-17" }, preferredTime: "10:00" }),
     JSON.stringify({ type: "respond", response: "Wednesday at 10:00 AM is available. Would you like me to schedule that?" }),
   ]);
   const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Tuesday at 10 works for me"), trustedContext: trustedContext(), modelProvider });
@@ -295,7 +295,7 @@ test("5+6. the final-response call for an exact-match available time is fed fact
   const db = makeDb();
   await seedThrowawayOfferToReachScheduling(db);
   const modelProvider = scriptedProvider([
-    JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredTime: "10:00" }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "explicit_date", date: "2027-03-17" }, preferredTime: "10:00" }),
     JSON.stringify({ type: "respond", response: "Tuesday at 10 AM is available. Would you like me to schedule that?" }),
   ]);
   const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Tuesday at 10 works for me"), trustedContext: trustedContext(), modelProvider });
@@ -325,7 +325,7 @@ test("3. requested exact time is unavailable: the nearest appropriate REAL alter
   });
   await seedThrowawayOfferToReachScheduling(db);
   const modelProvider = scriptedProvider([
-    JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredTime: "10:00" }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "explicit_date", date: "2027-03-17" }, preferredTime: "10:00" }),
     JSON.stringify({ type: "respond", response: "10:00 AM isn't available, but I have 9:00 AM or 11:00 AM. Would either work?" }),
   ]);
   const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Tuesday at 10 works for me"), trustedContext: trustedContext(), modelProvider });
@@ -346,7 +346,7 @@ test("4. customer asks for an afternoon slot: real afternoon candidates are prio
   const db = makeDb(); // no blockers — both morning and afternoon slots are genuinely open
   await seedThrowawayOfferToReachScheduling(db);
   const modelProvider = scriptedProvider([
-    JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredDaypart: "afternoon" }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "explicit_date", date: "2027-03-17" }, preferredDaypart: "afternoon" }),
     JSON.stringify({ type: "respond", response: "I have a few afternoon openings — which works?" }),
   ]);
   const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Any time Friday afternoon"), trustedContext: trustedContext(), modelProvider });
@@ -364,7 +364,7 @@ test("5. customer provides a date but no time: a small, bounded list of real slo
   const db = makeDb();
   await seedThrowawayOfferToReachScheduling(db);
   const modelProvider = scriptedProvider([
-    JSON.stringify({ type: "get_availability", date: "2027-03-17" }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "explicit_date", date: "2027-03-17" } }),
     JSON.stringify({ type: "respond", response: "Here are a few openings on Wednesday — which works?" }),
   ]);
   const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Does Wednesday work?"), trustedContext: trustedContext(), modelProvider });
@@ -387,6 +387,65 @@ test("6. customer gives only a time, with no resolvable day: Scheduling must ask
   assert.equal(result.responseText, "Happy to help — what day did you have in mind?");
   const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
   assert.ok(!row || !row.scheduling_offered_slots, "no availability lookup, no offer, when no day could be resolved");
+});
+
+// ── LIVE BUG FIX: deterministic date-intent resolution ──────────────────
+//
+// The model is only ever scripted with a semantic dateIntent (weekday/
+// relative_day/explicit_date) here — never a model-computed relative date
+// — proving the orchestrator, not the model, is what turns that intent
+// into the real "YYYY-MM-DD" handed to get_availability.
+
+/** 2026-10-11 12:00 America/New_York (EDT, UTC-4) — the exact org-local
+ * date the live production-preview defect occurred on. */
+const LIVE_BUG_NOW = new Date("2026-10-11T16:00:00.000Z");
+
+test("Section J — LIVE BUG INTEGRATION: now=2026-10-11, dateIntent={weekday:thursday, occurrence:next_occurrence} + preferredDaypart=afternoon resolves to the REAL date 2026-10-15, never the live defect's wrong 2026-10-16, and afternoon-only filtering still applies on top of the correct date", async () => {
+  const db = makeDb(); // no blockers — 2026-10-15 is genuinely open all day
+  await seedThrowawayOfferToReachScheduling(db);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "thursday", occurrence: "next_occurrence" }, preferredDaypart: "afternoon" }),
+    JSON.stringify({ type: "respond", response: "Thursday afternoon has a few openings — which works?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Thursday afternoon works for me"), trustedContext: trustedContext(), modelProvider, now: LIVE_BUG_NOW });
+  assert.equal(result.status, "completed");
+
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.ok(Array.isArray(row.scheduling_offered_slots) && row.scheduling_offered_slots.length > 0);
+  for (const slot of row.scheduling_offered_slots) {
+    assert.ok(slot.start.startsWith("2026-10-15"), `expected the correct resolved Thursday 2026-10-15, got ${slot.start}`);
+    assert.ok(!slot.start.startsWith("2026-10-16"), "must never resolve to 2026-10-16 — this is the live defect's exact wrong date");
+    const localHour = new Date(slot.start).getUTCHours() - 4; // EDT offset
+    assert.ok(localHour >= 12 && localHour < 17, `expected an afternoon slot, got local hour ${localHour} for ${slot.start}`);
+  }
+});
+
+test("16a. an organization with an invalid/unresolvable timezone fails closed: get_availability's own executeStep() never runs, no offer is persisted, and the customer is asked to clarify rather than being guessed at", async () => {
+  const db = makeDb({ organizations: [{ id: ORG_A, name: "Acme Remodeling", timezone: "Not/ARealZone", ai_center_settings: {} }] });
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "ready", summary: "Ready to schedule." }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "thursday", occurrence: "next_occurrence" } }),
+    JSON.stringify({ type: "respond", response: "Sorry — I'm having trouble checking availability right now. A teammate will follow up shortly." }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Thursday works for me"), trustedContext: trustedContext(), modelProvider, now: LIVE_BUG_NOW });
+  assert.equal(result.status, "completed");
+
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.ok(!row || !row.scheduling_offered_slots?.length, "no offer may ever be persisted when the org timezone itself could not be resolved");
+});
+
+test("16b. an explicit_date that is syntactically well-formed but not a real calendar date (e.g. 2026-02-30) fails closed: get_availability never runs against an invented/rolled-over date, and the model is asked to clarify", async () => {
+  const db = makeDb();
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "ready", summary: "Ready to schedule." }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "explicit_date", date: "2026-02-30" } }),
+    JSON.stringify({ type: "respond", response: "I didn't quite catch which day you meant — could you clarify the exact date?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("How about Feb 30th"), trustedContext: trustedContext(), modelProvider, now: LIVE_BUG_NOW });
+  assert.equal(result.status, "completed");
+
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.ok(!row || !row.scheduling_offered_slots?.length, "no offer may ever be persisted for an impossible calendar date");
 });
 
 // ── Slot selection: matched / ambiguous / unmatched ──────────────────────
