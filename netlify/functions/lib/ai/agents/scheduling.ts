@@ -295,12 +295,32 @@ export type SlotPreference = {
 
 export type SlotSelectionResult = {
   slots: PersistedSlotOffer[];
-  /** True only when the customer's exact preferredTime matches a REAL
-   * returned slot's own start time precisely (0-minute distance) — the
-   * one signal the orchestrator uses to phrase "that time is available"
-   * vs. "that time isn't available, but here are the closest real
-   * alternatives" without re-deriving the time math itself. */
-  exactMatch: boolean;
+  /**
+   * LIVE BUG FIX: a real live SMS exposed a contradiction — "Thursday
+   * afternoon isn't available, but ... noon, 12:30, 1:00, 1:30" (all of
+   * which ARE afternoon). The old boolean `exactMatch` only ever meant
+   * "the requested CLOCK TIME matched a real slot exactly," so a daypart
+   * preference with real matching slots was indistinguishable from one
+   * with none — both reported `exactMatch: false`. A daypart has no
+   * single "exact" instant to match, so it needs its own trusted
+   * true/false fact, not a reuse of the clock-time one.
+   *
+   * This discriminated result is the one trusted signal the orchestrator
+   * uses to phrase the outcome — the model never decides whether a
+   * preference was satisfied:
+   *   - "none": no preferredTime/preferredDaypart was given at all.
+   *   - "exact_time": preferredTime was given AND a real slot exists at
+   *     that exact clock time (0-minute distance).
+   *   - "daypart": preferredDaypart was given AND at least one real
+   *     returned slot falls inside that daypart's window — regardless of
+   *     whether it's the only slot being offered.
+   *   - "not_matched": a preference was given but could not be
+   *     satisfied by any real slot (preferredTime with no exact real
+   *     match, OR preferredDaypart with zero real slots in that window —
+   *     in which case `slots` falls back to the ordinary first-N real
+   *     alternatives, never a fabricated daypart slot).
+   */
+  preferenceMatch: "none" | "exact_time" | "daypart" | "not_matched";
 };
 
 /** Local-timezone minutes-since-midnight of a slot's own start — same
@@ -348,16 +368,21 @@ const DEFAULT_CANDIDATE_LIMIT = 4;
  * With `preference.time` set: ranks every real candidate by absolute
  * distance (in minutes, local to each slot's own timeZone) from the
  * requested time, picks the closest `limit`, and re-sorts that picked set
- * back into chronological order for presentation. `exactMatch` is true
- * only when the single closest candidate is an exact (0-minute) match —
- * i.e. the customer's requested time genuinely exists in the real
- * availability data, never assumed.
+ * back into chronological order for presentation. `preferenceMatch` is
+ * "exact_time" only when the single closest candidate is an exact
+ * (0-minute) match — i.e. the customer's requested time genuinely exists
+ * in the real availability data, never assumed — otherwise "not_matched".
  *
  * With `preference.daypart` set (and no `time`): filters to real
- * candidates whose local start time falls in that daypart's window; if
- * NONE do, falls back to the ordinary unconditional first-`limit` list
- * (still real data — never fabricated just to fill the daypart) rather
- * than returning nothing.
+ * candidates whose local start time falls in that daypart's window.
+ * `preferenceMatch` is "daypart" whenever at least one real candidate
+ * matched — the daypart preference WAS satisfied, even if only one real
+ * slot happens to fall in it. If NONE match, falls back to the ordinary
+ * unconditional first-`limit` list (still real data — never fabricated
+ * just to fill the daypart) and reports "not_matched", so the orchestrator
+ * can tell these two cases apart instead of conflating "satisfied" with
+ * "fell back to unrelated real slots" (the exact live bug this type fixes
+ * — see SlotSelectionResult's own comment).
  */
 export function selectCandidateSlots(
   allSlots: PersistedSlotOffer[],
@@ -365,12 +390,12 @@ export function selectCandidateSlots(
   limit: number = DEFAULT_CANDIDATE_LIMIT,
 ): SlotSelectionResult {
   if (!preference?.time && !preference?.daypart) {
-    return { slots: allSlots.slice(0, limit), exactMatch: false };
+    return { slots: allSlots.slice(0, limit), preferenceMatch: "none" };
   }
 
   if (preference.time) {
     const target = parseHHMM(preference.time);
-    if (target === null) return { slots: allSlots.slice(0, limit), exactMatch: false };
+    if (target === null) return { slots: allSlots.slice(0, limit), preferenceMatch: "not_matched" };
 
     const ranked = allSlots
       .map((slot) => ({ slot, distance: Math.abs(localMinutesOfDay(slot) - target) }))
@@ -381,7 +406,7 @@ export function selectCandidateSlots(
       .slice(0, limit)
       .map((r) => r.slot)
       .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
-    return { slots: picked, exactMatch };
+    return { slots: picked, preferenceMatch: exactMatch ? "exact_time" : "not_matched" };
   }
 
   // preference.daypart, no preference.time
@@ -390,8 +415,8 @@ export function selectCandidateSlots(
     const minutes = localMinutesOfDay(slot);
     return minutes >= lo && minutes < hi;
   });
-  if (matching.length > 0) return { slots: matching.slice(0, limit), exactMatch: false };
-  return { slots: allSlots.slice(0, limit), exactMatch: false };
+  if (matching.length > 0) return { slots: matching.slice(0, limit), preferenceMatch: "daypart" };
+  return { slots: allSlots.slice(0, limit), preferenceMatch: "not_matched" };
 }
 
 // ── Prompt builders ───────────────────────────────────────────────────────

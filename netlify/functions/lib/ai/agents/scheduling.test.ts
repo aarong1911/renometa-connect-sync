@@ -280,19 +280,19 @@ const ALL_MORNING_PLUS_AFTERNOON = [MORNING_1, MORNING_2, MORNING_3, MORNING_4, 
 test("with no preference at all, returns the first `limit` candidates unchanged — the pre-fix behavior, preserved for the date-only/no-time case", () => {
   const result = S.selectCandidateSlots(ALL_MORNING_PLUS_AFTERNOON, undefined, 4);
   assert.deepEqual(result.slots, [MORNING_1, MORNING_2, MORNING_3, MORNING_4]);
-  assert.equal(result.exactMatch, false);
+  assert.equal(result.preferenceMatch, "none");
 });
 
 test("an exact preferredTime match is detected and surfaced first — never silently missed just because it wasn't chronologically first", () => {
   const result = S.selectCandidateSlots([MORNING_1, TEN_AM, TWO_PM], { time: "10:00" }, 4);
-  assert.equal(result.exactMatch, true);
+  assert.equal(result.preferenceMatch, "exact_time");
   assert.ok(result.slots.some((s: any) => s.start === TEN_AM.start));
 });
 
 test("no exact match for the requested time: the nearest REAL alternatives are returned, chronologically ordered, never the requested (nonexistent) time itself", () => {
   // Real candidates at 9:30 and 10:30 ET; customer asked for 10:00 ET, which does not exist.
   const result = S.selectCandidateSlots([NINE_THIRTY, TEN_THIRTY, TWO_PM, FIVE_PM], { time: "10:00" }, 2);
-  assert.equal(result.exactMatch, false);
+  assert.equal(result.preferenceMatch, "not_matched");
   assert.equal(result.slots.length, 2);
   assert.deepEqual(result.slots.map((s: any) => s.start), [NINE_THIRTY.start, TEN_THIRTY.start]);
 });
@@ -303,15 +303,20 @@ test("a daypart preference (afternoon) prefers real afternoon candidates — mor
   assert.ok(!result.slots.some((s: any) => s.start === MORNING_1.start));
 });
 
-test("a daypart preference with zero real matches falls back to the ordinary first-N list — never fabricates a slot just to fill the daypart", () => {
+test("LIVE BUG: a daypart preference with one or more real matches reports preferenceMatch 'daypart' — the daypart WAS satisfied, never conflated with 'not_matched' just because it isn't a single exact clock time", () => {
+  const result = S.selectCandidateSlots(ALL_MORNING_PLUS_AFTERNOON, { daypart: "afternoon" }, 4);
+  assert.equal(result.preferenceMatch, "daypart");
+});
+
+test("a daypart preference with zero real matches falls back to the ordinary first-N list — never fabricates a slot just to fill the daypart — and reports preferenceMatch 'not_matched', distinguishing this from a genuinely satisfied daypart", () => {
   const result = S.selectCandidateSlots([MORNING_1, MORNING_2], { daypart: "evening" }, 4);
   assert.deepEqual(result.slots, [MORNING_1, MORNING_2]);
-  assert.equal(result.exactMatch, false);
+  assert.equal(result.preferenceMatch, "not_matched");
 });
 
 test("preferredTime takes precedence over preferredDaypart when both are somehow set", () => {
   const result = S.selectCandidateSlots([NINE_THIRTY, TWO_PM], { time: "09:30", daypart: "afternoon" }, 4);
-  assert.equal(result.exactMatch, true);
+  assert.equal(result.preferenceMatch, "exact_time");
   assert.ok(result.slots.some((s: any) => s.start === NINE_THIRTY.start));
 });
 

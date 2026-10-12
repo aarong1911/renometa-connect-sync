@@ -448,6 +448,110 @@ test("16b. an explicit_date that is syntactically well-formed but not a real cal
   assert.ok(!row || !row.scheduling_offered_slots?.length, "no offer may ever be persisted for an impossible calendar date");
 });
 
+// ── LIVE BUG FIX: daypart-vs-exact-time outcome phrasing ─────────────────
+//
+// Real live SMS defect: "Thursday afternoon isn't available, but we have
+// noon, 12:30 PM, 1:00 PM, or 1:30 PM" — self-contradictory, since every
+// one of those times IS in the afternoon. Caused by the old boolean
+// `exactMatch` only ever being true for a CLOCK-TIME match, so a
+// genuinely-satisfied daypart request fell into the same "NOT available"
+// branch as a real miss. These tests assert the trusted outcome text
+// itself (fed to the final-response model call) is never contradictory.
+
+test("DAYPART MATCH — LIVE BUG: real afternoon slots exist (noon, 12:30, 1:00, 1:30) for 'Thursday afternoon' — the trusted outcome must state afternoon IS available, never 'NOT available'", async () => {
+  const db = makeDb(); // no blockers — the full day, including afternoon, is genuinely open
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "ready", summary: "Ready to schedule." }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "thursday", occurrence: "next_occurrence" }, preferredDaypart: "afternoon" }),
+    JSON.stringify({ type: "respond", response: "Thursday afternoon has openings at noon, 12:30, 1:00, or 1:30 — which works?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Thursday afternoon works for me"), trustedContext: trustedContext(), modelProvider, now: LIVE_BUG_NOW });
+  assert.equal(result.status, "completed");
+
+  assert.equal(modelProvider.requests.length, 3, "handoff decision, get_availability decision, then exactly one final-response call");
+  const factualOutcome = modelProvider.requests[2].messages[0].content;
+  assert.match(factualOutcome, /requested afternoon on 2026-10-15 genuinely HAS real availability/, "the trusted fact must explicitly state the daypart WAS satisfied");
+  assert.doesNotMatch(factualOutcome, /NOT available/, "must never say the requested afternoon is unavailable when real afternoon slots were actually found — the exact live contradiction this fix closes");
+  assert.match(factualOutcome, /Do NOT say afternoon is unavailable/);
+
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  for (const slot of row.scheduling_offered_slots) {
+    assert.ok(slot.start.startsWith("2026-10-15"));
+    const localHour = new Date(slot.start).getUTCHours() - 4; // EDT offset
+    assert.ok(localHour >= 12 && localHour < 17, `expected a real afternoon slot, got local hour ${localHour}`);
+  }
+});
+
+test("DAYPART NO MATCH: only morning slots are genuinely open — the trusted outcome correctly states the requested afternoon is NOT available, and only real (morning) alternatives are offered", async () => {
+  // Block the entire afternoon/evening (noon ET onward = 16:00Z onward) on
+  // 2026-10-15, leaving only real morning slots open.
+  const db = makeDb({
+    appointments: [{ id: "blocker", org_id: ORG_A, scheduled_at: "2026-10-15T16:00:00.000Z", ends_at: "2026-10-16T03:00:00.000Z", duration_min: 660, assigned_to: null, status: "scheduled" }],
+  });
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "ready", summary: "Ready to schedule." }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "thursday", occurrence: "next_occurrence" }, preferredDaypart: "afternoon" }),
+    JSON.stringify({ type: "respond", response: "Afternoon is booked up, but I have some morning openings — would one of those work?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Thursday afternoon works for me"), trustedContext: trustedContext(), modelProvider, now: LIVE_BUG_NOW });
+  assert.equal(result.status, "completed");
+
+  const factualOutcome = modelProvider.requests[2].messages[0].content;
+  assert.match(factualOutcome, /requested afternoon is NOT available for 2026-10-15/, "a genuinely unsatisfied daypart request must still be reported as unavailable");
+  assert.match(factualOutcome, /nearest REAL alternatives/);
+
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.ok(Array.isArray(row.scheduling_offered_slots) && row.scheduling_offered_slots.length > 0);
+  for (const slot of row.scheduling_offered_slots) {
+    const localHour = new Date(slot.start).getUTCHours() - 4;
+    assert.ok(localHour < 12, `fallback alternatives must be the real (morning) slots that actually exist, got local hour ${localHour}`);
+  }
+});
+
+test("EXACT TIME MATCH: preferredTime with a real exact-match slot is reported as available (unchanged from before this fix)", async () => {
+  const db = makeDb();
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "ready", summary: "Ready to schedule." }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "thursday", occurrence: "next_occurrence" }, preferredTime: "14:00" }),
+    JSON.stringify({ type: "respond", response: "2 PM Thursday works — want me to book it?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Thursday at 2pm works"), trustedContext: trustedContext(), modelProvider, now: LIVE_BUG_NOW });
+  assert.equal(result.status, "completed");
+  const factualOutcome = modelProvider.requests[2].messages[0].content;
+  assert.match(factualOutcome, /genuinely AVAILABLE \(not yet booked\)/);
+  assert.doesNotMatch(factualOutcome, /NOT available/);
+});
+
+test("EXACT TIME NO MATCH: preferredTime with no real exact-match slot is reported as unavailable, with real nearest alternatives offered (unchanged from before this fix)", async () => {
+  // Block exactly 2:00-3:00 PM ET (18:00-19:00Z) on 2026-10-15.
+  const db = makeDb({
+    appointments: [{ id: "blocker", org_id: ORG_A, scheduled_at: "2026-10-15T18:00:00.000Z", ends_at: "2026-10-15T19:00:00.000Z", duration_min: 60, assigned_to: null, status: "scheduled" }],
+  });
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "ready", summary: "Ready to schedule." }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "thursday", occurrence: "next_occurrence" }, preferredTime: "14:00" }),
+    JSON.stringify({ type: "respond", response: "2 PM isn't open, but I have other times Thursday — want to see them?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Thursday at 2pm works"), trustedContext: trustedContext(), modelProvider, now: LIVE_BUG_NOW });
+  assert.equal(result.status, "completed");
+  const factualOutcome = modelProvider.requests[2].messages[0].content;
+  assert.match(factualOutcome, /requested time is NOT available for 2026-10-15/);
+  assert.match(factualOutcome, /nearest REAL alternatives/);
+});
+
+test("NO PREFERENCE: a plain date-only request (no time/daypart) still gets the unchanged 'these real slots were found' phrasing", async () => {
+  const db = makeDb();
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "ready", summary: "Ready to schedule." }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "thursday", occurrence: "next_occurrence" } }),
+    JSON.stringify({ type: "respond", response: "Here are a few openings Thursday — which works?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Does Thursday work?"), trustedContext: trustedContext(), modelProvider, now: LIVE_BUG_NOW });
+  assert.equal(result.status, "completed");
+  const factualOutcome = modelProvider.requests[2].messages[0].content;
+  assert.match(factualOutcome, /These real, available slots were just found for 2026-10-15/);
+});
+
 // ── Slot selection: matched / ambiguous / unmatched ──────────────────────
 
 async function seedOffer(db: any, slots: Array<{ start: string; end: string; timeZone: string }>) {

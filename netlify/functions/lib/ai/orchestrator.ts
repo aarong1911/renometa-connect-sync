@@ -91,6 +91,7 @@ import {
   selectCandidateSlots,
   type SchedulingDecision,
   type SchedulingSlotReferenceDecision,
+  type SlotSelectionResult,
 } from "./agents/scheduling";
 // LIVE BUG FIX: the one trusted place a model-supplied dateIntent is
 // ever turned into an authoritative YYYY-MM-DD — see that module's own
@@ -1387,11 +1388,10 @@ async function runSchedulingTurn(params: {
       // get_availability's own handler returned — it never invents or
       // reorders anything beyond picking/ranking which of those real
       // candidates to present.
-      const { slots: offeredNow, exactMatch } = selectCandidateSlots(
+      const { slots: offeredNow, preferenceMatch } = selectCandidateSlots(
         allSlots,
         { time: decision.preferredTime, daypart: decision.preferredDaypart },
       );
-      const hadPreference = !!(decision.preferredTime || decision.preferredDaypart);
 
       if (offeredNow.length === 0) {
         outcomeSummary = `No open appointment slots were found for ${resolvedDate}. Ask the customer if a different day would work, or suggest one.`;
@@ -1407,12 +1407,12 @@ async function runSchedulingTurn(params: {
         } else {
           nextOfferedSlots = offeredNow;
         }
-        outcomeSummary = describeAvailabilityOutcome(resolvedDate, offeredNow, hadPreference, exactMatch);
+        outcomeSummary = describeAvailabilityOutcome(resolvedDate, offeredNow, preferenceMatch, decision.preferredDaypart);
       } else {
         // No contactId/unsupported channel — can't persist an offer to
         // resolve a later reply against, but the lookup itself is still a
         // real answer worth giving.
-        outcomeSummary = `${describeAvailabilityOutcome(resolvedDate, offeredNow, hadPreference, exactMatch)} Also ask them to confirm their choice clearly in their next message.`;
+        outcomeSummary = `${describeAvailabilityOutcome(resolvedDate, offeredNow, preferenceMatch, decision.preferredDaypart)} Also ask them to confirm their choice clearly in their next message.`;
       }
     }
 
@@ -1535,14 +1535,24 @@ function resolveSelectedSlot(offeredSlots: PersistedSlotOffer[] | undefined, sel
  * (final-response) model call after a get_availability lookup — phrased
  * differently depending on whether the customer had expressed a
  * time/daypart preference at all, and whether that preference turned out
- * to be an exact real match. Facts only (real slot labels, via
+ * to be a real match. Facts only (real slot labels, via
  * formatOfferedSlotOptions()); the model still does all customer-facing
- * phrasing — this never writes customer-visible text itself. */
+ * phrasing — this never writes customer-visible text itself.
+ *
+ * LIVE BUG FIX: previously took a single boolean `exactMatch` that only
+ * ever meant "the requested CLOCK TIME matched a real slot exactly" — a
+ * daypart preference could never be true for it, so a genuinely satisfied
+ * "Thursday afternoon" request fell into the same "NOT available" branch
+ * as a real miss, producing a contradictory live reply ("afternoon isn't
+ * available, but ... noon, 12:30, 1:00, 1:30" — all of which ARE
+ * afternoon). `preferenceMatch` is the trusted, already-computed fact
+ * from selectCandidateSlots() — this function only has to phrase it, never
+ * re-derive or infer whether the preference was satisfied. */
 function describeAvailabilityOutcome(
   resolvedDate: string,
   offeredNow: PersistedSlotOffer[],
-  hadPreference: boolean,
-  exactMatch: boolean,
+  preferenceMatch: SlotSelectionResult["preferenceMatch"],
+  preferredDaypart: "morning" | "afternoon" | "evening" | undefined,
 ): string {
   const labels = formatOfferedSlotOptions(offeredNow).join("; ");
   // LIVE VALIDATION FIX (PR #17 defect #2): every branch below states the
@@ -1554,13 +1564,22 @@ function describeAvailabilityOutcome(
   // NO_PREMATURE_BOOKING_LANGUAGE_RULE in both system prompts.
   // `resolvedDate` is the trusted, server-resolved YYYY-MM-DD (see
   // scheduling-date-intent.ts) — never the model's own dateIntent.
-  if (!hadPreference) {
+  if (preferenceMatch === "none") {
     return `These real, available slots were just found for ${resolvedDate}: ${labels}. Nothing is booked yet. Present them to the customer by their natural time (never "option 1") and ask which works.`;
   }
-  if (exactMatch) {
+  if (preferenceMatch === "exact_time") {
     return `The customer's requested time is genuinely AVAILABLE (not yet booked): ${labels}. State clearly that it is available and ask if they'd like you to go ahead and schedule it — do not say it is already booked, scheduled, or confirmed.`;
   }
-  return `The customer's requested time is NOT available for ${resolvedDate}. Nothing is booked yet. These are the nearest REAL alternatives: ${labels}. Let the customer know their requested time isn't available and offer these instead, by their natural time (never "option 1").`;
+  if (preferenceMatch === "daypart") {
+    return `The customer's requested ${preferredDaypart} on ${resolvedDate} genuinely HAS real availability (not yet booked): ${labels}. Do NOT say ${preferredDaypart} is unavailable — state clearly that it IS available and ask which of these real times works, by their natural time (never "option 1").`;
+  }
+  // "not_matched": covers BOTH an exact clock-time request with no real
+  // match, and a daypart request with zero real slots in that window
+  // (selectCandidateSlots() having fallen back to other real alternatives
+  // on the same date) — in either case the requested preference itself
+  // was not satisfiable, and only the real fallback alternatives exist.
+  const requested = preferredDaypart ? `requested ${preferredDaypart}` : "requested time";
+  return `The customer's ${requested} is NOT available for ${resolvedDate}. Nothing is booked yet. These are the nearest REAL alternatives: ${labels}. Let the customer know their request isn't available and offer these instead, by their natural time (never "option 1").`;
 }
 
 /** Shared "make the second, final model call, then finalize" tail for
