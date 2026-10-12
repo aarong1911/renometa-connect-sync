@@ -90,9 +90,13 @@ import {
   parseSchedulingDecision,
   selectCandidateSlots,
   type SchedulingDecision,
-  type SchedulingGetAvailabilityDecision,
   type SchedulingSlotReferenceDecision,
+  type SlotSelectionResult,
 } from "./agents/scheduling";
+// LIVE BUG FIX: the one trusted place a model-supplied dateIntent is
+// ever turned into an authoritative YYYY-MM-DD — see that module's own
+// header for the live defect this closes.
+import { resolveDateIntent, type ResolveDateIntentResult } from "./scheduling-date-intent";
 import { executeStep, type ExecuteStepResult } from "../../../../src/lib/agentic/action-executor";
 import {
   SCHEDULING_OFFER_CHANNELS,
@@ -405,6 +409,11 @@ export type OrchestrateAIParams = {
    * call). Defaults to the real Anthropic provider via AI-1A's factory
    * when omitted. */
   modelProvider?: ModelProvider;
+  /** Trusted server time — injectable for deterministic testing of
+   * Scheduling's date-intent resolution (scheduling-date-intent.ts);
+   * defaults to the real current time. See runSchedulingTurn()'s own
+   * doc comment. */
+  now?: Date;
 };
 
 /**
@@ -423,6 +432,7 @@ export type OrchestrateAIParams = {
 export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunResult> {
   const { supabase, event, trustedContext } = params;
   const modelProvider = params.modelProvider ?? createAnthropicProvider();
+  const now = params.now ?? new Date();
 
   let executionId: string;
   try {
@@ -471,7 +481,7 @@ export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunR
     // flow.
     if (route.agentKey === "lead_qualification") {
       return await runLeadQualificationTurn({
-        supabase, trustedContext, event, context, activeAgentKey: route.agentKey, modelProvider, executionId, agentConfig, inputSummary,
+        supabase, trustedContext, event, context, activeAgentKey: route.agentKey, modelProvider, executionId, agentConfig, inputSummary, now,
       });
     }
 
@@ -494,7 +504,7 @@ export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunR
     // through to the original AI-1F plain-response flow below, unchanged.
     if (route.agentKey === "scheduling") {
       return await runSchedulingTurn({
-        supabase, trustedContext, event, context, modelProvider, executionId, agentConfig, inputSummary,
+        supabase, trustedContext, event, context, modelProvider, executionId, agentConfig, inputSummary, now,
       });
     }
 
@@ -622,8 +632,11 @@ async function runLeadQualificationTurn(params: {
    * agent_executions.input_tokens/output_tokens/cost_usd_estimated always
    * reflect the ENTIRE execution — never just this function's share. */
   seedUsage?: { inputTokens: number; outputTokens: number; costUsd: number };
+  /** Passed straight through to runSchedulingTurn() if this turn ends in
+   * a handoff — see that function's own doc comment. */
+  now?: Date;
 }): Promise<AIRunResult> {
-  const { supabase, trustedContext, event, context, activeAgentKey, modelProvider, executionId, agentConfig, inputSummary, handoff, seedUsage } = params;
+  const { supabase, trustedContext, event, context, activeAgentKey, modelProvider, executionId, agentConfig, inputSummary, handoff, seedUsage, now } = params;
 
   // ── Model call: structured decision ──────────────────────────────────
   const decisionRequest = buildLeadQualificationDecisionRequest(agentConfig.instructions, context, event, handoff);
@@ -754,6 +767,7 @@ async function runLeadQualificationTurn(params: {
       inputSummary: { ...inputSummary, handoff: handoffSummary },
       handoff,
       seedUsage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens, costUsd: totalCostUsd },
+      now,
     });
 
     // Attach the full validated handoff regardless of how the Scheduling
@@ -1231,8 +1245,15 @@ async function runSchedulingTurn(params: {
   inputSummary: AIExecutionInputSummary;
   handoff?: AIAgentHandoff;
   seedUsage?: { inputTokens: number; outputTokens: number; costUsd: number };
+  /** Trusted server time — injectable for deterministic testing of the
+   * date-intent resolver below (and of describeTodayInOrgTimezone()'s
+   * weekday name); defaults to the real current time. Never the
+   * browser's or server machine's own local timezone — only ever
+   * consulted together with organizations.timezone. */
+  now?: Date;
 }): Promise<AIRunResult> {
   const { supabase, trustedContext, event, context, modelProvider, executionId, agentConfig, inputSummary, handoff, seedUsage } = params;
+  const now = params.now ?? new Date();
   const channel = event.channel;
   const contactId = trustedContext.contactId;
   const orgId = trustedContext.orgId;
@@ -1253,7 +1274,7 @@ async function runSchedulingTurn(params: {
   }
 
   // ── Model call: structured decision ──────────────────────────────────
-  const decisionRequest = buildSchedulingDecisionRequest(agentConfig.instructions, context, event, offeredSlots, handoff);
+  const decisionRequest = buildSchedulingDecisionRequest(agentConfig.instructions, context, event, offeredSlots, handoff, now);
 
   let decisionResponse;
   try {
@@ -1301,13 +1322,45 @@ async function runSchedulingTurn(params: {
   // ── get_availability ──────────────────────────────────────────────────
   if (decision.type === "get_availability") {
     const toolingSummary: AIToolingSummary = { attempted: true, toolName: "get_availability" };
+
+    // LIVE BUG FIX: resolve the model's semantic dateIntent into an
+    // authoritative YYYY-MM-DD HERE, in trusted server code, BEFORE
+    // get_availability is ever called — never trust a model-computed
+    // relative date (see scheduling-date-intent.ts's own header for the
+    // real production-preview defect this closes: org-local "today" was
+    // Saturday 2026-10-11, the customer said "Thursday afternoon," and
+    // the model's own arithmetic produced 2026-10-16 — a Friday — instead
+    // of the real next Thursday, 2026-10-15).
+    const timeZone = context.organization.timezone;
+    const dateResolution: ResolveDateIntentResult = timeZone
+      ? resolveDateIntent({ dateIntent: decision.dateIntent, timeZone, now })
+      : { status: "invalid_timezone" };
+
+    if (dateResolution.status !== "resolved") {
+      // FAIL CLOSED toward clarification, never toward an arbitrary date
+      // — get_availability is never called when the date intent can't be
+      // safely resolved.
+      return await finalizeAfterSchedulingAction(supabase, executionId, {
+        agentConfig, context, event, handoff,
+        outcomeSummary: describeDateResolutionFailure(dateResolution),
+        offeredSlots,
+        modelProvider, totalInputTokens, totalOutputTokens, totalCostUsd,
+        inputSummary: { ...inputSummary, tooling: { attempted: false, toolName: "get_availability", skippedReason: dateResolution.status } },
+        orgId, executionIdForUsage: executionId, now,
+      });
+    }
+
+    const resolvedDate = dateResolution.date;
+
     const availabilityResult: ExecuteStepResult = await executeStep({
       supabase, orgId, actor: trustedContext.actor, executionId, sequence: 1,
       actionKey: "get_availability",
       // DEFAULT_DURATION_MINUTES equivalent (60) — matches
       // scheduling-availability.ts's own default; this phase does not ask
-      // the model to choose a duration.
-      rawInput: { date: decision.date, durationMinutes: 60 },
+      // the model to choose a duration. `resolvedDate` — never
+      // `decision.dateIntent` or any model-computed date — is the only
+      // date value that ever reaches this trusted action.
+      rawInput: { date: resolvedDate, durationMinutes: 60 },
       autonomyLevel: trustedContext.autonomyLevel ?? 1,
       targetEntityType: contactId ? "contact" : trustedContext.leadId ? "lead" : undefined,
       targetEntityId: contactId ?? trustedContext.leadId,
@@ -1335,14 +1388,13 @@ async function runSchedulingTurn(params: {
       // get_availability's own handler returned — it never invents or
       // reorders anything beyond picking/ranking which of those real
       // candidates to present.
-      const { slots: offeredNow, exactMatch } = selectCandidateSlots(
+      const { slots: offeredNow, preferenceMatch } = selectCandidateSlots(
         allSlots,
         { time: decision.preferredTime, daypart: decision.preferredDaypart },
       );
-      const hadPreference = !!(decision.preferredTime || decision.preferredDaypart);
 
       if (offeredNow.length === 0) {
-        outcomeSummary = `No open appointment slots were found for ${decision.date}. Ask the customer if a different day would work, or suggest one.`;
+        outcomeSummary = `No open appointment slots were found for ${resolvedDate}. Ask the customer if a different day would work, or suggest one.`;
       } else if (contactId && schedulingChannel) {
         const writeResult = await writeOfferedSlots({ supabase }, { orgId, contactId, channel: schedulingChannel, slots: offeredNow });
         if (!writeResult.ok) {
@@ -1355,12 +1407,12 @@ async function runSchedulingTurn(params: {
         } else {
           nextOfferedSlots = offeredNow;
         }
-        outcomeSummary = describeAvailabilityOutcome(decision, offeredNow, hadPreference, exactMatch);
+        outcomeSummary = describeAvailabilityOutcome(resolvedDate, offeredNow, preferenceMatch, decision.preferredDaypart);
       } else {
         // No contactId/unsupported channel — can't persist an offer to
         // resolve a later reply against, but the lookup itself is still a
         // real answer worth giving.
-        outcomeSummary = `${describeAvailabilityOutcome(decision, offeredNow, hadPreference, exactMatch)} Also ask them to confirm their choice clearly in their next message.`;
+        outcomeSummary = `${describeAvailabilityOutcome(resolvedDate, offeredNow, preferenceMatch, decision.preferredDaypart)} Also ask them to confirm their choice clearly in their next message.`;
       }
     }
 
@@ -1369,7 +1421,7 @@ async function runSchedulingTurn(params: {
       offeredSlots: nextOfferedSlots,
       modelProvider, totalInputTokens, totalOutputTokens, totalCostUsd,
       inputSummary: { ...inputSummary, tooling: toolingSummary },
-      orgId, executionIdForUsage: executionId,
+      orgId, executionIdForUsage: executionId, now,
     });
   }
 
@@ -1436,7 +1488,7 @@ async function runSchedulingTurn(params: {
         agentConfig, context, event, handoff, outcomeSummary, offeredSlots,
         modelProvider, totalInputTokens, totalOutputTokens, totalCostUsd,
         inputSummary: { ...inputSummary, tooling: toolingSummary },
-        orgId, executionIdForUsage: executionId, approvalRequestId: proposeResult.approvalRequestId,
+        orgId, executionIdForUsage: executionId, approvalRequestId: proposeResult.approvalRequestId, now,
       });
     }
 
@@ -1447,8 +1499,20 @@ async function runSchedulingTurn(params: {
     agentConfig, context, event, handoff, outcomeSummary, offeredSlots,
     modelProvider, totalInputTokens, totalOutputTokens, totalCostUsd,
     inputSummary: { ...inputSummary, tooling: toolingSummary },
-    orgId, executionIdForUsage: executionId,
+    orgId, executionIdForUsage: executionId, now,
   });
+}
+
+/** LIVE BUG FIX: builds the factual summary fed to the second (final-
+ * response) model call when a model-expressed dateIntent could not be
+ * safely resolved — fails closed toward a clarifying question, never
+ * toward an arbitrary date. */
+function describeDateResolutionFailure(result: Exclude<ResolveDateIntentResult, { status: "resolved" }>): string {
+  if (result.status === "invalid_timezone") {
+    return "The organization's timezone could not be resolved, so availability cannot be checked right now. Apologize briefly and let the customer know a teammate will follow up.";
+  }
+  // invalid_intent / invalid_explicit_date
+  return "The day the customer meant could not be determined safely. Do not guess a date — ask the customer to clarify which specific day (or an exact date) works for them.";
 }
 
 /** Matches a model-chosen 1-indexed option number against the REAL
@@ -1471,14 +1535,24 @@ function resolveSelectedSlot(offeredSlots: PersistedSlotOffer[] | undefined, sel
  * (final-response) model call after a get_availability lookup — phrased
  * differently depending on whether the customer had expressed a
  * time/daypart preference at all, and whether that preference turned out
- * to be an exact real match. Facts only (real slot labels, via
+ * to be a real match. Facts only (real slot labels, via
  * formatOfferedSlotOptions()); the model still does all customer-facing
- * phrasing — this never writes customer-visible text itself. */
+ * phrasing — this never writes customer-visible text itself.
+ *
+ * LIVE BUG FIX: previously took a single boolean `exactMatch` that only
+ * ever meant "the requested CLOCK TIME matched a real slot exactly" — a
+ * daypart preference could never be true for it, so a genuinely satisfied
+ * "Thursday afternoon" request fell into the same "NOT available" branch
+ * as a real miss, producing a contradictory live reply ("afternoon isn't
+ * available, but ... noon, 12:30, 1:00, 1:30" — all of which ARE
+ * afternoon). `preferenceMatch` is the trusted, already-computed fact
+ * from selectCandidateSlots() — this function only has to phrase it, never
+ * re-derive or infer whether the preference was satisfied. */
 function describeAvailabilityOutcome(
-  decision: SchedulingGetAvailabilityDecision,
+  resolvedDate: string,
   offeredNow: PersistedSlotOffer[],
-  hadPreference: boolean,
-  exactMatch: boolean,
+  preferenceMatch: SlotSelectionResult["preferenceMatch"],
+  preferredDaypart: "morning" | "afternoon" | "evening" | undefined,
 ): string {
   const labels = formatOfferedSlotOptions(offeredNow).join("; ");
   // LIVE VALIDATION FIX (PR #17 defect #2): every branch below states the
@@ -1488,13 +1562,24 @@ function describeAvailabilityOutcome(
   // is booked yet" reminder is included in the fact string itself, not
   // left to the model to infer, on top of the standing
   // NO_PREMATURE_BOOKING_LANGUAGE_RULE in both system prompts.
-  if (!hadPreference) {
-    return `These real, available slots were just found for ${decision.date}: ${labels}. Nothing is booked yet. Present them to the customer by their natural time (never "option 1") and ask which works.`;
+  // `resolvedDate` is the trusted, server-resolved YYYY-MM-DD (see
+  // scheduling-date-intent.ts) — never the model's own dateIntent.
+  if (preferenceMatch === "none") {
+    return `These real, available slots were just found for ${resolvedDate}: ${labels}. Nothing is booked yet. Present them to the customer by their natural time (never "option 1") and ask which works.`;
   }
-  if (exactMatch) {
+  if (preferenceMatch === "exact_time") {
     return `The customer's requested time is genuinely AVAILABLE (not yet booked): ${labels}. State clearly that it is available and ask if they'd like you to go ahead and schedule it — do not say it is already booked, scheduled, or confirmed.`;
   }
-  return `The customer's requested time is NOT available for ${decision.date}. Nothing is booked yet. These are the nearest REAL alternatives: ${labels}. Let the customer know their requested time isn't available and offer these instead, by their natural time (never "option 1").`;
+  if (preferenceMatch === "daypart") {
+    return `The customer's requested ${preferredDaypart} on ${resolvedDate} genuinely HAS real availability (not yet booked): ${labels}. Do NOT say ${preferredDaypart} is unavailable — state clearly that it IS available and ask which of these real times works, by their natural time (never "option 1").`;
+  }
+  // "not_matched": covers BOTH an exact clock-time request with no real
+  // match, and a daypart request with zero real slots in that window
+  // (selectCandidateSlots() having fallen back to other real alternatives
+  // on the same date) — in either case the requested preference itself
+  // was not satisfiable, and only the real fallback alternatives exist.
+  const requested = preferredDaypart ? `requested ${preferredDaypart}` : "requested time";
+  return `The customer's ${requested} is NOT available for ${resolvedDate}. Nothing is booked yet. These are the nearest REAL alternatives: ${labels}. Let the customer know their request isn't available and offer these instead, by their natural time (never "option 1").`;
 }
 
 /** Shared "make the second, final model call, then finalize" tail for
@@ -1520,12 +1605,16 @@ async function finalizeAfterSchedulingAction(
     orgId: string;
     executionIdForUsage: string;
     approvalRequestId?: string;
+    /** Trusted server time, forwarded to buildSchedulingFinalRequest()'s
+     * own `now`-dependent weekday line — see runSchedulingTurn()'s doc
+     * comment. Defaults to the real current time. */
+    now?: Date;
   },
 ): Promise<AIRunResult> {
   const { agentConfig, context, event, handoff, outcomeSummary, offeredSlots, modelProvider, inputSummary, orgId, executionIdForUsage, approvalRequestId } = params;
   let { totalInputTokens, totalOutputTokens, totalCostUsd } = params;
 
-  const finalRequest = buildSchedulingFinalRequest(agentConfig.instructions, context, event, outcomeSummary, offeredSlots, handoff);
+  const finalRequest = buildSchedulingFinalRequest(agentConfig.instructions, context, event, outcomeSummary, offeredSlots, handoff, params.now);
 
   let finalResponse;
   try {

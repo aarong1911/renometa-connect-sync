@@ -56,15 +56,46 @@ test("respond decision with no declineScheduling field at all still parses (opti
   assert.equal(parsed.decision.declineScheduling, undefined);
 });
 
-test("get_availability decision requires a well-formed YYYY-MM-DD date — a malformed one falls back safely, never silently coerced", () => {
-  const good = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", date: "2027-03-20" }));
-  assert.equal(good.kind, "decision");
-  assert.equal(good.decision.type, "get_availability");
+// LIVE BUG FIX: get_availability now carries a structured, semantic
+// dateIntent — never a model-resolved date for anything relative. See
+// scheduling-date-intent.ts's own header for the live defect this closes.
 
+test("get_availability decision accepts all three dateIntent shapes", () => {
+  const explicit = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", dateIntent: { kind: "explicit_date", date: "2027-03-20" } }));
+  assert.equal(explicit.kind, "decision");
+  assert.equal(explicit.decision.type, "get_availability");
+
+  const relative = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", dateIntent: { kind: "relative_day", value: "tomorrow" } }));
+  assert.equal(relative.kind, "decision");
+
+  const weekday = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "thursday", occurrence: "next_occurrence" } }));
+  assert.equal(weekday.kind, "decision");
+});
+
+test("explicit_date requires a well-formed YYYY-MM-DD string — a malformed one falls back safely, never silently coerced", () => {
   for (const badDate of ["March 20", "2027-3-20", "2027/03/20", "tomorrow", ""]) {
-    const parsed = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", date: badDate }));
+    const parsed = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", dateIntent: { kind: "explicit_date", date: badDate } }));
     assert.equal(parsed.kind, "fallback", badDate);
   }
+});
+
+test("relative_day only accepts 'today'/'tomorrow'; weekday only accepts the 7 known weekday names and the 2 known occurrence values", () => {
+  assert.equal(S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", dateIntent: { kind: "relative_day", value: "yesterday" } })).kind, "fallback");
+  assert.equal(S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "funday", occurrence: "next_occurrence" } })).kind, "fallback");
+  assert.equal(S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "thursday", occurrence: "sometime" } })).kind, "fallback");
+});
+
+test("there is no way for the model to supply a raw/resolved date for a relative expression — only explicit_date carries a literal date string, and only strictly, never free text", () => {
+  // A model trying to sneak a model-computed date onto a weekday/
+  // relative_day intent (extra field) fails the WHOLE object, per
+  // .strict() — never partially matches and silently drops the extra.
+  const smuggled = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "thursday", occurrence: "next_occurrence", date: "2026-10-16" } }));
+  assert.equal(smuggled.kind, "fallback");
+});
+
+test("the OLD direct model-owned 'date' field is no longer accepted at all, even for what would have been a valid date", () => {
+  const old = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", date: "2027-03-20" }));
+  assert.equal(old.kind, "fallback", "the old flat `date` field must be rejected now that dateIntent is required — explicit_date is the only intentional backward-compatible path, and it requires the {kind:\"explicit_date\",date:...} shape");
 });
 
 test("select_offered_slot / propose_appointment require a positive integer selectedOptionNumber", () => {
@@ -126,10 +157,19 @@ test("with no currently offered slots, the prompt says select_offered_slot/propo
   assert.match(req.system, /propose_appointment: only usable when options were just offered/);
 });
 
-test("the prompt includes today's date in the organization's own timezone, not the server's local time or UTC", () => {
+// LIVE BUG FIX: this test used to assert the prompt included today's
+// literal calendar date — exactly the information whose presence caused
+// the model to attempt its own calendar arithmetic in the first place
+// (see scheduling-date-intent.ts's own header). It now asserts the
+// opposite: the org-local WEEKDAY NAME is still surfaced (computed
+// correctly from organizations.timezone, not server/UTC time), but the
+// actual date number is withheld entirely.
+test("the prompt surfaces today's weekday NAME from the organization's own timezone (not server/UTC time), but never the literal calendar date", () => {
   const req = S.buildSchedulingDecisionRequest(AGENT_INSTRUCTIONS, baseContext(), baseEvent, undefined, undefined, new Date("2027-03-16T02:30:00.000Z"));
-  // 2027-03-16T02:30:00Z is 2027-03-15 22:30 in America/New_York (EDT, UTC-4) — a different calendar day than the raw UTC date.
-  assert.match(req.system, /2027-03-15/);
+  // 2027-03-16T02:30:00Z is 2027-03-15 22:30 in America/New_York (EDT, UTC-4) — a different calendar day than the raw UTC date; 2027-03-15 is a Monday.
+  assert.match(req.system, /Today where this business is located is a Monday/);
+  assert.ok(!req.system.includes("2027-03-15"), "the literal calendar date must never appear in the prompt the model sees");
+  assert.ok(!req.system.includes("2027-03-16"), "the raw UTC date must never appear either");
 });
 
 test("known qualification fields (budget/timeline/location/first name) are surfaced exactly like Lead Qualification's own known-fields block", () => {
@@ -159,37 +199,57 @@ test("without a handoff, no handoff context block or continuity instruction appe
 // ── LIVE VALIDATION FIX: get_availability schema now carries optional
 // preference hints, and the prompt requires a real day-signal first ────
 
+const SAMPLE_DATE_INTENT = { kind: "explicit_date", date: "2027-03-17" };
+
 test("get_availability decision accepts optional preferredTime (24-hour HH:MM) and preferredDaypart", () => {
-  const withTime = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredTime: "10:00" }));
+  const withTime = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", dateIntent: SAMPLE_DATE_INTENT, preferredTime: "10:00" }));
   assert.equal(withTime.kind, "decision");
   assert.equal(withTime.decision.preferredTime, "10:00");
 
-  const withDaypart = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredDaypart: "afternoon" }));
+  const withDaypart = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", dateIntent: SAMPLE_DATE_INTENT, preferredDaypart: "afternoon" }));
   assert.equal(withDaypart.kind, "decision");
   assert.equal(withDaypart.decision.preferredDaypart, "afternoon");
 
-  const withNeither = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", date: "2027-03-17" }));
+  const withNeither = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", dateIntent: SAMPLE_DATE_INTENT }));
   assert.equal(withNeither.kind, "decision");
   assert.equal(withNeither.decision.preferredTime, undefined);
 });
 
 test("preferredTime must be 24-hour HH:MM — a 12-hour or malformed value falls back safely, never silently coerced", () => {
   for (const bad of ["10:00am", "25:00", "10:60", "10", "10:0"]) {
-    const parsed = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredTime: bad }));
+    const parsed = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", dateIntent: SAMPLE_DATE_INTENT, preferredTime: bad }));
     assert.equal(parsed.kind, "fallback", bad);
   }
 });
 
 test("preferredDaypart only accepts the three known literal values", () => {
-  const parsed = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", date: "2027-03-17", preferredDaypart: "late_night" }));
+  const parsed = S.parseSchedulingDecision(JSON.stringify({ type: "get_availability", dateIntent: SAMPLE_DATE_INTENT, preferredDaypart: "late_night" }));
   assert.equal(parsed.kind, "fallback");
 });
 
 test("the prompt now REQUIRES a real day-signal from the customer before get_availability may be used — the root cause of the live defect (an unconditional 'use this when you don't have a current offer' invitation) is gone", () => {
   const req = S.buildSchedulingDecisionRequest(AGENT_INSTRUCTIONS, baseContext(), baseEvent, undefined);
-  assert.match(req.system, /ONLY use this when the customer has given you SOME indication of which day they mean/);
+  assert.match(req.system, /Use it ONLY when the customer has given you SOME indication of which day they mean/);
   assert.match(req.system, /NEVER call get_availability, and NEVER pick a day yourself, when the customer has not told you ANY day or time preference yet/);
   assert.ok(!req.system.includes("Use this when you don't yet have a current offer to work with"), "the old unconditional invitation line must be gone");
+});
+
+// ── LIVE BUG FIX: dateIntent — the model must never calculate the date ──
+
+test("the prompt explicitly forbids the model from calculating/computing a relative calendar date itself, and instructs it to express a dateIntent shape instead", () => {
+  const req = S.buildSchedulingDecisionRequest(AGENT_INSTRUCTIONS, baseContext(), baseEvent, undefined);
+  assert.match(req.system, /Do NOT calculate what calendar date 'tomorrow' or 'Thursday' actually falls on/);
+  assert.match(req.system, /dateIntent/);
+  assert.match(req.system, /"kind":"weekday"/);
+  assert.match(req.system, /"kind":"relative_day"/);
+  assert.match(req.system, /"kind":"explicit_date"/);
+});
+
+test("the prompt no longer tells the model today's actual calendar date (the root cause of the live date-arithmetic defect) — only the weekday NAME, which carries no number to compute with", () => {
+  const req = S.buildSchedulingDecisionRequest(AGENT_INSTRUCTIONS, baseContext(), baseEvent, undefined, undefined, new Date("2026-10-11T18:00:00.000Z"));
+  assert.ok(!req.system.includes("2026-10-11"), "the actual resolved calendar date must never appear in the prompt the model sees");
+  assert.ok(!/Today's date where this business is located: \d{4}-\d{2}-\d{2}/.test(req.system), "the old 'today's date: YYYY-MM-DD' line must be gone entirely");
+  assert.match(req.system, /Today where this business is located is a Sunday/);
 });
 
 test("the prompt describes preferredTime/preferredDaypart and defines the exact daypart boundaries selectCandidateSlots() itself uses", () => {
@@ -220,19 +280,19 @@ const ALL_MORNING_PLUS_AFTERNOON = [MORNING_1, MORNING_2, MORNING_3, MORNING_4, 
 test("with no preference at all, returns the first `limit` candidates unchanged — the pre-fix behavior, preserved for the date-only/no-time case", () => {
   const result = S.selectCandidateSlots(ALL_MORNING_PLUS_AFTERNOON, undefined, 4);
   assert.deepEqual(result.slots, [MORNING_1, MORNING_2, MORNING_3, MORNING_4]);
-  assert.equal(result.exactMatch, false);
+  assert.equal(result.preferenceMatch, "none");
 });
 
 test("an exact preferredTime match is detected and surfaced first — never silently missed just because it wasn't chronologically first", () => {
   const result = S.selectCandidateSlots([MORNING_1, TEN_AM, TWO_PM], { time: "10:00" }, 4);
-  assert.equal(result.exactMatch, true);
+  assert.equal(result.preferenceMatch, "exact_time");
   assert.ok(result.slots.some((s: any) => s.start === TEN_AM.start));
 });
 
 test("no exact match for the requested time: the nearest REAL alternatives are returned, chronologically ordered, never the requested (nonexistent) time itself", () => {
   // Real candidates at 9:30 and 10:30 ET; customer asked for 10:00 ET, which does not exist.
   const result = S.selectCandidateSlots([NINE_THIRTY, TEN_THIRTY, TWO_PM, FIVE_PM], { time: "10:00" }, 2);
-  assert.equal(result.exactMatch, false);
+  assert.equal(result.preferenceMatch, "not_matched");
   assert.equal(result.slots.length, 2);
   assert.deepEqual(result.slots.map((s: any) => s.start), [NINE_THIRTY.start, TEN_THIRTY.start]);
 });
@@ -243,15 +303,20 @@ test("a daypart preference (afternoon) prefers real afternoon candidates — mor
   assert.ok(!result.slots.some((s: any) => s.start === MORNING_1.start));
 });
 
-test("a daypart preference with zero real matches falls back to the ordinary first-N list — never fabricates a slot just to fill the daypart", () => {
+test("LIVE BUG: a daypart preference with one or more real matches reports preferenceMatch 'daypart' — the daypart WAS satisfied, never conflated with 'not_matched' just because it isn't a single exact clock time", () => {
+  const result = S.selectCandidateSlots(ALL_MORNING_PLUS_AFTERNOON, { daypart: "afternoon" }, 4);
+  assert.equal(result.preferenceMatch, "daypart");
+});
+
+test("a daypart preference with zero real matches falls back to the ordinary first-N list — never fabricates a slot just to fill the daypart — and reports preferenceMatch 'not_matched', distinguishing this from a genuinely satisfied daypart", () => {
   const result = S.selectCandidateSlots([MORNING_1, MORNING_2], { daypart: "evening" }, 4);
   assert.deepEqual(result.slots, [MORNING_1, MORNING_2]);
-  assert.equal(result.exactMatch, false);
+  assert.equal(result.preferenceMatch, "not_matched");
 });
 
 test("preferredTime takes precedence over preferredDaypart when both are somehow set", () => {
   const result = S.selectCandidateSlots([NINE_THIRTY, TWO_PM], { time: "09:30", daypart: "afternoon" }, 4);
-  assert.equal(result.exactMatch, true);
+  assert.equal(result.preferenceMatch, "exact_time");
   assert.ok(result.slots.some((s: any) => s.start === NINE_THIRTY.start));
 });
 
