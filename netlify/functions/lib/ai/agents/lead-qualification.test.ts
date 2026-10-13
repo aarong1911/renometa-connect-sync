@@ -35,6 +35,16 @@ const S: any = await import(pathToFileURL(path.join(outDir, "subject.mjs")).href
 const AGENT_INSTRUCTIONS =
   "The business using RenoMeta Connect is the contractor/service provider the lead is contacting — you represent THAT business, not a marketplace, referral service, or neutral third party. Assume the customer is considering hiring this business for the project. Do not ask whether the customer is looking for another contractor, comparing contractors, already has a contractor, or needs help finding one, unless the customer explicitly brings that up first.";
 
+// LIVE BUG FIX: the real business-fact-grounding rule orchestrator.ts now
+// also passes as part of `agentInstructions` — see this file's own doc
+// comment above AGENT_INSTRUCTIONS for why this is reused verbatim rather
+// than an invented stand-in. A real Scheduling -> Lead Qualification
+// reverse handoff produced "Yes, we handle all the permitting and
+// inspections for kitchen remodels" for a permits question with nothing
+// in trusted context supporting that claim — this rule is the fix.
+const GROUNDING_RULE =
+  "Separately from the customer's own project facts: for any question about THIS BUSINESS's own capabilities or policies — whether it handles permits, licensing, inspections, financing, warranties, service area, specific included services, pricing policies, or guarantees — answer using ONLY an explicit statement already present in the trusted CRM/business context provided below. Never invent, assume, or infer an answer to one of these from general industry knowledge or what a typical contractor usually does — generic industry knowledge is not a fact about this specific business. If the customer asks one of these and trusted context does not explicitly state the answer, say naturally that you'd want to confirm the specifics with the team (or ask a clarifying question) rather than asserting a yes/no answer or a specific policy. This does not apply to the customer's own project facts (their budget, timeline, project scope, or similar) — those remain fully usable exactly as the rules above already describe whenever trusted context actually contains them.";
+
 const baseContext = (lead?: Record<string, unknown>) => ({
   organization: { id: "org-1", name: "Acme Remodeling" },
   channel: "sms" as const,
@@ -66,6 +76,46 @@ test("20+21. the marketplace/referral-avoidance persona instruction is present v
   const req = S.buildLeadQualificationDecisionRequest(AGENT_INSTRUCTIONS, context, baseEvent);
   assert.match(req.system, /not a marketplace, referral service, or neutral third party/);
   assert.match(req.system, /Do not ask whether the customer is looking for another contractor/);
+});
+
+// ── LIVE BUG FIX: business-fact grounding rule ───────────────────────────
+//
+// `agentInstructions` (SYSTEM_AGENTS.lead_qualification.instructions in
+// orchestrator.ts) is the ONE source of truth fed into BOTH
+// buildLeadQualificationDecisionRequest() and
+// buildLeadQualificationFinalRequest() — see each call below — so a
+// single instruction here covers both model calls Lead Qualification ever
+// makes, with no duplication needed across prompt layers.
+const FULL_INSTRUCTIONS = [AGENT_INSTRUCTIONS, GROUNDING_RULE].join(" ");
+
+test("the business-fact grounding rule reaches BOTH the decision prompt and the final-response prompt — the one `agentInstructions` source of truth covers both model calls", () => {
+  const context = baseContext({ id: "l1", status: "new" });
+  const decisionReq = S.buildLeadQualificationDecisionRequest(FULL_INSTRUCTIONS, context, baseEvent);
+  assert.match(decisionReq.system, /answer using ONLY an explicit statement already present in the trusted CRM\/business context/);
+  assert.match(decisionReq.system, /permits, licensing, inspections, financing, warranties, service area/);
+
+  const finalReq = S.buildLeadQualificationFinalRequest(FULL_INSTRUCTIONS, context, baseEvent, "Decision: respond.");
+  assert.match(finalReq.system, /answer using ONLY an explicit statement already present in the trusted CRM\/business context/);
+});
+
+test("the grounding rule explicitly carves out the customer's OWN project facts (budget/timeline/scope) as still fully usable — it is not a blanket 'never state any fact' rule", () => {
+  const context = baseContext({ id: "l1", status: "new" });
+  const req = S.buildLeadQualificationDecisionRequest(FULL_INSTRUCTIONS, context, baseEvent);
+  assert.match(req.system, /This does not apply to the customer's own project facts/);
+});
+
+test("known project facts (budget/timeline) still render in the prompt exactly as before, alongside the new grounding rule — the rule does not suppress or interfere with the existing known-fields block", () => {
+  const context = baseContext({ id: "l1", status: "new", name: "John Test", estimatedBudget: 25000, timeline: "within two months" });
+  const req = S.buildLeadQualificationDecisionRequest(FULL_INSTRUCTIONS, context, baseEvent);
+  assert.match(req.system, /Budget: \$25,000 \(already known; do not ask for budget again\)/);
+  assert.match(req.system, /Desired timeline: within two months \(already known; do not ask when they want to start again\)/);
+  assert.match(req.system, /answer using ONLY an explicit statement already present in the trusted CRM\/business context/);
+});
+
+test("a known location/service-area fact still renders in the prompt — a SUPPORTED business fact (e.g. the lead's own location, which the model may use to answer a service-area question) is not blocked by the grounding rule", () => {
+  const context = baseContext({ id: "l1", status: "new", location: "Boca Raton, FL" });
+  const req = S.buildLeadQualificationDecisionRequest(FULL_INSTRUCTIONS, context, baseEvent);
+  assert.match(req.system, /Location\/service area: Boca Raton, FL \(already known; do not ask where the project is again\)/);
 });
 
 test("22. the model is steered toward exactly one allowlisted tool, never invited to invent pricing/availability/promises", () => {

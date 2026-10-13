@@ -752,6 +752,14 @@ test("TEST 1 — LIVE OWNERSHIP SCENARIO: an active offer routes to Scheduling f
   const lqDecisionCall = modelProvider.requests[1];
   assert.match(lqDecisionCall.messages[0].content, /Also, do you handle permits for kitchen remodels\?/);
 
+  // LIVE BUG FIX: the real system prompt sent to Lead Qualification's
+  // decision call — for this EXACT live scenario (a permits question
+  // reaching it via the reverse handoff) — must carry the business-fact
+  // grounding rule. This proves the rule is actually wired into the live
+  // orchestration path, not just defined in isolation in SYSTEM_AGENTS.
+  assert.match(lqDecisionCall.system, /answer using ONLY an explicit statement already present in the trusted CRM\/business context/);
+  assert.match(lqDecisionCall.system, /permits, licensing, inspections, financing, warranties, service area/);
+
   // The scheduling offer is cleared.
   const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
   assert.equal(row.scheduling_offered_slots, null);
@@ -996,4 +1004,96 @@ test("router regression: an active scheduling offer still places a plain inbound
   const { data: execRow } = await db.from("agent_executions").select("*").eq("id", result.executionId).maybeSingle();
   assert.equal(execRow.input_summary.route.source, "conversation_state");
   assert.equal(execRow.input_summary.route.agentKey, "scheduling");
+});
+
+// ── LIVE BUG FIX: Lead Qualification business-fact grounding ────────────
+//
+// A real Scheduling -> Lead Qualification reverse handoff surfaced an
+// UNSUPPORTED business-fact claim ("Yes, we handle all the permitting and
+// inspections for kitchen remodels") for a permits question with nothing
+// in trusted context supporting it. The model is fully scripted in every
+// test in this file, so the only thing these tests can (and should)
+// verify is the WIRED CONTRACT: the real system prompt actually sent to
+// Lead Qualification's decision call carries the grounding rule, and —
+// separately — that a genuinely supported fact still reaches the model
+// un-suppressed. Per this task's own instruction: assert the instruction
+// contract and the real request content, not an invented exact sentence
+// a scripted mock could never actually test.
+
+test("TEST 1 — UNSUPPORTED PERMIT CLAIM (LIVE BUG): a permits question with NO supporting trusted-context fact carries the grounding rule into the real decision-call system prompt, and trusted context contains no permit-related statement for the model to (correctly) ground an answer in", async () => {
+  const db = makeDb(); // no lead.custom_fields permit/licensing/inspection statement anywhere
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "lead_qualification", reason: "non-scheduling business question", summary: "Customer asked whether we handle permits for kitchen remodels." }),
+    // The SAFE, grounded response this fix is meant to produce — never
+    // "yes, we handle all permitting," which this test proves there is
+    // no supporting trusted-context fact for in the first place.
+    JSON.stringify({ type: "respond", response: "I can help with that. Permit requirements can vary by project and location, so I'd want to confirm how our team handles that for your remodel." }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Do you handle permits for kitchen remodels?"), trustedContext: trustedContext(), modelProvider });
+
+  assert.equal(result.agentKey, "lead_qualification");
+  assert.ok(!/\byes\b/i.test(result.responseText ?? "") || /confirm|team|vary|not certain|double-check/i.test(result.responseText ?? ""), "the scripted safe response must not be a bare unsupported 'yes'");
+  assert.doesNotMatch(result.responseText ?? "", /we handle all (the )?permitting/i);
+
+  const lqDecisionCall = modelProvider.requests[1];
+  // The grounding rule is actually present in the real request sent.
+  assert.match(lqDecisionCall.system, /Never invent, assume, or infer an answer to one of these from general industry knowledge/);
+  // And trusted context's own known-fields block (budget/name/timeline/
+  // location — whatever this fixture's lead happens to have) contains no
+  // permit/licensing/inspection line at all — confirming this is a
+  // genuinely unsupported case the model has no fact to ground a "yes"
+  // in, not a false positive.
+  const knownFieldsBlock = /Already known about this lead[\s\S]*?(?=\n\n|$)/.exec(lqDecisionCall.system)?.[0] ?? "";
+  assert.doesNotMatch(knownFieldsBlock, /permit/i);
+  assert.doesNotMatch(lqDecisionCall.messages[0].content, /permits?:\s*(yes|handled|included)/i);
+});
+
+test("TEST 2 — SUPPORTED BUSINESS FACT: a known location/service-area fact reaches the real decision-call prompt un-suppressed — the grounding rule does not cause a blanket refusal when trusted context actually supports the answer", async () => {
+  // context-builder.ts's fetchLeadSummary() reads AILeadSummary.location
+  // from custom_fields.address (the vapi-webhook.ts save_lead convention —
+  // see that function's own comment), not a "location" key.
+  const db = makeDb({
+    leads: [{ id: LEAD_1, org_id: ORG_A, status: "qualified", contact_id: CONTACT_1, source: "sms", score: null, name: "Jane", estimated_value: 50000, custom_fields: { address: "Boca Raton, FL" } }],
+  });
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "lead_qualification", reason: "service-area question", summary: "Customer asked whether we service Boca Raton." }),
+    JSON.stringify({ type: "respond", response: "Yes, we service the Boca Raton area." }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Do you service Boca Raton?"), trustedContext: trustedContext(), modelProvider });
+
+  assert.equal(result.agentKey, "lead_qualification");
+  assert.equal(result.status, "completed");
+  // Not a blanket refusal — the model was allowed to answer, and the
+  // underlying SUPPORTING fact genuinely reached its real prompt.
+  const lqDecisionCall = modelProvider.requests[1];
+  assert.match(lqDecisionCall.system, /Location\/service area: Boca Raton, FL \(already known; do not ask where the project is again\)/);
+  assert.equal(result.responseText, "Yes, we service the Boca Raton area.");
+});
+
+test("TEST 3 — PROJECT FACTS STILL USABLE: known budget and timeline still reach the real decision-call prompt unaffected by the grounding rule", async () => {
+  const db = makeDb({
+    leads: [{ id: LEAD_1, org_id: ORG_A, status: "qualified", contact_id: CONTACT_1, source: "sms", score: null, name: "Jane", estimated_value: 25000, custom_fields: { timeline: "within 2 months" } }],
+  });
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "respond", response: "A $25,000 budget and a two-month timeline both give us a solid starting point." }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Just checking in on my kitchen project"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.agentKey, "lead_qualification");
+  const decisionCall = modelProvider.requests[0];
+  assert.match(decisionCall.system, /Budget: \$25,000 \(already known; do not ask for budget again\)/);
+  assert.match(decisionCall.system, /Desired timeline: within 2 months \(already known; do not ask when they want to start again\)/);
+});
+
+test("TEST 5 — FORWARD HANDOFF REGRESSION: Lead Qualification -> Scheduling still works unchanged when the customer clearly wants to schedule", async () => {
+  const db = makeDb();
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "customer ready to book", summary: "Customer wants to schedule a consultation." }),
+    JSON.stringify({ type: "respond", response: "What day works best for you?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("I'm ready to book a time"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.agentKey, "scheduling");
+  assert.equal(result.handoff.fromAgent, "lead_qualification");
+  assert.equal(result.handoff.toAgent, "scheduling");
 });

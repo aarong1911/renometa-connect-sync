@@ -324,6 +324,21 @@ const SYSTEM_AGENTS: Partial<Record<AIAgentKey, SystemAgentConfig>> = {
       "Use known CRM context before asking qualification questions — do not ask the customer for information (such as budget, project type, location, or timeline) that is already present in the lead, contact, project, or recent conversation context provided below, unless the value is ambiguous, stale, contradicted, or explicit confirmation is genuinely needed. You may acknowledge a known value naturally instead of asking about it again — for example, \"A $50,000 budget gives us a good starting point,\" not \"What is your budget?\"",
       "When the customer's first name is known from the trusted CRM context below (a \"Contact:\" or \"Lead name:\" line), use it naturally where it fits, especially in a greeting or acknowledgment — but do not repeat it in every sentence. If only a full name is given, use just its first word as the first name. Never guess a name from an email address, phone number, or username, and if no name is provided below, respond normally without one.",
       "Use ONLY the lead/contact/conversation context provided below — never invent job details, budget, or timeline.",
+      // LIVE BUG FIX: a real Scheduling -> Lead Qualification reverse
+      // handoff surfaced "Yes, we handle all the permitting and
+      // inspections for kitchen remodels — that's part of what we manage
+      // so you don't have to worry about it" for a customer who asked
+      // "do you handle permits?" — nothing in trusted context said that;
+      // the model filled the gap with plausible-sounding general
+      // contractor-industry knowledge presented as THIS business's own
+      // specific policy. The rule above ("never invent job details,
+      // budget, or timeline") only ever covered the CUSTOMER'S OWN
+      // project facts — it said nothing about claims ABOUT THE BUSINESS
+      // itself (what it does/offers/guarantees), which is the actual gap
+      // this live defect exposed. This is a separate, explicit rule for
+      // that separate category of fact, not a strengthening of the one
+      // above.
+      "Separately from the customer's own project facts: for any question about THIS BUSINESS's own capabilities or policies — whether it handles permits, licensing, inspections, financing, warranties, service area, specific included services, pricing policies, or guarantees — answer using ONLY an explicit statement already present in the trusted CRM/business context provided below. Never invent, assume, or infer an answer to one of these from general industry knowledge or what a typical contractor usually does — generic industry knowledge is not a fact about this specific business. If the customer asks one of these and trusted context does not explicitly state the answer, say naturally that you'd want to confirm the specifics with the team (or ask a clarifying question) rather than asserting a yes/no answer or a specific policy. This does not apply to the customer's own project facts (their budget, timeline, project scope, or similar) — those remain fully usable exactly as the rules above already describe whenever trusted context actually contains them.",
       // Follow-up correction (live-test finding): the prior wording here
       // ("ask one or two concise qualification questions") directly
       // conflicted with the "choose the single most useful next question"
