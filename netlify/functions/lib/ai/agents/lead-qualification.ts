@@ -52,30 +52,39 @@ import { describeKnownQualificationFields, resolveKnownQualificationFields } fro
 // ── AI-1K: optional handoff continuity (see orchestrator.ts's "Reception
 // turn") ─────────────────────────────────────────────────────────────────
 //
-// When Reception hands off, Lead Qualification's prompts get this
-// addendum plus a compact block built from the validated AIAgentHandoff.
-// Per this task's explicit instruction: the customer-facing experience
-// must read as ONE business conversation — never "I am the Lead
-// Qualification Agent" or "Reception transferred you." Also per this
-// task: handoff facts are context only — trusted CRM context (already
-// injected above this block by buildContextLines()) remains authoritative
-// if the two ever conflict; this is why the block below is explicitly
-// labeled as such rather than presented as equally-trusted data.
+// When Reception OR Scheduling hands off, Lead Qualification's prompts
+// get this addendum plus a compact block built from the validated
+// AIAgentHandoff. Per this task's explicit instruction: the customer-
+// facing experience must read as ONE business conversation — never "I am
+// the Lead Qualification Agent" or "Reception/Scheduling transferred
+// you." Also per this task: handoff facts are context only — trusted CRM
+// context (already injected above this block by buildContextLines())
+// remains authoritative if the two ever conflict; this is why the block
+// below is explicitly labeled as such rather than presented as equally-
+// trusted data.
+//
+// Scheduling -> Lead Qualification reverse handoff phase: this text is
+// deliberately source-agnostic (no "Reception has handed..." literal)
+// since `handoff.fromAgent` can now be either "reception" or
+// "scheduling" — the customer-facing continuity requirement (one
+// business conversation, never a visible transfer) is identical either
+// way, so one shared instruction covers both rather than branching on
+// fromAgent for wording that must say the same thing regardless.
 const HANDOFF_CONTINUITY_INSTRUCTION =
-  "Reception has handed this conversation to you. Continue naturally as the same business conversation — do not introduce yourself as a separate AI agent, and do not tell the customer they were transferred or handed off, unless the customer explicitly asks how this works.";
+  "This conversation has just been handed to you from earlier in the same business interaction. Continue naturally as the same business conversation — do not introduce yourself as a separate AI agent, and do not tell the customer they were transferred or handed off, unless the customer explicitly asks how this works. If this handoff happened because the customer's message moved on from a scheduling-specific topic, address what they actually just said or asked — do not hand this conversation back for scheduling again in this same reply; only respond to or otherwise handle their current message.";
 
 function buildHandoffContextBlock(handoff: AIAgentHandoff): string {
   const lines: string[] = [
-    `Notes from Reception (context only — the CRM data above is authoritative if anything here conflicts): ${handoff.summary}`,
+    `Notes from earlier in this conversation (context only — the CRM data above is authoritative if anything here conflicts): ${handoff.summary}`,
   ];
   if (handoff.knownFacts && Object.keys(handoff.knownFacts).length > 0) {
     const facts = Object.entries(handoff.knownFacts)
       .map(([label, value]) => `${label}: ${String(value)}`)
       .join("; ");
-    lines.push(`Reception noted: ${facts}`);
+    lines.push(`Noted so far: ${facts}`);
   }
   if (handoff.openQuestions && handoff.openQuestions.length > 0) {
-    lines.push(`Still open per Reception: ${handoff.openQuestions.join("; ")}`);
+    lines.push(`Still open: ${handoff.openQuestions.join("; ")}`);
   }
   return lines.join("\n");
 }

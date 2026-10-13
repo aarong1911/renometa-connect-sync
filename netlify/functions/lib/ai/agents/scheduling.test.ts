@@ -114,9 +114,45 @@ test("neither select_offered_slot nor propose_appointment has a field for a raw 
   assert.equal(withTime.kind, "fallback");
 });
 
-test("there is no 'handoff' decision variant at all — Scheduling cannot hand off to anything in this phase (structural loop prevention)", () => {
+// Scheduling -> Lead Qualification reverse handoff phase: Scheduling now
+// HAS a 'handoff' decision variant, but ONLY to "lead_qualification" —
+// never to reception, scheduling itself, or any other/arbitrary string.
+test("a 'handoff' decision to the single allowlisted destination (lead_qualification) parses as a real decision", () => {
   const parsed = S.parseSchedulingDecision(JSON.stringify({ type: "handoff", toAgent: "lead_qualification", reason: "x", summary: "y" }));
+  assert.equal(parsed.kind, "decision");
+  assert.equal(parsed.decision.type, "handoff");
+  assert.equal(parsed.decision.toAgent, "lead_qualification");
+});
+
+test("a 'handoff' decision to anything OTHER than lead_qualification (reception, scheduling itself, or an arbitrary string) fails schema validation and falls back safely", () => {
+  for (const toAgent of ["reception", "scheduling", "billing", "anything_else"]) {
+    const parsed = S.parseSchedulingDecision(JSON.stringify({ type: "handoff", toAgent, reason: "x", summary: "y" }));
+    assert.equal(parsed.kind, "fallback", toAgent);
+  }
+});
+
+test("the handoff schema is .strict() — an extra/unexpected field (e.g. a model trying to smuggle a raw selectedOptionNumber or date alongside the handoff) fails the whole object", () => {
+  const parsed = S.parseSchedulingDecision(JSON.stringify({ type: "handoff", toAgent: "lead_qualification", reason: "x", summary: "y", selectedOptionNumber: 1 }));
   assert.equal(parsed.kind, "fallback");
+});
+
+test("handoff knownFacts/openQuestions are optional and bounded, matching lead-qualification.ts's own handoff shape", () => {
+  const withExtras = S.parseSchedulingDecision(JSON.stringify({
+    type: "handoff", toAgent: "lead_qualification", reason: "x", summary: "y",
+    knownFacts: { projectType: "kitchen remodel" }, openQuestions: ["What is the budget?"],
+  }));
+  assert.equal(withExtras.kind, "decision");
+
+  const tooManyFacts = S.parseSchedulingDecision(JSON.stringify({
+    type: "handoff", toAgent: "lead_qualification", reason: "x", summary: "y",
+    knownFacts: { a: "1", b: "2", c: "3", d: "4", e: "5", f: "6", g: "7" },
+  }));
+  assert.equal(tooManyFacts.kind, "fallback", "more than 6 knownFacts entries must be rejected, same bound as lead-qualification.ts");
+});
+
+test("SCHEDULING_HANDOFF_ALLOWLIST contains exactly lead_qualification", () => {
+  assert.ok(S.SCHEDULING_HANDOFF_ALLOWLIST.has("lead_qualification"));
+  assert.equal(S.SCHEDULING_HANDOFF_ALLOWLIST.size, 1);
 });
 
 test("an unrecognized decision type falls back safely", () => {

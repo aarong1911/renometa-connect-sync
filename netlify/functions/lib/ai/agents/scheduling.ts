@@ -55,10 +55,25 @@
 // generated time is never authoritative. This file's schema structurally
 // cannot violate that — it has no way to express a raw time at all.
 //
-// No handoff variant exists in this schema, on purpose — see
-// orchestrator.ts's "Scheduling turn" section for why Scheduling cannot
-// hand off to anything in this PR (structural loop prevention, same
-// pattern Lead Qualification's own schema already relies on).
+// Scheduling -> Lead Qualification reverse handoff phase: ONE additional
+// decision type, `handoff`, with `toAgent` schema-fixed to the single
+// literal "lead_qualification" (see SCHEDULING_HANDOFF_ALLOWLIST below —
+// same defense-in-depth pattern as lead-qualification.ts's own
+// LEAD_QUALIFICATION_HANDOFF_ALLOWLIST: the Zod literal already makes any
+// other destination unparseable, and orchestrator.ts checks the allowlist
+// again anyway). This exists so a conversation Scheduling is currently
+// routed to (because a fresh offer exists — see router.ts's Tier 2) can
+// return to Lead Qualification when the customer's CURRENT message is
+// clearly no longer about the scheduling interaction (a project/sales
+// question, not a day/time/slot/logistics one — see
+// buildDecisionSystemInstructions() for the exact criteria). Scheduling
+// still cannot hand off to Reception, back to itself, or to any other
+// destination — the schema has no way to express that. orchestrator.ts
+// also enforces that Lead Qualification, once reached this way, cannot
+// immediately hand back to Scheduling in the SAME execution (a narrow,
+// structural `allowSchedulingHandoff` guard, not a runtime loop counter)
+// — see its own "Scheduling turn" section for the full loop-prevention
+// reasoning.
 
 import { z } from "zod";
 import type { AIAgentHandoff, AIChannel, AIChannelEvent, AIResolvedContext } from "../types";
@@ -207,11 +222,50 @@ const proposeAppointmentDecisionSchema = z
   })
   .strict();
 
+// Scheduling -> Lead Qualification reverse handoff phase. Mirrors
+// lead-qualification.ts's own handoffDecisionSchema exactly (same
+// MAX_HANDOFF_KNOWN_FACTS/MAX_HANDOFF_OPEN_QUESTIONS bounds, same
+// knownFacts shape matching AIAgentHandoff.knownFacts so no reshaping is
+// needed) — the only difference is the fixed destination literal
+// ("lead_qualification" instead of "scheduling") and which direction it
+// runs. Whether the current message is "still about scheduling" has no
+// deterministic CRM signal (an active offer only tells the ROUTER who
+// owns the NEXT inbound turn — see router.ts's Tier 2 comment — it says
+// nothing about what THIS message is actually about); this is a per-turn
+// MODEL judgment call, gated only by this schema + the prompt
+// instructions below, never by a status field this code reads or writes.
+const MAX_SCHEDULING_HANDOFF_KNOWN_FACTS = 6;
+const MAX_SCHEDULING_HANDOFF_OPEN_QUESTIONS = 6;
+
+const handoffDecisionSchema = z
+  .object({
+    type: z.literal("handoff"),
+    toAgent: z.literal("lead_qualification"),
+    reason: z.string().min(1).max(300),
+    summary: z.string().min(1).max(1000),
+    knownFacts: z
+      .record(z.string().min(1).max(60), z.string().min(1).max(300))
+      .refine((facts) => Object.keys(facts).length <= MAX_SCHEDULING_HANDOFF_KNOWN_FACTS, {
+        message: `knownFacts must have at most ${MAX_SCHEDULING_HANDOFF_KNOWN_FACTS} entries`,
+      })
+      .optional(),
+    openQuestions: z.array(z.string().min(1).max(200)).max(MAX_SCHEDULING_HANDOFF_OPEN_QUESTIONS).optional(),
+  })
+  .strict();
+
+/** Same defense-in-depth pattern as lead-qualification.ts's own
+ * LEAD_QUALIFICATION_HANDOFF_ALLOWLIST: the Zod schema above already
+ * restricts `toAgent` to the single literal "lead_qualification", but
+ * orchestrator.ts checks this allowlist too before ever building an
+ * AIAgentHandoff or invoking Lead Qualification. */
+export const SCHEDULING_HANDOFF_ALLOWLIST: ReadonlySet<string> = new Set(["lead_qualification"]);
+
 const schedulingDecisionSchema = z.union([
   respondDecisionSchema,
   getAvailabilityDecisionSchema,
   selectOfferedSlotDecisionSchema,
   proposeAppointmentDecisionSchema,
+  handoffDecisionSchema,
 ]);
 
 export type DateIntent = z.infer<typeof dateIntentSchema>;
@@ -220,6 +274,7 @@ export type SchedulingRespondDecision = Extract<SchedulingDecision, { type: "res
 export type SchedulingGetAvailabilityDecision = Extract<SchedulingDecision, { type: "get_availability" }>;
 export type SchedulingSelectOfferedSlotDecision = Extract<SchedulingDecision, { type: "select_offered_slot" }>;
 export type SchedulingProposeAppointmentDecision = Extract<SchedulingDecision, { type: "propose_appointment" }>;
+export type SchedulingHandoffDecision = Extract<SchedulingDecision, { type: "handoff" }>;
 /** Either slot-referencing variant — orchestrator.ts validates
  * `selectedOptionNumber` against the real persisted offer identically for
  * both before branching on which one it is. */
@@ -511,7 +566,13 @@ function buildDecisionSystemInstructions(
     offeredSlots && offeredSlots.length > 0
       ? "- propose_appointment: use when the customer's reply clearly and unambiguously identifies ONE of the numbered options above AND confirms they want it booked (e.g. \"yes, 11 works\", \"book the second one\", \"that works, let's do it\")."
       : "- propose_appointment: only usable when options were just offered above — not available right now.",
-    "- respond: use for anything else — greeting, asking what day and time works (the correct choice when nothing has been specified yet), answering a question using the CRM context above, asking for clarification when you cannot tell which numbered option the customer means, or acknowledging a clear decline (set declineScheduling:true only when the customer clearly does not want to schedule right now, e.g. \"not now\" or \"no thanks\").",
+    "- respond: use for anything else — greeting, asking what day and time works (the correct choice when nothing has been specified yet), answering a question using the CRM context above, asking for clarification when you cannot tell which numbered option the customer means, or acknowledging a clear decline (set declineScheduling:true only when the customer clearly does not want to schedule right now AND asked nothing else, e.g. just \"not now\" or \"no thanks\" with nothing further).",
+    // Scheduling -> Lead Qualification reverse handoff phase. The customer
+    // may still be routed to you because a scheduling offer is active, but
+    // their CURRENT message may no longer be about scheduling at all —
+    // hand off in that case rather than trying to answer a sales/project
+    // question yourself, or ignoring it.
+    "- handoff: use ONLY when the customer's CURRENT message is clearly about something outside this scheduling interaction — a project/sales question such as project scope, service area, permits, budget, project details, renovation questions, sales qualification, or estimate questions — OR when they decline scheduling AND also clearly ask something else unrelated to scheduling in the same message. Set toAgent to the fixed value \"lead_qualification\", a short reason, and a one-or-two-sentence summary of what the customer just said/asked so Lead Qualification can continue from it naturally. Do NOT use handoff merely because the message is about: choosing one of the offered times, changing the requested date/time/daypart, appointment duration, appointment availability, scheduling logistics, or confirming/cancelling/clarifying the current scheduling attempt — handle all of those yourself using respond/get_availability/select_offered_slot/propose_appointment as appropriate. When genuinely ambiguous whether the message is still about scheduling, prefer a short Scheduling clarification (respond) over guessing a handoff.",
     "If the customer's reply could match more than one numbered option, or doesn't clearly match any of them, use respond and ask a short clarifying question — never guess which option they meant.",
     "Never state a specific appointment time yourself unless it is one of the exact numbered options you were just given above, or one just returned by get_availability.",
     "You have not booked anything yet, and selecting or proposing an option here does not mean it is confirmed — you will be told the real outcome afterward.",
@@ -525,6 +586,7 @@ function buildDecisionSystemInstructions(
     '{"type":"get_availability","dateIntent":{"kind":"explicit_date","date":"<YYYY-MM-DD>"} | {"kind":"relative_day","value":"today"|"tomorrow"} | {"kind":"weekday","weekday":"<monday..sunday>","occurrence":"next_occurrence"|"next_week"},"preferredTime":"<HH:MM, optional>","preferredDaypart":"<morning|afternoon|evening, optional>","reason":"<short optional reason>"}',
     '{"type":"select_offered_slot","selectedOptionNumber":<the option number>,"reason":"<short optional reason>"}',
     '{"type":"propose_appointment","selectedOptionNumber":<the option number>,"reason":"<short optional reason>"}',
+    '{"type":"handoff","toAgent":"lead_qualification","reason":"<short reason the message is no longer about scheduling>","summary":"<one or two sentence summary of what the customer just said/asked>","knownFacts":{"<short fact label>":"<short value>"},"openQuestions":["<short open question, if any>"]}',
   ].join("\n");
 }
 
