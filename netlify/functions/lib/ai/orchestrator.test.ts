@@ -668,17 +668,15 @@ test("the offer is NOT cleared immediately after a successful propose_appointmen
 
 // ── No reverse/second handoff ─────────────────────────────────────────────
 
-test("Scheduling's own decision call, even if coerced into a handoff-shaped reply, can never actually hand off — the schema has no such variant, so it always falls back to a safe response", async () => {
-  const db = makeDb();
-  await seedOffer(db, [SLOT_1]);
-  const modelProvider = scriptedProvider([
-    JSON.stringify({ type: "handoff", toAgent: "lead_qualification", reason: "trying to bounce back", summary: "x" }),
-  ]);
-  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("something"), trustedContext: trustedContext(), modelProvider });
-  assert.equal(result.agentKey, "scheduling");
-  assert.ok(!result.handoff, "no second handoff can ever be produced from inside a Scheduling turn");
-  assert.equal(result.status, "completed");
-});
+// Superseded by the Scheduling -> Lead Qualification reverse handoff
+// phase: Scheduling's decision schema now DOES have a "handoff" variant,
+// with `toAgent` fixed to the single literal "lead_qualification" — see
+// the dedicated "SCHEDULING -> LEAD QUALIFICATION REVERSE HANDOFF" test
+// section below for full coverage (TEST 1, 5, 6, 9, 10, 11). The old
+// "Scheduling can never hand off at all" assertion this test made is no
+// longer true by design; a destination OTHER than "lead_qualification"
+// (e.g. attempting "reception" or "scheduling" itself) is covered by
+// TEST 10 instead.
 
 // ── Full regression: Reception -> Lead Qualification, and plain turns ───
 
@@ -722,4 +720,380 @@ test("regression: a plain Lead Qualification tool turn (get_lead_context) still 
   assert.equal(result.agentKey, "lead_qualification");
   assert.equal(result.status, "completed");
   assert.equal(result.toolResults?.[0]?.status, "completed");
+});
+
+// ── SCHEDULING -> LEAD QUALIFICATION REVERSE HANDOFF ─────────────────────
+//
+// An active, still-fresh scheduling offer makes router.ts's Tier 2 place
+// the turn with Scheduling FIRST (unchanged — see the router regression
+// tests below). What's new: Scheduling itself may now decide the
+// CURRENT inbound message is no longer about scheduling and hand off to
+// Lead Qualification mid-turn, in the SAME execution, exactly like the
+// two forward handoffs already do.
+
+test("TEST 1 — LIVE OWNERSHIP SCENARIO: an active offer routes to Scheduling first, Scheduling hands off to Lead Qualification for a clearly non-scheduling message, in the SAME execution, with ONE customer-facing reply and the offer cleared", async () => {
+  const db = makeDb();
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "lead_qualification", reason: "customer asked an unrelated permits question", summary: "Customer asked whether we handle permits for kitchen remodels." }),
+    JSON.stringify({ type: "respond", response: "Yes, we can help coordinate the permit requirements for your kitchen remodel." }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Also, do you handle permits for kitchen remodels?"), trustedContext: trustedContext(), modelProvider });
+
+  assert.equal(result.agentKey, "lead_qualification", "the SAME execution ends on Lead Qualification, not Scheduling");
+  assert.equal(result.status, "completed");
+  assert.ok(result.handoff);
+  assert.equal(result.handoff.fromAgent, "scheduling");
+  assert.equal(result.handoff.toAgent, "lead_qualification");
+  assert.equal(result.responseText, "Yes, we can help coordinate the permit requirements for your kitchen remodel.", "exactly one customer-facing response");
+
+  // The original inbound message reached Lead Qualification's own decision
+  // call — not a re-synthesized/truncated version of it.
+  const lqDecisionCall = modelProvider.requests[1];
+  assert.match(lqDecisionCall.messages[0].content, /Also, do you handle permits for kitchen remodels\?/);
+
+  // LIVE BUG FIX: the real system prompt sent to Lead Qualification's
+  // decision call — for this EXACT live scenario (a permits question
+  // reaching it via the reverse handoff) — must carry the business-fact
+  // grounding rule. This proves the rule is actually wired into the live
+  // orchestration path, not just defined in isolation in SYSTEM_AGENTS.
+  assert.match(lqDecisionCall.system, /answer using ONLY an explicit statement already present in the trusted CRM\/business context/);
+  assert.match(lqDecisionCall.system, /permits, licensing, inspections, financing, warranties, service area/);
+
+  // The scheduling offer is cleared.
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.equal(row.scheduling_offered_slots, null);
+  assert.equal(row.scheduling_offered_at, null);
+
+  // Same execution row throughout — never a second agent_executions row.
+  const { data: execRows } = await db.from("agent_executions").select("id");
+  assert.equal(execRows.length, 1);
+  assert.equal(execRows[0].id, result.executionId);
+  assert.equal(execRows[0].agent_key, "lead_qualification", "the execution row's final agent_key reflects where the run ended, matching the forward-handoff convention");
+
+  // No appointment write, no approval — a reverse handoff is a content
+  // decision only.
+  const { data: appts } = await db.from("appointments").select("id");
+  assert.equal(appts.length, 0);
+  const { data: approvals } = await db.from("agent_approval_requests").select("id");
+  assert.equal(approvals.length, 0);
+});
+
+test("TEST 2 — OFFER SELECTION STAYS SCHEDULING: '1 PM works' resolves against the real offer, no reverse handoff", async () => {
+  const db = makeDb();
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "select_offered_slot", selectedOptionNumber: 1 }),
+    JSON.stringify({ type: "respond", response: "Great — that time works. Should I go ahead and book it?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("1 PM works."), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.agentKey, "scheduling");
+  assert.ok(!result.handoff, "no reverse handoff for a clear slot-selection reply");
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.ok(Array.isArray(row.scheduling_offered_slots) && row.scheduling_offered_slots.length > 0, "the offer is untouched by a normal slot selection");
+});
+
+test("TEST 3 — DATE CHANGE STAYS SCHEDULING: 'Can we do Friday afternoon instead?' stays with Scheduling and can still call get_availability", async () => {
+  const db = makeDb();
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "friday", occurrence: "next_occurrence" }, preferredDaypart: "afternoon" }),
+    JSON.stringify({ type: "respond", response: "Friday afternoon has a few openings — which works?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Can we do Friday afternoon instead?"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.agentKey, "scheduling");
+  assert.ok(!result.handoff, "a date/time change within the current scheduling interaction is never a reverse handoff");
+});
+
+test("TEST 4 — SCHEDULING QUESTION STAYS SCHEDULING: 'How long is the consultation?' is handled by Scheduling directly, no reverse handoff merely because it isn't a slot number", async () => {
+  const db = makeDb();
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "respond", response: "Consultations typically run about an hour. Would one of the times I shared work for you?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("How long is the consultation?"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.agentKey, "scheduling");
+  assert.ok(!result.handoff);
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.ok(Array.isArray(row.scheduling_offered_slots) && row.scheduling_offered_slots.length > 0, "a scheduling-logistics question must never clear the offer");
+});
+
+test("TEST 5 — PROJECT DETAIL HANDS BACK: 'Actually we're replacing the flooring too' hands off to Lead Qualification and clears the offer", async () => {
+  const db = makeDb();
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "lead_qualification", reason: "new project detail, not a scheduling message", summary: "Customer added that they're also replacing the kitchen flooring." }),
+    JSON.stringify({ type: "respond", response: "Good to know — I'll make sure that's noted for your project." }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Actually, we're also replacing the flooring in the kitchen."), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.agentKey, "lead_qualification");
+  assert.ok(result.handoff);
+  assert.equal(result.handoff.fromAgent, "scheduling");
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.equal(row.scheduling_offered_slots, null);
+});
+
+test("TEST 6 — SERVICE AREA QUESTION HANDS BACK: 'Do you service Boca Raton?' hands off to Lead Qualification and clears the offer — an active offer must never force Scheduling to answer unrelated sales questions", async () => {
+  const db = makeDb();
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "lead_qualification", reason: "service-area question, not scheduling", summary: "Customer asked whether we service Boca Raton." }),
+    JSON.stringify({ type: "respond", response: "Yes, we service the Boca Raton area." }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Do you service Boca Raton?"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.agentKey, "lead_qualification");
+  assert.ok(result.handoff);
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.equal(row.scheduling_offered_slots, null);
+});
+
+test("TEST 7 — DECLINE ONLY: 'Not right now.' preserves the existing direct decline behavior (no reverse handoff needed)", async () => {
+  const db = makeDb();
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "respond", response: "No problem — let us know whenever you're ready.", declineScheduling: true }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Not right now."), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.agentKey, "scheduling");
+  assert.ok(!result.handoff, "a plain decline with nothing else asked stays a direct Scheduling response + cleanup, not a handoff");
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.equal(row.scheduling_offered_slots, null);
+  assert.equal(row.scheduling_offered_at, null);
+});
+
+test("TEST 8 — DECLINE + NEW QUESTION: 'Not right now. Do you handle permits?' clears the offer AND lets Lead Qualification answer the permits question in the same execution — no lost question, no loop", async () => {
+  const db = makeDb();
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "lead_qualification", reason: "declined scheduling for now and asked an unrelated question", summary: "Customer declined scheduling for now and asked whether we handle permits." }),
+    JSON.stringify({ type: "respond", response: "No problem on the timing — and yes, we do handle permits for kitchen remodels." }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Not right now. Do you handle permits?"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.agentKey, "lead_qualification");
+  assert.ok(result.handoff);
+  assert.equal(result.responseText, "No problem on the timing — and yes, we do handle permits for kitchen remodels.", "the permits question is not lost");
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  assert.equal(row.scheduling_offered_slots, null);
+});
+
+test("TEST 9 — LOOP PREVENTION: Lead Qualification (reached via a Scheduling reverse handoff) attempting to hand back to Scheduling is rejected — no second Scheduling turn, no recursion, a safe Lead Qualification response instead", async () => {
+  const db = makeDb();
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "lead_qualification", reason: "non-scheduling question", summary: "Customer asked about permits." }),
+    // Lead Qualification's own decision call now (incorrectly) tries to
+    // bounce straight back to Scheduling in the SAME execution.
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "trying to bounce back to scheduling", summary: "x" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Also, do you handle permits?"), trustedContext: trustedContext(), modelProvider });
+
+  assert.equal(modelProvider.requests.length, 2, "exactly two model calls total: Scheduling's decision, then Lead Qualification's decision — no THIRD call back into Scheduling");
+  assert.equal(result.agentKey, "lead_qualification", "the run ends on Lead Qualification, never bounces back to Scheduling");
+  assert.equal(result.status, "completed");
+  assert.ok(!result.toolResults, "no tool/second handoff was executed");
+  // The ONLY handoff attached to the final result is the original
+  // Scheduling -> Lead Qualification one — the attempted bounce-back
+  // never became a second, real handoff.
+  assert.equal(result.handoff.fromAgent, "scheduling");
+  assert.equal(result.handoff.toAgent, "lead_qualification");
+});
+
+test("TEST 10 — INVALID DESTINATION: Scheduling attempting a handoff to anything other than lead_qualification is rejected by the schema/allowlist — no arbitrary agent execution, safe fallback response", async () => {
+  const db = makeDb();
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "reception", reason: "trying an arbitrary destination", summary: "x" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("something"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.agentKey, "scheduling", "an invalid destination never leaves Scheduling");
+  assert.ok(!result.handoff, "no handoff object is ever built for a disallowed destination");
+  assert.equal(result.status, "completed");
+  assert.equal(result.responseText, "Thanks for your patience — let me check on scheduling and get back to you.", "the exact GENERIC_FALLBACK_RESPONSE scheduling.ts exports for an unparseable/disallowed decision");
+});
+
+test("TEST 11 — OFFER CLEANUP FAILURE: a failed clearOfferedSlots() during the reverse handoff is logged, does NOT fail the handoff, and does NOT corrupt the conversation — the customer still gets a real answer", async () => {
+  const db = makeDb();
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+
+  // Force the SPECIFIC update clearOfferedSlots() performs on
+  // conversation_states to fail, without touching any other table's
+  // behavior — same technique scheduling-offer-state.test.ts's own
+  // spying-wrapper tests already use. The fake client's own FakeQueryBuilder
+  // makes every .eq() return `this` (chainable) and resolves via .then(),
+  // so a minimal erroring stand-in only needs those same two members.
+  const erroringChain = { eq: () => erroringChain, then: (resolve: any) => resolve({ data: null, error: { message: "simulated DB failure" } }) };
+  const originalFrom = db.from.bind(db);
+  (db as any).from = (table: string) => {
+    const builder = originalFrom(table);
+    if (table !== "conversation_states") return builder;
+    const originalUpdate = builder.update.bind(builder);
+    builder.update = (row: any) => {
+      if (row && Object.prototype.hasOwnProperty.call(row, "scheduling_offered_slots") && row.scheduling_offered_slots === null) {
+        return erroringChain;
+      }
+      return originalUpdate(row);
+    };
+    return builder;
+  };
+
+  const errors: unknown[][] = [];
+  const originalConsoleError = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args); };
+
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "lead_qualification", reason: "non-scheduling question", summary: "Customer asked about permits." }),
+    JSON.stringify({ type: "respond", response: "Yes, we handle permits for kitchen remodels." }),
+  ]);
+  let result: any;
+  try {
+    result = await S.orchestrateAI({ supabase: db, event: smsEvent("Do you handle permits?"), trustedContext: trustedContext(), modelProvider });
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  // The handoff still proceeds and the customer still gets a real answer
+  // — a best-effort cleanup failure must never silently drop their
+  // message (see orchestrator.ts's own documented reasoning for this
+  // exact design decision).
+  assert.equal(result.status, "completed");
+  assert.equal(result.agentKey, "lead_qualification");
+  assert.equal(result.responseText, "Yes, we handle permits for kitchen remodels.");
+  assert.ok(errors.some((args) => String(args[0]).includes("clearOfferedSlots failed on Scheduling -> Lead Qualification handoff")), "the cleanup failure must be logged, not silently swallowed");
+});
+
+test("TEST 12 — DATE RESOLUTION REGRESSION (PR #19): Thursday -> 2026-10-15 still resolves correctly, unaffected by the reverse-handoff phase", async () => {
+  const db = makeDb();
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "ready", summary: "Ready to schedule." }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "thursday", occurrence: "next_occurrence" } }),
+    JSON.stringify({ type: "respond", response: "Thursday has a few openings — which works?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Does Thursday work?"), trustedContext: trustedContext(), modelProvider, now: new Date("2026-10-11T16:00:00.000Z") });
+  assert.equal(result.status, "completed");
+  const { data: row } = await db.from("conversation_states").select("*").eq("org_id", ORG_A).eq("contact_id", CONTACT_1).eq("channel", "sms").maybeSingle();
+  for (const slot of row.scheduling_offered_slots) {
+    assert.ok(slot.start.startsWith("2026-10-15"));
+    assert.ok(!slot.start.startsWith("2026-10-16"));
+  }
+});
+
+test("TEST 13 — DAYPART REGRESSION (PR #19): 'Thursday afternoon' with real afternoon slots never says afternoon is unavailable, unaffected by the reverse-handoff phase", async () => {
+  const db = makeDb();
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "ready", summary: "Ready to schedule." }),
+    JSON.stringify({ type: "get_availability", dateIntent: { kind: "weekday", weekday: "thursday", occurrence: "next_occurrence" }, preferredDaypart: "afternoon" }),
+    JSON.stringify({ type: "respond", response: "Thursday afternoon has openings at noon, 12:30, 1:00, or 1:30 — which works?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Thursday afternoon works for me"), trustedContext: trustedContext(), modelProvider, now: new Date("2026-10-11T16:00:00.000Z") });
+  assert.equal(result.status, "completed");
+  const factualOutcome = modelProvider.requests[2].messages[0].content;
+  assert.match(factualOutcome, /genuinely HAS real availability/);
+  assert.doesNotMatch(factualOutcome, /NOT available/);
+});
+
+// ── Router regression: an active offer still routes a selection reply to
+// Scheduling, and the router itself never semantically classifies messages ──
+
+test("router regression: an active scheduling offer still places a plain inbound message with Scheduling via Tier 2/conversation_state — the reverse handoff only happens AFTER Scheduling itself sees the message, never inside the router", async () => {
+  const db = makeDb();
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "respond", response: "Sure — here's what I can tell you." }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("1 PM works."), trustedContext: trustedContext(), modelProvider });
+  const { data: execRow } = await db.from("agent_executions").select("*").eq("id", result.executionId).maybeSingle();
+  assert.equal(execRow.input_summary.route.source, "conversation_state");
+  assert.equal(execRow.input_summary.route.agentKey, "scheduling");
+});
+
+// ── LIVE BUG FIX: Lead Qualification business-fact grounding ────────────
+//
+// A real Scheduling -> Lead Qualification reverse handoff surfaced an
+// UNSUPPORTED business-fact claim ("Yes, we handle all the permitting and
+// inspections for kitchen remodels") for a permits question with nothing
+// in trusted context supporting it. The model is fully scripted in every
+// test in this file, so the only thing these tests can (and should)
+// verify is the WIRED CONTRACT: the real system prompt actually sent to
+// Lead Qualification's decision call carries the grounding rule, and —
+// separately — that a genuinely supported fact still reaches the model
+// un-suppressed. Per this task's own instruction: assert the instruction
+// contract and the real request content, not an invented exact sentence
+// a scripted mock could never actually test.
+
+test("TEST 1 — UNSUPPORTED PERMIT CLAIM (LIVE BUG): a permits question with NO supporting trusted-context fact carries the grounding rule into the real decision-call system prompt, and trusted context contains no permit-related statement for the model to (correctly) ground an answer in", async () => {
+  const db = makeDb(); // no lead.custom_fields permit/licensing/inspection statement anywhere
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "lead_qualification", reason: "non-scheduling business question", summary: "Customer asked whether we handle permits for kitchen remodels." }),
+    // The SAFE, grounded response this fix is meant to produce — never
+    // "yes, we handle all permitting," which this test proves there is
+    // no supporting trusted-context fact for in the first place.
+    JSON.stringify({ type: "respond", response: "I can help with that. Permit requirements can vary by project and location, so I'd want to confirm how our team handles that for your remodel." }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Do you handle permits for kitchen remodels?"), trustedContext: trustedContext(), modelProvider });
+
+  assert.equal(result.agentKey, "lead_qualification");
+  assert.ok(!/\byes\b/i.test(result.responseText ?? "") || /confirm|team|vary|not certain|double-check/i.test(result.responseText ?? ""), "the scripted safe response must not be a bare unsupported 'yes'");
+  assert.doesNotMatch(result.responseText ?? "", /we handle all (the )?permitting/i);
+
+  const lqDecisionCall = modelProvider.requests[1];
+  // The grounding rule is actually present in the real request sent.
+  assert.match(lqDecisionCall.system, /Never invent, assume, or infer an answer to one of these from general industry knowledge/);
+  // And trusted context's own known-fields block (budget/name/timeline/
+  // location — whatever this fixture's lead happens to have) contains no
+  // permit/licensing/inspection line at all — confirming this is a
+  // genuinely unsupported case the model has no fact to ground a "yes"
+  // in, not a false positive.
+  const knownFieldsBlock = /Already known about this lead[\s\S]*?(?=\n\n|$)/.exec(lqDecisionCall.system)?.[0] ?? "";
+  assert.doesNotMatch(knownFieldsBlock, /permit/i);
+  assert.doesNotMatch(lqDecisionCall.messages[0].content, /permits?:\s*(yes|handled|included)/i);
+});
+
+test("TEST 2 — SUPPORTED BUSINESS FACT: a known location/service-area fact reaches the real decision-call prompt un-suppressed — the grounding rule does not cause a blanket refusal when trusted context actually supports the answer", async () => {
+  // context-builder.ts's fetchLeadSummary() reads AILeadSummary.location
+  // from custom_fields.address (the vapi-webhook.ts save_lead convention —
+  // see that function's own comment), not a "location" key.
+  const db = makeDb({
+    leads: [{ id: LEAD_1, org_id: ORG_A, status: "qualified", contact_id: CONTACT_1, source: "sms", score: null, name: "Jane", estimated_value: 50000, custom_fields: { address: "Boca Raton, FL" } }],
+  });
+  await seedOffer(db, [SLOT_1, SLOT_2]);
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "lead_qualification", reason: "service-area question", summary: "Customer asked whether we service Boca Raton." }),
+    JSON.stringify({ type: "respond", response: "Yes, we service the Boca Raton area." }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Do you service Boca Raton?"), trustedContext: trustedContext(), modelProvider });
+
+  assert.equal(result.agentKey, "lead_qualification");
+  assert.equal(result.status, "completed");
+  // Not a blanket refusal — the model was allowed to answer, and the
+  // underlying SUPPORTING fact genuinely reached its real prompt.
+  const lqDecisionCall = modelProvider.requests[1];
+  assert.match(lqDecisionCall.system, /Location\/service area: Boca Raton, FL \(already known; do not ask where the project is again\)/);
+  assert.equal(result.responseText, "Yes, we service the Boca Raton area.");
+});
+
+test("TEST 3 — PROJECT FACTS STILL USABLE: known budget and timeline still reach the real decision-call prompt unaffected by the grounding rule", async () => {
+  const db = makeDb({
+    leads: [{ id: LEAD_1, org_id: ORG_A, status: "qualified", contact_id: CONTACT_1, source: "sms", score: null, name: "Jane", estimated_value: 25000, custom_fields: { timeline: "within 2 months" } }],
+  });
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "respond", response: "A $25,000 budget and a two-month timeline both give us a solid starting point." }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("Just checking in on my kitchen project"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.agentKey, "lead_qualification");
+  const decisionCall = modelProvider.requests[0];
+  assert.match(decisionCall.system, /Budget: \$25,000 \(already known; do not ask for budget again\)/);
+  assert.match(decisionCall.system, /Desired timeline: within 2 months \(already known; do not ask when they want to start again\)/);
+});
+
+test("TEST 5 — FORWARD HANDOFF REGRESSION: Lead Qualification -> Scheduling still works unchanged when the customer clearly wants to schedule", async () => {
+  const db = makeDb();
+  const modelProvider = scriptedProvider([
+    JSON.stringify({ type: "handoff", toAgent: "scheduling", reason: "customer ready to book", summary: "Customer wants to schedule a consultation." }),
+    JSON.stringify({ type: "respond", response: "What day works best for you?" }),
+  ]);
+  const result = await S.orchestrateAI({ supabase: db, event: smsEvent("I'm ready to book a time"), trustedContext: trustedContext(), modelProvider });
+  assert.equal(result.agentKey, "scheduling");
+  assert.equal(result.handoff.fromAgent, "lead_qualification");
+  assert.equal(result.handoff.toAgent, "scheduling");
 });

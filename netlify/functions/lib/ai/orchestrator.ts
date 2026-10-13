@@ -84,12 +84,14 @@ import {
 import { LEAD_QUALIFICATION_HANDOFF_ALLOWLIST, type LeadQualificationHandoffDecision } from "./agents/lead-qualification";
 import {
   GENERIC_FALLBACK_RESPONSE as SCHEDULING_GENERIC_FALLBACK_RESPONSE,
+  SCHEDULING_HANDOFF_ALLOWLIST,
   buildSchedulingDecisionRequest,
   buildSchedulingFinalRequest,
   formatOfferedSlotOptions,
   parseSchedulingDecision,
   selectCandidateSlots,
   type SchedulingDecision,
+  type SchedulingHandoffDecision,
   type SchedulingSlotReferenceDecision,
   type SlotSelectionResult,
 } from "./agents/scheduling";
@@ -206,6 +208,49 @@ import {
 // own handoff is still exactly one hop, as before — this paragraph only
 // adds a second, independent one-hop handoff later in the same pipeline,
 // not a second hop for the same one.)
+//
+// SCHEDULING-TO-LEAD-QUALIFICATION REVERSE HANDOFF PHASE (third agent-to-
+// agent handoff, and the first REVERSE one): agents/scheduling.ts's
+// decision schema now ALSO has a "handoff" variant (destination fixed to
+// "lead_qualification" — see SCHEDULING_HANDOFF_ALLOWLIST), handled below
+// in runSchedulingTurn() by calling BACK into runLeadQualificationTurn() —
+// same executionId, same unmodified trustedContext, no second execution
+// row, same pattern as the two forward handoffs above. This is NOT a
+// generic agent graph: the only two hop pairs that can ever occur in one
+// execution are (lead_qualification -> scheduling) and, newly,
+// (scheduling -> lead_qualification), and never more than one hop in
+// either direction per execution.
+//
+// LOOP PREVENTION (critical, structural, not a runtime counter): adding a
+// reverse hop creates a theoretical bounce — lead_qualification ->
+// scheduling -> lead_qualification -> scheduling -> ... — that the
+// forward-only design before this phase could never produce. Prevented by
+// a narrow typed guard, `allowSchedulingHandoff`, threaded through
+// runLeadQualificationTurn()'s own params: true (the default) for every
+// NORMAL entry into Lead Qualification (the router's direct Tier 3 pick,
+// or a Reception handoff), explicitly false ONLY when
+// runLeadQualificationTurn() is invoked from runSchedulingTurn()'s reverse-
+// handoff branch. When false, Lead Qualification may still respond or use
+// either of its allowlisted tools exactly as normal — the ONLY thing
+// disabled is its own "handoff" decision type being honored; if the model
+// attempts one anyway (it is told not to, but nothing here trusts that
+// instruction alone), it is treated exactly like a disallowed-destination
+// attempt already was before this phase (fall back to a safe generic
+// response) rather than invoking Scheduling again. This guarantees at most
+// one reverse hop per execution, with no possibility of a second forward
+// hop following it in the same run.
+//
+// SCHEDULING OWNERSHIP CLEANUP: accepting a Scheduling -> Lead
+// Qualification handoff also clears the current (org, contact, channel)
+// scheduling offer via the EXISTING clearOfferedSlots() (same helper the
+// decline path and the PR #18 post-booking cleanup already use) — see
+// runSchedulingTurn()'s handoff branch for why: router.ts's Tier 2 treats
+// an active offer as "the NEXT inbound message belongs to Scheduling," so
+// leaving a stale offer in place after the customer has already moved on
+// would trap their next, unrelated message right back in Scheduling. This
+// NEVER touches public.appointments or any approval — it only removes a
+// routing-ownership signal that is, by this architecture's own existing
+// invariant, never proof of actual availability either way.
 
 /**
  * Placeholder value written to agent_executions.agent_key at INSERT time.
@@ -279,6 +324,21 @@ const SYSTEM_AGENTS: Partial<Record<AIAgentKey, SystemAgentConfig>> = {
       "Use known CRM context before asking qualification questions — do not ask the customer for information (such as budget, project type, location, or timeline) that is already present in the lead, contact, project, or recent conversation context provided below, unless the value is ambiguous, stale, contradicted, or explicit confirmation is genuinely needed. You may acknowledge a known value naturally instead of asking about it again — for example, \"A $50,000 budget gives us a good starting point,\" not \"What is your budget?\"",
       "When the customer's first name is known from the trusted CRM context below (a \"Contact:\" or \"Lead name:\" line), use it naturally where it fits, especially in a greeting or acknowledgment — but do not repeat it in every sentence. If only a full name is given, use just its first word as the first name. Never guess a name from an email address, phone number, or username, and if no name is provided below, respond normally without one.",
       "Use ONLY the lead/contact/conversation context provided below — never invent job details, budget, or timeline.",
+      // LIVE BUG FIX: a real Scheduling -> Lead Qualification reverse
+      // handoff surfaced "Yes, we handle all the permitting and
+      // inspections for kitchen remodels — that's part of what we manage
+      // so you don't have to worry about it" for a customer who asked
+      // "do you handle permits?" — nothing in trusted context said that;
+      // the model filled the gap with plausible-sounding general
+      // contractor-industry knowledge presented as THIS business's own
+      // specific policy. The rule above ("never invent job details,
+      // budget, or timeline") only ever covered the CUSTOMER'S OWN
+      // project facts — it said nothing about claims ABOUT THE BUSINESS
+      // itself (what it does/offers/guarantees), which is the actual gap
+      // this live defect exposed. This is a separate, explicit rule for
+      // that separate category of fact, not a strengthening of the one
+      // above.
+      "Separately from the customer's own project facts: for any question about THIS BUSINESS's own capabilities or policies — whether it handles permits, licensing, inspections, financing, warranties, service area, specific included services, pricing policies, or guarantees — answer using ONLY an explicit statement already present in the trusted CRM/business context provided below. Never invent, assume, or infer an answer to one of these from general industry knowledge or what a typical contractor usually does — generic industry knowledge is not a fact about this specific business. If the customer asks one of these and trusted context does not explicitly state the answer, say naturally that you'd want to confirm the specifics with the team (or ask a clarifying question) rather than asserting a yes/no answer or a specific policy. This does not apply to the customer's own project facts (their budget, timeline, project scope, or similar) — those remain fully usable exactly as the rules above already describe whenever trusted context actually contains them.",
       // Follow-up correction (live-test finding): the prior wording here
       // ("ask one or two concise qualification questions") directly
       // conflicted with the "choose the single most useful next question"
@@ -635,8 +695,24 @@ async function runLeadQualificationTurn(params: {
   /** Passed straight through to runSchedulingTurn() if this turn ends in
    * a handoff — see that function's own doc comment. */
   now?: Date;
+  /** LOOP PREVENTION (Scheduling -> Lead Qualification reverse handoff
+   * phase): defaults to true for every normal entry (direct router pick,
+   * or a Reception handoff). Explicitly set to `false` ONLY by
+   * runSchedulingTurn()'s own reverse-handoff branch, which invokes THIS
+   * function as the destination of a Scheduling -> Lead Qualification
+   * hop — see this file's own "SCHEDULING-TO-LEAD-QUALIFICATION REVERSE
+   * HANDOFF PHASE" header addendum for the full reasoning. When false, a
+   * "handoff" decision from the model is treated exactly like a
+   * disallowed-destination one: a safe generic fallback response, never a
+   * second call into runSchedulingTurn() — this is the one structural
+   * guard that makes "at most one reverse hop per execution, never a
+   * bounce back" true regardless of what the model attempts. Lead
+   * Qualification may still respond or use either of its allowlisted
+   * tools normally either way — only its own handoff path is affected. */
+  allowSchedulingHandoff?: boolean;
 }): Promise<AIRunResult> {
   const { supabase, trustedContext, event, context, activeAgentKey, modelProvider, executionId, agentConfig, inputSummary, handoff, seedUsage, now } = params;
+  const allowSchedulingHandoff = params.allowSchedulingHandoff ?? true;
 
   // ── Model call: structured decision ──────────────────────────────────
   const decisionRequest = buildLeadQualificationDecisionRequest(agentConfig.instructions, context, event, handoff);
@@ -708,7 +784,16 @@ async function runLeadQualificationTurn(params: {
     // file applies a SECOND, explicit allowlist check before ever building
     // an AIAgentHandoff or invoking Scheduling. Should be unreachable given
     // the schema, but never trusted to be unreachable.
-    if (!LEAD_QUALIFICATION_HANDOFF_ALLOWLIST.has(decision.toAgent)) {
+    //
+    // LOOP PREVENTION (Scheduling -> Lead Qualification reverse handoff
+    // phase): `allowSchedulingHandoff === false` means THIS call reached
+    // Lead Qualification as the destination of a Scheduling reverse
+    // handoff — bouncing straight back to Scheduling again in the same
+    // execution is exactly the loop this guard exists to prevent. Checked
+    // alongside the allowlist, with the identical safe fallback, so a
+    // model that attempts this anyway is handled no differently than one
+    // that names a disallowed destination.
+    if (!LEAD_QUALIFICATION_HANDOFF_ALLOWLIST.has(decision.toAgent) || !allowSchedulingHandoff) {
       return await finalizeLeadQualificationRun(supabase, executionId, activeAgentKey, {
         status: "succeeded",
         responseText: GENERIC_FALLBACK_RESPONSE_LOCAL,
@@ -1317,6 +1402,108 @@ async function runSchedulingTurn(params: {
       status: "succeeded", responseText: decision.response,
       inputTokens: totalInputTokens, outputTokens: totalOutputTokens, costUsd: totalCostUsd, inputSummary,
     });
+  }
+
+  // ── handoff (Scheduling -> Lead Qualification reverse handoff) ───────
+  if (decision.type === "handoff") {
+    const handoffDecision = decision as SchedulingHandoffDecision;
+
+    // Same defense-in-depth pattern as the forward handoff's own
+    // LEAD_QUALIFICATION_HANDOFF_ALLOWLIST check: the Zod schema already
+    // restricts `toAgent` to the single literal "lead_qualification",
+    // this is a second, explicit check before ever building an
+    // AIAgentHandoff or invoking Lead Qualification. Should be
+    // unreachable given the schema, but never trusted to be unreachable.
+    if (!SCHEDULING_HANDOFF_ALLOWLIST.has(handoffDecision.toAgent)) {
+      return await finalizeSchedulingRun(supabase, executionId, {
+        status: "succeeded", responseText: SCHEDULING_GENERIC_FALLBACK_RESPONSE,
+        inputTokens: totalInputTokens, outputTokens: totalOutputTokens, costUsd: totalCostUsd, inputSummary,
+      });
+    }
+
+    const leadQualificationConfig = SYSTEM_AGENTS.lead_qualification;
+    if (!leadQualificationConfig) {
+      // Defensive only — both agents are defined together in
+      // SYSTEM_AGENTS; this should never actually happen.
+      const message = "Lead Qualification is not available right now.";
+      await finalizeExecution(supabase, executionId, {
+        agentKey: "scheduling", status: "failed", error: message,
+        inputTokens: totalInputTokens, outputTokens: totalOutputTokens, costUsd: totalCostUsd, inputSummary,
+      });
+      return { executionId, status: "failed", agentKey: "scheduling", error: message };
+    }
+
+    // CLEAR STALE SCHEDULING OWNERSHIP (required by this phase): the
+    // customer has moved on from the current scheduling interaction, so
+    // the active offer must not keep forcing their NEXT inbound message
+    // back to Scheduling via router.ts's Tier 2. Reuses the EXISTING
+    // clearOfferedSlots() — the same helper the decline path above and
+    // the PR #18 post-booking cleanup already use — never a new write
+    // path. This NEVER touches public.appointments, an approval, or any
+    // booking state; it only removes a routing-ownership signal that was
+    // already, by this architecture's own existing invariant, never proof
+    // of actual availability.
+    //
+    // FAILURE BEHAVIOR (explicitly designed, not left undefined): if this
+    // write fails, it is logged and the handoff PROCEEDS anyway — the
+    // customer's current message still deserves a real answer from Lead
+    // Qualification right now, and failing the entire handoff over a
+    // best-effort cleanup write would silently drop their message instead
+    // (worse than the alternative). The cost of a failed cleanup is
+    // narrow and self-correcting: at most the customer's OWN next message
+    // might be mis-routed back to Scheduling one more time by Tier 2 (an
+    // UX hiccup, not data corruption — Scheduling would simply see a
+    // message that's "clearly not scheduling" again and could hand off a
+    // second time on a LATER execution; the one-reverse-hop-per-execution
+    // guard above only bounds a SINGLE execution, not the whole
+    // conversation). No retry/queue infrastructure is added for this
+    // narrow, already-safe-to-leave-logged case. Same exact "log, don't
+    // throw, don't invent success" convention as the decline path three
+    // branches up, which has the identical failure shape.
+    if (contactId && schedulingChannel) {
+      const cleared = await clearOfferedSlots({ supabase }, { orgId, contactId, channel: schedulingChannel });
+      if (!cleared.ok) {
+        console.error("[ai/orchestrator] clearOfferedSlots failed on Scheduling -> Lead Qualification handoff:", cleared.reason);
+      }
+    }
+
+    // Same CONTENT-decision-only reasoning as both forward handoffs:
+    // nothing here comes from or widens trustedContext. The handoff's
+    // only job is to carry WHY Scheduling thinks this has moved on, not
+    // to grant Lead Qualification any capability it wouldn't otherwise
+    // have.
+    const reverseHandoff: AIAgentHandoff = {
+      fromAgent: "scheduling",
+      toAgent: handoffDecision.toAgent,
+      reason: handoffDecision.reason,
+      summary: handoffDecision.summary,
+      knownFacts: handoffDecision.knownFacts,
+      openQuestions: handoffDecision.openQuestions,
+    };
+    const handoffSummary: AIHandoffSummary = { fromAgent: "scheduling", toAgent: handoffDecision.toAgent, reason: handoffDecision.reason };
+
+    // SAME execution row, SAME unmodified trustedContext — exactly the
+    // two forward-handoff precedents. Scheduling's own usage so far is
+    // folded in via seedUsage so the execution's totals cover the entire
+    // run. `allowSchedulingHandoff: false` is the loop-prevention guard —
+    // see this file's own header addendum and that param's own doc
+    // comment for the full reasoning.
+    const result = await runLeadQualificationTurn({
+      supabase, trustedContext, event, context,
+      activeAgentKey: "lead_qualification",
+      modelProvider, executionId,
+      agentConfig: leadQualificationConfig,
+      inputSummary: { ...inputSummary, handoff: handoffSummary },
+      handoff: reverseHandoff,
+      seedUsage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens, costUsd: totalCostUsd },
+      allowSchedulingHandoff: false,
+      now,
+    });
+
+    // Attach the full validated handoff regardless of how the Lead
+    // Qualification turn concluded — same "never lose the fact a handoff
+    // occurred" requirement as both forward handoffs.
+    return { ...result, handoff: reverseHandoff };
   }
 
   // ── get_availability ──────────────────────────────────────────────────
