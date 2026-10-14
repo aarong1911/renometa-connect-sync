@@ -62,7 +62,7 @@ import type {
 } from "./types";
 import { createAnthropicProvider } from "./providers/anthropic";
 import type { ModelProvider, ModelRequest } from "./providers/model-provider";
-import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines, channelGuidance } from "./prompting";
+import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildBusinessKnowledgeSection, buildContextLines, channelGuidance } from "./prompting";
 import { executeAITool } from "./tools/registry";
 import type { AIToolExecutionResult } from "./tools/types";
 import {
@@ -100,6 +100,7 @@ import {
 // header for the live defect this closes.
 import { resolveDateIntent, type ResolveDateIntentResult } from "./scheduling-date-intent";
 import { executeStep, type ExecuteStepResult } from "../../../../src/lib/agentic/action-executor";
+import { handleClarifyDecision } from "./knowledge-clarification";
 import {
   SCHEDULING_OFFER_CHANNELS,
   clearOfferedSlots,
@@ -339,6 +340,13 @@ const SYSTEM_AGENTS: Partial<Record<AIAgentKey, SystemAgentConfig>> = {
       // that separate category of fact, not a strengthening of the one
       // above.
       "Separately from the customer's own project facts: for any question about THIS BUSINESS's own capabilities or policies — whether it handles permits, licensing, inspections, financing, warranties, service area, specific included services, pricing policies, or guarantees — answer using ONLY an explicit statement already present in the trusted CRM/business context provided below. Never invent, assume, or infer an answer to one of these from general industry knowledge or what a typical contractor usually does — generic industry knowledge is not a fact about this specific business. If the customer asks one of these and trusted context does not explicitly state the answer, say naturally that you'd want to confirm the specifics with the team (or ask a clarifying question) rather than asserting a yes/no answer or a specific policy. This does not apply to the customer's own project facts (their budget, timeline, project scope, or similar) — those remain fully usable exactly as the rules above already describe whenever trusted context actually contains them.",
+      // Business Knowledge + Owner Clarification phase: the rule above is the
+      // unchanged safety floor; this adds the two constructive halves — an
+      // owner-configured Business Knowledge entry IS an "explicit statement"
+      // for that rule, and the correct response to a MISSING one is the
+      // structured clarify decision (agents/lead-qualification.ts), not a
+      // free-form guess or an open-ended "I'll get back to you".
+      "Trusted Business Knowledge (when provided below) counts as an explicit statement for the rule above: answer a matching business question directly and confidently from it, exactly as written. When the answer is NOT stated in Trusted Business Knowledge or the CRM context, do not respond with a guess or a promise to follow up yourself — use the clarify decision described below so the business owner can answer.",
       // Follow-up correction (live-test finding): the prior wording here
       // ("ask one or two concise qualification questions") directly
       // conflicted with the "choose the single most useful next question"
@@ -391,6 +399,8 @@ type AIContextPresenceSummary = {
   project: boolean;
   /** Count only — never the message text itself. */
   recentMessageCount: number;
+  /** Count of ACTIVE Business Knowledge entries in context — never their text. */
+  businessKnowledgeCount: number;
 };
 
 function summarizeContextPresence(context: AIResolvedContext): AIContextPresenceSummary {
@@ -400,6 +410,7 @@ function summarizeContextPresence(context: AIResolvedContext): AIContextPresence
     lead: !!context.lead,
     project: !!context.project,
     recentMessageCount: context.conversation?.recentMessages?.length ?? 0,
+    businessKnowledgeCount: context.businessKnowledge?.entries.length ?? 0,
   };
 }
 
@@ -445,6 +456,17 @@ type AIHandoffSummary = {
   reason: string;
 };
 
+/** Business Knowledge + Owner Clarification addition: a compact audit record
+ * of what the knowledge gate did this run — ids/labels only, never the
+ * customer's text or the owner's answer. `clarificationId` links the run to
+ * its ai_clarification_requests row (which itself carries execution_id). */
+type AIClarificationSummary = {
+  outcome: "created" | "coalesced" | "answered_from_knowledge" | "unsupported";
+  clarificationId?: string;
+  category?: string;
+  reason?: string;
+};
+
 /** Full shape written to agent_executions.input_summary. `route`/`context`
  * are omitted (not merely empty) when execution failed before routing/
  * context-building completed — an absent key means "never computed,"
@@ -455,6 +477,7 @@ type AIExecutionInputSummary = {
   context?: AIContextPresenceSummary;
   tooling?: AIToolingSummary;
   handoff?: AIHandoffSummary;
+  clarification?: AIClarificationSummary;
 };
 
 export type OrchestrateAIParams = {
@@ -859,6 +882,75 @@ async function runLeadQualificationTurn(params: {
     // turn concluded — same "never lose the fact a handoff occurred"
     // requirement as Reception's own handoff.
     return { ...result, handoff };
+  }
+
+  if (decision.type === "clarify") {
+    // Business Knowledge + Owner Clarification phase. The model only FLAGGED a
+    // gap; handleClarifyDecision() (trusted server code) validates the
+    // category, re-checks Business Knowledge itself, coalesces duplicates and
+    // creates the request. This branch never executes a tool, never writes a
+    // CRM record, and never lets the model author the customer-facing text of
+    // a follow-up promise (the holding reply is deterministic).
+    const outcome = await handleClarifyDecision({ supabase, trustedContext, event, context, decision, executionId });
+
+    if (outcome.kind === "answer_from_knowledge") {
+      // The model asked the owner something Business Knowledge already
+      // answers — never bother the owner; answer from the trusted fact via
+      // the same response-only final call the tool path uses.
+      const clarificationSummary: AIClarificationSummary = { outcome: "answered_from_knowledge", category: outcome.entry.category };
+      const finalRequest = buildLeadQualificationFinalRequest(
+        agentConfig.instructions,
+        context,
+        event,
+        `Trusted Business Knowledge DOES answer the customer's question: "${outcome.entry.answer}". Answer the customer directly from it, exactly as written — do not add, extend, or soften it.`,
+        handoff,
+      );
+      let finalResponse;
+      try {
+        finalResponse = await modelProvider.run(finalRequest);
+      } catch (err) {
+        console.error(`[ai/orchestrator] lead_qualification knowledge-answer call failed (execution ${executionId}):`, err);
+        return await finalizeLeadQualificationRun(supabase, executionId, activeAgentKey, {
+          status: "failed",
+          errorMessage: "The AI model could not generate a response.",
+          inputTokens: totalInputTokens,
+          outputTokens: totalOutputTokens,
+          costUsd: totalCostUsd,
+          inputSummary: { ...inputSummary, clarification: clarificationSummary },
+        });
+      }
+      totalInputTokens += finalResponse.usage.inputTokens;
+      totalOutputTokens += finalResponse.usage.outputTokens;
+      totalCostUsd += await recordUsageEvent(supabase, {
+        orgId: trustedContext.orgId,
+        executionId,
+        provider: finalResponse.provider,
+        model: finalResponse.model,
+        inputTokens: finalResponse.usage.inputTokens,
+        outputTokens: finalResponse.usage.outputTokens,
+      });
+      return await finalizeLeadQualificationRun(supabase, executionId, activeAgentKey, {
+        status: "succeeded",
+        responseText: finalResponse.text,
+        inputTokens: totalInputTokens,
+        outputTokens: totalOutputTokens,
+        costUsd: totalCostUsd,
+        inputSummary: { ...inputSummary, clarification: clarificationSummary },
+      });
+    }
+
+    const clarificationSummary: AIClarificationSummary =
+      outcome.kind === "clarification"
+        ? { outcome: outcome.created ? "created" : "coalesced", clarificationId: outcome.clarificationId, category: outcome.category }
+        : { outcome: "unsupported", reason: outcome.reason };
+    return await finalizeLeadQualificationRun(supabase, executionId, activeAgentKey, {
+      status: "succeeded",
+      responseText: outcome.reply,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+      costUsd: totalCostUsd,
+      inputSummary: { ...inputSummary, clarification: clarificationSummary },
+    });
   }
 
   // decision.type === "tool" from here on.
@@ -2006,7 +2098,7 @@ function buildModelRequest(
   event: AIChannelEvent,
 ): ModelRequest {
   const guidance = channelGuidance(context.channel);
-  const system = `${agentConfig.instructions}${guidance ? `\n\n${guidance}` : ""}\n\nOrganization: ${context.organization.name}.`;
+  const system = `${agentConfig.instructions}${guidance ? `\n\n${guidance}` : ""}${buildBusinessKnowledgeSection(context)}\n\nOrganization: ${context.organization.name}.`;
   const contextLines = buildContextLines(context);
   const inboundText = event.content.text?.trim() || "(no message text provided)";
 

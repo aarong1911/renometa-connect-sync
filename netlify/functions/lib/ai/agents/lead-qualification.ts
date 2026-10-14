@@ -46,8 +46,9 @@
 import { z } from "zod";
 import type { AIAgentHandoff, AIChannel, AIChannelEvent, AIResolvedContext } from "../types";
 import type { ModelRequest } from "../providers/model-provider";
-import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines, channelGuidance } from "../prompting";
+import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildBusinessKnowledgeSection, buildContextLines, channelGuidance } from "../prompting";
 import { describeKnownQualificationFields, resolveKnownQualificationFields } from "../lead-trigger";
+import { BUSINESS_KNOWLEDGE_CATALOG_KEYS, CUSTOM_CATEGORY, MAX_QUESTION_LENGTH } from "../../../../../src/lib/agentic/business-knowledge-catalog";
 
 // ── AI-1K: optional handoff continuity (see orchestrator.ts's "Reception
 // turn") ─────────────────────────────────────────────────────────────────
@@ -186,16 +187,35 @@ const handoffDecisionSchema = z
   })
   .strict();
 
+// Business Knowledge + Owner Clarification phase. The model may flag "the
+// customer asked a company-specific factual question and Trusted Business
+// Knowledge does not contain the answer". That is ALL it supplies: a
+// category label and a neutral restatement of the question. It supplies no
+// customer-facing text (the holding reply is deterministic, see
+// knowledge-clarification.ts), no ids, and cannot write anything — the
+// server validates `category` against the catalog (unknown values are
+// treated as unsupported, never trusted), re-checks Business Knowledge
+// itself, coalesces duplicates, and creates the request.
+const clarifyDecisionSchema = z
+  .object({
+    type: z.literal("clarify"),
+    category: z.string().min(1).max(80),
+    question: z.string().min(8).max(MAX_QUESTION_LENGTH),
+  })
+  .strict();
+
 const leadQualificationDecisionSchema = z.union([
   respondDecisionSchema,
   getLeadContextDecisionSchema,
   addInternalNoteDecisionSchema,
   handoffDecisionSchema,
+  clarifyDecisionSchema,
 ]);
 
 export type LeadQualificationDecision = z.infer<typeof leadQualificationDecisionSchema>;
 export type LeadQualificationToolDecision = Extract<LeadQualificationDecision, { type: "tool" }>;
 export type LeadQualificationHandoffDecision = Extract<LeadQualificationDecision, { type: "handoff" }>;
+export type LeadQualificationClarifyDecision = Extract<LeadQualificationDecision, { type: "clarify" }>;
 
 export type ParsedLeadQualificationDecision =
   | { kind: "decision"; decision: LeadQualificationDecision }
@@ -296,6 +316,9 @@ function buildDecisionSystemInstructions(agentInstructions: string, organization
     agentInstructions,
     ...(guidance ? ["", guidance] : []),
     buildKnownFieldsBlock(context),
+    // Business Knowledge: shared trusted block (prompting.ts) — answer-priority rule + the
+    // owner-configured facts. A customer question this block answers is answered DIRECTLY.
+    buildBusinessKnowledgeSection(context),
     "",
     "You may optionally use ONE of the following tools, or simply respond directly — most turns should simply respond:",
     "- get_lead_context: re-reads the current lead's CRM record, if you need to confirm details beyond what's already provided below.",
@@ -308,6 +331,12 @@ function buildDecisionSystemInstructions(agentInstructions: string, organization
     "Hand off to Scheduling when BOTH of these are true: (1) you have enough information to reasonably proceed (you don't need every possible detail — just enough that a next appointment makes sense), AND (2) the customer has indicated readiness or interest in scheduling, booking, or taking the next appointment step (e.g. \"when can someone come out?\", \"let's set something up\", \"I'd like to book a consultation\", or a clear yes to your own suggestion of a next step).",
     "Do NOT hand off just because a project was mentioned — wait until the customer is actually ready to move toward an appointment. Do NOT hand off while a genuinely important qualification question is still clearly unanswered and the customer hasn't signaled readiness.",
     "",
+    // Owner Clarification: the ONLY correct response to a company-specific question that Trusted
+    // Business Knowledge cannot answer. The conditions are deliberately narrow so the owner is not
+    // flooded with requests.
+    `Instead of responding, you may flag that the owner needs to answer a question ("clarify"). Use clarify ONLY when ALL of these are true: (1) the customer's CURRENT message asks a concrete factual question about THIS business — its policies, capabilities, services, permits, inspections, licensing, financing, warranty, service area, payment, pricing rules, and similar; (2) Trusted Business Knowledge above does NOT contain the answer; (3) the CRM context above cannot answer it either. Set "category" to the single best-matching key from [${BUSINESS_KNOWLEDGE_CATALOG_KEYS.join(", ")}], or "${CUSTOM_CATEGORY}" if none fits, and "question" to a short, neutral restatement of what the customer asked.`,
+    "Do NOT use clarify for: greetings or small talk; thanks or acknowledgments; a question Trusted Business Knowledge already answers (answer it directly with respond); facts already in the CRM context (budget, timeline, project type, location, name); picking or confirming an appointment time; one of your own qualification questions or the customer's answer to it; or vague, ambiguous, or off-topic messages — use respond for all of those. Never write the customer-facing text for a clarify decision; the system sends the customer an appropriate holding reply itself.",
+    "",
     `Organization: ${organizationName}.`,
     "",
     "Respond with ONLY a single JSON object — no markdown, no code fences, no text outside the JSON — matching exactly one of these shapes:",
@@ -315,6 +344,7 @@ function buildDecisionSystemInstructions(agentInstructions: string, organization
     '{"type":"tool","tool":"get_lead_context","reason":"<short optional reason>"}',
     '{"type":"tool","tool":"add_internal_note","arguments":{"content":"<concise, factual note text>"},"reason":"<short optional reason>"}',
     '{"type":"handoff","toAgent":"scheduling","reason":"<short reason the customer is ready to schedule>","summary":"<one or two sentence summary of the project/opportunity for Scheduling>","knownFacts":{"<short fact label>":"<short value>"},"openQuestions":["<short open question, if any>"]}',
+    '{"type":"clarify","category":"<catalog key or custom>","question":"<short neutral restatement of the customer\'s company-specific question>"}',
     '"knownFacts" and "openQuestions" are optional on the handoff shape — include them only when you actually have something to note; do not invent facts that weren\'t said.',
   ].join("\n");
 }
@@ -365,6 +395,7 @@ export function buildLeadQualificationFinalRequest(
     agentInstructions,
     ...(guidance ? ["", guidance] : []),
     buildKnownFieldsBlock(context),
+    buildBusinessKnowledgeSection(context),
     "",
     "You just completed an internal action. Do not mention internal tools, notes, or CRM systems to the customer — respond naturally based on what you now know.",
     `Organization: ${context.organization.name}.`,

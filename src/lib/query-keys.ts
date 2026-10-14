@@ -236,5 +236,13 @@ export const queryKeys = {
     all: (orgId: string) => ["aiApprovals", orgId] as const,
     pendingCount: (orgId: string) => ["aiApprovals", orgId, "pendingCount"] as const,
     list: (orgId: string, filter: string) => ["aiApprovals", orgId, "list", filter] as const,
+    // Owner Clarification cards (ai-clarifications-list.ts) live under the SAME
+    // ["aiApprovals", orgId] prefix on purpose: they render in the Approvals tab,
+    // and the existing prefix invalidation after any decision refreshes them too.
+    clarifications: (orgId: string, filter: string) => ["aiApprovals", orgId, "clarifications", filter] as const,
+  },
+  /** Business Knowledge settings list (business_knowledge_entries, RLS-scoped read). */
+  businessKnowledge: {
+    all: (orgId: string) => ["businessKnowledge", orgId] as const,
   },
 };

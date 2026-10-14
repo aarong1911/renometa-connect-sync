@@ -62,6 +62,16 @@ type RunContextPresence = {
   lead?: boolean;
   project?: boolean;
   recentMessageCount?: number;
+  businessKnowledgeCount?: number;
+};
+
+/** Business Knowledge phase — compact audit record written by orchestrator.ts
+ * (ids/labels only, never customer text or the owner's answer). */
+type RunClarificationSummary = {
+  outcome?: string;
+  clarificationId?: string;
+  category?: string;
+  reason?: string;
 };
 
 /** AI-1K addition — the backend persists only this compact audit record
@@ -80,6 +90,7 @@ type RunInputSummary = {
   route?: RunRouteSummary;
   context?: RunContextPresence;
   handoff?: unknown;
+  clarification?: RunClarificationSummary;
 };
 
 type RunOutputSummary = {
@@ -438,7 +449,8 @@ function ExecutionDetail({ row, usage }: { row: ExecutionRow; usage?: UsageInfo 
             <PresenceRow label="Project" present={!!context.project} />
           </div>
           <p className="text-[11px] text-muted-foreground">
-            Recent messages: {context.recentMessageCount ?? 0}
+            Recent messages: {context.recentMessageCount ?? 0} · Business Knowledge entries: {context.businessKnowledgeCount ?? 0}
+            {input?.clarification?.outcome && <> · Knowledge check: {input.clarification.outcome.replace(/_/g, " ")}</>}
           </p>
         </div>
       )}

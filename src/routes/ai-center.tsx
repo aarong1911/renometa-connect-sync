@@ -15,6 +15,8 @@ import { AITestConsole } from "@/components/ai-center/ai-test-console";
 import { AIEmergencyPauseControl } from "@/components/ai-center/ai-emergency-pause-control";
 import { LeadQualificationSettingsControl } from "@/components/ai-center/lead-qualification-settings-control";
 import { AIApprovalsTab } from "@/components/ai-center/ai-approvals-tab";
+import { BusinessKnowledgeSettings } from "@/components/ai-center/business-knowledge-settings";
+import { fetchOpenClarificationCount } from "@/lib/ai-clarifications-list";
 import { supabase } from "@/lib/supabase";
 import { useOrgId } from "@/lib/org-id";
 import {
@@ -63,6 +65,7 @@ import {
   WandSparkles,
   ShieldCheck,
   FlaskConical,
+  BookOpen,
   X as XIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -81,14 +84,14 @@ import {
 } from "@/lib/ai-center-store";
 import { isAgentConfigured } from "@/lib/agent-config";
 
-type TopTab = "agents" | "tools" | "voice" | "agentic" | "approvals" | "console";
+type TopTab = "agents" | "tools" | "voice" | "agentic" | "knowledge" | "approvals" | "console";
 type AgentsSearchParams = AgentSearchParams & { tab?: TopTab };
 
 export const Route = createFileRoute("/ai-center")({
   validateSearch: (search: Record<string, unknown>): AgentsSearchParams => ({
     agentId: typeof search.agentId === "string" ? search.agentId : undefined,
     tab:
-      search.tab === "agents" || search.tab === "tools" || search.tab === "voice" || search.tab === "agentic" || search.tab === "approvals" || search.tab === "console"
+      search.tab === "agents" || search.tab === "tools" || search.tab === "voice" || search.tab === "agentic" || search.tab === "knowledge" || search.tab === "approvals" || search.tab === "console"
         ? search.tab
         : undefined,
   }),
@@ -213,6 +216,7 @@ const TOP_TABS: { value: TopTab; label: string; icon: LucideIcon }[] = [
   { value: "tools", label: "AI Tools", icon: WandSparkles },
   { value: "voice", label: "Voice Agent", icon: AudioLines },
   { value: "agentic", label: "Agentic (Beta)", icon: ShieldCheck },
+  { value: "knowledge", label: "Business Knowledge", icon: BookOpen },
   { value: "approvals", label: "Approvals", icon: ClipboardList },
   { value: "console", label: "Test Console", icon: FlaskConical },
 ];
@@ -241,12 +245,17 @@ function AgentsPage() {
   useEffect(() => {
     if (!orgIdForApprovalsBadge) return;
     let cancelled = false;
-    supabase
-      .from("agent_approval_requests")
-      .select("id", { count: "exact", head: true })
-      .eq("org_id", orgIdForApprovalsBadge)
-      .eq("status", "pending")
-      .then(({ count }) => { if (!cancelled) setPendingApprovalCount(count ?? 0); });
+    // Open Knowledge Clarifications count toward the same Approvals badge —
+    // they are owner-actionable items in the same inbox.
+    Promise.all([
+      supabase
+        .from("agent_approval_requests")
+        .select("id", { count: "exact", head: true })
+        .eq("org_id", orgIdForApprovalsBadge)
+        .eq("status", "pending")
+        .then(({ count }) => count ?? 0),
+      fetchOpenClarificationCount(orgIdForApprovalsBadge),
+    ]).then(([approvals, clarifications]) => { if (!cancelled) setPendingApprovalCount(approvals + clarifications); });
     return () => { cancelled = true; };
   }, [orgIdForApprovalsBadge, topTab]);
 
@@ -478,6 +487,10 @@ function AgentsPage() {
 
         <TabsContent value="agentic" className="mt-3">
           <AgenticPreviewPanel />
+        </TabsContent>
+
+        <TabsContent value="knowledge" className="mt-3">
+          <BusinessKnowledgeSettings />
         </TabsContent>
 
         <TabsContent value="approvals" className="mt-3">

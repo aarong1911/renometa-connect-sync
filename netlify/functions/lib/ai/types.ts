@@ -327,12 +327,43 @@ export type AIConversationSummary = {
   schedulingOfferActive?: boolean;
 };
 
+/** One ACTIVE business_knowledge_entries row, stripped to what an agent
+ * needs. Owner-authored and therefore authoritative for company-specific
+ * facts (see prompting.ts's BUSINESS_KNOWLEDGE_RULES). */
+export type AIBusinessKnowledgeEntry = {
+  key: string;
+  category: string;
+  question: string;
+  answer: string;
+};
+
+/**
+ * Business Knowledge as resolved for ONE organization (context-builder.ts
+ * fetches it once per turn; agents never fetch it themselves).
+ *
+ * `status: "unavailable"` means the read FAILED — deliberately distinct from
+ * "ok with zero entries". Unlike the other context sections (where a query
+ * failure aborts the whole turn), a failed knowledge read degrades safely:
+ * the agent is told it has no trusted company facts right now, and the
+ * clarification workflow is NOT triggered (we can't know whether the answer
+ * exists, so we must not ask the owner something they may already have
+ * answered).
+ */
+export type AIBusinessKnowledge = {
+  status: "ok" | "unavailable";
+  entries: AIBusinessKnowledgeEntry[];
+};
+
 export type AIResolvedContext = {
   organization: AIOrganizationSummary;
   contact?: AIContactSummary;
   lead?: AILeadSummary;
   project?: AIProjectSummary;
   conversation?: AIConversationSummary;
+  /** Trusted Business Knowledge for the current org. Optional only so
+   * hand-built contexts in older tests still type-check; the real
+   * buildAIContext() always populates it. */
+  businessKnowledge?: AIBusinessKnowledge;
   channel: AIChannel;
 };
 
