@@ -53,6 +53,8 @@ import {
   type InboundMessage,
   type FilterValue,
 } from "@/lib/ai-approvals-list";
+import { fetchAiClarificationsList } from "@/lib/ai-clarifications-list";
+import { KnowledgeClarificationCard } from "@/components/ai-center/knowledge-clarification-card";
 
 type ExecutionRow = {
   id: string;
@@ -177,17 +179,34 @@ export function AIApprovalsTab({
   // "setLoading(true) on every single load" behavior — every other Query-
   // backed list in this app (conversations, leads, deals, …) already
   // behaves this way; it isn't a visual redesign, same cards/empty state.
+  // Owner Clarification cards ("Knowledge Clarification") — a separate
+  // query/type from the action approvals above (see ai-clarifications-list.ts
+  // for why), rendered in the same grid so the owner has ONE inbox.
+  const clarificationsQuery = useQuery({
+    queryKey: orgId ? queryKeys.aiApprovals.clarifications(orgId, filter) : ["aiApprovals", "clarifications", filter],
+    queryFn: () => fetchAiClarificationsList(orgId as string, filter),
+    enabled: !!orgId,
+    staleTime: 15_000,
+  });
+  const clarifications = clarificationsQuery.data?.clarifications ?? [];
+  const clarificationContacts = clarificationsQuery.data?.contactById ?? new Map<string, ContactSummary>();
+  const clarificationInbound = clarificationsQuery.data?.inboundById ?? new Map<string, InboundMessage>();
+  const refreshAll = () => {
+    if (orgId) void queryClient.invalidateQueries({ queryKey: queryKeys.aiApprovals.all(orgId) });
+  };
+
+  // Only the approvals query gates the full-panel spinner (unchanged); a slow
+  // or failed clarifications read must never blank the approvals list.
   const loading = !orgId || approvalsQuery.isPending;
 
   // Reports the current PENDING count up to the parent (ai-center.tsx's
-  // own Approvals-tab-trigger badge) — same value, same two-branch
-  // computation as before (see fetchAiApprovalsList's pendingCount), now
-  // sourced from this query's result instead of a duplicate inline fetch.
+  // own Approvals-tab-trigger badge) — approvals' count (same two-branch
+  // computation as before) plus open Knowledge Clarifications.
   useEffect(() => {
     if (onPendingCountChange && approvalsQuery.data) {
-      onPendingCountChange(approvalsQuery.data.pendingCount);
+      onPendingCountChange(approvalsQuery.data.pendingCount + (clarificationsQuery.data?.openCount ?? 0));
     }
-  }, [approvalsQuery.data, onPendingCountChange]);
+  }, [approvalsQuery.data, clarificationsQuery.data, onPendingCountChange]);
 
   async function handleDecision(approval: ApprovalRow, decision: "approve" | "reject") {
     setDecidingId(approval.id);
@@ -311,8 +330,8 @@ export function AIApprovalsTab({
             ))}
           </TabsList>
         </Tabs>
-        <Button size="sm" variant="outline" className="h-9 text-xs" onClick={() => void approvalsQuery.refetch()} disabled={approvalsQuery.isFetching}>
-          {approvalsQuery.isFetching ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 h-3.5 w-3.5" />}
+        <Button size="sm" variant="outline" className="h-9 text-xs" onClick={() => { void approvalsQuery.refetch(); void clarificationsQuery.refetch(); }} disabled={approvalsQuery.isFetching || clarificationsQuery.isFetching}>
+          {approvalsQuery.isFetching || clarificationsQuery.isFetching ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 h-3.5 w-3.5" />}
           Refresh
         </Button>
       </div>
@@ -321,12 +340,21 @@ export function AIApprovalsTab({
         <div className="flex items-center justify-center py-16">
           <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
         </div>
-      ) : approvals.length === 0 ? (
+      ) : approvals.length === 0 && clarifications.length === 0 ? (
         <Card className="p-8 text-center text-sm text-muted-foreground">
           {filter === "pending" ? "No actions are currently awaiting approval." : "No approvals match this filter."}
         </Card>
       ) : (
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+          {clarifications.map((k) => (
+            <KnowledgeClarificationCard
+              key={k.id}
+              clarification={k}
+              contact={clarificationContacts.get(k.contact_id)}
+              inbound={k.inbound_message_id ? clarificationInbound.get(k.inbound_message_id) : undefined}
+              onChanged={refreshAll}
+            />
+          ))}
           {approvals.map((a) => {
             const replyChannel = channelForActionKey(a.action_key);
             const isSms = replyChannel !== undefined;

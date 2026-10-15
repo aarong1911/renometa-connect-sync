@@ -242,6 +242,10 @@ export async function dispatchLeadQualification(params: DispatchLeadQualificatio
       eventType: source === "inbound_lead_message" ? "message_received" : "new_lead",
       externalMessageId: inboundEvent?.externalMessageId,
       content: { type: "text", text: inboundEvent?.text ?? "" },
+      // Business Knowledge phase: carries the persisted inbound row id so an
+      // Owner Clarification request can link back to the exact customer
+      // message (display only — never authorization; read back org-scoped).
+      ...(inboundEvent?.messageRowId ? { metadata: { messageRowId: inboundEvent.messageRowId } } : {}),
       occurredAt: new Date().toISOString(),
     };
     const trustedContext: AITrustedContext = {

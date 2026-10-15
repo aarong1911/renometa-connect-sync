@@ -78,7 +78,7 @@
 import { z } from "zod";
 import type { AIAgentHandoff, AIChannel, AIChannelEvent, AIResolvedContext } from "../types";
 import type { ModelRequest } from "../providers/model-provider";
-import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines, channelGuidance } from "../prompting";
+import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildBusinessKnowledgeSection, buildContextLines, channelGuidance } from "../prompting";
 import { describeKnownQualificationFields, resolveKnownQualificationFields } from "../lead-trigger";
 import type { PersistedSlotOffer } from "../../scheduling-offer-state";
 import { WEEKDAYS } from "../scheduling-date-intent";
@@ -548,6 +548,10 @@ function buildDecisionSystemInstructions(
     ...(guidance ? ["", guidance] : []),
     buildKnownFieldsBlock(context),
     buildOfferedSlotsBlock(offeredSlots),
+    // Business Knowledge (shared trusted block). Scheduling consumes it only so it never
+    // contradicts or invents company facts; an unanswered company question is a reverse
+    // handoff to Lead Qualification (below), which owns the Owner Clarification workflow.
+    buildBusinessKnowledgeSection(context),
     "",
     ...(todayLine ? [todayLine] : []),
     "You may choose exactly one of the following actions:",
@@ -641,6 +645,7 @@ export function buildSchedulingFinalRequest(
     ...(guidance ? ["", guidance] : []),
     buildKnownFieldsBlock(context),
     buildOfferedSlotsBlock(offeredSlots),
+    buildBusinessKnowledgeSection(context),
     "",
     ...(todayLine ? [todayLine] : []),
     "You just completed an internal step. Do not mention internal tools, systems, option numbers, or CRM details to the customer — respond naturally based on the real outcome you're told below.",

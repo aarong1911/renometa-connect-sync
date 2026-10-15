@@ -12,6 +12,7 @@
 // constants only.
 
 import type { AIChannel, AIResolvedContext } from "./types";
+import { getCatalogCategory } from "../../../../src/lib/agentic/business-knowledge-catalog";
 
 /**
  * Temporary default model, unchanged since AI-1A/AI-1F — the exact alias
@@ -69,6 +70,44 @@ export function buildContextLines(context: AIResolvedContext): string[] {
   }
 
   return contextLines;
+}
+
+/**
+ * Shared answer-priority rule, appended (via buildBusinessKnowledgeSection)
+ * to every agent's system prompt — one definition, so Reception, Lead
+ * Qualification, Scheduling and every future agent follow the identical
+ * rule instead of each carrying its own paraphrase.
+ */
+export const BUSINESS_KNOWLEDGE_RULES = [
+  "Answer priority: (1) Trusted Business Knowledge below is AUTHORITATIVE for facts about THIS business (its policies, capabilities, services, pricing rules, service area, warranties, financing, permits, and so on). (2) The CRM context is AUTHORITATIVE for facts about THIS customer, lead, or project. You may combine the two naturally.",
+  "State a company-specific fact ONLY if it is written in Trusted Business Knowledge — and state it as written, without embellishing or extending it. Never present generic industry knowledge, or what a typical contractor does, as this business's own policy or capability. If a company-specific fact is not in Trusted Business Knowledge, you do not know it.",
+].join(" ");
+
+/**
+ * Renders the Trusted Business Knowledge block plus the shared answer-
+ * priority rule, for appending to an agent's SYSTEM prompt. Pure formatting
+ * of what context-builder.ts already resolved (org-scoped, active-only,
+ * bounded) — never fetches anything. Always returns a non-empty string:
+ * "none configured" and "unavailable" are both stated explicitly so the
+ * model never infers facts from silence.
+ */
+export function buildBusinessKnowledgeSection(context: AIResolvedContext): string {
+  const knowledge = context.businessKnowledge;
+  let body: string;
+  if (!knowledge || knowledge.status === "unavailable") {
+    body = "Trusted Business Knowledge: currently unavailable. Do not assert any company-specific policy or capability.";
+  } else if (knowledge.entries.length === 0) {
+    body = "Trusted Business Knowledge: none has been configured yet. Do not assert any company-specific policy or capability.";
+  } else {
+    body = [
+      "Trusted Business Knowledge (facts the business owner has configured about THIS business):",
+      ...knowledge.entries.map((e) => {
+        const label = getCatalogCategory(e.key)?.label;
+        return label ? `- ${label}: ${e.answer}` : `- ${e.question || "Other"} — ${e.answer}`;
+      }),
+    ].join("\n");
+  }
+  return ["", BUSINESS_KNOWLEDGE_RULES, body].join("\n");
 }
 
 /**

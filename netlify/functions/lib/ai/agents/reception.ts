@@ -42,7 +42,7 @@
 import { z } from "zod";
 import type { AIChannel, AIChannelEvent, AIResolvedContext } from "../types";
 import type { ModelRequest } from "../providers/model-provider";
-import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildContextLines, channelGuidance } from "../prompting";
+import { AI_CENTER_DEFAULT_MODEL, AI_CENTER_MAX_TOKENS, buildBusinessKnowledgeSection, buildContextLines, channelGuidance } from "../prompting";
 
 // ── Handoff allowlist (AI-1K) ─────────────────────────────────────────────
 //
@@ -148,11 +148,16 @@ export function parseReceptionDecision(rawText: string): ParsedReceptionDecision
 
 // ── Prompt builder ─────────────────────────────────────────────────────────
 
-function buildDecisionSystemInstructions(agentInstructions: string, organizationName: string, channel: AIChannel): string {
+function buildDecisionSystemInstructions(agentInstructions: string, organizationName: string, channel: AIChannel, context: AIResolvedContext): string {
   const guidance = channelGuidance(channel);
   return [
     agentInstructions,
     ...(guidance ? ["", guidance] : []),
+    // Business Knowledge: one shared trusted block (see prompting.ts). Reception may answer a
+    // company-specific question ONLY from it; an unanswered one goes to Lead Qualification,
+    // which owns the Owner Clarification workflow.
+    buildBusinessKnowledgeSection(context),
+    "If the customer asks a company-specific factual question (about this business's permits, financing, warranty, service area, policies, etc.): answer it directly ONLY if Trusted Business Knowledge above contains the answer; if it does not, hand off to Lead Qualification instead of guessing or deflecting.",
     "",
     "You may either respond directly, or hand this conversation off to Lead Qualification — a specialist on the same team who will continue naturally as part of the same business conversation (the customer will not be told about a hand-off).",
     "Hand off to Lead Qualification only when the customer is clearly presenting a potential project, job, or service opportunity for this business — e.g. a remodeling/renovation request, an estimate request, or a description of project scope, budget, timeline, or property work.",
@@ -179,7 +184,7 @@ export function buildReceptionDecisionRequest(
   context: AIResolvedContext,
   event: AIChannelEvent,
 ): ModelRequest {
-  const system = buildDecisionSystemInstructions(agentInstructions, context.organization.name, context.channel);
+  const system = buildDecisionSystemInstructions(agentInstructions, context.organization.name, context.channel, context);
   const contextLines = buildContextLines(context);
   const inboundText = event.content.text?.trim() || "(no message text provided)";
 

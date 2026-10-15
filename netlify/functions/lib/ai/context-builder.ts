@@ -25,6 +25,8 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type {
+  AIBusinessKnowledge,
+  AIBusinessKnowledgeEntry,
   AIChannel,
   AIConversationMessageSummary,
   AIConversationSummary,
@@ -393,6 +395,51 @@ async function resolveSchedulingOfferActive(
   return now.getTime() - offeredAtMs <= SCHEDULING_OFFER_TTL_MS;
 }
 
+// ── Business Knowledge ───────────────────────────────────────────────────
+//
+// Fetched ONCE here (never per-agent) so every current and future agent
+// (Reception, Lead Qualification, Scheduling, Voice, Follow-Up, ...) sees
+// the identical, org-scoped set. Only ACTIVE entries. Bounded: a hard row
+// cap and a per-answer length cap keep the prompt small and keep one
+// runaway entry from crowding out the rest.
+//
+// FAILURE POSTURE differs deliberately from every other fetch in this file
+// (see AIBusinessKnowledge's doc comment): a read error resolves to
+// `{status:"unavailable"}` rather than throwing. Knowledge is additive
+// grounding — losing it must not take the whole customer turn down — but
+// the unavailable marker stops anything downstream from treating "couldn't
+// read" as "owner has configured nothing".
+const BUSINESS_KNOWLEDGE_MAX_ENTRIES = 60;
+const BUSINESS_KNOWLEDGE_MAX_ANSWER_CHARS = 800;
+
+async function fetchBusinessKnowledge(supabase: SupabaseClient, orgId: string): Promise<AIBusinessKnowledge> {
+  try {
+    const { data, error } = await supabase
+      .from("business_knowledge_entries")
+      .select("key, category, question, answer")
+      .eq("org_id", orgId)
+      .eq("status", "active")
+      .order("key", { ascending: true })
+      .limit(BUSINESS_KNOWLEDGE_MAX_ENTRIES);
+    if (error) {
+      console.error("[ai/context-builder] fetchBusinessKnowledge failed:", error);
+      return { status: "unavailable", entries: [] };
+    }
+    const entries: AIBusinessKnowledgeEntry[] = (data ?? [])
+      .filter((r: any) => typeof r.key === "string" && typeof r.answer === "string" && r.answer.trim().length > 0)
+      .map((r: any) => ({
+        key: r.key,
+        category: typeof r.category === "string" ? r.category : "custom",
+        question: typeof r.question === "string" ? r.question : "",
+        answer: r.answer.trim().slice(0, BUSINESS_KNOWLEDGE_MAX_ANSWER_CHARS),
+      }));
+    return { status: "ok", entries };
+  } catch (err) {
+    console.error("[ai/context-builder] fetchBusinessKnowledge threw:", err);
+    return { status: "unavailable", entries: [] };
+  }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 /**
@@ -418,13 +465,14 @@ export async function buildAIContext(params: BuildAIContextParams): Promise<AIRe
   const { supabase, orgId, channel, contactId, leadId, projectId, conversationKey } = params;
   const now = params.now ?? new Date();
 
-  const [organization, contact, lead, project, conversation, schedulingOfferActive] = await Promise.all([
+  const [organization, contact, lead, project, conversation, schedulingOfferActive, businessKnowledge] = await Promise.all([
     fetchOrganizationSummary(supabase, orgId),
     contactId ? fetchContactSummary(supabase, orgId, contactId) : Promise.resolve(undefined),
     leadId ? fetchLeadSummary(supabase, orgId, leadId) : Promise.resolve(undefined),
     projectId ? fetchProjectSummary(supabase, orgId, projectId) : Promise.resolve(undefined),
     fetchConversationSummary(supabase, orgId, channel, contactId, conversationKey),
     resolveSchedulingOfferActive(supabase, orgId, channel, contactId, now),
+    fetchBusinessKnowledge(supabase, orgId),
   ]);
 
   // schedulingOfferActive is supported on a slightly WIDER channel set
@@ -438,5 +486,5 @@ export async function buildAIContext(params: BuildAIContextParams): Promise<AIRe
     ? { ...(conversation ?? { channel }), schedulingOfferActive: true }
     : conversation;
 
-  return { organization, contact, lead, project, conversation: finalConversation, channel };
+  return { organization, contact, lead, project, conversation: finalConversation, businessKnowledge, channel };
 }
