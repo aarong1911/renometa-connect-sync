@@ -139,8 +139,31 @@ test("23. LEAD_QUALIFICATION_TOOL_ALLOWLIST stays narrow — never includes a se
 
 // ── Lead-Qualification-to-Scheduling handoff phase ──────────────────────
 
-test("LEAD_QUALIFICATION_HANDOFF_ALLOWLIST contains only 'scheduling'", () => {
-  assert.deepEqual([...S.LEAD_QUALIFICATION_HANDOFF_ALLOWLIST], ["scheduling"]);
+// Estimate Assistant Foundation: an explicit two-entry allowlist (NOT a
+// generic agent mesh). Anything outside these two is still rejected.
+test("LEAD_QUALIFICATION_HANDOFF_ALLOWLIST contains exactly 'scheduling' and 'estimate_assistant'", () => {
+  assert.deepEqual([...S.LEAD_QUALIFICATION_HANDOFF_ALLOWLIST].sort(), ["estimate_assistant", "scheduling"]);
+});
+
+test("a handoff to any destination outside the two allowlisted agents fails strict validation", () => {
+  for (const toAgent of ["reception", "lead_qualification", "billing", "anything_else"]) {
+    const parsed = S.parseLeadQualificationDecision(JSON.stringify({ type: "handoff", toAgent, reason: "x", summary: "y" }));
+    assert.equal(parsed.kind, "fallback", `toAgent=${toAgent} must not parse as a handoff`);
+  }
+});
+
+test("a valid Estimate Assistant handoff decision parses", () => {
+  const parsed = S.parseLeadQualificationDecision(JSON.stringify({ type: "handoff", toAgent: "estimate_assistant", reason: "asked for an estimate", summary: "Kitchen remodel" }));
+  assert.equal(parsed.kind, "decision");
+  assert.equal(parsed.decision.toAgent, "estimate_assistant");
+});
+
+test("the decision prompt documents the estimate handoff shape and says a budget alone is NOT an estimate request", () => {
+  const req = S.buildLeadQualificationDecisionRequest(AGENT_INSTRUCTIONS, baseContext({ id: "l1", status: "qualified" }), baseEvent);
+  assert.match(req.system, /"type":"handoff","toAgent":"estimate_assistant"/);
+  assert.match(req.system, /CURRENT message explicitly asks for an estimate, quote, or proposal/);
+  assert.match(req.system, /Do NOT hand off to the Estimate Assistant just because a budget, price, or cost was mentioned/);
+  assert.match(req.system, /never for appointment\/scheduling requests/);
 });
 
 test("a valid Scheduling handoff decision parses successfully", () => {

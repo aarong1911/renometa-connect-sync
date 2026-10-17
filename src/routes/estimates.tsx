@@ -55,6 +55,11 @@ import {
   type EstimateStatus, type EstimateItemType, type EstimateItemUnit, type DiscountType, type DepositType, type WorkType,
 } from "@/lib/estimate-status";
 import { calculateEstimate, round2, type CalcLineItem } from "@/lib/estimate-calculations";
+import { UNPRICED_ESTIMATE_ERROR, UNPRICED_ESTIMATE_HINT, isPricePendingItem } from "@/lib/estimate-pricing-gate";
+import {
+  asMetadataObject, buildItemMetadata, duplicateEstimateMetadata, duplicateItemMetadata,
+  mergeEstimateMetadata, replaceEstimateItems,
+} from "@/lib/estimate-item-rows";
 import {
   sharedPresetsForCategory, findSharedPreset, PROPOSAL_PRESET_CATEGORY_LABELS, type ProposalPresetCategory,
 } from "@/lib/proposal-presets";
@@ -127,6 +132,10 @@ type EstimateItem = {
   taxable: boolean;
   optional: boolean;
   is_heading: boolean;
+  /** Estimate Assistant safety: unpriced placeholder (metadata.price_pending) — blocks sending until priced. */
+  price_pending: boolean;
+  /** The row's full metadata object (never null) — preserved across editor saves and duplicates. */
+  metadata: Record<string, unknown>;
 };
 
 export type Estimate = {
@@ -150,6 +159,8 @@ export type Estimate = {
   exclusions: string | null;
   assumptions: string | null;
   service_address: string | null;
+  /** The estimate's full metadata object (never null) — merged, not replaced, on save. */
+  metadata: Record<string, unknown>;
   valid_until: string | null;
   created_at: string;
   updated_at: string;
@@ -249,6 +260,8 @@ function mapItems(raw: any[]): EstimateItem[] {
         taxable: row.taxable !== false,
         optional: !!row.optional,
         is_heading: !!row.is_heading,
+        price_pending: isPricePendingItem(row),
+        metadata: asMetadataObject(row.metadata),
       };
     });
 }
@@ -282,6 +295,7 @@ export function mapEstimateRow(
     exclusions: r.exclusions ?? null,
     assumptions: r.assumptions ?? null,
     service_address: r.metadata?.serviceAddress ?? null,
+    metadata: asMetadataObject(r.metadata),
     valid_until: r.valid_until ?? null,
     created_at: r.created_at,
     updated_at: r.updated_at,
@@ -378,13 +392,17 @@ type LineItem = {
   taxable: boolean;
   optional: boolean;
   isHeading: boolean;
+  /** Still carries the price_pending marker; cleared the moment the owner edits the price. */
+  pricePending?: boolean;
+  /** The line's full metadata object (never null); only `price_pending` is ever managed by the editor. */
+  metadata: Record<string, unknown>;
 };
 
 function newLineItem(overrides: Partial<LineItem> = {}): LineItem {
   return {
     key: `n${Math.random().toString(36).slice(2)}`,
     itemType: "labor", name: "", description: "", quantity: "1", unit: "each",
-    unitPrice: "", taxable: true, optional: false, isHeading: false,
+    unitPrice: "", taxable: true, optional: false, isHeading: false, metadata: {},
     ...overrides,
   };
 }
@@ -393,7 +411,8 @@ function itemToLine(i: EstimateItem): LineItem {
   return {
     key: i.id, id: i.id, itemType: i.item_type, name: i.name, description: i.description ?? "",
     quantity: String(i.quantity), unit: (i.unit as EstimateItemUnit) || "each", unitPrice: String(i.unit_price),
-    taxable: i.taxable, optional: i.optional, isHeading: i.is_heading,
+    taxable: i.taxable, optional: i.optional, isHeading: i.is_heading, pricePending: i.price_pending,
+    metadata: { ...i.metadata },
   };
 }
 
@@ -770,6 +789,10 @@ export function EstimateFormSheet({
           taxable: it.taxable,
           optional: it.optional,
           is_heading: it.isHeading,
+          // ALWAYS present (uniform bulk-insert shape): estimate_items.metadata is NOT NULL and a
+          // bulk insert fills any missing key with NULL. Existing keys are preserved; only
+          // price_pending is managed (kept for an untouched pending line, removed once the price is edited).
+          metadata: buildItemMetadata(it.metadata, { pricePending: it.pricePending, isHeading: it.isHeading, price }),
         };
       });
   }
@@ -838,7 +861,8 @@ export function EstimateFormSheet({
         client_total: calc.total,
         deposit_amount: calc.depositAmount,
         balance_due: Math.max(0, calc.balanceDue),
-        metadata: { serviceAddress: address.trim() || null },
+        // Merge, never replace: keeps ai_generated / ai_execution_id and any unrelated keys.
+        metadata: mergeEstimateMetadata(estimate?.metadata, { serviceAddress: address.trim() || null }),
       };
 
       if (import.meta.env.DEV) {
@@ -858,15 +882,11 @@ export function EstimateFormSheet({
         phase = "update estimate header";
         const { error: updErr } = await supabase.from("estimates").update({ ...header, updated_at: new Date().toISOString() }).eq("id", estimate.id).eq("org_id", orgId);
         if (updErr) throw updErr;
-        phase = "delete existing line items";
-        const { error: delErr } = await supabase.from("estimate_items").delete().eq("estimate_id", estimate.id);
-        if (delErr) throw delErr;
-        phase = "insert line items";
-        const rows = buildItemRows(estimate.id);
-        if (rows.length) {
-          const { error: itemErr } = await supabase.from("estimate_items").insert(rows);
-          if (itemErr) throw itemErr;
-        }
+        // Insert the replacement rows FIRST and delete the old ones only after that succeeds, so a
+        // failed insert can never erase the estimate's existing line items (see estimate-item-rows.ts).
+        phase = "replace line items";
+        const replaced = await replaceEstimateItems(supabase, estimate.id, buildItemRows(estimate.id));
+        if (!replaced.ok) throw replaced.error;
         estimateId = estimate.id;
         if (!sendAfter) toast.success("Estimate updated");
       } else {
@@ -917,6 +937,8 @@ export function EstimateFormSheet({
   };
 
   const canSend = estimate ? (estimate.status === "draft" || estimate.status === "ready") : true;
+  // An editor line still carrying the price_pending marker with no price entered.
+  const hasUnpricedItems = items.some((it) => it.pricePending && !it.isHeading && !(parseFloat(it.unitPrice) > 0));
 
   return (
     <Sheet open={open} onOpenChange={o => !o && handleClose()}>
@@ -1156,7 +1178,7 @@ export function EstimateFormSheet({
                     <div className="w-28">
                       <div className="relative">
                         <span className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">$</span>
-                        <DecimalInput value={it.unitPrice} onChange={v => setItem(it.key, { unitPrice: v })} className="h-8 pl-4.5 text-right text-sm" placeholder="0.00" aria-label="Unit price" />
+                        <DecimalInput value={it.unitPrice} onChange={v => setItem(it.key, { unitPrice: v, pricePending: false })} className="h-8 pl-4.5 text-right text-sm" placeholder="0.00" aria-label="Unit price" />
                       </div>
                     </div>
                   </div>
@@ -1243,7 +1265,7 @@ export function EstimateFormSheet({
             {saving ? <><Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />Saving…</> : (isEdit ? "Save Changes" : "Save Draft")}
           </Button>
           {canSend && (
-            <Button type="button" className="flex-1" onClick={() => save(true)} disabled={saving}>
+            <Button type="button" className="flex-1" onClick={() => save(true)} disabled={saving || hasUnpricedItems} title={hasUnpricedItems ? UNPRICED_ESTIMATE_HINT : undefined}>
               {saving ? <><Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />Saving…</> : <><Send className="mr-1.5 h-3.5 w-3.5" />Save &amp; Send</>}
             </Button>
           )}
@@ -1687,6 +1709,8 @@ function EstimateDetailSheet({
 }) {
   const [activities, setActivities] = useState<EstimateActivityRow[]>([]);
   const [versions, setVersions] = useState<EstimateVersionRow[]>([]);
+  // Convenience only — estimate-send.ts refuses to send an unpriced estimate regardless.
+  const unpriced = !!estimate && estimate.estimate_items.some((i) => i.price_pending);
 
   useEffect(() => {
     if (!estimate) { setActivities([]); setVersions([]); return; }
@@ -1723,25 +1747,28 @@ function EstimateDetailSheet({
         </SheetHeader>
 
         <div className="mt-4 space-y-5 pb-20 text-sm">
+          {unpriced && ["draft", "ready", "sent", "viewed", "changes_requested", "expired"].includes(estimate.status) && (
+            <p className="text-xs text-amber-700 dark:text-amber-400">{UNPRICED_ESTIMATE_HINT}</p>
+          )}
           {/* Lifecycle actions — status-gated per the canonical transition map */}
           <div className="flex flex-wrap gap-2">
             {estimate.status === "draft" && (
               <>
                 <Button size="sm" variant="outline" onClick={() => onStatusChange(estimate.id, "ready")}><CheckCircle2 className="mr-1.5 h-3.5 w-3.5" />Mark Ready</Button>
-                <Button size="sm" onClick={() => onSend(estimate.id)} disabled={sending}>{sending ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Send className="mr-1.5 h-3.5 w-3.5" />}Send</Button>
+                <Button size="sm" onClick={() => onSend(estimate.id)} disabled={sending || unpriced}>{sending ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Send className="mr-1.5 h-3.5 w-3.5" />}Send</Button>
                 <Button size="sm" variant="outline" className="text-destructive" onClick={() => onStatusChange(estimate.id, "cancelled")}><Ban className="mr-1.5 h-3.5 w-3.5" />Cancel</Button>
               </>
             )}
             {estimate.status === "ready" && (
               <>
-                <Button size="sm" onClick={() => onSend(estimate.id)} disabled={sending}>{sending ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Send className="mr-1.5 h-3.5 w-3.5" />}Send</Button>
+                <Button size="sm" onClick={() => onSend(estimate.id)} disabled={sending || unpriced}>{sending ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Send className="mr-1.5 h-3.5 w-3.5" />}Send</Button>
                 <Button size="sm" variant="outline" onClick={() => onStatusChange(estimate.id, "draft")}>Return to Draft</Button>
                 <Button size="sm" variant="outline" className="text-destructive" onClick={() => onStatusChange(estimate.id, "cancelled")}><Ban className="mr-1.5 h-3.5 w-3.5" />Cancel</Button>
               </>
             )}
             {["sent", "viewed"].includes(estimate.status) && (
               <>
-                <Button size="sm" variant="outline" onClick={() => onSend(estimate.id)} disabled={sending}>{sending ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Send className="mr-1.5 h-3.5 w-3.5" />}Resend</Button>
+                <Button size="sm" variant="outline" onClick={() => onSend(estimate.id)} disabled={sending || unpriced}>{sending ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Send className="mr-1.5 h-3.5 w-3.5" />}Resend</Button>
                 <Button size="sm" variant="outline" onClick={() => onCopyLink(estimate)}>Copy Link</Button>
                 <Button size="sm" variant="outline" onClick={() => onCreateRevision(estimate)} disabled={isBusy("revision")}>{isBusy("revision") ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <History className="mr-1.5 h-3.5 w-3.5" />}Create Revision</Button>
                 {(estimate.convertedDealId || estimate.deal_id) ? (
@@ -1796,7 +1823,7 @@ function EstimateDetailSheet({
             )}
             {estimate.status === "expired" && (
               <>
-                <Button size="sm" onClick={() => onSend(estimate.id)} disabled={sending}>{sending ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Send className="mr-1.5 h-3.5 w-3.5" />}Extend &amp; Resend</Button>
+                <Button size="sm" onClick={() => onSend(estimate.id)} disabled={sending || unpriced}>{sending ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Send className="mr-1.5 h-3.5 w-3.5" />}Extend &amp; Resend</Button>
                 <Button size="sm" variant="outline" onClick={() => onCreateRevision(estimate)} disabled={isBusy("revision")}><History className="mr-1.5 h-3.5 w-3.5" />Create Revision</Button>
                 <Button size="sm" variant="outline" onClick={() => onStatusChange(estimate.id, "archived")}><Archive className="mr-1.5 h-3.5 w-3.5" />Archive</Button>
               </>
@@ -2057,6 +2084,9 @@ function EstimatesPage() {
 
   const [sendingId, setSendingId] = useState<string | null>(null);
   const handleSend = async (id: string) => {
+    // Early, friendlier refusal; the server (estimate-send.ts) is authoritative.
+    const target = estimates.find((x) => x.id === id);
+    if (target?.estimate_items.some((i) => i.price_pending)) { toast.error(UNPRICED_ESTIMATE_ERROR); return; }
     setSendingId(id);
     const result = await sendEstimateProposal(id);
     if (!result.ok) toast.error(result.error ?? "Failed to send proposal");
@@ -2238,7 +2268,9 @@ function EstimatesPage() {
         owner_id: e.owner_id, valid_until: plusDays(30), scope: e.scope, notes: e.notes,
         customer_note: e.customer_note, terms: e.terms, exclusions: e.exclusions, assumptions: e.assumptions,
         tax_rate: e.taxRate, discount_type: e.discountType, discount_value: e.discountValue,
-        deposit_type: e.depositType, deposit_value: e.depositValue, metadata: { serviceAddress: e.service_address },
+        deposit_type: e.depositType, deposit_value: e.depositValue,
+        // Provenance (e.g. ai_generated) is kept; ai_execution_id is dropped so a copy never looks like a replay.
+        metadata: { ...duplicateEstimateMetadata(e.metadata), serviceAddress: e.service_address },
         // total + client_total together (trg_sync_total forces
         // total := client_total on every write — see save()'s comment).
         subtotal: e.subtotal, discount_total: e.discountTotal, tax_total: e.taxTotal,
@@ -2249,8 +2281,17 @@ function EstimatesPage() {
         estimate_id: est.id, category: it.category, item_type: it.item_type, name: it.name, description: it.description,
         quantity: it.quantity, unit: it.unit, unit_price: it.unit_price, total: it.total, position: idx,
         taxable: it.taxable, optional: it.optional, is_heading: it.is_heading,
+        // Uniform shape on every row; price_pending is preserved (an unpriced copy stays blocked from Send).
+        metadata: duplicateItemMetadata(it.metadata),
       }));
-      if (rows.length) await supabase.from("estimate_items").insert(rows);
+      if (rows.length) {
+        const { error: itemsErr } = await supabase.from("estimate_items").insert(rows);
+        if (itemsErr) {
+          // Don't leave an item-less copy behind (the copy header is brand new, so removing it is safe).
+          await supabase.from("estimates").delete().eq("id", est.id);
+          throw itemsErr;
+        }
+      }
       toast.success("Estimate duplicated");
       load();
     } catch (err: any) {
@@ -2375,10 +2416,10 @@ function EstimatesPage() {
                         <DropdownMenuContent align="end">
                           <DropdownMenuItem onClick={() => setViewTarget(e)}>Preview Proposal</DropdownMenuItem>
                           {e.status !== "archived" && <DropdownMenuItem onClick={() => { setSelected(null); setEditTarget(e); }}>Edit</DropdownMenuItem>}
-                          {(e.status === "draft" || e.status === "ready") && <DropdownMenuItem onClick={() => handleSend(e.id)}>Send Proposal</DropdownMenuItem>}
+                          {(e.status === "draft" || e.status === "ready") && <DropdownMenuItem disabled={e.estimate_items.some(i => i.price_pending)} onClick={() => handleSend(e.id)}>Send Proposal</DropdownMenuItem>}
                           {["sent", "viewed", "changes_requested", "expired"].includes(e.status) && (
                             <>
-                              <DropdownMenuItem onClick={() => handleSend(e.id)}>{e.status === "expired" ? "Extend & Resend" : "Resend Proposal"}</DropdownMenuItem>
+                              <DropdownMenuItem disabled={e.estimate_items.some(i => i.price_pending)} onClick={() => handleSend(e.id)}>{e.status === "expired" ? "Extend & Resend" : "Resend Proposal"}</DropdownMenuItem>
                               <DropdownMenuItem onClick={() => handleCopyLink(e)}>Copy Proposal Link</DropdownMenuItem>
                               <DropdownMenuItem onClick={() => handleCreateRevision(e)}>Create Revision</DropdownMenuItem>
                             </>

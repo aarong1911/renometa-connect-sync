@@ -44,6 +44,7 @@ import type {
   Actor,
   AutonomyLevel,
 } from "../../../../src/lib/agentic/types";
+import type { EstimateContextOutput } from "../../../../src/lib/agentic/estimate-handlers";
 import type { AIToolExecutionResult } from "./tools/types";
 
 // ── Channels ─────────────────────────────────────────────────────────────
@@ -202,6 +203,12 @@ export type AITrustedContext = {
   contactId?: string;
   leadId?: string;
   projectId?: string;
+  /** Estimate Assistant Foundation. Only ever set by trusted server code
+   * that has already verified the estimate belongs to `orgId` (e.g.
+   * ai-orchestrate.ts's verifyEntityBelongsToOrg). Never from a model. When
+   * absent, the Estimate Assistant resolves the current estimate itself from
+   * projectId/leadId/contactId (org-scoped). */
+  estimateId?: string;
   /** Matches the conversation_states convention of keying a conversation
    * by (contact, channel) — e.g. `${contactId}::${channel}` — until/unless
    * a real conversations table exists. Optional: not every event is part
@@ -364,6 +371,20 @@ export type AIResolvedContext = {
    * hand-built contexts in older tests still type-check; the real
    * buildAIContext() always populates it. */
   businessKnowledge?: AIBusinessKnowledge;
+  /**
+   * Estimate Assistant Foundation. NOT populated by buildAIContext() — the
+   * estimate is only relevant once a run actually belongs to the Estimate
+   * Assistant, so orchestrator.ts's runEstimateAssistantTurn() reads it ONCE
+   * through the audited get_estimate_context action and attaches it to a
+   * derived copy of this context. That keeps Reception / Lead Qualification /
+   * Scheduling turns free of an extra query, and means the Estimate
+   * Assistant reuses (never re-fetches) the contact/lead/project/Business
+   * Knowledge already resolved above.
+   *
+   * `undefined` means "not loaded" (or the read failed) — NEVER "no estimate
+   * exists"; that is `{ found: false }`.
+   */
+  estimate?: EstimateContextOutput;
   channel: AIChannel;
 };
 
@@ -376,7 +397,7 @@ export type AIResolvedContext = {
 // configuration on a shared orchestrator, and defining a key here confers
 // no capability by itself.
 
-export const KNOWN_AI_AGENT_KEYS = ["reception", "lead_qualification", "scheduling"] as const;
+export const KNOWN_AI_AGENT_KEYS = ["reception", "lead_qualification", "scheduling", "estimate_assistant"] as const;
 export type KnownAIAgentKey = (typeof KNOWN_AI_AGENT_KEYS)[number];
 export type AIAgentKey = KnownAIAgentKey | (string & {});
 

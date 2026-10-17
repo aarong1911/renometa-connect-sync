@@ -30,6 +30,10 @@ import {
   getLeadContext, createFollowUpTask, addInternalNote, draftCustomerReply, sendSms, sendWhatsapp,
   scheduleAppointment, getAvailability, getAppointmentTypes,
 } from "./handlers";
+import {
+  getEstimateContext, createEstimateDraft, addEstimateLineItems,
+  getEstimateContextInput, createEstimateDraftInput, addEstimateLineItemsInput,
+} from "./estimate-handlers";
 
 // ── Zod input schemas ────────────────────────────────────────────────────
 
@@ -250,6 +254,27 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition<any, any>> = {
     isExecutable: false,
   },
 
+  // Estimate Assistant Foundation. The first REAL estimate read: a bounded,
+  // org-scoped, internal-field-free snapshot (see estimate-handlers.ts's
+  // header). `get_estimate_status` above stays a metadata-only stub — this is
+  // a different, richer action, not a replacement.
+  get_estimate_context: {
+    key: "get_estimate_context",
+    displayName: "Get estimate context",
+    description: "Loads a bounded snapshot of the estimate linked to a project/lead/contact: header, line items, stored totals, and whether trusted pricing exists. Read-only; never exposes internal cost/margin fields.",
+    category: "estimate",
+    riskLevel: "read",
+    supportedActorTypes: ["user", "agent", "workflow", "system"],
+    inputSchema: getEstimateContextInput,
+    requiresApproval: false,
+    minimumAutonomyLevel: 1,
+    idempotent: true,
+    timeoutMs: 8000,
+    retryPolicy: DEFAULT_RETRY,
+    isExecutable: true,
+    handler: getEstimateContext,
+  },
+
   // ── Low-risk writes ──────────────────────────────────────────────────────
   create_follow_up_task: {
     key: "create_follow_up_task",
@@ -403,6 +428,45 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition<any, any>> = {
     // for duplicate-execution protection — no new idempotency framework.
     isExecutable: true,
     handler: scheduleAppointment,
+  },
+  // ── Estimate mutations (Estimate Assistant Foundation) ───────────────────
+  // Financially meaningful, so BOTH require human approval unconditionally
+  // (requiresApproval: true is not autonomy-configurable) and sit at the
+  // same Level-2 floor + "high" risk label as schedule_appointment. Neither
+  // schema has a price/quantity/tax/discount/deposit field — see
+  // estimate-handlers.ts's "NO INVENTED MONEY" note. Neither sends, accepts,
+  // converts, or status-changes an estimate; both are draft-only.
+  create_estimate_draft: {
+    key: "create_estimate_draft",
+    displayName: "Create estimate draft",
+    description: "Proposes creating a DRAFT estimate (title, scope, and unpriced line-item structure) for a customer. Prices, quantities, tax, discounts and deposits are never part of this action — the business owner enters them. Never sends the estimate.",
+    category: "estimate",
+    riskLevel: "high",
+    supportedActorTypes: ["user", "agent", "workflow"],
+    inputSchema: createEstimateDraftInput,
+    requiresApproval: true,
+    minimumAutonomyLevel: 2,
+    idempotent: true,
+    timeoutMs: 8000,
+    retryPolicy: DEFAULT_RETRY,
+    isExecutable: true,
+    handler: createEstimateDraft,
+  },
+  add_estimate_line_items: {
+    key: "add_estimate_line_items",
+    displayName: "Add estimate line items",
+    description: "Proposes adding unpriced line-item structure to an existing DRAFT estimate. Totals are recomputed server-side by the shared estimate calculation engine. Existing items, prices, tax, discounts and deposits are never modified.",
+    category: "estimate",
+    riskLevel: "high",
+    supportedActorTypes: ["user", "agent", "workflow"],
+    inputSchema: addEstimateLineItemsInput,
+    requiresApproval: true,
+    minimumAutonomyLevel: 2,
+    idempotent: true,
+    timeoutMs: 8000,
+    retryPolicy: DEFAULT_RETRY,
+    isExecutable: true,
+    handler: addEstimateLineItems,
   },
   get_availability: {
     key: "get_availability",

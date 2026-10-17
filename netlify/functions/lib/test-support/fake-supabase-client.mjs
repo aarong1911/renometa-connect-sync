@@ -98,7 +98,7 @@ function parseCondition(item) {
 }
 
 class FakeQueryBuilder {
-  constructor(table, store, uniqueConstraints) {
+  constructor(table, store, uniqueConstraints, notNullColumns, bulkNullFill, afterInsert) {
     this.table = table;
     this.store = store;
     // AI-2E extension: an array of column-name arrays, e.g.
@@ -106,6 +106,15 @@ class FakeQueryBuilder {
     // own doc comment. Empty/undefined means "no declared constraint,"
     // matching this fake's original no-constraints-enforced behavior.
     this.uniqueConstraints = uniqueConstraints ?? [];
+    // Opt-in NOT NULL enforcement (options.notNullColumns) — see createFakeSupabaseClient's doc. Empty by default.
+    this.notNullColumns = notNullColumns ?? [];
+    // Opt-in (options.bulkInsertMissingAsNull): model supabase-js/PostgREST bulk-insert semantics, where the
+    // column list is the UNION of every row's keys and a row lacking one of them gets NULL (not the column
+    // default) — the exact behavior behind the estimate_items.metadata 23502. Off by default.
+    this.bulkNullFill = !!bulkNullFill;
+    // Opt-in (options.afterInsert[table]): called as hook(newRow, store) after a successful single-row INSERT, to
+    // simulate an AFTER INSERT database trigger (e.g. log_estimate_activity writing estimate_activities). Off by default.
+    this.afterInsert = afterInsert ?? null;
     this.filters = [];
     this.op = null; // "insert" | "update" | "upsert" | "select" | "delete"
     this.payload = null;
@@ -127,6 +136,11 @@ class FakeQueryBuilder {
   filter(col, op, val) { this.filters.push({ col, op, val }); return this; }
   or(expr) { this.filters.push({ op: "or", branches: splitTopLevel(expr).map((i) => [parseCondition(i)]) }); return this; }
   in(col, vals) { this.filters.push({ col, op: "in", val: vals }); return this; }
+
+  // Type-level-only in supabase-js (`.returns<T>()` just narrows the result
+  // type, it adds no query behavior) — a no-op here. Added so the real
+  // estimate-send.ts handler can run against this fake in the send-gate tests.
+  returns() { return this; }
 
   order(col, opts) {
     this.orderSpec = { col, ascending: opts?.ascending !== false };
@@ -225,6 +239,39 @@ class FakeQueryBuilder {
   async _execute() {
     const rows = this.store.get(this.table) ?? [];
 
+    // Estimate Assistant Foundation extension: a bulk insert (PostgREST
+    // `.insert([row, row, ...])`, used by estimate-handlers.ts's line-item
+    // writes) applies row by row through the SAME single-row path, so unique
+    // constraints / generated ids behave identically. Additive — no existing
+    // caller passes an array to insert().
+    if (this.op === "insert" && Array.isArray(this.payload)) {
+      let bulkRows = this.payload;
+      if (this.bulkNullFill) {
+        const union = new Set();
+        for (const row of bulkRows) for (const k of Object.keys(row)) union.add(k);
+        bulkRows = bulkRows.map((row) => {
+          const filled = { ...row };
+          for (const k of union) if (filled[k] === undefined) filled[k] = null;
+          return filled;
+        });
+      }
+      // A single bulk INSERT statement is atomic in Postgres: if any row is rejected, NONE are written.
+      const before = (this.store.get(this.table) ?? []).slice();
+      const out = [];
+      for (const p of bulkRows) {
+        const one = new FakeQueryBuilder(this.table, this.store, this.uniqueConstraints, this.notNullColumns);
+        one.op = "insert";
+        one.payload = p;
+        const r = await one._execute();
+        if (r.error) {
+          this.store.set(this.table, before);
+          return r;
+        }
+        out.push(...(r.data ?? []));
+      }
+      return { data: out, error: null };
+    }
+
     if (this.op === "insert") {
       // AI-2E extension: a declared unique constraint (see
       // createFakeSupabaseClient's doc comment) now genuinely rejects a
@@ -258,6 +305,18 @@ class FakeQueryBuilder {
           };
         }
       }
+      // Opt-in NOT NULL enforcement: a missing/null value in a declared column
+      // is rejected with Postgres's real error shape (23502), which is what a
+      // service-role write with no auth.uid() default really hits (e.g.
+      // estimates.created_by). Columns are NOT checked unless declared.
+      for (const col of this.notNullColumns) {
+        if (this.payload[col] === undefined || this.payload[col] === null) {
+          return {
+            data: null,
+            error: { code: "23502", message: `null value in column "${col}" of relation "${this.table}" violates not-null constraint` },
+          };
+        }
+      }
       // Real Postgres tables in this schema default `id` to
       // gen_random_uuid() — callers like action-executor.ts's insertStep()
       // rely on getting a real generated id back via
@@ -268,6 +327,7 @@ class FakeQueryBuilder {
       if (newRow.id === undefined) newRow.id = crypto.randomUUID();
       rows.push(newRow);
       this.store.set(this.table, rows);
+      if (this.afterInsert) this.afterInsert(newRow, this.store);
       return { data: [newRow], error: null };
     }
 
@@ -286,7 +346,7 @@ class FakeQueryBuilder {
       // Bulk upsert (gmail-sync.ts upserts an array): apply row by row.
       const out = [];
       for (const p of this.payload) {
-        const one = new FakeQueryBuilder(this.table, this.store, this.uniqueConstraints);
+        const one = new FakeQueryBuilder(this.table, this.store, this.uniqueConstraints, this.notNullColumns);
         one.op = "upsert";
         one.payload = p;
         one.upsertOpts = this.upsertOpts;
@@ -375,10 +435,17 @@ export function createFakeSupabaseClient(seedTables = {}, rpcHandlers = {}, opti
   // see the insert-op comment above for why this exists (AI-2E). Omitted
   // entirely by default, matching every pre-existing caller of this fake.
   const uniqueConstraints = options.uniqueConstraints ?? {};
+  // `options.notNullColumns`: { tableName: ["col", ...] } — opt-in NOT NULL
+  // enforcement on single-row/bulk inserts (Estimate Assistant: estimates.created_by).
+  const notNullColumns = options.notNullColumns ?? {};
+  // `options.bulkInsertMissingAsNull`: ["tableName", ...] — opt-in PostgREST union-of-keys NULL fill for bulk inserts.
+  const bulkNullFillTables = options.bulkInsertMissingAsNull ?? [];
+  // `options.afterInsert`: { tableName: (row, store) => void } — opt-in simulated AFTER INSERT trigger.
+  const afterInsertHooks = options.afterInsert ?? {};
 
   return {
     from(table) {
-      return new FakeQueryBuilder(table, store, uniqueConstraints[table]);
+      return new FakeQueryBuilder(table, store, uniqueConstraints[table], notNullColumns[table], bulkNullFillTables.includes(table), afterInsertHooks[table]);
     },
     async rpc(fnName, args) {
       const handler = rpcHandlers[fnName];

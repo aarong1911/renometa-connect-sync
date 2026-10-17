@@ -74,6 +74,43 @@ type RunClarificationSummary = {
   reason?: string;
 };
 
+/** Estimate Assistant Foundation — compact audit record written by
+ * orchestrator.ts's runEstimateAssistantTurn() (booleans/counts/internal ids
+ * only — never line-item text, prices, or customer words). Every field is
+ * optional and read defensively: this is jsonb read back from the database. */
+type RunEstimateSummary = {
+  contextLoaded?: boolean;
+  estimateFound?: boolean;
+  estimateId?: string;
+  estimateStatus?: string;
+  ambiguous?: boolean;
+  itemCount?: number;
+  pricePendingCount?: number;
+  projectId?: string;
+  proposal?: string;
+  priceGuardTriggered?: boolean;
+  /** Value-free structured-decision validation record (statuses / field paths / Zod codes only). */
+  decisionValidation?: {
+    initial?: { status?: string; normalized?: boolean; issues?: Array<{ path?: string; code?: string }> };
+    repairAttempted?: boolean;
+    repair?: { status?: string; normalized?: boolean; issues?: Array<{ path?: string; code?: string }> };
+  };
+};
+
+/** One short, value-free line describing how the model's structured decision fared. */
+function describeDecisionValidation(v: RunEstimateSummary["decisionValidation"]): string | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const issuesOf = (stage?: { issues?: Array<{ path?: string; code?: string }> }) =>
+    (stage?.issues ?? []).filter((i) => typeof i?.path === "string" && typeof i?.code === "string").map((i) => `${i.path} (${i.code})`).join(", ");
+  if (v.initial?.status === "valid") return v.initial.normalized ? "Valid on first attempt (harmless formatting normalized)" : "Valid on first attempt";
+  const first = issuesOf(v.initial);
+  if (!v.repairAttempted) return `Invalid on first attempt${first ? `: ${first}` : ""}`;
+  const base = `Invalid on first attempt${first ? ` (${first})` : ""}; repair attempted: `;
+  if (v.repair?.status === "valid") return `${base}succeeded`;
+  const second = issuesOf(v.repair);
+  return `${base}failed${v.repair?.status === "error" ? " (model call error)" : second ? ` (${second})` : ""} — generic reply used`;
+}
+
 /** AI-1K addition — the backend persists only this compact audit record
  * (fromAgent/toAgent/reason), never knownFacts/openQuestions/raw model
  * output (see orchestrator.ts's AIHandoffSummary). Kept optional and
@@ -91,6 +128,7 @@ type RunInputSummary = {
   context?: RunContextPresence;
   handoff?: unknown;
   clarification?: RunClarificationSummary;
+  estimate?: RunEstimateSummary;
 };
 
 type RunOutputSummary = {
@@ -421,6 +459,7 @@ function ExecutionDetail({ row, usage }: { row: ExecutionRow; usage?: UsageInfo 
   const route = input.route;
   const context = input.context;
   const handoff = getValidHandoff(input.handoff);
+  const estimate = input.estimate && typeof input.estimate === "object" ? input.estimate : undefined;
 
   return (
     // No outer Card here — this now renders inline directly beneath its own
@@ -474,6 +513,32 @@ function ExecutionDetail({ row, usage }: { row: ExecutionRow; usage?: UsageInfo 
             {formatAgentKey(handoff.fromAgent)} <span className="text-muted-foreground">→</span> {formatAgentKey(handoff.toAgent)}
           </p>
           <p className="text-[11px] leading-snug text-muted-foreground">{handoff.reason}</p>
+        </div>
+      )}
+
+      {estimate && (
+        <div className="space-y-1.5">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Estimate</div>
+          <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+            <Field label="Estimate context" value={estimate.contextLoaded ? "Loaded" : "Not loaded"} />
+            <Field label="Existing estimate" value={estimate.estimateFound ? `Yes${estimate.estimateStatus ? ` (${estimate.estimateStatus})` : ""}` : estimate.contextLoaded ? "None" : "—"} />
+            <Field label="Line items" value={typeof estimate.itemCount === "number" ? `${estimate.itemCount}${typeof estimate.pricePendingCount === "number" && estimate.pricePendingCount > 0 ? ` (${estimate.pricePendingCount} unpriced)` : ""}` : "—"} />
+            <Field label="Proposal" value={estimate.proposal ? <span className="capitalize">{estimate.proposal.replace(/_/g, " ")}</span> : "None"} />
+          </div>
+          {estimate.ambiguous && <p className="text-[11px] text-muted-foreground">More than one active estimate matched — no change was proposed.</p>}
+          {describeDecisionValidation(estimate.decisionValidation) && (
+            <p className="text-[11px] text-muted-foreground">Decision validation: {describeDecisionValidation(estimate.decisionValidation)}</p>
+          )}
+          {estimate.priceGuardTriggered && (
+            <Badge variant="outline" className="h-5 rounded text-[10px]">Unsupported price blocked in reply</Badge>
+          )}
+          {(estimate.estimateId || estimate.projectId) && (
+            <p className="font-mono text-[10px] text-muted-foreground">
+              {estimate.estimateId && <>estimate {estimate.estimateId}</>}
+              {estimate.estimateId && estimate.projectId && " · "}
+              {estimate.projectId && <>project {estimate.projectId}</>}
+            </p>
+          )}
         </div>
       )}
 

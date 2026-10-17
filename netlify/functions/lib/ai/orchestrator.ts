@@ -101,6 +101,20 @@ import {
 import { resolveDateIntent, type ResolveDateIntentResult } from "./scheduling-date-intent";
 import { executeStep, type ExecuteStepResult } from "../../../../src/lib/agentic/action-executor";
 import { handleClarifyDecision } from "./knowledge-clarification";
+// Estimate Assistant Foundation. Reached ONLY via a Lead Qualification
+// handoff (router.ts never selects it directly) — see runEstimateAssistantTurn().
+import {
+  ESTIMATE_ASSISTANT_TOOL_ALLOWLIST,
+  GENERIC_FALLBACK_RESPONSE as ESTIMATE_GENERIC_FALLBACK_RESPONSE,
+  buildEstimateAssistantDecisionRequest,
+  buildEstimateAssistantFinalRequest,
+  buildTrustedAddItemsInput,
+  buildTrustedCreateDraftInput,
+  guardEstimateReply,
+  parseEstimateAssistantDecision,
+  summarizeProposalSubmitted,
+} from "./agents/estimate-assistant";
+import type { EstimateContextOutput } from "../../../../src/lib/agentic/estimate-handlers";
 import {
   SCHEDULING_OFFER_CHANNELS,
   clearOfferedSlots,
@@ -377,6 +391,24 @@ const SYSTEM_AGENTS: Partial<Record<AIAgentKey, SystemAgentConfig>> = {
       "Respond briefly and naturally, as if speaking directly to the customer — this conversation is a continuation of the same business relationship Lead Qualification was already having with them, not a new introduction.",
     ].join(" "),
   },
+  // Estimate Assistant Foundation: reached only via a Lead Qualification
+  // handoff. The estimate-specific rules (money, permits-vs-permit-fees,
+  // known-vs-proposed) live in agents/estimate-assistant.ts's
+  // ESTIMATE_ASSISTANT_RULES so the decision and final prompts share one
+  // definition; this string is the agent's identity and its non-negotiables.
+  estimate_assistant: {
+    agentKey: "estimate_assistant",
+    instructions: [
+      "You are the Estimate Assistant, responsible for helping prepare accurate estimate drafts for a home improvement contractor from TRUSTED project, CRM, estimate, and Business Knowledge context.",
+      "The business using RenoMeta Connect is the contractor the customer is contacting — you represent THAT business, not a marketplace, referral service, or neutral third party.",
+      "Use ONLY the trusted business, project, and estimate context provided below. Never invent prices, quantities, measurements, taxes, discounts, deposits, permit fees, warranty terms, project duration, company policies, or line items.",
+      "Say explicitly what is still missing instead of guessing. Distinguish facts you were given from structure you are proposing.",
+      "Do not promise that an estimate has been created, updated, or sent unless you were told a trusted action succeeded, and never call a price final unless it is stored on the estimate.",
+      "If the customer asks for something outside estimating (for example appointment times), say the team will follow up on that rather than answering it yourself.",
+      "When the customer's first name is known from the CRM context, use it naturally where it fits — never guess a name.",
+      "Respond briefly and naturally, as if speaking directly to the customer — this is a continuation of the same business conversation, not a new introduction.",
+    ].join(" "),
+  },
 };
 
 // ── Observability summaries (AI-1I-A) ────────────────────────────────────
@@ -478,6 +510,44 @@ type AIExecutionInputSummary = {
   tooling?: AIToolingSummary;
   handoff?: AIHandoffSummary;
   clarification?: AIClarificationSummary;
+  estimate?: AIEstimateSummary;
+};
+
+/** Estimate Assistant Foundation: a compact audit record of what the
+ * Estimate Assistant saw and did — booleans/counts/ids only, never line-item
+ * text, prices, or the customer's words. `estimateId`/`projectId` are
+ * internal ids for the Run Inspector (staff-only surface), never customer
+ * output. `priceGuardTriggered` records that the deterministic money guard
+ * replaced a reply that stated an ungrounded dollar figure. */
+type AIEstimateSummary = {
+  contextLoaded: boolean;
+  estimateFound?: boolean;
+  estimateId?: string;
+  estimateStatus?: string;
+  ambiguous?: boolean;
+  itemCount?: number;
+  pricePendingCount?: number;
+  projectId?: string;
+  proposal?: "create_estimate_draft" | "add_estimate_line_items";
+  priceGuardTriggered?: boolean;
+  /** Structured-decision validation outcome — VALUE-FREE: statuses, schema field
+   * paths and Zod issue codes only. Never the raw model output, field values,
+   * customer text, ids or prompt content. */
+  decisionValidation?: AIDecisionValidation;
+};
+
+type AIDecisionValidationStage = {
+  status: "valid" | "invalid" | "error";
+  /** The narrow benign normalization (omit null/blank optional text, unknown itemType -> custom) was applied. */
+  normalized?: boolean;
+  issues?: Array<{ path: string; code: string }>;
+};
+
+type AIDecisionValidation = {
+  initial: AIDecisionValidationStage;
+  /** At most one repair call is ever made. */
+  repairAttempted: boolean;
+  repair?: AIDecisionValidationStage;
 };
 
 export type OrchestrateAIParams = {
@@ -588,6 +658,16 @@ export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunR
     if (route.agentKey === "scheduling") {
       return await runSchedulingTurn({
         supabase, trustedContext, event, context, modelProvider, executionId, agentConfig, inputSummary, now,
+      });
+    }
+
+    // Estimate Assistant Foundation. router.ts never returns this key today
+    // (it is handoff-only), but if a future route does, it must run the real
+    // estimate flow — never the generic plain-response fallthrough below,
+    // which would answer an estimate question with no estimate grounding.
+    if (route.agentKey === "estimate_assistant") {
+      return await runEstimateAssistantTurn({
+        supabase, trustedContext, event, context, modelProvider, executionId, agentConfig, inputSummary,
       });
     }
 
@@ -842,6 +922,44 @@ async function runLeadQualificationTurn(params: {
       openQuestions: decision.openQuestions,
     };
     const handoffSummary: AIHandoffSummary = { fromAgent: "lead_qualification", toAgent: decision.toAgent, reason: decision.reason };
+
+    // Estimate Assistant Foundation: the second allowlisted destination.
+    // Same execution row, same unmodified trustedContext, Lead
+    // Qualification's own usage folded in via seedUsage — exactly the
+    // Scheduling precedent below. Dispatched BEFORE the Scheduling lookup so
+    // an estimate handoff can never accidentally run Scheduling.
+    if (decision.toAgent === "estimate_assistant") {
+      // Deterministic gate: an estimate needs SOMETHING trusted to be an
+      // estimate for. With no lead/contact/project/estimate resolved there
+      // is nothing to read or attach to, so the handoff is declined with a
+      // safe reply rather than letting the agent talk about estimates with
+      // zero grounding.
+      const hasTrustedSubject = !!(trustedContext.leadId || trustedContext.contactId || trustedContext.projectId || trustedContext.estimateId);
+      const estimateConfig = SYSTEM_AGENTS.estimate_assistant;
+      if (!hasTrustedSubject || !estimateConfig) {
+        return await finalizeLeadQualificationRun(supabase, executionId, activeAgentKey, {
+          status: "succeeded",
+          responseText: ESTIMATE_NO_SUBJECT_RESPONSE,
+          inputTokens: totalInputTokens,
+          outputTokens: totalOutputTokens,
+          costUsd: totalCostUsd,
+          inputSummary,
+        });
+      }
+      const estimateResult = await runEstimateAssistantTurn({
+        supabase,
+        trustedContext,
+        event,
+        context,
+        modelProvider,
+        executionId,
+        agentConfig: estimateConfig,
+        inputSummary: { ...inputSummary, handoff: handoffSummary },
+        handoff,
+        seedUsage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens, costUsd: totalCostUsd },
+      });
+      return { ...estimateResult, handoff };
+    }
 
     const schedulingConfig = SYSTEM_AGENTS.scheduling;
     if (!schedulingConfig) {
@@ -1978,6 +2096,326 @@ async function finalizeSchedulingRun(
     responseText: params.responseText,
     error: params.errorMessage,
   };
+}
+
+// ── Estimate Assistant turn (Estimate Assistant Foundation) ─────────────
+//
+// Reached via a Lead Qualification handoff (runLeadQualificationTurn()'s
+// estimate_assistant branch) — same executionId, same unmodified
+// trustedContext, no second execution row, exactly the Scheduling precedent.
+//
+// Sequence:
+//
+//   step 1  get_estimate_context   (deterministic, read-only, audited — NOT
+//                                   model-chosen; trusted ids only)
+//   model call (structured decision)
+//     -> "respond"                -> money guard -> finalize
+//     -> "clarify"                -> existing Owner Clarification workflow
+//     -> "propose_estimate_draft" -> server pre-checks -> executeAITool(
+//                                    create_estimate_draft, step 2) ->
+//                                    approval_required -> one response-only
+//                                    model call -> finalize "awaiting_approval"
+//     -> "propose_add_line_items" -> server pre-checks -> executeAITool(
+//                                    add_estimate_line_items, step 2) -> same
+//
+// At most one mutation proposal per run, and it can only ever reach
+// "approval_required": both mutation actions are registered with
+// requiresApproval:true, so this function has NO path that mutates an
+// estimate. Every customer-facing string goes through guardEstimateReply().
+// Like Scheduling (and unlike Lead Qualification), every path produces a
+// real customer-facing reply — a failed proposal gets a safe apology, never
+// silence.
+//
+// Loop prevention is structural: the decision schema has no handoff variant.
+
+/** Reply when an estimate handoff is requested but the run has no trusted
+ * lead/contact/project/estimate to ground it on. */
+const ESTIMATE_NO_SUBJECT_RESPONSE =
+  "I'd be glad to help get an estimate started — could you tell me a little about the project so I can pull up the right details?";
+
+function estimateItemNames(items: Array<{ name: string }> | undefined): string[] {
+  return (items ?? []).map((i) => i.name);
+}
+
+async function runEstimateAssistantTurn(params: {
+  supabase: SupabaseClient;
+  trustedContext: AITrustedContext;
+  event: AIChannelEvent;
+  context: AIResolvedContext;
+  modelProvider: ModelProvider;
+  executionId: string;
+  agentConfig: SystemAgentConfig;
+  inputSummary: AIExecutionInputSummary;
+  handoff?: AIAgentHandoff;
+  seedUsage?: { inputTokens: number; outputTokens: number; costUsd: number };
+}): Promise<AIRunResult> {
+  const { supabase, trustedContext, event, context, modelProvider, executionId, agentConfig, handoff, seedUsage } = params;
+  const agentKey: AIAgentKey = "estimate_assistant";
+  const orgId = trustedContext.orgId;
+  const autonomyLevel = trustedContext.autonomyLevel ?? 2;
+
+  let totalInputTokens = seedUsage?.inputTokens ?? 0;
+  let totalOutputTokens = seedUsage?.outputTokens ?? 0;
+  let totalCostUsd = seedUsage?.costUsd ?? 0;
+  const toolResults: AIToolExecutionResult[] = [];
+  let inputSummary: AIExecutionInputSummary = params.inputSummary;
+
+  const finalize = async (
+    status: "succeeded" | "failed" | "awaiting_approval",
+    responseText: string | undefined,
+    errorMessage?: string,
+  ): Promise<AIRunResult> => {
+    const finalized = await finalizeExecution(supabase, executionId, {
+      agentKey,
+      status,
+      error: errorMessage,
+      outputSummary: responseText !== undefined ? { responseText } : undefined,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+      costUsd: totalCostUsd,
+      inputSummary,
+    });
+    if (!finalized) console.error(`[ai/orchestrator] estimate_assistant execution ${executionId} (${status}) could not be finalized in the database.`);
+    return {
+      executionId,
+      status: status === "succeeded" ? "completed" : status === "awaiting_approval" ? "awaiting_approval" : "failed",
+      agentKey,
+      responseText,
+      error: errorMessage,
+      toolResults: toolResults.length > 0 ? toolResults : undefined,
+    };
+  };
+
+  const trackUsage = async (resp: Awaited<ReturnType<ModelProvider["run"]>>) => {
+    totalInputTokens += resp.usage.inputTokens;
+    totalOutputTokens += resp.usage.outputTokens;
+    totalCostUsd += await recordUsageEvent(supabase, {
+      orgId, executionId, provider: resp.provider, model: resp.model,
+      inputTokens: resp.usage.inputTokens, outputTokens: resp.usage.outputTokens,
+    });
+  };
+
+  // ── Step 1: trusted, audited, read-only estimate read ─────────────────
+  const readResult = await executeAITool(
+    {
+      toolName: "get_estimate_context",
+      input: {
+        ...(trustedContext.estimateId ? { estimateId: trustedContext.estimateId } : {}),
+        ...(trustedContext.projectId ? { projectId: trustedContext.projectId } : {}),
+        ...(trustedContext.leadId ? { leadId: trustedContext.leadId } : {}),
+        ...(trustedContext.contactId ? { contactId: trustedContext.contactId } : {}),
+      },
+    },
+    {
+      supabase, orgId, actor: trustedContext.actor, executionId, sequence: 1, autonomyLevel,
+      targetEntityType: primaryTargetEntity(trustedContext).targetEntityType ?? undefined,
+      targetEntityId: primaryTargetEntity(trustedContext).targetEntityId ?? undefined,
+    },
+  );
+  toolResults.push(readResult);
+
+  const estimate: EstimateContextOutput | undefined =
+    readResult.status === "completed" ? (readResult.output as EstimateContextOutput) : undefined;
+  const estimateSummary: AIEstimateSummary = estimate
+    ? {
+        contextLoaded: true,
+        estimateFound: estimate.found,
+        estimateId: estimate.estimate?.id,
+        estimateStatus: estimate.estimate?.status,
+        ambiguous: estimate.ambiguous || undefined,
+        itemCount: estimate.items?.filter((i) => !i.isHeading).length,
+        pricePendingCount: estimate.items?.filter((i) => i.pricePending).length,
+        projectId: trustedContext.projectId,
+      }
+    : { contextLoaded: false, projectId: trustedContext.projectId };
+  inputSummary = { ...inputSummary, tooling: { attempted: true, toolName: "get_estimate_context" }, estimate: estimateSummary };
+
+  // Derived context: everything Business Knowledge / CRM already resolved,
+  // plus the one estimate read. Nothing is fetched twice.
+  const estimateContext: AIResolvedContext = { ...context, estimate };
+
+  const guard = (text: string): string => {
+    const g = guardEstimateReply(text, estimateContext, event);
+    if (g.replaced) inputSummary = { ...inputSummary, estimate: { ...(inputSummary.estimate ?? estimateSummary), priceGuardTriggered: true } };
+    return g.text;
+  };
+
+  /** One response-only model call after a proposal/outcome is known. */
+  const respondWithOutcome = async (outcome: string, status: "succeeded" | "awaiting_approval"): Promise<AIRunResult> => {
+    let finalResponse;
+    try {
+      finalResponse = await modelProvider.run(buildEstimateAssistantFinalRequest(agentConfig.instructions, estimateContext, event, outcome, handoff));
+    } catch (err) {
+      console.error(`[ai/orchestrator] estimate_assistant final response call failed (execution ${executionId}):`, err);
+      return await finalize("failed", undefined, "The AI model could not generate a final response.");
+    }
+    await trackUsage(finalResponse);
+    return await finalize(status, guard(finalResponse.text));
+  };
+
+  // ── Step 2: structured decision (+ AT MOST ONE repair) ──────────────────
+  // Raw model text is never customer-facing: a reply that is not a single JSON
+  // object, or that fails the STRICT schema (after the narrow normalization in
+  // agents/estimate-assistant.ts), triggers exactly one repair call built from
+  // the same trusted context plus a value-free issue list. If that also fails
+  // the fixed GENERIC_FALLBACK_RESPONSE is used. Only validated metadata
+  // (statuses, field paths, Zod codes) is recorded or logged.
+  const recordValidation = (decisionValidation: AIDecisionValidation) => {
+    inputSummary = { ...inputSummary, estimate: { ...(inputSummary.estimate ?? estimateSummary), decisionValidation } };
+  };
+  const logInvalidDecision = (stage: "initial" | "repair", issues: Array<{ path: string; code: string }>) => {
+    console.warn("[ai/orchestrator] estimate_assistant decision validation failed", {
+      event: "estimate_decision_validation_failed",
+      stage,
+      issues: issues.map(({ path, code }) => ({ path, code })),
+    });
+  };
+
+  let decisionResponse;
+  try {
+    decisionResponse = await modelProvider.run(buildEstimateAssistantDecisionRequest(agentConfig.instructions, estimateContext, event, handoff));
+  } catch (err) {
+    console.error(`[ai/orchestrator] estimate_assistant decision call failed (execution ${executionId}):`, err);
+    return await finalize("failed", undefined, "The AI model could not generate a response.");
+  }
+  await trackUsage(decisionResponse);
+
+  const initialParse = parseEstimateAssistantDecision(decisionResponse.text);
+  let decision;
+  if (initialParse.kind === "decision") {
+    decision = initialParse.decision;
+    recordValidation({ initial: { status: "valid", ...(initialParse.normalized ? { normalized: true } : {}) }, repairAttempted: false });
+  } else {
+    logInvalidDecision("initial", initialParse.issues);
+    const initial: AIDecisionValidationStage = { status: "invalid", ...(initialParse.normalized ? { normalized: true } : {}), issues: initialParse.issues };
+
+    let repairResponse;
+    try {
+      repairResponse = await modelProvider.run(
+        buildEstimateAssistantDecisionRequest(agentConfig.instructions, estimateContext, event, handoff, initialParse.issues),
+      );
+    } catch (err) {
+      console.error(`[ai/orchestrator] estimate_assistant decision repair call failed (execution ${executionId}):`, err);
+      recordValidation({ initial, repairAttempted: true, repair: { status: "error" } });
+      return await finalize("succeeded", ESTIMATE_GENERIC_FALLBACK_RESPONSE);
+    }
+    await trackUsage(repairResponse);
+
+    const repairParse = parseEstimateAssistantDecision(repairResponse.text);
+    if (repairParse.kind === "fallback") {
+      logInvalidDecision("repair", repairParse.issues);
+      recordValidation({ initial, repairAttempted: true, repair: { status: "invalid", ...(repairParse.normalized ? { normalized: true } : {}), issues: repairParse.issues } });
+      return await finalize("succeeded", ESTIMATE_GENERIC_FALLBACK_RESPONSE);
+    }
+    decision = repairParse.decision;
+    recordValidation({ initial, repairAttempted: true, repair: { status: "valid", ...(repairParse.normalized ? { normalized: true } : {}) } });
+  }
+
+  if (decision.type === "respond") return await finalize("succeeded", guard(decision.response));
+
+  // ── Owner Clarification (existing workflow, reused as-is) ─────────────
+  if (decision.type === "clarify") {
+    const outcome = await handleClarifyDecision({ supabase, trustedContext, event, context: estimateContext, decision, executionId });
+    if (outcome.kind === "answer_from_knowledge") {
+      inputSummary = { ...inputSummary, clarification: { outcome: "answered_from_knowledge", category: outcome.entry.category } };
+      return await respondWithOutcome(
+        `Trusted Business Knowledge DOES answer the customer's question: "${outcome.entry.answer}". Answer the customer directly from it, exactly as written — do not add, extend, or soften it. If the customer asked about something specific to THIS estimate (what it includes or costs), the Estimate context above is the only source for that.`,
+        "succeeded",
+      );
+    }
+    inputSummary = {
+      ...inputSummary,
+      clarification:
+        outcome.kind === "clarification"
+          ? { outcome: outcome.created ? "created" : "coalesced", clarificationId: outcome.clarificationId, category: outcome.category }
+          : { outcome: "unsupported", reason: outcome.reason },
+    };
+    return await finalize("succeeded", outcome.reply);
+  }
+
+  // ── Mutation proposals (approval-gated; this function never mutates) ──
+  const proposalKind = decision.type === "propose_estimate_draft" ? "create_estimate_draft" : "add_estimate_line_items";
+
+  // Defense in depth: the schema already limits the decision to these
+  // variants, but the agent-level tool allowlist is checked independently.
+  if (!ESTIMATE_ASSISTANT_TOOL_ALLOWLIST.has(proposalKind)) {
+    return await finalize("succeeded", ESTIMATE_GENERIC_FALLBACK_RESPONSE);
+  }
+
+  let rawInput: Record<string, unknown>;
+  let itemNames: string[];
+  let targetEntityType: string;
+  let targetEntityId: string;
+  let approvalSummary: string;
+  let refusal: string | undefined;
+
+  if (decision.type === "propose_estimate_draft") {
+    itemNames = estimateItemNames(decision.items);
+    if (!estimate) {
+      refusal = "The existing estimate could not be checked just now, so no estimate draft was proposed. Tell the customer the team will follow up on the estimate; do not say anything was prepared.";
+    } else if (estimate.found) {
+      refusal = "An estimate already exists for this customer/project (see the Estimate context), so no new draft was proposed. Describe only what the Estimate context actually lists, and say the team will review any changes.";
+    } else if (!trustedContext.leadId && !trustedContext.contactId) {
+      refusal = "There is no linked customer record to attach an estimate to yet, so no draft was proposed. Tell the customer the team will follow up to get their details and start the estimate.";
+    }
+    rawInput = buildTrustedCreateDraftInput(decision, {
+      contactId: trustedContext.contactId, leadId: trustedContext.leadId, projectId: trustedContext.projectId,
+    });
+    targetEntityType = trustedContext.leadId ? "lead" : trustedContext.contactId ? "contact" : "project";
+    targetEntityId = (trustedContext.leadId ?? trustedContext.contactId ?? trustedContext.projectId) as string;
+    approvalSummary = `Estimate Assistant proposed a draft estimate "${decision.title}" with ${itemNames.length} unpriced line item${itemNames.length === 1 ? "" : "s"}. No prices or quantities are included.`;
+  } else {
+    const est = estimate?.found ? estimate.estimate : undefined;
+    const existingNames = new Set(estimateItemNames(estimate?.items).map((n) => n.trim().toLowerCase()));
+    const newItems = decision.items.filter((i) => !existingNames.has(i.name.trim().toLowerCase()));
+    itemNames = estimateItemNames(newItems);
+    if (!estimate || !est) {
+      refusal = "There is no existing estimate that can be edited, so no line items were proposed. Describe only what the Estimate context actually lists.";
+    } else if (estimate.ambiguous) {
+      refusal = "More than one active estimate matches, so no change was proposed. Ask the customer which project/estimate they mean, or say the team will confirm.";
+    } else if (!est.editableByAssistant) {
+      refusal = "The estimate is no longer a draft, so no change was proposed. Say the team will review the requested change and update the estimate; do not say it was changed.";
+    } else if (newItems.length === 0) {
+      refusal = "Everything the customer asked to add is already listed on the estimate, so no change was proposed. Tell them what is already listed (from the Estimate context).";
+    }
+    rawInput = buildTrustedAddItemsInput({ ...decision, items: newItems.length > 0 ? newItems : decision.items }, est?.id ?? "");
+    targetEntityType = "estimate";
+    targetEntityId = est?.id ?? "";
+    approvalSummary = `Estimate Assistant proposed adding ${itemNames.length} unpriced line item${itemNames.length === 1 ? "" : "s"} to estimate "${est?.title ?? ""}". Existing items and totals are not changed except for the recalculated total.`;
+  }
+
+  if (refusal) {
+    inputSummary = { ...inputSummary, tooling: { attempted: false, toolName: proposalKind, skippedReason: "proposal_precondition_failed" } };
+    return await respondWithOutcome(refusal, "succeeded");
+  }
+
+  // The ONLY mutation call site in this function — and it can only ever
+  // produce a pending approval (requiresApproval is unconditional on both
+  // actions), never a write.
+  const proposeResult = await executeAITool(
+    { toolName: proposalKind, input: rawInput },
+    { supabase, orgId, actor: trustedContext.actor, executionId, sequence: 2, autonomyLevel, targetEntityType, targetEntityId, approvalSummary },
+  );
+  toolResults.push(proposeResult);
+  inputSummary = {
+    ...inputSummary,
+    tooling: { attempted: true, toolName: proposalKind },
+    estimate: { ...(inputSummary.estimate ?? estimateSummary), proposal: proposalKind },
+  };
+
+  if (proposeResult.status === "approval_required") {
+    return await respondWithOutcome(
+      summarizeProposalSubmitted(proposalKind === "create_estimate_draft" ? "draft" : "add_items", itemNames),
+      "awaiting_approval",
+    );
+  }
+
+  // denied / failed / completed-without-approval (should be unreachable):
+  // never claim anything was submitted.
+  return await respondWithOutcome(
+    "The estimate request could not be submitted right now (for example a policy restriction). Apologize briefly and let the customer know a teammate will follow up on the estimate — do not say anything was prepared, created, or changed, and do not guess why.",
+    "succeeded",
+  );
 }
 
 // ── agent_executions lifecycle ──────────────────────────────────────────

@@ -66,6 +66,13 @@ const AI_TOOL_ALLOWLIST: ReadonlySet<string> = new Set([
   "get_lead_context",
   "add_internal_note",
   "create_follow_up_task",
+  // Estimate Assistant Foundation: one read + two approval-gated, draft-only,
+  // unpriced-structure writes. Still reachable ONLY through each agent's own
+  // narrower allowlist (agents/estimate-assistant.ts) — this global list is
+  // the outer bound, not a grant.
+  "get_estimate_context",
+  "create_estimate_draft",
+  "add_estimate_line_items",
 ]);
 
 // ── Manual argument descriptors ─────────────────────────────────────────
@@ -98,6 +105,21 @@ const ARGUMENT_DESCRIPTORS: Record<string, AIToolArgumentDescriptor[]> = {
       enumValues: ["low", "medium", "high", "urgent"],
     },
     { name: "assignedTo", type: "string", required: false, description: "UUID of the team member to assign, or omit to leave unassigned." },
+  ],
+  get_estimate_context: [
+    { name: "estimateId", type: "string", required: false, description: "UUID of a specific estimate, if already known." },
+    { name: "projectId", type: "string", required: false, description: "UUID of the project whose estimate to load." },
+    { name: "leadId", type: "string", required: false, description: "UUID of the lead whose estimate to load." },
+    { name: "contactId", type: "string", required: false, description: "UUID of the contact whose estimate to load." },
+  ],
+  create_estimate_draft: [
+    { name: "title", type: "string", required: true, description: "Estimate title (max 200 chars)." },
+    { name: "scope", type: "string", required: false, description: "Scope-of-work text drawn only from known facts (max 4000 chars)." },
+    { name: "items", type: "string", required: false, description: "Up to 25 unpriced line-item structures: { name, description?, itemType? }. No prices or quantities." },
+  ],
+  add_estimate_line_items: [
+    { name: "estimateId", type: "string", required: true, description: "UUID of the draft estimate to add to." },
+    { name: "items", type: "string", required: true, description: "1-25 unpriced line-item structures: { name, description?, itemType? }. No prices or quantities." },
   ],
 };
 
