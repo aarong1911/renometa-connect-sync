@@ -74,7 +74,7 @@ import { BUSINESS_KNOWLEDGE_CATALOG_KEYS, CUSTOM_CATEGORY, MAX_QUESTION_LENGTH }
 const HANDOFF_CONTINUITY_INSTRUCTION =
   "This conversation has just been handed to you from earlier in the same business interaction. Continue naturally as the same business conversation — do not introduce yourself as a separate AI agent, and do not tell the customer they were transferred or handed off, unless the customer explicitly asks how this works. If this handoff happened because the customer's message moved on from a scheduling-specific topic, address what they actually just said or asked — do not hand this conversation back for scheduling again in this same reply; only respond to or otherwise handle their current message.";
 
-function buildHandoffContextBlock(handoff: AIAgentHandoff): string {
+export function buildHandoffContextBlock(handoff: AIAgentHandoff): string {
   const lines: string[] = [
     `Notes from earlier in this conversation (context only — the CRM data above is authoritative if anything here conflicts): ${handoff.summary}`,
   ];
@@ -97,7 +97,13 @@ function buildHandoffContextBlock(handoff: AIAgentHandoff): string {
 // "scheduling", but per that file's own "do not rely only on type
 // literals" reasoning, orchestrator.ts checks this allowlist too before
 // ever building an AIAgentHandoff or invoking Scheduling.
-export const LEAD_QUALIFICATION_HANDOFF_ALLOWLIST: ReadonlySet<string> = new Set(["scheduling"]);
+//
+// Estimate Assistant Foundation: "estimate_assistant" is the second (and
+// only other) permitted destination. This is an explicit two-entry allowlist,
+// NOT a generic agent mesh — Reception still reaches only Lead Qualification,
+// Scheduling still reaches only Lead Qualification, and the Estimate
+// Assistant has no handoff variant at all (structural loop prevention).
+export const LEAD_QUALIFICATION_HANDOFF_ALLOWLIST: ReadonlySet<string> = new Set(["scheduling", "estimate_assistant"]);
 
 // ── Per-agent tool allowlist (AI-1J) ─────────────────────────────────────
 //
@@ -174,7 +180,7 @@ const MAX_HANDOFF_OPEN_QUESTIONS = 6;
 const handoffDecisionSchema = z
   .object({
     type: z.literal("handoff"),
-    toAgent: z.literal("scheduling"),
+    toAgent: z.enum(["scheduling", "estimate_assistant"]),
     reason: z.string().min(1).max(300),
     summary: z.string().min(1).max(1000),
     knownFacts: z
@@ -331,6 +337,11 @@ function buildDecisionSystemInstructions(agentInstructions: string, organization
     "Hand off to Scheduling when BOTH of these are true: (1) you have enough information to reasonably proceed (you don't need every possible detail — just enough that a next appointment makes sense), AND (2) the customer has indicated readiness or interest in scheduling, booking, or taking the next appointment step (e.g. \"when can someone come out?\", \"let's set something up\", \"I'd like to book a consultation\", or a clear yes to your own suggestion of a next step).",
     "Do NOT hand off just because a project was mentioned — wait until the customer is actually ready to move toward an appointment. Do NOT hand off while a genuinely important qualification question is still clearly unanswered and the customer hasn't signaled readiness.",
     "",
+    // Estimate Assistant Foundation. Deliberately narrow, and deliberately about the customer's
+    // CURRENT message: a budget figure is qualification information, not an estimate request.
+    "You may instead hand off to the Estimate Assistant (toAgent \"estimate_assistant\") — a specialist who prepares estimate drafts strictly from trusted project and business data. Hand off to it ONLY when the customer's CURRENT message explicitly asks for an estimate, quote, or proposal, asks what an estimate would include, or asks to add, change, or remove something on an existing estimate (e.g. \"Can you prepare an estimate?\", \"Can you give me a quote for the kitchen remodel?\", \"What would the estimate include?\", \"Can you update the estimate with quartz countertops?\", \"I need a proposal\").",
+    "Do NOT hand off to the Estimate Assistant just because a budget, price, or cost was mentioned (\"my budget is $25,000\" is qualification information — acknowledge it and keep qualifying), and never for appointment/scheduling requests (those go to Scheduling). Never quote, estimate, or promise any price yourself.",
+    "",
     // Owner Clarification: the ONLY correct response to a company-specific question that Trusted
     // Business Knowledge cannot answer. The conditions are deliberately narrow so the owner is not
     // flooded with requests.
@@ -344,6 +355,7 @@ function buildDecisionSystemInstructions(agentInstructions: string, organization
     '{"type":"tool","tool":"get_lead_context","reason":"<short optional reason>"}',
     '{"type":"tool","tool":"add_internal_note","arguments":{"content":"<concise, factual note text>"},"reason":"<short optional reason>"}',
     '{"type":"handoff","toAgent":"scheduling","reason":"<short reason the customer is ready to schedule>","summary":"<one or two sentence summary of the project/opportunity for Scheduling>","knownFacts":{"<short fact label>":"<short value>"},"openQuestions":["<short open question, if any>"]}',
+    '{"type":"handoff","toAgent":"estimate_assistant","reason":"<short reason the customer asked for an estimate>","summary":"<one or two sentence summary of the project and what the customer asked for>","knownFacts":{"<short fact label>":"<short value>"},"openQuestions":["<short open question, if any>"]}',
     '{"type":"clarify","category":"<catalog key or custom>","question":"<short neutral restatement of the customer\'s company-specific question>"}',
     '"knownFacts" and "openQuestions" are optional on the handoff shape — include them only when you actually have something to note; do not invent facts that weren\'t said.',
   ].join("\n");

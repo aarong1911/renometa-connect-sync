@@ -163,6 +163,10 @@ const contextSchema = z
     contactId: z.string().uuid().optional(),
     leadId: z.string().uuid().optional(),
     projectId: z.string().uuid().optional(),
+    // Estimate Assistant Foundation: optional, re-verified against the
+    // caller's org below like every other id here. Only ever used to tell
+    // the Estimate Assistant WHICH estimate a test run is about.
+    estimateId: z.string().uuid().optional(),
     // No canonical conversations table exists yet (see ai/types.ts) — an
     // opaque, bounded label only, never used for authorization.
     conversationKey: z.string().trim().min(1).max(200).optional(),
@@ -189,7 +193,7 @@ const MAX_REQUEST_BODY_BYTES = 20_000;
 // Context Builder's own scoping to make an unverified id merely harmless.
 // A minimal `select("id")` — never the full row.
 async function verifyEntityBelongsToOrg(
-  table: "contacts" | "leads" | "projects",
+  table: "contacts" | "leads" | "projects" | "estimates",
   id: string,
   orgId: string,
 ): Promise<boolean> {
@@ -247,6 +251,10 @@ export const handler: Handler = async (event) => {
     if (requestBody.context?.projectId) {
       const ok = await verifyEntityBelongsToOrg("projects", requestBody.context.projectId, orgId);
       if (!ok) return json(400, { error: "projectId does not reference a project in your organization." });
+    }
+    if (requestBody.context?.estimateId) {
+      const ok = await verifyEntityBelongsToOrg("estimates", requestBody.context.estimateId, orgId);
+      if (!ok) return json(400, { error: "estimateId does not reference an estimate in your organization." });
     }
   } catch (err) {
     console.error("[ai-orchestrate] entity ownership verification failed:", err);
@@ -313,6 +321,7 @@ export const handler: Handler = async (event) => {
     contactId: requestBody.context?.contactId,
     leadId: requestBody.context?.leadId,
     projectId: requestBody.context?.projectId,
+    estimateId: requestBody.context?.estimateId,
     conversationKey: requestBody.context?.conversationKey,
     autonomyLevel,
   };

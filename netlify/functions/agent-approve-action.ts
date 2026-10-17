@@ -141,6 +141,16 @@ export function idempotencyKeyFor(actionKey: string, approval: { id: string; tar
     // itself.
     return `schedule_appointment:${approval.id}`;
   }
+  if (actionKey === "create_estimate_draft" || actionKey === "add_estimate_line_items") {
+    // Estimate Assistant Foundation. Keyed on the approval's own id for the
+    // exact reasoning schedule_appointment's case documents above: two
+    // DISTINCT approvals may legitimately propose identical content and must
+    // stay independently decidable, while a retried/double-clicked decision
+    // on the SAME approval must never write twice. The handlers add a second,
+    // independent guard (rows stamped with this execution's id) so even a
+    // lost idempotency slot cannot duplicate an estimate or its line items.
+    return `${actionKey}:${approval.id}`;
+  }
   return undefined;
 }
 
@@ -225,6 +235,33 @@ export function verifyActionSuccess(actionKey: string, realResult: Record<string
       verified: false,
       reason: "Handler completed without a verifiable appointment id.",
       publicError: "Could not verify the appointment was created. Please try again.",
+    };
+  }
+
+  if (actionKey === "create_estimate_draft") {
+    // The real estimates.id returned by the handler's own INSERT ... RETURNING
+    // — a "succeeded" status with no id is never trusted as a created estimate.
+    const estimateId = realResult?.estimateId;
+    if (typeof estimateId === "string" && estimateId.length > 0) return { verified: true };
+    return {
+      verified: false,
+      reason: "Handler completed without a verifiable estimate id.",
+      publicError: "Could not verify the estimate draft was created. Please try again.",
+    };
+  }
+
+  if (actionKey === "add_estimate_line_items") {
+    // Proof is the real estimate id PLUS the handler's own list of inserted
+    // (or already-present, on replay) item ids. An empty list is legitimate
+    // only when every proposed item was already on the estimate (reported via
+    // skippedDuplicateNames) — the array itself must still be present.
+    const estimateId = realResult?.estimateId;
+    const addedItemIds = realResult?.addedItemIds;
+    if (typeof estimateId === "string" && estimateId.length > 0 && Array.isArray(addedItemIds)) return { verified: true };
+    return {
+      verified: false,
+      reason: "Handler completed without a verifiable estimate id / item list.",
+      publicError: "Could not verify the line items were added. Please try again.",
     };
   }
 

@@ -77,7 +77,7 @@ export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 
 // ── Action registry shape (Priority 1) ───────────────────────────────────
 export type ActionCategory =
-  | "context" | "task" | "note" | "communication" | "lead" | "deal" | "scheduling";
+  | "context" | "task" | "note" | "communication" | "lead" | "deal" | "scheduling" | "estimate";
 
 /**
  * AI-1L addition. `category: "communication"` alone is NOT enough to tell

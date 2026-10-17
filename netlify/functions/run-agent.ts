@@ -628,30 +628,24 @@ async function executeActions(
   }
 
   // ── create_estimate ────────────────────────────────────────────────────────
+  //
+  // Estimate Assistant safety hardening: this branch used to INSERT an
+  // estimate and its line items directly from the model's JSON — including
+  // model-chosen `unit_price`/`total` — with no human approval, bypassing the
+  // approval-gated estimate actions (src/lib/agentic/estimate-handlers.ts).
+  // It was reachable from the AI Center "Run" button for the seeded Estimate
+  // Drafter agent. The legacy agent still READS estimates and still returns
+  // its suggested breakdown as run output (`result_summary`), but it can no
+  // longer write a financial record. Estimate creation/edits now exist only
+  // through create_estimate_draft / add_estimate_line_items (human-approved,
+  // draft-only, unpriced structure). The honest outcome is recorded below so
+  // run history never implies an estimate was created.
   if (has("create_estimate") && parsed?.line_items?.length) {
-    const { data: est } = await supabase
-      .from("estimates")
-      .insert({
-        org_id: orgId,
-        job_type: (realData as any).job_type ?? "Unknown",
-        total_amount: parsed.subtotal ?? 0,
-        status: "draft",
-        notes: parsed.notes ?? null,
-      })
-      .select()
-      .single();
-    if (est) {
-      const items = (parsed.line_items as any[]).map((li: any) => ({
-        estimate_id: est.id,
-        description: li.description,
-        quantity: li.quantity ?? 1,
-        unit: li.unit ?? "ls",
-        unit_price: li.unit_price ?? 0,
-        total: li.total ?? 0,
-      }));
-      await supabase.from("estimate_items").insert(items);
-      taken.push({ type: "estimate_created", estimate_id: est.id, line_item_count: items.length });
-    }
+    taken.push({
+      type: "estimate_not_created",
+      reason: "Direct estimate creation by this agent is disabled; its suggested line items are advisory only. Use the Estimate Assistant (approval-gated) or create the estimate manually.",
+      suggested_line_item_count: (parsed.line_items as unknown[]).length,
+    });
   }
 
   return taken;

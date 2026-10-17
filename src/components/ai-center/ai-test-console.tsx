@@ -63,6 +63,13 @@ import { AIRunInspector } from "@/components/ai-center/ai-run-inspector";
 // test lead id, never casually pick a real customer from a list.
 type TestMode = "reception" | "lead_qualification";
 
+// Estimate Assistant Foundation: there is no separate "Estimate Assistant"
+// test mode on purpose — the Estimate Assistant is handoff-only, so the real
+// way to reach it is the real way a customer does: ask Lead Qualification
+// for an estimate. This sample is just a convenience for doing exactly that.
+const ESTIMATE_SAMPLE_MESSAGE =
+  "We're remodeling the kitchen. We need new cabinets, quartz countertops, and a new sink. Can you prepare an estimate?";
+
 // Simple structural check only — the backend (ai-orchestrate.ts's Zod
 // schema, then verifyEntityBelongsToOrg()) remains the sole source of
 // truth for whether this id is well-formed AND actually belongs to the
@@ -380,6 +387,7 @@ export function AITestConsole() {
             )}
             <p className="text-[11px] leading-relaxed text-muted-foreground">
               Use only a designated test lead. This mode can read the lead and may add an internal CRM note.
+              Asking for an estimate hands the conversation to the Estimate Assistant, which can propose a draft estimate for approval — nothing is created until you approve it.
             </p>
           </div>
         )}
@@ -398,14 +406,21 @@ export function AITestConsole() {
             }
             className="min-h-28 text-sm"
           />
-          <div className="flex justify-end text-[10.5px] text-muted-foreground">
-            {message.length} / {MAX_MESSAGE_LENGTH}
+          <div className="flex items-center justify-between text-[10.5px] text-muted-foreground">
+            {isLeadQualificationMode ? (
+              <Button type="button" variant="ghost" size="sm" className="h-6 px-2 text-[11px] text-muted-foreground" onClick={() => setMessage(ESTIMATE_SAMPLE_MESSAGE)}>
+                Use estimate sample
+              </Button>
+            ) : (
+              <span />
+            )}
+            <span>{message.length} / {MAX_MESSAGE_LENGTH}</span>
           </div>
         </div>
 
         <div className="rounded-md border border-border bg-secondary/30 px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
           {isLeadQualificationMode
-            ? "This uses the live AI runtime. The agent may read this lead and may add one internal note. No customer message will be sent."
+            ? "This uses the live AI runtime. The agent may read this lead, may add one internal note, and may propose a draft estimate for approval. No customer message will be sent."
             : "Test runs use the live AI runtime and are recorded in AI Center activity. No customer message will be sent."}
         </div>
 

@@ -515,3 +515,72 @@ test("the cleanup call is wrapped in its own .catch() — a thrown error inside 
   const markExecutedIdx = source.indexOf("await markApprovalExecuted(supabaseAdmin, reqBody.approvalId, orgId);");
   assert.ok(cleanupIdx > 0 && markExecutedIdx > cleanupIdx, "markApprovalExecuted must still run after the cleanup call, regardless of whether cleanup succeeded or failed");
 });
+
+// ── Estimate Assistant Foundation: create_estimate_draft / add_estimate_line_items ─
+//
+// Both are financially meaningful, approval-gated, draft-only writes (see
+// src/lib/agentic/estimate-handlers.ts). Without these cases the endpoint
+// would (a) run them with NO idempotency key and (b) report a genuinely
+// created estimate as a FAILED approval via the unknown-action-key branch —
+// the exact two bugs this file's header documents for send_sms and
+// schedule_appointment.
+
+test("idempotencyKeyFor('create_estimate_draft' | 'add_estimate_line_items', ...) is <actionKey>:<approvalId> — stable per approval, distinct across approvals and across the two actions", () => {
+  const a = fakeApproval({ id: "approval-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+  const b = fakeApproval({ id: "approval-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" });
+  assert.equal(S.idempotencyKeyFor("create_estimate_draft", a), "create_estimate_draft:approval-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+  assert.equal(S.idempotencyKeyFor("add_estimate_line_items", a), "add_estimate_line_items:approval-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+  assert.equal(S.idempotencyKeyFor("create_estimate_draft", a), S.idempotencyKeyFor("create_estimate_draft", a));
+  assert.notEqual(S.idempotencyKeyFor("create_estimate_draft", a), S.idempotencyKeyFor("create_estimate_draft", b));
+  assert.notEqual(S.idempotencyKeyFor("create_estimate_draft", a), S.idempotencyKeyFor("add_estimate_line_items", a));
+});
+
+test("verifyActionSuccess('create_estimate_draft', ...) requires a real estimateId; anything else fails closed", () => {
+  assert.deepEqual(S.verifyActionSuccess("create_estimate_draft", { estimateId: "est-123" }), { verified: true });
+  for (const bad of [undefined, {}, { estimateId: "" }, { estimateId: 7 }, { taskId: "t" }]) {
+    const r = S.verifyActionSuccess("create_estimate_draft", bad as any);
+    assert.equal(r.verified, false, JSON.stringify(bad));
+    assert.doesNotMatch(r.reason, /No success-verification rule is configured/);
+  }
+});
+
+test("verifyActionSuccess('add_estimate_line_items', ...) requires a real estimateId AND an addedItemIds array (empty is fine only when present — e.g. all duplicates)", () => {
+  assert.deepEqual(S.verifyActionSuccess("add_estimate_line_items", { estimateId: "est-1", addedItemIds: ["i1"] }), { verified: true });
+  assert.deepEqual(S.verifyActionSuccess("add_estimate_line_items", { estimateId: "est-1", addedItemIds: [] }), { verified: true });
+  for (const bad of [undefined, {}, { estimateId: "est-1" }, { addedItemIds: ["i1"] }, { estimateId: "", addedItemIds: [] }, { estimateId: "est-1", addedItemIds: "i1" }]) {
+    const r = S.verifyActionSuccess("add_estimate_line_items", bad as any);
+    assert.equal(r.verified, false, JSON.stringify(bad));
+    assert.doesNotMatch(r.reason, /No success-verification rule is configured/);
+  }
+});
+
+test("E2E retry semantics through idempotencyKeyFor() + the REAL executeApprovedStep(): approving create_estimate_draft twice creates exactly ONE estimate", async () => {
+  const CONTACT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+  const db = withApprovalDefaults(
+    createFakeSupabaseClient(
+      {
+        organizations: [{ id: ORG_A, timezone: TZ, ai_center_settings: {} }],
+        contacts: [{ id: CONTACT, org_id: ORG_A, full_name: "Jane Homeowner" }],
+        leads: [], projects: [], estimates: [], estimate_items: [],
+        // The approving user must be a real team member of the org: estimates.created_by is NOT NULL on the live table.
+        profiles: [{ id: "approver-1", organization_id: ORG_A }],
+        agent_execution_steps: [], agent_approval_requests: [], agent_action_idempotency: [], marketing_contact_preferences: [],
+      },
+      {},
+      { uniqueConstraints: { agent_action_idempotency: [["org_id", "action_key", "idempotency_key"]] }, notNullColumns: { estimates: ["created_by"] } },
+    ),
+  );
+  const approval = fakeApproval({ id: "approval-estimate-retry-aaaa" });
+  const key = S.idempotencyKeyFor("create_estimate_draft", approval);
+  const approvedInput = { contactId: CONTACT, title: "Kitchen remodel", items: [{ name: "Cabinet replacement" }] };
+  const run = (stepId: string) => AE.executeApprovedStep({ supabase: db, orgId: ORG_A, actor: ACTOR, executionId: "exec-1", stepId, actionKey: "create_estimate_draft", approvedInput, idempotencyKey: key });
+
+  const first = await run("s1");
+  const second = await run("s2");
+  assert.equal(first.status, "succeeded", JSON.stringify(first));
+  assert.equal(S.verifyActionSuccess("create_estimate_draft", first.output).verified, true);
+  assert.equal(second.status, "skipped");
+  assert.equal(S.verifyActionSuccess("create_estimate_draft", second.output.result).verified, true, "a duplicate-suppressed replay still verifies against the REAL prior result");
+  assert.equal(db.__dumpTable("estimates").length, 1);
+  assert.equal(db.__dumpTable("estimate_items").length, 1);
+});

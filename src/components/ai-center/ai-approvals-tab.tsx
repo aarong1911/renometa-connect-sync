@@ -54,6 +54,7 @@ import {
   type FilterValue,
 } from "@/lib/ai-approvals-list";
 import { fetchAiClarificationsList } from "@/lib/ai-clarifications-list";
+import { ESTIMATE_PROPOSAL_DISCLOSURE, readEstimateProposal } from "@/lib/ai-estimate-proposal";
 import { KnowledgeClarificationCard } from "@/components/ai-center/knowledge-clarification-card";
 
 type ExecutionRow = {
@@ -122,6 +123,8 @@ function actionDisplayName(actionKey: string): string {
   if (actionKey === "send_whatsapp") return "WhatsApp Reply";
   if (actionKey === "send_email") return "Email Reply";
   if (actionKey === "create_follow_up_task") return "Follow-Up Task";
+  if (actionKey === "create_estimate_draft") return "Estimate Draft";
+  if (actionKey === "add_estimate_line_items") return "Estimate Line Items";
   return actionKey.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
@@ -249,6 +252,10 @@ export function AIApprovalsTab({
         toast.success(body.status === "already_executed" ? "Already sent — no duplicate message." : "SMS approved and sent.");
       } else if (approval.action_key === "create_follow_up_task") {
         toast.success(body.status === "already_executed" ? "Task already created — no duplicate added." : "Follow-up task created.");
+      } else if (approval.action_key === "create_estimate_draft") {
+        toast.success(body.status === "already_executed" ? "Estimate draft already created — no duplicate added." : "Estimate draft created. Review and price it in Estimates.");
+      } else if (approval.action_key === "add_estimate_line_items") {
+        toast.success(body.status === "already_executed" ? "Line items already added — no duplicates." : "Line items added to the draft estimate. Review and price them in Estimates.");
       } else {
         toast.success(body.status === "already_executed" ? "Already executed — no duplicate action taken." : "Action approved and executed.");
       }
@@ -361,6 +368,7 @@ export function AIApprovalsTab({
             const contact = contactByApproval.get(a.id);
             const inbound = inboundByApproval.get(a.id);
             const proposedBody = isSms ? readSmsBody(a.proposed_input) : undefined;
+            const estimateProposal = readEstimateProposal(a.action_key, a.proposed_input);
             const isPending = a.status === "pending";
             const isDeciding = decidingId === a.id;
 
@@ -402,6 +410,24 @@ export function AIApprovalsTab({
                         "{proposedBody}"
                       </div>
                     )}
+                  </div>
+                ) : estimateProposal ? (
+                  <div className="space-y-2 text-xs">
+                    {estimateProposal.title && <div className="font-medium text-foreground">{estimateProposal.title}</div>}
+                    {estimateProposal.scope && <div className="text-muted-foreground">{estimateProposal.scope}</div>}
+                    {estimateProposal.itemNames.length > 0 && (
+                      <div className="rounded-md border bg-secondary/40 p-2">
+                        <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                          Proposed line items (unpriced)
+                        </div>
+                        <ul className="list-disc space-y-0.5 pl-4">
+                          {estimateProposal.itemNames.map((name, idx) => (
+                            <li key={`${idx}-${name}`}>{name}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    <div className="text-[11px] text-muted-foreground">{ESTIMATE_PROPOSAL_DISCLOSURE}</div>
                   </div>
                 ) : (
                   <div className="text-xs text-muted-foreground">{a.summary}</div>

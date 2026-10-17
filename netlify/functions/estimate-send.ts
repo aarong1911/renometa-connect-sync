@@ -33,6 +33,11 @@ import {
   isCustomerActionable,
   type EstimateStatus,
 } from "../../src/lib/estimate-status";
+import {
+  UNPRICED_ESTIMATE_ERROR,
+  hasPricePendingItems,
+  type PricingGateItem,
+} from "../../src/lib/estimate-pricing-gate";
 import { syncEstimateDeal, logDealSyncWarning } from "../lib/estimate-deal-sync";
 
 const SUPABASE_URL =
@@ -716,7 +721,8 @@ export const handler: Handler = async (
     selected_by_customer,
     is_heading,
     discount_type,
-    discount_value
+    discount_value,
+    metadata
   `)
   .eq("estimate_id", estimate.id)
   .order("position", { ascending: true })
@@ -731,6 +737,21 @@ export const handler: Handler = async (
       return json(500, {
         error:
           "Could not load the estimate line items.",
+      });
+    }
+
+    // PRICING GATE (Estimate Assistant safety hardening). This is the ONE
+    // function that creates the public proposal token, emails the customer
+    // and marks an estimate sent, so it is the authoritative boundary: an
+    // estimate with any line item still flagged `price_pending` (e.g. an
+    // AI-proposed draft nobody has priced yet) is refused BEFORE a token is
+    // generated, any row is updated, any email is sent, or any activity /
+    // workflow event is recorded. Keyed on the explicit marker — a real,
+    // unmarked $0 line is NOT blocked. UI disabling is only a convenience.
+    if (hasPricePendingItems((itemRows ?? []) as PricingGateItem[])) {
+      return json(422, {
+        error: UNPRICED_ESTIMATE_ERROR,
+        code: "estimate_unpriced",
       });
     }
 
