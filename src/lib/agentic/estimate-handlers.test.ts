@@ -39,6 +39,7 @@ await esbuild.build({
     contents: `
       export * from "./src/lib/agentic/action-executor";
       export { getActionDefinition } from "./src/lib/agentic/action-registry";
+      export { isPricePendingItem } from "./src/lib/estimate-pricing-gate";
     `,
     resolveDir: repoRoot,
     loader: "ts",
@@ -153,6 +154,7 @@ function makeDb(overrides: Record<string, any[]> = {}, extraOptions: Record<stri
   );
 }
 
+const X_isPending = (row: any): boolean => S.isPricePendingItem(row);
 const dump = (db: any, table: string) => JSON.stringify(db.__dumpTable(table));
 
 function step(db: any, actionKey: string, rawInput: unknown, extra: Record<string, unknown> = {}) {
@@ -238,12 +240,79 @@ test("TEST 4 — an existing priced estimate is reported exactly as stored (item
   assert.equal(o.pricing.trustedCatalogAvailable, false);
 });
 
-test("an unpriced placeholder row is reported as pricePending with NULL price/total — never as $0", async () => {
-  const db = makeDb({ estimate_items: [itemRow({ id: "p1", name: "Backsplash", unit_price: 0, total: 0, quantity: 1 })] });
+test("an unpriced placeholder row (metadata.price_pending) is reported as pricePending with NULL price/total — never as $0", async () => {
+  const db = makeDb({ estimate_items: [itemRow({ id: "p1", name: "Backsplash", unit_price: 0, total: 0, quantity: 1, metadata: { price_pending: true } })] });
   const o = (await step(db, "get_estimate_context", { estimateId: EST_A })).output;
   assert.equal(o.items[0].pricePending, true);
   assert.equal(o.items[0].unitPrice, null);
   assert.equal(o.items[0].lineTotal, null);
+});
+
+// ── get_estimate_context uses the SAME price_pending semantics as the send gate / editor ──
+// pending iff metadata.price_pending === true AND no positive price; headings never; a reviewed $0 is a real $0.
+
+async function readItems(rows: any[]) {
+  const db = makeDb({ estimate_items: rows });
+  const res = await step(db, "get_estimate_context", { estimateId: EST_A });
+  assert.equal(res.status, "succeeded", JSON.stringify(res));
+  return Object.fromEntries(res.output.items.map((i: any) => [i.name, i]));
+}
+
+test("READ SEMANTICS — price_pending=true + $0 => pending; price and line total are hidden (null), never surfaced as $0", async () => {
+  const items = await readItems([itemRow({ id: "r1", name: "AI placeholder", unit_price: 0, total: 0, metadata: { price_pending: true, ai_proposed: true } })]);
+  assert.equal(items["AI placeholder"].pricePending, true);
+  assert.equal(items["AI placeholder"].unitPrice, null);
+  assert.equal(items["AI placeholder"].lineTotal, null);
+});
+
+test("READ SEMANTICS — metadata={} + explicit $0 => NOT pending: a real zero price is surfaced (the owner reviewed it)", async () => {
+  const items = await readItems([itemRow({ id: "r2", name: "Included at no charge", unit_price: 0, total: 0, metadata: {} })]);
+  assert.equal(items["Included at no charge"].pricePending, false);
+  assert.equal(items["Included at no charge"].unitPrice, 0);
+  assert.equal(items["Included at no charge"].lineTotal, 0);
+});
+
+test("READ SEMANTICS — missing / null / non-object metadata + $0 => NOT pending (only the explicit marker makes a line pending)", async () => {
+  const noKey = itemRow({ id: "r3", name: "No metadata key", unit_price: 0, total: 0 });
+  delete (noKey as any).metadata;
+  const items = await readItems([noKey, itemRow({ id: "r4", name: "Null metadata", unit_price: 0, total: 0, metadata: null }), itemRow({ id: "r5", name: "Array metadata", unit_price: 0, total: 0, metadata: [] }), itemRow({ id: "r6", name: "String marker", unit_price: 0, total: 0, metadata: { price_pending: "true" } })]);
+  for (const name of ["No metadata key", "Null metadata", "Array metadata", "String marker"]) {
+    assert.equal(items[name].pricePending, false, name);
+    assert.equal(items[name].unitPrice, 0, name);
+  }
+});
+
+test("READ SEMANTICS — a stale price_pending marker on a POSITIVE price => NOT pending: described as priced with its real figures", async () => {
+  const items = await readItems([itemRow({ id: "r7", name: "Stale marker", unit_price: 250, quantity: 2, total: 500, metadata: { price_pending: true } })]);
+  assert.equal(items["Stale marker"].pricePending, false);
+  assert.equal(items["Stale marker"].unitPrice, 250);
+  assert.equal(items["Stale marker"].lineTotal, 500);
+});
+
+test("READ SEMANTICS — a heading carrying the marker is NEVER pending (and exposes no price)", async () => {
+  const items = await readItems([itemRow({ id: "r8", name: "Section", is_heading: true, unit_price: 0, total: 0, quantity: 0, metadata: { price_pending: true } })]);
+  assert.equal(items["Section"].pricePending, false);
+  assert.equal(items["Section"].isHeading, true);
+  assert.equal(items["Section"].unitPrice, null);
+  assert.equal(items["Section"].lineTotal, null);
+});
+
+test("READ SEMANTICS — consistent with the send gate on every case (single shared rule), and metadata itself is never copied into the output", async () => {
+  const rows = [
+    itemRow({ id: "c1", name: "pending", unit_price: 0, total: 0, metadata: { price_pending: true } }),
+    itemRow({ id: "c2", name: "reviewed zero", unit_price: 0, total: 0, metadata: {} }),
+    itemRow({ id: "c3", name: "stale", unit_price: 10, total: 10, metadata: { price_pending: true } }),
+    itemRow({ id: "c4", name: "heading", is_heading: true, unit_price: 0, total: 0, metadata: { price_pending: true } }),
+    itemRow({ id: "c5", name: "plain", unit_price: 5, total: 5, metadata: { secret_internal: "SENTINEL-META" } }),
+  ];
+  const db = makeDb({ estimate_items: rows });
+  const res = await step(db, "get_estimate_context", { estimateId: EST_A });
+  for (const out of res.output.items) {
+    const row = rows.find((r) => r.name === out.name)!;
+    assert.equal(out.pricePending, X_isPending(row), out.name);
+  }
+  assert.ok(!JSON.stringify(res).includes("SENTINEL-META"), "item metadata is not exposed to the model context");
+  assert.ok(!("metadata" in res.output.items[0]));
 });
 
 test("TEST 18 — INTERNAL cost/margin/contingency/notes/public_token never appear in the context output", async () => {

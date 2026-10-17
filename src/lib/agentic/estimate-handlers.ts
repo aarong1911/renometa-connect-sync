@@ -62,6 +62,7 @@
 import { z } from "zod";
 import type { ActionHandler } from "./types";
 import { calculateEstimate, round2, type CalcLineItem } from "../estimate-calculations";
+import { isPricePendingItem } from "../estimate-pricing-gate";
 
 // ── Shared constants ─────────────────────────────────────────────────────
 
@@ -233,8 +234,10 @@ export type AddEstimateLineItemsOutput = {
 const ESTIMATE_CONTEXT_COLUMNS =
   "id, number, title, status, client_id, lead_id, project_id, scope, exclusions, assumptions, valid_until, tax_rate, discount_type, discount_value, deposit_type, deposit_value, subtotal, discount_total, tax_total, total, deposit_amount, balance_due, created_at, updated_at";
 
+// `metadata` is selected ONLY so pending-ness is decided by the shared gate (estimate-pricing-gate.ts); it is
+// never copied into the output. (Items carry no internal cost/margin fields — those live on `estimates`.)
 const ESTIMATE_ITEM_CONTEXT_COLUMNS =
-  "id, name, description, item_type, quantity, unit, unit_price, total, position, taxable, optional, is_heading";
+  "id, name, description, item_type, quantity, unit, unit_price, total, position, taxable, optional, is_heading, metadata";
 
 function num(value: unknown, fallback = 0): number {
   const n = Number(value);
@@ -285,8 +288,10 @@ function mapEstimateRow(row: any): EstimateContextEstimate {
 function mapItemRow(row: any): EstimateContextItem {
   const isHeading = !!row.is_heading;
   const unitPrice = num(row.unit_price);
-  // An unpriced (<= 0) non-heading row is a placeholder, never a price.
-  const pricePending = !isHeading && unitPrice <= 0;
+  // SAME rule as the send gate and the editor (estimate-pricing-gate.ts): a line is an unpriced PLACEHOLDER only
+  // when it carries metadata.price_pending === true AND has no positive price; headings are never pending. So a
+  // reviewed $0 (marker removed) is a real zero price, and a stale marker on a positive price is simply priced.
+  const pricePending = isPricePendingItem(row);
   return {
     id: row.id,
     name: clip(row.name, CONTEXT_MAX_ITEM_TEXT) ?? "Untitled item",

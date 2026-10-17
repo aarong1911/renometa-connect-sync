@@ -165,6 +165,16 @@ test("TEST 4 — an existing priced estimate is described exactly: items, prices
   assert.match(text, /Unit price and quantity for: Backsplash/);
 });
 
+test("a reviewed $0 line (not pending) is described as a real $0 — never as 'price NOT set yet'; a true placeholder still is", () => {
+  const ctx = baseContext({ estimate: estimateWith([priced("Site visit (included)", 0), pending("Backsplash")], { total: 0 }) });
+  const block = S.buildEstimateContextBlock(ctx);
+  assert.match(block, /Site visit \(included\) \[material\] — 1 each @ \$0 = \$0/);
+  assert.doesNotMatch(block, /Site visit \(included\)[^\n]*NOT set yet/);
+  assert.match(block, /Backsplash \[material\] — price and quantity NOT set yet/);
+  const readiness = S.computeEstimateReadiness(ctx);
+  assert.ok(readiness.missing.some((m: string) => /Unit price and quantity for: Backsplash$/.test(m)), "only the true placeholder is listed as missing");
+});
+
 test("a non-draft estimate is flagged as not editable; several matches are flagged ambiguous; missing context is stated honestly", () => {
   const sent = decisionText(baseContext({ estimate: estimateWith([priced("Cabinets", 100)], { status: "sent", editableByAssistant: false, total: 100 }) }), evt("hi"));
   assert.match(sent, /It is no longer a draft — you cannot propose changes to it\./);
