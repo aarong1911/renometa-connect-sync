@@ -58,7 +58,7 @@ import { calculateEstimate, round2, type CalcLineItem } from "@/lib/estimate-cal
 import { UNPRICED_ESTIMATE_ERROR, UNPRICED_ESTIMATE_HINT, isPricePendingItem } from "@/lib/estimate-pricing-gate";
 import {
   asMetadataObject, buildItemMetadata, duplicateEstimateMetadata, duplicateItemMetadata,
-  mergeEstimateMetadata, replaceEstimateItems,
+  friendlyEstimateSaveError, mergeEstimateMetadata, saveEstimateWithItems,
 } from "@/lib/estimate-item-rows";
 import {
   sharedPresetsForCategory, findSharedPreset, PROPOSAL_PRESET_CATEGORY_LABELS, type ProposalPresetCategory,
@@ -875,18 +875,20 @@ export function EstimateFormSheet({
       }
 
       if (isEdit && estimate) {
-        // Immutable/DB-owned fields are deliberately absent from this
-        // payload: number, created_at, public_token, version_number, and
-        // every lifecycle timestamp — none of them are touched here, so
-        // Postgres leaves their current values exactly as they are.
-        phase = "update estimate header";
-        const { error: updErr } = await supabase.from("estimates").update({ ...header, updated_at: new Date().toISOString() }).eq("id", estimate.id).eq("org_id", orgId);
-        if (updErr) throw updErr;
-        // Insert the replacement rows FIRST and delete the old ones only after that succeeds, so a
-        // failed insert can never erase the estimate's existing line items (see estimate-item-rows.ts).
-        phase = "replace line items";
-        const replaced = await replaceEstimateItems(supabase, estimate.id, buildItemRows(estimate.id));
-        if (!replaced.ok) throw replaced.error;
+        // ONE database transaction (replace_estimate_items_transaction): the editor-owned header fields AND the
+        // full item replacement either both apply or neither does — no header-only update, no delete-then-failed
+        // insert. The RPC whitelists the columns (immutable/DB-owned fields such as number, status, created_by,
+        // public_token, version_number and the lifecycle timestamps cannot be sent), writes client_total equal to
+        // total itself, and MERGES the metadata patch so AI provenance survives.
+        phase = "save estimate and line items";
+        const { metadata: _metadataMerged, client_total: _clientTotal, ...updateHeader } = header;
+        const saved = await saveEstimateWithItems(supabase, {
+          estimateId: estimate.id,
+          header: updateHeader,
+          metadataPatch: { serviceAddress: address.trim() || null },
+          rows: buildItemRows(estimate.id),
+        });
+        if (!saved.ok) throw saved.error;
         estimateId = estimate.id;
         if (!sendAfter) toast.success("Estimate updated");
       } else {
@@ -929,7 +931,8 @@ export function EstimateFormSheet({
       // failure. The phase marker says which step failed without logging
       // any payload content (no tokens, signatures, or note/proposal text).
       console.error(`[estimates] Save failed at phase: ${phase}`, JSON.stringify(serializeSupabaseError(err), null, 2));
-      const message = err && typeof err === "object" && "message" in err ? String((err as { message?: unknown }).message) : "Failed to save estimate";
+      // A deliberate RPC failure ('estimate_rpc:<code>') gets a friendly "nothing was changed" message.
+      const message = friendlyEstimateSaveError(err) ?? (err && typeof err === "object" && "message" in err ? String((err as { message?: unknown }).message) : "Failed to save estimate");
       toast.error(message);
     } finally {
       setSaving(false);

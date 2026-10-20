@@ -2,9 +2,10 @@
 //
 // Run:  node --test src/lib/estimate-item-rows.test.ts
 //
-// Estimate editor metadata persistence + safer item replacement (live bug: saving
+// Estimate editor metadata persistence + the transactional save caller contract (live bug: saving
 // EST-000006 raised 23502 on estimate_items.metadata AND, because the old save was
-// delete-then-insert, erased the estimate's line items).
+// delete-then-insert, erased the estimate's line items; the fix is now ONE database transaction
+// — replace_estimate_items_transaction — so there is no client-side replace/compensation to test).
 //
 // Uses the in-memory fake Supabase client with two OPT-IN behaviors that reproduce
 // the live database: `notNullColumns: { estimate_items: ["metadata"] }` and
@@ -202,123 +203,104 @@ test("N + O — pending markers survive a no-op save (Send stays BLOCKED); once 
   assert.equal(S.hasPricePendingItems([priced[0], noop[1]]), true);
 });
 
-// ── K / L / M: safer replacement ────────────────────────────────────────
+// ── saveEstimateWithItems: the editor's caller contract for replace_estimate_items_transaction ──
+//
+// TypeScript-level only. That the header update and the item replacement are ONE all-or-nothing transaction is a
+// property of the PL/pgSQL function and is NOT proven here (the fake just records the call).
+// See supabase/verification/estimate_transactional_rpcs_verification.sql for the SQL-level checks.
 
 const newRows = () => [editorRow({ name: "New A", unitPrice: "", metadata: { ...AI_META }, pricePending: true }, 0), editorRow({ name: "New B", unitPrice: "300" }, 1)];
-const names = (db: any) => db.__dumpTable("estimate_items").map((r: any) => r.name).sort();
 
-test("L — successful replacement: the new rows exist and the old rows are gone (only this estimate's)", async () => {
-  const other = { ...oldItem("other-1", "Other estimate item"), estimate_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1" };
-  const db = makeDb([oldItem("o1", "Old 1"), oldItem("o2", "Old 2"), other]);
-  const res = await S.replaceEstimateItems(db, EST, newRows());
-  assert.equal(res.ok, true, JSON.stringify(res));
-  assert.equal(res.removedCount, 2);
-  assert.equal(res.insertedIds.length, 2);
-  assert.deepEqual(names(db), ["New A", "New B", "Other estimate item"]);
+function rpcClient(result: { data?: unknown; error?: unknown } = { data: { estimate_id: EST, item_ids: ["x", "y"], item_count: 2 } }) {
+  const calls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+  return { calls, rpc: async (fn: string, args: Record<string, unknown>) => { calls.push({ fn, args }); return { data: result.data ?? null, error: result.error ?? null }; } };
+}
+
+test("saveEstimateWithItems — ONE rpc call carrying the estimate id, editor header, metadata patch and the complete row set; nothing else is touched", async () => {
+  const client = rpcClient();
+  const header = { title: "T", scope: "S", subtotal: 300, tax_total: 0, total: 300 };
+  const res = await S.saveEstimateWithItems(client, { estimateId: EST, header, metadataPatch: { serviceAddress: "1 Main St" }, rows: newRows() });
+  assert.deepEqual(res, { ok: true, itemCount: 2 });
+  assert.equal(client.calls.length, 1);
+  assert.equal(client.calls[0].fn, "replace_estimate_items_transaction");
+  assert.deepEqual(Object.keys(client.calls[0].args).sort(), ["p_estimate_id", "p_header", "p_items", "p_metadata_patch"]);
+  assert.equal(client.calls[0].args.p_estimate_id, EST);
+  assert.deepEqual(client.calls[0].args.p_header, header);
+  assert.deepEqual(client.calls[0].args.p_metadata_patch, { serviceAddress: "1 Main St" });
+  assert.equal((client.calls[0].args.p_items as unknown[]).length, 2);
 });
 
-test("K — a FAILED replacement INSERT leaves the old items intact and deletes nothing (the EST-000006 data-loss bug)", async () => {
-  const base = makeDb([oldItem("o1", "Old 1"), oldItem("o2", "Old 2")]);
-  let deleteCalls = 0;
-  const db = {
-    from: (t: string) => {
-      const b = base.from(t);
-      if (t === "estimate_items") {
-        b.insert = () => ({ select: () => ({ then: (res: any) => res({ data: null, error: { code: "23502", message: "null value in column \"metadata\" of relation \"estimate_items\" violates not-null constraint" } }) }) });
-        const realDelete = b.delete.bind(b);
-        b.delete = () => { deleteCalls += 1; return realDelete(); };
-      }
-      return b;
-    },
-  };
-  const res = await S.replaceEstimateItems(db, EST, newRows());
-  assert.equal(res.ok, false);
-  assert.equal(res.phase, "insert_new");
-  assert.equal(res.error.code, "23502");
-  assert.equal(deleteCalls, 0, "nothing may be deleted when the insert fails");
-  assert.deepEqual(names(base), ["Old 1", "Old 2"]);
+test("saveEstimateWithItems — every row sent carries a metadata OBJECT and pending markers survive (uniform shape, no NULL-fill hazard)", async () => {
+  const client = rpcClient();
+  const rows = [
+    editorRow({ name: "P", unitPrice: "", metadata: { ...AI_META }, pricePending: true }, 0),
+    editorRow({ name: "Q", unitPrice: "10" }, 1),
+    editorRow({ name: "Z", unitPrice: "0" }, 2),
+    editorRow({ name: "H", unitPrice: "", isHeading: true, metadata: { price_pending: true } }, 3),
+  ];
+  await S.saveEstimateWithItems(client, { estimateId: EST, header: {}, metadataPatch: {}, rows });
+  const sent = client.calls[0].args.p_items as any[];
+  assert.ok(sent.every((r) => r.metadata && typeof r.metadata === "object" && !Array.isArray(r.metadata)));
+  assert.equal(sent[0].metadata.price_pending, true);
+  assert.equal(sent[0].metadata.ai_execution_id, "exec-1", "unrelated AI metadata preserved");
+  assert.ok(!("price_pending" in sent[1].metadata));
+  assert.ok(!("price_pending" in sent[2].metadata), "a reviewed $0 stays reviewed");
+  assert.ok(!("price_pending" in sent[3].metadata), "a heading is never pending");
 });
 
-test("K2 — the REAL pre-fix scenario end to end: mixed rows through the NOT-NULL / NULL-fill fake, old items survive", async () => {
-  const db = makeDb([oldItem("o1", "Old 1")]);
-  const mixedPreFix = [preFixRow({ name: "P", unitPrice: "", pricePending: true }, 0), preFixRow({ name: "Q", unitPrice: "10" }, 1)];
-  const res = await S.replaceEstimateItems(db, EST, mixedPreFix);
-  assert.equal(res.ok, false);
-  assert.equal(res.error.code, "23502");
-  assert.deepEqual(names(db), ["Old 1"], "old items intact");
-});
-
-test("M — insert OK but deleting the OLD rows fails: ONLY the newly inserted rows are removed (best-effort), the old rows are preserved, and the save reports failure", async () => {
-  const base = makeDb([oldItem("o1", "Old 1"), oldItem("o2", "Old 2")]);
-  let deleteCalls = 0;
-  const db = {
-    from: (t: string) => {
-      const b = base.from(t);
-      if (t === "estimate_items") {
-        const realDelete = b.delete.bind(b);
-        b.delete = () => {
-          deleteCalls += 1;
-          if (deleteCalls === 1) return { in: () => ({ then: (res: any) => res({ data: null, error: { code: "42501", message: "boom" } }) }) };
-          return realDelete(); // the compensating delete of the NEW ids runs for real
-        };
-      }
-      return b;
-    },
-  };
-  const res = await S.replaceEstimateItems(db, EST, newRows());
-  assert.equal(res.ok, false);
-  assert.equal(res.phase, "delete_old");
-  assert.equal(deleteCalls, 2, "one failed old-row delete + one compensating delete");
-  assert.deepEqual(names(base), ["Old 1", "Old 2"], "old rows preserved, new rows cleaned up");
-});
-
-test("replacement edge cases: no rows -> old items removed (user deleted every line); first-time save (no old rows) just inserts; a failure loading existing ids aborts before any write", async () => {
-  const db = makeDb([oldItem("o1", "Old 1")]);
-  assert.equal((await S.replaceEstimateItems(db, EST, [])).ok, true);
-  assert.deepEqual(names(db), []);
-
-  const fresh = makeDb([]);
-  const res = await S.replaceEstimateItems(fresh, EST, newRows());
-  assert.equal(res.ok, true);
-  assert.equal(res.removedCount, 0);
-  assert.deepEqual(names(fresh), ["New A", "New B"]);
-
-  const base = makeDb([oldItem("o1", "Old 1")]);
-  const failingLoad = { from: (t: string) => { const b = base.from(t); if (t === "estimate_items") b.select = () => ({ eq: () => ({ then: (res: any) => res({ data: null, error: { code: "XX000", message: "down" } }) }) }); return b; } };
-  const r = await S.replaceEstimateItems(failingLoad, EST, newRows());
-  assert.equal(r.ok, false);
-  assert.equal(r.phase, "load_existing");
-  assert.deepEqual(names(base), ["Old 1"]);
-});
-
-test("replacement logs only operation + Postgres code/message — never row content", async () => {
+test("saveEstimateWithItems — an RPC error is returned untouched (nothing swallowed, no retry, no compensating writes) and logged as operation + code + message only", async () => {
+  const err = { code: "P0001", message: "estimate_rpc:delete_blocked" };
+  const client = rpcClient({ error: err });
   const logged: unknown[][] = [];
   const prev = console.error;
   console.error = (...a: unknown[]) => { logged.push(a); };
-  try {
-    const base = makeDb([oldItem("o1", "SECRET-OLD-ITEM")]);
-    const db = { from: (t: string) => { const b = base.from(t); if (t === "estimate_items") b.insert = () => ({ select: () => ({ then: (res: any) => res({ data: null, error: { code: "23502", message: "null value in column \"metadata\"" } }) }) }); return b; } };
-    await S.replaceEstimateItems(db, EST, [editorRow({ name: "SECRET-NEW-ITEM", unitPrice: "1" })]);
-  } finally { console.error = prev; }
+  let res: any;
+  try { res = await S.saveEstimateWithItems(client, { estimateId: EST, header: { title: "SECRET-TITLE" }, metadataPatch: {}, rows: [editorRow({ name: "SECRET-ITEM", unitPrice: "1" })] }); } finally { console.error = prev; }
+  assert.equal(res.ok, false);
+  assert.equal(res.error, err);
+  assert.equal(client.calls.length, 1, "exactly one call — the database rolled everything back, the client has nothing to undo");
   const blob = JSON.stringify(logged);
-  assert.match(blob, /replace_items\.insert_new/);
-  assert.match(blob, /23502/);
+  assert.match(blob, /save_estimate\.replace_items_transaction/);
+  assert.match(blob, /P0001/);
   assert.ok(!blob.includes("SECRET"));
+});
+
+test("saveEstimateWithItems — the helper module has no direct table access (no .from / no delete-then-insert)", () => {
+  const src = readFileSync(path.join(repoRoot, "src/lib/estimate-item-rows.ts"), "utf8");
+  assert.doesNotMatch(src, /\.from\(/);
+  assert.doesNotMatch(src, /replaceEstimateItems/);
+});
+
+test("friendlyEstimateSaveError — maps estimate_rpc codes to safe 'nothing was changed' messages; anything else is null (caller falls back)", () => {
+  assert.match(S.friendlyEstimateSaveError({ message: "estimate_rpc:not_found" }), /could not be found.*Nothing was changed/);
+  assert.match(S.friendlyEstimateSaveError({ message: "estimate_rpc:delete_blocked" }), /Nothing was changed/);
+  assert.match(S.friendlyEstimateSaveError({ message: "estimate_rpc:invalid_item_field" }), /Nothing was changed/);
+  assert.match(S.friendlyEstimateSaveError({ message: "ERROR: estimate_rpc:invalid_header_field detail" }), /Nothing was changed/);
+  assert.equal(S.friendlyEstimateSaveError({ message: "permission denied" }), null);
+  assert.equal(S.friendlyEstimateSaveError(null), null);
+  assert.equal(S.friendlyEstimateSaveError(undefined), null);
+  assert.equal(S.friendlyEstimateSaveError("estimate_rpc:not_found"), null);
 });
 
 // ── editor wiring (source-level, repo precedent) ────────────────────────
 
-test("the editor is wired to the helpers: uniform metadata via buildItemMetadata, safe replacement, header merge, duplicate helpers — and the old patterns are gone", () => {
+test("the editor is wired to the helpers: uniform metadata via buildItemMetadata, ONE transactional save for edits, header merge, duplicate helpers — and the old patterns are gone", () => {
   const src = readFileSync(path.join(repoRoot, "src/routes/estimates.tsx"), "utf8");
   assert.match(src, /metadata: buildItemMetadata\(it\.metadata, \{ pricePending: it\.pricePending, isHeading: it\.isHeading, price \}\)/);
-  assert.match(src, /replaceEstimateItems\(supabase, estimate\.id, buildItemRows\(estimate\.id\)\)/);
+  assert.match(src, /saveEstimateWithItems\(supabase, \{/);
+  assert.match(src, /estimateId: estimate\.id,/);
+  assert.match(src, /metadataPatch: \{ serviceAddress: address\.trim\(\) \|\| null \},/);
+  assert.match(src, /rows: buildItemRows\(estimate\.id\),/);
+  assert.match(src, /const \{ metadata: _metadataMerged, client_total: _clientTotal, \.\.\.updateHeader \} = header;/, "client_total and the merged metadata are NOT sent: the database owns both");
+  assert.match(src, /friendlyEstimateSaveError\(err\)/);
   assert.match(src, /mergeEstimateMetadata\(estimate\?\.metadata, \{ serviceAddress:/);
   assert.match(src, /metadata: duplicateItemMetadata\(it\.metadata\)/);
   assert.match(src, /\.\.\.duplicateEstimateMetadata\(e\.metadata\)/);
   assert.doesNotMatch(src, /\.\.\.\(it\.pricePending && !it\.isHeading && price <= 0 \? \{ metadata/, "the conditional metadata spread must not come back");
   assert.doesNotMatch(src, /\.\.\.\(it\.price_pending \? \{ metadata/, "nor in the duplicate flow");
   assert.doesNotMatch(src, /phase = "delete existing line items"/, "the delete-first update flow must not come back");
-  // The old header replacement:
+  assert.doesNotMatch(src, /replaceEstimateItems/, "the client-side compensating replace must not come back");
+  assert.doesNotMatch(src, /phase = "update estimate header"/, "a separate header update (committed before the items) must not come back");
   assert.doesNotMatch(src, /metadata: \{ serviceAddress: address\.trim\(\) \|\| null \}/);
   // New manual lines start with {} and loaded lines copy their metadata:
   assert.match(src, /isHeading: false, metadata: \{\},/);

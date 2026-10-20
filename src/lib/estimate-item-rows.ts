@@ -66,15 +66,14 @@ export function mergeEstimateMetadata(existing: unknown, patch: JsonObject): Jso
   return { ...asMetadataObject(existing), ...patch };
 }
 
-// ── Safer replacement of an estimate's line items ─────────────────────────
+// ── Atomic editor save (one database transaction) ─────────────────────────
 
-/** Minimal slice of the Supabase client this helper needs (kept structural so it can
- * be unit-tested with the in-memory fake). */
-type ItemsClient = { from: (table: string) => any };
+/** Minimal slice of the Supabase client this helper needs (structural, so it is unit-testable with a fake). */
+type RpcClient = { rpc: (fn: string, args: Record<string, unknown>) => PromiseLike<{ data: unknown; error: unknown }> };
 
-export type ReplaceItemsResult =
-  | { ok: true; insertedIds: string[]; removedCount: number }
-  | { ok: false; phase: "load_existing" | "insert_new" | "delete_old"; error: unknown };
+export type SaveEstimateResult =
+  | { ok: true; itemCount: number }
+  | { ok: false; error: unknown };
 
 function logDbError(operation: string, error: unknown): void {
   const e = (error && typeof error === "object" ? error : {}) as { code?: unknown; message?: unknown };
@@ -87,43 +86,63 @@ function logDbError(operation: string, error: unknown): void {
 }
 
 /**
- * Replace all line items of an estimate WITHOUT the delete-first data-loss window.
- *   1. read the ids of the CURRENT items;
- *   2. insert the replacement rows (database-generated ids — the rows carry no id,
- *      so nothing can collide with the old rows' primary keys);
- *   3. only after that succeeds, delete the OLD ids.
- * If the insert fails the old items are untouched. If deleting the old items fails,
- * the newly inserted rows (and ONLY those) are removed as a best-effort compensation,
- * so the estimate is left exactly as it was. Not a transaction (no RPC/migration) —
- * the worst residual case is a failed compensation leaving duplicates, never loss.
+ * Saves the editor's header fields AND replaces the estimate's line items in ONE database transaction
+ * (public.replace_estimate_items_transaction, SECURITY INVOKER — the caller's existing RLS is the boundary).
+ * If any part fails, the header and the old items are exactly as they were: there is no partial header
+ * update, no delete-then-failed-insert, and no client-side compensation to fail in turn.
+ *
+ *  - header:        only editor-owned columns (the RPC whitelists and REJECTS anything else — never org_id,
+ *                   status, number, created_by, lifecycle timestamps or relationship ids). Do not send
+ *                   client_total: the database writes it equal to total.
+ *  - metadataPatch: only editor-owned metadata keys (serviceAddress). Merged server-side, so AI provenance
+ *                   (ai_generated / ai_execution_id) is never replaced.
+ *  - rows:          the complete replacement item set; every row carries a metadata OBJECT (see buildItemMetadata).
+ *                   Rows may still be built with an `estimate_id` (the direct-insert create/duplicate paths need it);
+ *                   it is STRIPPED here because the RPC takes the estimate from p_estimate_id and its item whitelist
+ *                   deliberately rejects `estimate_id` (a row must never be able to name a different estimate).
  */
-export async function replaceEstimateItems(
-  client: ItemsClient,
-  estimateId: string,
-  rows: ReadonlyArray<Record<string, unknown>>,
-): Promise<ReplaceItemsResult> {
-  const { data: existing, error: loadError } = await client.from("estimate_items").select("id").eq("estimate_id", estimateId);
-  if (loadError) { logDbError("replace_items.load_existing", loadError); return { ok: false, phase: "load_existing", error: loadError }; }
-  const oldIds: string[] = ((existing ?? []) as Array<{ id: string }>).map((r) => r.id);
+/** Removes the only editor-row key the RPC does not accept: `estimate_id` (the RPC binds items to p_estimate_id). */
+function toRpcItemRow(row: Record<string, unknown>): Record<string, unknown> {
+  const { estimate_id: _estimateId, ...rest } = row;
+  return rest;
+}
 
-  let insertedIds: string[] = [];
-  if (rows.length > 0) {
-    const { data: inserted, error: insertError } = await client.from("estimate_items").insert(rows).select("id");
-    if (insertError) { logDbError("replace_items.insert_new", insertError); return { ok: false, phase: "insert_new", error: insertError }; }
-    insertedIds = ((inserted ?? []) as Array<{ id: string }>).map((r) => r.id);
+export async function saveEstimateWithItems(
+  client: RpcClient,
+  args: {
+    estimateId: string;
+    header: Record<string, unknown>;
+    metadataPatch: Record<string, unknown>;
+    rows: ReadonlyArray<Record<string, unknown>>;
+  },
+): Promise<SaveEstimateResult> {
+  const { data, error } = await client.rpc("replace_estimate_items_transaction", {
+    p_estimate_id: args.estimateId,
+    p_header: args.header,
+    p_metadata_patch: args.metadataPatch,
+    p_items: args.rows.map(toRpcItemRow),
+  });
+  if (error) {
+    logDbError("save_estimate.replace_items_transaction", error);
+    return { ok: false, error };
   }
+  const itemCount = data && typeof data === "object" && typeof (data as { item_count?: unknown }).item_count === "number"
+    ? (data as { item_count: number }).item_count
+    : args.rows.length;
+  return { ok: true, itemCount };
+}
 
-  if (oldIds.length > 0) {
-    const { error: deleteError } = await client.from("estimate_items").delete().in("id", oldIds);
-    if (deleteError) {
-      logDbError("replace_items.delete_old", deleteError);
-      if (insertedIds.length > 0) {
-        // Compensate: remove ONLY the rows we just inserted; never touch the old rows.
-        const { error: cleanupError } = await client.from("estimate_items").delete().in("id", insertedIds);
-        if (cleanupError) logDbError("replace_items.compensating_delete", cleanupError);
-      }
-      return { ok: false, phase: "delete_old", error: deleteError };
-    }
+/** A user-safe message for a deliberate RPC failure ('estimate_rpc:<code>'), or null for anything else
+ * (callers then fall back to their existing error handling). Nothing was changed in any of these cases. */
+export function friendlyEstimateSaveError(error: unknown): string | null {
+  const message = error && typeof error === "object" ? (error as { message?: unknown }).message : undefined;
+  if (typeof message !== "string") return null;
+  const i = message.indexOf("estimate_rpc:");
+  if (i < 0) return null;
+  const code = message.slice(i + "estimate_rpc:".length).split(/[^a-z_]/)[0];
+  switch (code) {
+    case "not_found": return "This estimate could not be found, or you don't have access to it. Nothing was changed.";
+    case "delete_blocked": return "The estimate's line items could not be replaced. Nothing was changed.";
+    default: return "The estimate could not be saved. Nothing was changed.";
   }
-  return { ok: true, insertedIds, removedCount: oldIds.length };
 }

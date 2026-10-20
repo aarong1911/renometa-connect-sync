@@ -13,10 +13,9 @@
 // under RLS, totals computed in the browser). AI code must never write
 // Supabase directly from model/orchestrator code, so this is the narrowest
 // trusted server-side seam that reuses the SAME rules the editor applies:
-//   - totals come from src/lib/estimate-calculations.ts (the one shared
-//     calculation engine — never reimplemented here, never model-computed),
-//   - `total` and `client_total` are written together and equal (the
-//     pre-existing trg_sync_total trigger would otherwise zero `total`),
+//   - every AI line is a $0 pending placeholder, so no total is ever
+//     model-computed (the RPCs write total and client_total together and
+//     equal — the pre-existing trg_sync_total trigger copies client_total),
 //   - estimate numbers are left to the set_estimate_number() trigger.
 //
 // ── NO INVENTED MONEY (structural, not just prompted) ───────────────────
@@ -49,19 +48,23 @@
 // selected here (the column lists below are explicit — no `select("*")`), so
 // they cannot reach a model prompt or a customer reply.
 //
-// ── ATOMICITY NOTE ──────────────────────────────────────────────────────
+// ── ATOMICITY ───────────────────────────────────────────────────────────
 //
-// PostgREST has no multi-statement transaction, and this phase deliberately
-// creates no migration/RPC. Each write handler therefore orders its steps so
-// a failure leaves nothing half-done: create inserts the header then the
-// items and DELETES the header if the items fail; add inserts the items then
-// updates the totals and DELETES the just-inserted items if the totals
-// update fails. A transactional RPC would be the stronger fix and is listed
-// as a follow-up in the phase report.
+// The two WRITE handlers below are thin callers of single-transaction database
+// functions (supabase/migrations/20261017_estimate_transactional_rpcs.sql):
+//   create_estimate_draft_transaction   header + items + created-activity
+//                                       attribution, or nothing
+//   add_estimate_line_items_transaction locks the estimate, requires draft
+//                                       status in-transaction, appends lines
+// Because the database makes each all-or-nothing, there is NO client-side
+// compensation here (no "delete the header if the items fail", no separate
+// attribution step). Authorization is enforced inside the functions too: they
+// are EXECUTE-able by service_role only, re-verify the approving user's
+// membership and every related entity's organization in SQL, and HARDCODE all
+// money/quantity values, so nothing a caller (or model) sends can set a price.
 
 import { z } from "zod";
 import type { ActionHandler } from "./types";
-import { calculateEstimate, round2, type CalcLineItem } from "../estimate-calculations";
 import { isPricePendingItem } from "../estimate-pricing-gate";
 
 // ── Shared constants ─────────────────────────────────────────────────────
@@ -71,15 +74,6 @@ import { isPricePendingItem } from "../estimate-pricing-gate";
  * purpose (a discount is a price decision the assistant must never make). */
 export const ESTIMATE_DRAFT_ITEM_TYPES = ["labor", "material", "service", "equipment", "allowance", "fee", "custom"] as const;
 export type EstimateDraftItemType = (typeof ESTIMATE_DRAFT_ITEM_TYPES)[number];
-
-/** Same labels as src/lib/estimate-status.ts's ESTIMATE_ITEM_TYPE_LABELS —
- * duplicated here only because that module imports lucide-react, which this
- * tree must not pull into a Netlify bundle. `category` is free text, so a
- * drift here is cosmetic, never a constraint violation. */
-const ITEM_TYPE_CATEGORY_LABELS: Record<EstimateDraftItemType, string> = {
-  labor: "Labor", material: "Material", service: "Service", equipment: "Equipment",
-  allowance: "Allowance", fee: "Fee", custom: "Custom",
-};
 
 /** The assistant may only mutate an estimate that is still a plain draft.
  * A "ready" estimate has been internally reviewed (editing it silently would
@@ -251,10 +245,6 @@ function clip(value: unknown, max: number): string | null {
   return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
-function normalizeName(name: string): string {
-  return name.trim().toLowerCase().replace(/\s+/g, " ");
-}
-
 function mapEstimateRow(row: any): EstimateContextEstimate {
   return {
     id: row.id,
@@ -353,69 +343,6 @@ async function resolveEstimateRow(
   return { kind: "none" };
 }
 
-function toCalcItem(row: any): CalcLineItem {
-  return {
-    quantity: num(row.quantity),
-    unitPrice: num(row.unit_price),
-    taxable: row.taxable !== false,
-    optional: !!row.optional,
-    selectedByCustomer: row.selected_by_customer !== false,
-    isHeading: !!row.is_heading,
-    discountType: row.discount_type ?? null,
-    discountValue: row.discount_value == null ? null : num(row.discount_value),
-  };
-}
-
-/** The editor's own header-totals payload shape (estimates.tsx save()): note
- * `total` and `client_total` are always written together and equal. */
-function totalsPatch(calc: ReturnType<typeof calculateEstimate>) {
-  return {
-    subtotal: calc.subtotal,
-    discount_total: calc.discountTotal,
-    tax_total: calc.taxTotal,
-    total: calc.total,
-    client_total: calc.total,
-    deposit_amount: calc.depositAmount,
-    balance_due: Math.max(0, calc.balanceDue),
-  };
-}
-
-function buildItemRows(
-  estimateId: string,
-  items: EstimateDraftItemInput[],
-  startPosition: number,
-  executionId: string | undefined,
-) {
-  return items.map((it, idx) => {
-    const itemType: EstimateDraftItemType = it.itemType ?? "custom";
-    return {
-      estimate_id: estimateId,
-      category: ITEM_TYPE_CATEGORY_LABELS[itemType],
-      item_type: itemType,
-      name: it.name,
-      description: it.description ?? null,
-      // Placeholders, NOT facts: the editor treats a blank quantity as 1 and
-      // a blank price as 0. `price_pending` / `quantity_pending` make the
-      // placeholder explicit so nothing (including this file's own readers)
-      // ever reports it as a real price or measurement.
-      quantity: 1,
-      unit: "each",
-      unit_price: 0,
-      total: 0,
-      position: startPosition + idx,
-      taxable: true,
-      optional: false,
-      is_heading: false,
-      metadata: {
-        ai_proposed: true,
-        price_pending: true,
-        quantity_pending: true,
-        ...(executionId ? { ai_execution_id: executionId } : {}),
-      },
-    };
-  });
-}
-
 // ── get_estimate_context (read-only) ─────────────────────────────────────
 
 export const getEstimateContext: ActionHandler<GetEstimateContextInput, EstimateContextOutput> = async (ctx, input) => {
@@ -451,15 +378,18 @@ export const getEstimateContext: ActionHandler<GetEstimateContextInput, Estimate
   }
 };
 
-// ── create_estimate_draft (approval-gated write) ─────────────────────────
+// ── RPC plumbing (shared by the two approval-gated writes) ───────────────
 
 const CREATE_DRAFT_FAILED = "Could not create the estimate draft.";
+const ADD_ITEMS_FAILED = "Could not add the line items.";
 const NEEDS_TEAM_MEMBER = "An estimate must be attributed to a team member.";
+const NEEDS_CONTACT = "An estimate needs a linked customer contact, and none is on file yet.";
+const NOT_A_DRAFT = "This estimate is no longer a draft, so the assistant cannot change it. A team member can edit it directly.";
 
 /** Server-side diagnostics for a database failure: the operation name and the
  * Postgres/PostgREST error code + message ONLY. Never the row payload, ids from
  * the request, customer content, tokens or secrets. The caller still returns
- * the same user-safe outward message as before. */
+ * the same user-safe outward message. */
 function logDbError(operation: string, error: unknown): void {
   const e = (error && typeof error === "object" ? error : {}) as { code?: unknown; message?: unknown };
   console.error("[estimate-handlers] db error", {
@@ -469,237 +399,78 @@ function logDbError(operation: string, error: unknown): void {
   });
 }
 
-/**
- * `estimates.created_by` is NOT NULL (default auth.uid(), FK profiles.id). The
- * browser editor satisfies it because it writes as the logged-in user; this
- * handler writes with the service-role client, where auth.uid() is NULL, so the
- * attribution must be supplied explicitly — and it must be a REAL team member of
- * THIS org, never a guessed owner/admin/system identity and never an unverified
- * id taken from context.
- *
- * Membership follows the repo's canonical precedence (resolve-org.ts):
- * profiles.organization_id first, then org_memberships. Returns the verified
- * user id, or null when the actor is absent, not a user, or not in this org
- * (callers fail closed BEFORE any write). A lookup error also yields null.
- */
-async function resolveAttributableUserId(ctx: Parameters<ActionHandler>[0]): Promise<string | null> {
-  if (ctx.actor.actorType !== "user") return null;
-  const userId = typeof ctx.actor.actorId === "string" ? ctx.actor.actorId.trim() : "";
-  if (!userId) return null;
-
-  const { data: profile, error: profileError } = await ctx.supabase
-    .from("profiles")
-    .select("id")
-    .eq("id", userId)
-    .eq("organization_id", ctx.orgId)
-    .maybeSingle();
-  if (profileError) { logDbError("estimate_actor.profile_lookup", profileError); return null; }
-  if (profile) return userId;
-
-  const { data: membership, error: membershipError } = await ctx.supabase
-    .from("org_memberships")
-    .select("member_id")
-    .eq("member_id", userId)
-    .eq("org_id", ctx.orgId)
-    .maybeSingle();
-  if (membershipError) { logDbError("estimate_actor.membership_lookup", membershipError); return null; }
-  return membership ? userId : null;
+/** The RPCs raise deliberate failures as 'estimate_rpc:<code>' (see the migration's ERROR CONTRACT). */
+const RPC_ERROR_PREFIX = "estimate_rpc:";
+function rpcErrorCode(error: unknown): string | null {
+  const message = error && typeof error === "object" ? (error as { message?: unknown }).message : undefined;
+  if (typeof message !== "string") return null;
+  const i = message.indexOf(RPC_ERROR_PREFIX);
+  return i < 0 ? null : message.slice(i + RPC_ERROR_PREFIX.length).split(/[^a-z_]/)[0] || null;
 }
 
-/**
- * "Estimate created" attribution. log_estimate_activity() (AFTER INSERT trigger)
- * records the created event using auth.uid(), which is NULL for this service-role
- * write, so it writes actor_type = 'system', actor_id = NULL — misleading, because
- * a real team member approved the AI action. The trigger cannot be told otherwise
- * without a migration, so the handler corrects THAT ONE row after a successful
- * create:
- *   - only the unattributed trigger row is touched (activity_type 'created',
- *     actor_type 'system', actor_id NULL, this org, this estimate) — a row that
- *     already names a user is never overwritten;
- *   - it is an UPDATE of the existing row, never an extra INSERT, so there is
- *     never a duplicate "Estimate created";
- *   - the actor is the SAME verified same-org user stamped into estimates.created_by
- *     (nothing is fabricated), and the row records that it was originally written as
- *     'system' and corrected via the approval flow;
- *   - best effort: a failure is logged (operation + code + message only) and never
- *     fails or rolls back the create. If no unattributed row exists (e.g. the trigger
- *     is absent) nothing is invented.
- * Ordinary user-created estimates never pass through here and keep the trigger's
- * auth.uid() attribution; automation with no verified user is refused earlier.
- */
-async function attributeCreatedActivity(
-  ctx: Parameters<ActionHandler>[0],
-  estimateId: string,
-  userId: string,
-  executionId: string | undefined,
-): Promise<void> {
-  try {
-    const { data, error } = await ctx.supabase
-      .from("estimate_activities")
-      .update({
-        actor_id: userId,
-        actor_type: "user",
-        description: "Drafted by the Estimate Assistant and approved by a team member.",
-        metadata: {
-          attributed_via: "estimate_assistant_approval",
-          originally_recorded_as: "system",
-          ...(executionId ? { ai_execution_id: executionId } : {}),
-        },
-      })
-      .eq("org_id", ctx.orgId)
-      .eq("estimate_id", estimateId)
-      .eq("activity_type", "created")
-      .eq("actor_type", "system")
-      .is("actor_id", null)
-      .select("id");
-    if (error) { logDbError("create_estimate_draft.attribute_created_activity", error); return; }
-    if ((data ?? []).length === 0) {
-      logDbError("create_estimate_draft.attribute_created_activity", { message: "no unattributed 'created' activity row found; nothing changed" });
-    }
-  } catch (err) {
-    logDbError("create_estimate_draft.attribute_created_activity", err);
-  }
+/** AI items cross the RPC boundary as { name, description?, itemType? } and NOTHING else — the SQL validator
+ * rejects any other key, and the SQL hardcodes every quantity and price. */
+function toRpcItems(items: ReadonlyArray<EstimateDraftItemInput> | undefined): Array<Record<string, string>> {
+  return (items ?? []).map((it) => ({
+    name: it.name,
+    ...(it.description ? { description: it.description } : {}),
+    ...(it.itemType ? { itemType: it.itemType } : {}),
+  }));
 }
+
+// ── create_estimate_draft (approval-gated write) ─────────────────────────
 
 export const createEstimateDraft: ActionHandler<CreateEstimateDraftInput, CreateEstimateDraftOutput> = async (ctx, input) => {
   try {
-    const executionId = ctx.executionId;
-
-    // Fail closed BEFORE reading or writing anything else: the draft needs a
-    // verified same-org team member to attribute it to (see above).
-    const createdBy = await resolveAttributableUserId(ctx);
+    // The draft is attributed to the verified approving USER. Fail closed before any database call when there
+    // is none; the RPC re-verifies this user belongs to ctx.orgId (never trusted from context alone).
+    const createdBy = ctx.actor.actorType === "user" && typeof ctx.actor.actorId === "string" ? ctx.actor.actorId.trim() : "";
     if (!createdBy) return { ok: false, error: NEEDS_TEAM_MEMBER };
 
-    // Belt-and-suspenders idempotency on top of agent_action_idempotency: one
-    // execution proposes at most one draft, so an estimate already stamped
-    // with this execution id IS this action's prior success.
-    if (executionId) {
-      const { data: prior, error: priorError } = await ctx.supabase
-        .from("estimates")
-        .select("id, number, status")
-        .eq("org_id", ctx.orgId)
-        .eq("metadata->>ai_execution_id", executionId)
-        .maybeSingle();
-      if (priorError) { logDbError("create_estimate_draft.prior_lookup", priorError); return { ok: false, error: CREATE_DRAFT_FAILED }; }
-      if (prior) {
-        const { data: priorItems } = await ctx.supabase.from("estimate_items").select("id").eq("estimate_id", prior.id);
-        return {
-          ok: true,
-          output: {
-            estimateId: prior.id,
-            number: prior.number ?? null,
-            status: "draft",
-            itemCount: (priorItems ?? []).length,
-            pricePendingItemCount: (priorItems ?? []).length,
-            total: 0,
-            alreadyCreated: true,
-          },
-        };
+    const { data, error } = await ctx.supabase.rpc("create_estimate_draft_transaction", {
+      p_org_id: ctx.orgId,
+      p_created_by: createdBy,
+      p_client_id: input.contactId ?? null,
+      p_lead_id: input.leadId ?? null,
+      p_project_id: input.projectId ?? null,
+      p_title: input.title,
+      p_scope: input.scope ?? null,
+      p_items: toRpcItems(input.items),
+      p_execution_id: ctx.executionId ?? null,
+    });
+
+    if (error) {
+      switch (rpcErrorCode(error)) {
+        case "attribution_required": return { ok: false, error: NEEDS_TEAM_MEMBER };
+        case "attribution_failed":
+          // The database rolled the whole create back (the created-activity row could not be attributed
+          // unambiguously). Nothing exists; log the code only and return the generic safe message.
+          logDbError("create_estimate_draft.rpc", error);
+          return { ok: false, error: CREATE_DRAFT_FAILED };
+        case "not_found": return { ok: false, error: GENERIC_NOT_FOUND };
+        case "contact_required": return { ok: false, error: NEEDS_CONTACT };
+        default:
+          logDbError("create_estimate_draft.rpc", error);
+          return { ok: false, error: CREATE_DRAFT_FAILED };
       }
     }
 
-    // Every referenced entity must belong to THIS org. One generic message
-    // for every miss (no cross-tenant probing).
-    let leadContactId: string | null = null;
-    if (input.leadId) {
-      const { data: lead, error } = await ctx.supabase
-        .from("leads")
-        .select("id, contact_id")
-        .eq("id", input.leadId)
-        .eq("org_id", ctx.orgId)
-        .maybeSingle();
-      if (error) { logDbError("create_estimate_draft.lead_lookup", error); return { ok: false, error: CREATE_DRAFT_FAILED }; }
-      if (!lead) return { ok: false, error: GENERIC_NOT_FOUND };
-      leadContactId = lead.contact_id ?? null;
-    }
-    if (input.projectId) {
-      const { data: project, error } = await ctx.supabase
-        .from("projects")
-        .select("id")
-        .eq("id", input.projectId)
-        .eq("org_id", ctx.orgId)
-        .maybeSingle();
-      if (error) { logDbError("create_estimate_draft.project_lookup", error); return { ok: false, error: CREATE_DRAFT_FAILED }; }
-      if (!project) return { ok: false, error: GENERIC_NOT_FOUND };
-    }
-
-    const clientId = input.contactId ?? leadContactId;
-    if (!clientId) return { ok: false, error: "An estimate needs a linked customer contact, and none is on file yet." };
-    const { data: contact, error: contactError } = await ctx.supabase
-      .from("contacts")
-      .select("id")
-      .eq("id", clientId)
-      .eq("org_id", ctx.orgId)
-      .maybeSingle();
-    if (contactError) { logDbError("create_estimate_draft.contact_lookup", contactError); return { ok: false, error: CREATE_DRAFT_FAILED }; }
-    if (!contact) return { ok: false, error: GENERIC_NOT_FOUND };
-
-    const items = input.items ?? [];
-    // Authoritative totals from the shared engine over the rows about to be
-    // written (all unpriced → zeros, but derived, never hardcoded).
-    const itemRowsPreview = buildItemRows("preview", items, 0, executionId);
-    const calc = calculateEstimate({ items: itemRowsPreview.map(toCalcItem) });
-
-    const { data: header, error: headerError } = await ctx.supabase
-      .from("estimates")
-      .insert({
-        org_id: ctx.orgId,
-        // NOT NULL; auth.uid() is NULL for the service-role client, so it is
-        // supplied explicitly (verified same-org team member — see above).
-        created_by: createdBy,
-        status: "draft",
-        client_id: clientId,
-        lead_id: input.leadId ?? null,
-        project_id: input.projectId ?? null,
-        title: input.title,
-        scope: input.scope ?? null,
-        tax_rate: 0,
-        discount_type: null,
-        discount_value: 0,
-        deposit_type: null,
-        deposit_value: 0,
-        ...totalsPatch(calc),
-        metadata: {
-          ai_generated: true,
-          ai_source: "estimate_assistant",
-          ...(executionId ? { ai_execution_id: executionId } : {}),
-        },
-      })
-      .select("id, number")
-      .single();
-    if (headerError || !header) {
-      logDbError("create_estimate_draft.insert_estimate", headerError ?? { message: "insert returned no row" });
+    const out = (data ?? {}) as { estimate_id?: unknown; number?: unknown; status?: unknown; item_count?: unknown; already_created?: unknown };
+    if (typeof out.estimate_id !== "string" || !out.estimate_id) {
+      logDbError("create_estimate_draft.rpc", { message: "rpc returned no estimate id" });
       return { ok: false, error: CREATE_DRAFT_FAILED };
     }
-
-    if (items.length > 0) {
-      const { error: itemsError } = await ctx.supabase
-        .from("estimate_items")
-        .insert(buildItemRows(header.id, items, 0, executionId));
-      if (itemsError) {
-        logDbError("create_estimate_draft.insert_items", itemsError);
-        // Compensate: never leave a header the owner didn't approve in a
-        // half-built state.
-        const { error: cleanupError } = await ctx.supabase.from("estimates").delete().eq("id", header.id).eq("org_id", ctx.orgId);
-        if (cleanupError) logDbError("create_estimate_draft.compensating_delete", cleanupError);
-        return { ok: false, error: CREATE_DRAFT_FAILED };
-      }
-    }
-
-    // Only after the estimate AND its items are safely in place (a rolled-back create
-    // deletes the header, which cascades its activity rows away).
-    await attributeCreatedActivity(ctx, header.id, createdBy, executionId);
-
+    const itemCount = typeof out.item_count === "number" ? out.item_count : (input.items ?? []).length;
     return {
       ok: true,
       output: {
-        estimateId: header.id,
-        number: header.number ?? null,
+        estimateId: out.estimate_id,
+        number: typeof out.number === "string" ? out.number : null,
         status: "draft",
-        itemCount: items.length,
-        pricePendingItemCount: items.length,
-        total: calc.total,
-        alreadyCreated: false,
+        itemCount,
+        pricePendingItemCount: itemCount,
+        total: 0,
+        alreadyCreated: out.already_created === true,
       },
     };
   } catch (err) {
@@ -712,123 +483,46 @@ export const createEstimateDraft: ActionHandler<CreateEstimateDraftInput, Create
 
 export const addEstimateLineItems: ActionHandler<AddEstimateLineItemsInput, AddEstimateLineItemsOutput> = async (ctx, input) => {
   try {
-    const executionId = ctx.executionId;
+    const { data, error } = await ctx.supabase.rpc("add_estimate_line_items_transaction", {
+      p_org_id: ctx.orgId,
+      p_estimate_id: input.estimateId,
+      p_items: toRpcItems(input.items),
+      p_execution_id: ctx.executionId ?? null,
+    });
 
-    const { data: estimate, error: estimateError } = await ctx.supabase
-      .from("estimates")
-      .select("id, status, total, tax_rate, discount_type, discount_value, deposit_type, deposit_value")
-      .eq("id", input.estimateId)
-      .eq("org_id", ctx.orgId)
-      .maybeSingle();
-    if (estimateError) return { ok: false, error: "Could not add the line items." };
-    if (!estimate) return { ok: false, error: GENERIC_NOT_FOUND };
-    if (!AI_EDITABLE_ESTIMATE_STATUSES.has(estimate.status)) {
-      return { ok: false, error: "This estimate is no longer a draft, so the assistant cannot change it. A team member can edit it directly." };
-    }
-
-    const { data: existingRows, error: existingError } = await ctx.supabase
-      .from("estimate_items")
-      .select("id, name, position, quantity, unit_price, taxable, optional, selected_by_customer, is_heading, discount_type, discount_value, metadata")
-      .eq("estimate_id", estimate.id);
-    if (existingError) return { ok: false, error: "Could not add the line items." };
-    const existing = existingRows ?? [];
-
-    // Idempotent replay: this execution already inserted its items.
-    if (executionId) {
-      const prior = existing.filter((r: any) => r.metadata?.ai_execution_id === executionId);
-      if (prior.length > 0) {
-        return {
-          ok: true,
-          output: {
-            estimateId: estimate.id,
-            addedItemIds: prior.map((r: any) => r.id),
-            skippedDuplicateNames: [],
-            itemCount: existing.length,
-            totalsUpdated: false,
-            total: num(estimate.total),
-            alreadyApplied: true,
-          },
-        };
+    if (error) {
+      switch (rpcErrorCode(error)) {
+        case "not_found": return { ok: false, error: GENERIC_NOT_FOUND };
+        case "not_draft": return { ok: false, error: NOT_A_DRAFT };
+        default:
+          logDbError("add_estimate_line_items.rpc", error);
+          return { ok: false, error: ADD_ITEMS_FAILED };
       }
     }
 
-    // Skip anything already on the estimate (or repeated within this batch).
-    const seen = new Set(existing.filter((r: any) => !r.is_heading).map((r: any) => normalizeName(String(r.name ?? ""))));
-    const toAdd: EstimateDraftItemInput[] = [];
-    const skipped: string[] = [];
-    for (const it of input.items) {
-      const key = normalizeName(it.name);
-      if (seen.has(key)) { skipped.push(it.name); continue; }
-      seen.add(key);
-      toAdd.push(it);
+    const out = (data ?? {}) as {
+      estimate_id?: unknown; added_item_ids?: unknown; skipped_duplicate_names?: unknown;
+      item_count?: unknown; total?: unknown; already_applied?: unknown;
+    };
+    if (typeof out.estimate_id !== "string" || !Array.isArray(out.added_item_ids)) {
+      logDbError("add_estimate_line_items.rpc", { message: "rpc returned an unexpected shape" });
+      return { ok: false, error: ADD_ITEMS_FAILED };
     }
-
-    if (toAdd.length === 0) {
-      return {
-        ok: true,
-        output: {
-          estimateId: estimate.id,
-          addedItemIds: [],
-          skippedDuplicateNames: skipped,
-          itemCount: existing.length,
-          totalsUpdated: false,
-          total: num(estimate.total),
-          alreadyApplied: false,
-        },
-      };
-    }
-
-    const startPosition = existing.reduce((max: number, r: any) => Math.max(max, num(r.position, -1)), -1) + 1;
-    const rows = buildItemRows(estimate.id, toAdd, startPosition, executionId);
-    const { data: inserted, error: insertError } = await ctx.supabase
-      .from("estimate_items")
-      .insert(rows)
-      .select("id");
-    if (insertError || !inserted) return { ok: false, error: "Could not add the line items." };
-    const insertedIds = (inserted as Array<{ id: string }>).map((r) => r.id);
-
-    // Totals: recomputed by the shared engine over ALL items (never by the
-    // model). Guard: a legacy "quick estimate" (stored total, zero item rows)
-    // keeps its stored total — see src/lib/estimate-totals.ts — so adding the
-    // first placeholder rows can never silently zero a real stored figure.
-    const keepStoredTotals = existing.length === 0 && num(estimate.total) > 0;
-    let totalsUpdated = false;
-    let total = num(estimate.total);
-    if (!keepStoredTotals) {
-      const calc = calculateEstimate({
-        items: [...existing, ...rows].map(toCalcItem),
-        discountType: estimate.discount_type ?? null,
-        discountValue: estimate.discount_value == null ? null : num(estimate.discount_value),
-        taxRate: num(estimate.tax_rate),
-        depositType: estimate.deposit_type ?? null,
-        depositValue: estimate.deposit_value == null ? null : num(estimate.deposit_value),
-      });
-      const { error: updateError } = await ctx.supabase
-        .from("estimates")
-        .update({ ...totalsPatch(calc), updated_at: new Date().toISOString() })
-        .eq("id", estimate.id)
-        .eq("org_id", ctx.orgId);
-      if (updateError) {
-        await ctx.supabase.from("estimate_items").delete().in("id", insertedIds);
-        return { ok: false, error: "Could not add the line items." };
-      }
-      totalsUpdated = true;
-      total = calc.total;
-    }
-
     return {
       ok: true,
       output: {
-        estimateId: estimate.id,
-        addedItemIds: insertedIds,
-        skippedDuplicateNames: skipped,
-        itemCount: existing.length + insertedIds.length,
-        totalsUpdated,
-        total: round2(total),
-        alreadyApplied: false,
+        estimateId: out.estimate_id,
+        addedItemIds: out.added_item_ids.filter((x): x is string => typeof x === "string"),
+        skippedDuplicateNames: Array.isArray(out.skipped_duplicate_names) ? out.skipped_duplicate_names.filter((x): x is string => typeof x === "string") : [],
+        itemCount: typeof out.item_count === "number" ? out.item_count : 0,
+        // Totals are never touched: every added line is a $0 pending placeholder, which cannot change any total.
+        totalsUpdated: false,
+        total: Number.isFinite(Number(out.total)) ? Number(out.total) : 0,
+        alreadyApplied: out.already_applied === true,
       },
     };
-  } catch {
-    return { ok: false, error: "Could not add the line items." };
+  } catch (err) {
+    logDbError("add_estimate_line_items.unexpected", err);
+    return { ok: false, error: ADD_ITEMS_FAILED };
   }
 };
