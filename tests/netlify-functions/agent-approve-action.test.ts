@@ -554,22 +554,24 @@ test("verifyActionSuccess('add_estimate_line_items', ...) requires a real estima
   }
 });
 
-test("E2E retry semantics through idempotencyKeyFor() + the REAL executeApprovedStep(): approving create_estimate_draft twice creates exactly ONE estimate", async () => {
+test("E2E retry semantics through idempotencyKeyFor() + the REAL executeApprovedStep(): approving create_estimate_draft twice calls the transactional RPC exactly ONCE", async () => {
   const CONTACT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
-  const db = withApprovalDefaults(
+  const base = withApprovalDefaults(
     createFakeSupabaseClient(
       {
         organizations: [{ id: ORG_A, timezone: TZ, ai_center_settings: {} }],
         contacts: [{ id: CONTACT, org_id: ORG_A, full_name: "Jane Homeowner" }],
         leads: [], projects: [], estimates: [], estimate_items: [],
-        // The approving user must be a real team member of the org: estimates.created_by is NOT NULL on the live table.
         profiles: [{ id: "approver-1", organization_id: ORG_A }],
         agent_execution_steps: [], agent_approval_requests: [], agent_action_idempotency: [], marketing_contact_preferences: [],
       },
       {},
-      { uniqueConstraints: { agent_action_idempotency: [["org_id", "action_key", "idempotency_key"]] }, notNullColumns: { estimates: ["created_by"] } },
+      { uniqueConstraints: { agent_action_idempotency: [["org_id", "action_key", "idempotency_key"]] } },
     ),
   );
+  // The handler calls create_estimate_draft_transaction (all-or-nothing in PL/pgSQL — verified separately, not here).
+  const rpcCalls: Array<{ fn: string; args: any }> = [];
+  const db: any = { ...base, rpc: async (fn: string, args: any) => { rpcCalls.push({ fn, args }); return { data: { estimate_id: "est-1", number: "EST-000001", status: "draft", item_count: args.p_items.length, already_created: false }, error: null }; } };
   const approval = fakeApproval({ id: "approval-estimate-retry-aaaa" });
   const key = S.idempotencyKeyFor("create_estimate_draft", approval);
   const approvedInput = { contactId: CONTACT, title: "Kitchen remodel", items: [{ name: "Cabinet replacement" }] };
@@ -581,6 +583,7 @@ test("E2E retry semantics through idempotencyKeyFor() + the REAL executeApproved
   assert.equal(S.verifyActionSuccess("create_estimate_draft", first.output).verified, true);
   assert.equal(second.status, "skipped");
   assert.equal(S.verifyActionSuccess("create_estimate_draft", second.output.result).verified, true, "a duplicate-suppressed replay still verifies against the REAL prior result");
-  assert.equal(db.__dumpTable("estimates").length, 1);
-  assert.equal(db.__dumpTable("estimate_items").length, 1);
+  assert.equal(rpcCalls.length, 1);
+  assert.equal(db.__dumpTable("estimates").length, 0, "the TypeScript layer writes no estimate rows itself");
+  assert.equal(db.__dumpTable("estimate_items").length, 0);
 });

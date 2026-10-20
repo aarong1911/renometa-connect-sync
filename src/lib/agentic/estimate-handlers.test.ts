@@ -13,8 +13,8 @@
 // no cross-org), mutation-requires-approval (nothing written pre-approval),
 // approved mutation (one intended write, authoritative server result,
 // totals from the shared calculation engine), duplicate approval / replay
-// idempotency, cross-org refusal with non-probing errors, compensation on
-// partial failure, and the structural "no money fields" schema guarantee.
+// idempotency, cross-org refusal with non-probing errors, the write handlers being thin RPC
+// callers (no direct writes, no compensation), and the structural "no money fields" schema guarantee.
 
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
@@ -367,517 +367,312 @@ const CREATE_INPUT = {
   ],
 };
 
-test("TEST 14 — create_estimate_draft requires approval: the proposal creates an approval and writes NO estimate", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [] });
-  const res = await step(db, "create_estimate_draft", CREATE_INPUT);
-  assert.equal(res.status, "awaiting_approval", JSON.stringify(res));
-  assert.ok(res.approvalRequestId);
-  assert.equal(db.__dumpTable("estimates").length, 0, "no estimate before approval");
-  assert.equal(db.__dumpTable("estimate_items").length, 0, "no items before approval");
-  const approvals = db.__dumpTable("agent_approval_requests");
-  assert.equal(approvals.length, 1);
-  assert.equal(approvals[0].action_key, "create_estimate_draft");
-  assert.equal(approvals[0].status, "pending");
-});
+// ── Write handlers are THIN RPC CALLERS (transactional logic lives in SQL) ─────────────────
+//
+// TypeScript-level tests only. Atomicity itself (header+items all-or-nothing, locking, replay inside the
+// transaction) is a property of PL/pgSQL and is NOT proven here: the fake client below merely RECORDS the RPC
+// call and returns a canned result. SQL behavior is covered by supabase/verification/estimate_transactional_rpcs_verification.sql.
 
-test("create at autonomy Level 1 is refused outright (floor 2) — never an approval, never a write", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [] });
-  const res = await step(db, "create_estimate_draft", CREATE_INPUT, { autonomyLevel: 1 });
-  assert.equal(res.status, "failed");
-  assert.equal(db.__dumpTable("estimates").length, 0);
-  assert.equal(db.__dumpTable("agent_approval_requests").length, 0);
-});
+type RpcCall = { fn: string; args: any };
+const WRITE_TABLES = ["estimates", "estimate_items", "estimate_activities"];
 
-test("TEST 15 / TEST 5 — approved create: exactly one DRAFT with the proposed STRUCTURE, unpriced, totals from the shared engine, authoritative server result", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [] });
+/** A db whose rpc() records calls and answers from `results`, and whose estimate tables THROW on any direct write. */
+function makeRpcDb(results: Record<string, (args: any) => { data?: any; error?: any }> = {}, overrides: Record<string, any[]> = {}) {
+  const calls: RpcCall[] = [];
+  const base = makeDb(overrides);
+  const db: any = {
+    ...base,
+    from: (table: string) => {
+      const b = base.from(table);
+      if (WRITE_TABLES.includes(table)) {
+        for (const m of ["insert", "update", "delete", "upsert"]) {
+          b[m] = () => { throw new Error(`direct ${m} on ${table} is forbidden for AI estimate handlers`); };
+        }
+      }
+      return b;
+    },
+    rpc: async (fn: string, args: any) => {
+      calls.push({ fn, args });
+      const r = results[fn];
+      if (!r) throw new Error(`unexpected rpc ${fn}`);
+      const out = r(args);
+      return { data: out.data ?? null, error: out.error ?? null };
+    },
+  };
+  db.__rpcCalls = calls;
+  return db;
+}
+const createOk = (args: any) => ({ data: { estimate_id: EST_A, number: "EST-000007", status: "draft", item_count: args.p_items.length, already_created: false } });
+const addOk = (args: any) => ({ data: { estimate_id: EST_A, added_item_ids: args.p_items.map((_: any, i: number) => `new-${i}`), skipped_duplicate_names: [], item_count: 1 + args.p_items.length, total: 220, already_applied: false } });
+const rpcErr = (code: string) => () => ({ error: { code: "P0001", message: `estimate_rpc:${code}` } });
+
+test("create_estimate_draft — one RPC call with trusted org/actor ids and an items payload of {name, description?, itemType?} only", async () => {
+  const db = makeRpcDb({ create_estimate_draft_transaction: createOk });
   const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "create_estimate_draft:appr-1" });
   assert.equal(res.status, "succeeded", JSON.stringify(res));
-  assert.equal(typeof res.output.estimateId, "string");
+  assert.equal(db.__rpcCalls.length, 1);
+  const { fn, args } = db.__rpcCalls[0];
+  assert.equal(fn, "create_estimate_draft_transaction");
+  assert.deepEqual(Object.keys(args).sort(), ["p_client_id", "p_created_by", "p_execution_id", "p_items", "p_lead_id", "p_org_id", "p_project_id", "p_scope", "p_title"]);
+  assert.equal(args.p_org_id, ORG_A, "org comes from trusted server context");
+  assert.equal(args.p_created_by, "user-1", "approver comes from the verified actor");
+  assert.equal(args.p_execution_id, "exec-1");
+  assert.equal(args.p_client_id, CONTACT_A);
+  assert.equal(args.p_lead_id, LEAD_A);
+  assert.equal(args.p_project_id, null);
+  assert.deepEqual(args.p_items, [
+    { name: "Cabinet replacement", itemType: "material" },
+    { name: "Countertop replacement", description: "Quartz", itemType: "material" },
+    { name: "Sink installation", itemType: "labor" },
+  ]);
+  assert.equal(res.output.estimateId, EST_A);
+  assert.equal(res.output.number, "EST-000007");
   assert.equal(res.output.status, "draft");
   assert.equal(res.output.itemCount, 3);
   assert.equal(res.output.pricePendingItemCount, 3);
   assert.equal(res.output.total, 0);
   assert.equal(res.output.alreadyCreated, false);
-
-  const estimates = db.__dumpTable("estimates");
-  assert.equal(estimates.length, 1);
-  const e = estimates[0];
-  assert.equal(e.id, res.output.estimateId);
-  assert.equal(e.org_id, ORG_A);
-  assert.equal(e.status, "draft");
-  assert.equal(e.client_id, CONTACT_A);
-  assert.equal(e.lead_id, LEAD_A);
-  assert.equal(e.title, "Kitchen remodel");
-  assert.equal(e.total, 0);
-  assert.equal(e.client_total, e.total, "total and client_total are always written together (trg_sync_total)");
-  assert.equal(e.deposit_amount, 0);
-  assert.equal(e.tax_rate, 0, "tax is never invented");
-  assert.equal(e.metadata.ai_execution_id, "exec-1");
-
-  const items = db.__dumpTable("estimate_items");
-  assert.deepEqual(items.map((i: any) => i.name), ["Cabinet replacement", "Countertop replacement", "Sink installation"]);
-  for (const it of items) {
-    assert.equal(it.estimate_id, e.id);
-    assert.equal(it.unit_price, 0, "unpriced placeholder");
-    assert.equal(it.total, 0);
-    assert.equal(it.metadata.price_pending, true);
-    assert.equal(it.metadata.quantity_pending, true);
-    assert.equal(it.is_heading, false);
-  }
-  assert.deepEqual(items.map((i: any) => i.position), [0, 1, 2]);
 });
 
-test("TEST 16 — duplicate approval: a replay under the same idempotency key creates NO second estimate or item", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [] });
+test("create_estimate_draft — NO money field of any kind reaches the RPC", async () => {
+  const db = makeRpcDb({ create_estimate_draft_transaction: createOk });
+  await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-money" });
+  const json = JSON.stringify(db.__rpcCalls[0].args);
+  for (const forbidden of ["unit_price", "unitPrice", "quantity", "price", "total", "tax", "discount", "deposit", "markup", "status", "metadata"]) {
+    assert.ok(!json.includes(`"${forbidden}"`), `payload contains ${forbidden}`);
+  }
+  for (const it of db.__rpcCalls[0].args.p_items) assert.ok(Object.keys(it).every((k) => ["name", "description", "itemType"].includes(k)));
+});
+
+test("create_estimate_draft — makes NO direct estimates / estimate_items / estimate_activities write (the proxy throws on any)", async () => {
+  const db = makeRpcDb({ create_estimate_draft_transaction: createOk });
+  const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-nodirect" });
+  assert.equal(res.status, "succeeded", JSON.stringify(res));
+});
+
+test("create_estimate_draft — non-user / blank-actor approvers fail closed BEFORE any RPC call", async () => {
+  for (const actor of [{ actorType: "agent", actorId: "a-1" }, { actorType: "system", actorId: null }, { actorType: "workflow", actorId: "w" }, { actorType: "integration", actorId: "i" }, { actorType: "user", actorId: "" }, { actorType: "user", actorId: "   " }, { actorType: "user" }]) {
+    const db = makeRpcDb({ create_estimate_draft_transaction: createOk });
+    const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { actor, idempotencyKey: `k-${JSON.stringify(actor)}` });
+    assert.equal(res.status, "failed", JSON.stringify(actor));
+    assert.equal(res.error, "An estimate must be attributed to a team member.");
+    assert.equal(db.__rpcCalls.length, 0, `no rpc for ${JSON.stringify(actor)}`);
+  }
+});
+
+test("create_estimate_draft — safe error mapping: attribution_required / not_found / contact_required / unknown (no raw DB text leaks)", async () => {
+  const cases: Array<[string, string]> = [
+    ["attribution_required", "An estimate must be attributed to a team member."],
+    ["not_found", GENERIC_NOT_FOUND],
+    ["contact_required", "An estimate needs a linked customer contact, and none is on file yet."],
+    ["invalid_items", "Could not create the estimate draft."],
+  ];
+  for (const [code, expected] of cases) {
+    const db = makeRpcDb({ create_estimate_draft_transaction: rpcErr(code) });
+    const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: `k-${code}` });
+    assert.equal(res.status, "failed", code);
+    assert.equal(res.error, expected, code);
+  }
+  const db = makeRpcDb({ create_estimate_draft_transaction: () => ({ error: { code: "23502", message: 'null value in column "created_by" SECRET-ROW-DETAIL' } }) });
+  const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-raw" });
+  assert.equal(res.error, "Could not create the estimate draft.");
+  assert.ok(!JSON.stringify(res).includes("SECRET-ROW-DETAIL"));
+});
+
+test("create_estimate_draft — an unexpected RPC failure logs operation + code + message ONLY and returns the safe message", async () => {
+  const SECRET_TITLE = "Smith family kitchen — 123 Private Lane";
+  const db = makeRpcDb({ create_estimate_draft_transaction: () => ({ error: { code: "XX000", message: "boom" } }) });
+  const logged: unknown[][] = [];
+  const prev = console.error;
+  console.error = (...a: unknown[]) => { logged.push(a); };
+  let res: any;
+  try { res = await approved(db, "create_estimate_draft", { ...CREATE_INPUT, title: SECRET_TITLE }, { idempotencyKey: "k-log" }); } finally { console.error = prev; }
+  assert.equal(res.error, "Could not create the estimate draft.");
+  const entry = logged.find((a) => String(a[0]).includes("[estimate-handlers] db error"));
+  assert.ok(entry);
+  assert.deepEqual(Object.keys(entry![1] as object).sort(), ["code", "message", "operation"]);
+  assert.equal((entry![1] as any).operation, "create_estimate_draft.rpc");
+  for (const forbidden of [SECRET_TITLE, "Cabinet replacement", CONTACT_A, LEAD_A, "user-1", ORG_A]) assert.ok(!JSON.stringify(logged).includes(forbidden), forbidden);
+});
+
+test("create_estimate_draft — replay: the executor's idempotency key skips a duplicate approval before any second RPC; a lost slot reaches the RPC, whose already_created flag is surfaced", async () => {
+  let n = 0;
+  const db = makeRpcDb({ create_estimate_draft_transaction: (a) => { n++; const r = createOk(a); r.data.already_created = n > 1; return r; } });
   const key = "create_estimate_draft:appr-dup";
   const first = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: key });
   const second = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: key });
   assert.equal(first.status, "succeeded");
   assert.equal(second.status, "skipped");
-  assert.equal(second.output.result.estimateId, first.output.estimateId, "replay reuses the real prior result");
-  assert.equal(db.__dumpTable("estimates").length, 1);
-  assert.equal(db.__dumpTable("estimate_items").length, 3);
+  assert.equal(db.__rpcCalls.length, 1, "duplicate approval never reaches the database function");
+  const third = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "create_estimate_draft:other" });
+  assert.equal(third.status, "succeeded");
+  assert.equal(third.output.alreadyCreated, true);
+  assert.equal(db.__rpcCalls.length, 2);
+  assert.equal(db.__rpcCalls[1].args.p_execution_id, "exec-1");
 });
 
-test("TEST 16b — even with a LOST idempotency slot (different key, same execution), the handler's own guard prevents a duplicate estimate", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [] });
-  const first = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "create_estimate_draft:k1" });
-  const second = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "create_estimate_draft:k2" });
-  assert.equal(second.status, "succeeded");
-  assert.equal(second.output.alreadyCreated, true);
-  assert.equal(second.output.estimateId, first.output.estimateId);
-  assert.equal(db.__dumpTable("estimates").length, 1);
-  assert.equal(db.__dumpTable("estimate_items").length, 3);
-});
-
-test("TEST 17 — create with another org's lead / project / contact fails with ONE generic message, identical to a nonexistent id (no cross-tenant probing), and writes nothing", async () => {
-  const nonexistent = "99999999-9999-4999-8999-999999999999";
-  const messages = new Set<string>();
-  for (const input of [
-    { ...CREATE_INPUT, leadId: LEAD_B },
-    { ...CREATE_INPUT, leadId: undefined, projectId: PROJECT_B },
-    { ...CREATE_INPUT, leadId: undefined, contactId: CONTACT_B },
-    { ...CREATE_INPUT, leadId: nonexistent },
-    { ...CREATE_INPUT, leadId: undefined, projectId: nonexistent },
-    { ...CREATE_INPUT, leadId: undefined, contactId: nonexistent },
-  ]) {
-    const db = makeDb({ estimates: [], estimate_items: [] });
-    const clean = JSON.parse(JSON.stringify(input));
-    const res = await approved(db, "create_estimate_draft", clean, { idempotencyKey: `k-${Math.random()}` });
-    assert.equal(res.status, "failed", JSON.stringify(input));
-    messages.add(res.error);
-    assert.equal(db.__dumpTable("estimates").length, 0);
-    assert.equal(db.__dumpTable("estimate_items").length, 0);
-  }
-  assert.deepEqual([...messages], [GENERIC_NOT_FOUND]);
-});
-
-test("create resolves the contact from the lead when none is passed, and refuses (writing nothing) when none can be resolved", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [] });
-  const ok = await approved(db, "create_estimate_draft", { leadId: LEAD_A, title: "From lead" }, { idempotencyKey: "k-lead" });
-  assert.equal(ok.status, "succeeded");
-  assert.equal(db.__dumpTable("estimates")[0].client_id, CONTACT_A);
-
-  const db2 = makeDb({ estimates: [], estimate_items: [], leads: [{ id: LEAD_A, org_id: ORG_A, contact_id: null }] });
-  const no = await approved(db2, "create_estimate_draft", { leadId: LEAD_A, title: "No contact" }, { idempotencyKey: "k-nocontact" });
-  assert.equal(no.status, "failed");
-  assert.equal(db2.__dumpTable("estimates").length, 0);
-});
-
-test("create compensates: if the line items cannot be written, the half-built estimate header is deleted", async () => {
-  const base = makeDb({ estimates: [], estimate_items: [] });
-  const db = {
-    ...base,
-    from: (table: string) => {
-      const b = base.from(table);
-      if (table === "estimate_items") b.insert = () => ({ then: (res: any) => res({ data: null, error: { message: "boom" } }) });
-      return b;
-    },
-  };
-  const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-comp" });
+test("create_estimate_draft — an RPC that returns no estimate id is a failure, never a success", async () => {
+  const db = makeRpcDb({ create_estimate_draft_transaction: () => ({ data: {} }) });
+  const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-empty" });
   assert.equal(res.status, "failed");
-  assert.equal(base.__dumpTable("estimates").length, 0, "no orphan header");
+  assert.equal(res.error, "Could not create the estimate draft.");
 });
 
-// ── created_by attribution (live bug: estimates.created_by is NOT NULL, auth.uid() is NULL for service-role) ──
-
-test("created_by — the REAL failure reproduced: without an attributed user the insert hits the not-null violation the live database raised", async () => {
-  // Simulates the pre-fix handler payload by inserting directly into the NOT-NULL-enforcing fake.
-  const db = makeDb({ estimates: [], estimate_items: [] });
-  const r = await db.from("estimates").insert({ org_id: ORG_A, client_id: CONTACT_A, title: "x", status: "draft" }).select("id").single();
-  assert.equal(r.error.code, "23502");
-  assert.match(r.error.message, /null value in column "created_by" of relation "estimates" violates not-null constraint/);
+test("create_estimate_draft — approval boundary unchanged: the proposal calls no RPC; Level 1 is refused", async () => {
+  const db = makeRpcDb({ create_estimate_draft_transaction: createOk });
+  const res = await step(db, "create_estimate_draft", CREATE_INPUT);
+  assert.equal(res.status, "awaiting_approval", JSON.stringify(res));
+  assert.equal(db.__rpcCalls.length, 0);
+  const l1 = await step(db, "create_estimate_draft", CREATE_INPUT, { autonomyLevel: 1 });
+  assert.equal(l1.status, "failed");
+  assert.equal(db.__rpcCalls.length, 0);
 });
 
-test("created_by (a/e) — approved create writes created_by = the approving user; a valid same-org user (profiles.organization_id) proceeds", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [] });
-  const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-cb-1" });
+const ADD_INPUT = { estimateId: EST_A, items: [{ name: "Backsplash", itemType: "material" }, { name: "Paint", description: "Two coats" }] };
+
+test("add_estimate_line_items — one RPC call with trusted org id, the estimate id and name/description/itemType items only", async () => {
+  const db = makeRpcDb({ add_estimate_line_items_transaction: addOk });
+  const res = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: "add_estimate_line_items:a1" });
   assert.equal(res.status, "succeeded", JSON.stringify(res));
-  const e = db.__dumpTable("estimates");
-  assert.equal(e.length, 1);
-  assert.equal(e[0].created_by, "user-1");
-  assert.equal(e[0].org_id, ORG_A);
+  assert.equal(db.__rpcCalls.length, 1);
+  const { fn, args } = db.__rpcCalls[0];
+  assert.equal(fn, "add_estimate_line_items_transaction");
+  assert.deepEqual(Object.keys(args).sort(), ["p_estimate_id", "p_execution_id", "p_items", "p_org_id"]);
+  assert.equal(args.p_org_id, ORG_A);
+  assert.equal(args.p_estimate_id, EST_A);
+  assert.equal(args.p_execution_id, "exec-1");
+  assert.deepEqual(args.p_items, [{ name: "Backsplash", itemType: "material" }, { name: "Paint", description: "Two coats" }]);
+  assert.deepEqual(res.output.addedItemIds, ["new-0", "new-1"]);
+  assert.equal(res.output.totalsUpdated, false, "placeholder $0 rows cannot change totals; the RPC never recomputes them");
+  assert.equal(res.output.total, 220);
+  assert.equal(res.output.alreadyApplied, false);
 });
 
-test("created_by (e) — a same-org user known ONLY via org_memberships is also accepted (the repo's other canonical membership source)", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [] });
-  const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-cb-2", actor: { actorType: "user", actorId: USER_M } });
-  assert.equal(res.status, "succeeded", JSON.stringify(res));
-  assert.equal(db.__dumpTable("estimates")[0].created_by, USER_M);
-});
-
-test("created_by (b) — non-user actors (agent / workflow / system / integration) fail closed with the specific message and write NOTHING", async () => {
-  for (const actorType of ["agent", "workflow", "system", "integration"]) {
-    const db = makeDb({ estimates: [], estimate_items: [] });
-    const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: `k-nu-${actorType}`, actor: { actorType, actorId: "user-1" } });
-    assert.equal(res.status, "failed", actorType);
-    assert.equal(res.error, "An estimate must be attributed to a team member.", actorType);
-    assert.equal(db.__dumpTable("estimates").length, 0, actorType);
-    assert.equal(db.__dumpTable("estimate_items").length, 0, actorType);
-  }
-});
-
-test("created_by (c) — a user actor with a missing / blank actorId fails closed and writes nothing", async () => {
-  for (const actorId of [undefined, null, "", "   "]) {
-    const db = makeDb({ estimates: [], estimate_items: [] });
-    const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: `k-noid-${String(actorId)}`, actor: { actorType: "user", actorId } });
-    assert.equal(res.status, "failed", String(actorId));
-    assert.equal(res.error, "An estimate must be attributed to a team member.");
-    assert.equal(db.__dumpTable("estimates").length, 0);
-    assert.equal(db.__dumpTable("estimate_items").length, 0);
-  }
-});
-
-test("created_by (d) — a user from ANOTHER org (or unknown) is rejected and writes nothing, even though the other-org profile row exists", async () => {
-  for (const actorId of [USER_B, "99999999-9999-4999-8999-999999999999"]) {
-    const db = makeDb({ estimates: [], estimate_items: [] });
-    const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: `k-x-${actorId}`, actor: { actorType: "user", actorId } });
-    assert.equal(res.status, "failed", actorId);
-    assert.equal(res.error, "An estimate must be attributed to a team member.");
-    assert.equal(db.__dumpTable("estimates").length, 0);
-    assert.equal(db.__dumpTable("estimate_items").length, 0);
-  }
-});
-
-test("created_by — a rejected attribution leaves no idempotency claim behind: a corrected retry by a real member succeeds", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [] });
-  await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-order", actor: { actorType: "user", actorId: USER_B } });
-  assert.equal(db.__dumpTable("estimates").length, 0);
-  const retry = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-order" });
-  assert.equal(retry.status, "succeeded", JSON.stringify(retry));
-  assert.equal(db.__dumpTable("estimates").length, 1);
-});
-
-test("created_by (f) — idempotency intact with attribution: replay is a no-op, and a lost slot is still caught by the execution guard (one estimate, original created_by)", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [] });
-  const first = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-id-1" });
-  const replay = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-id-1" });
-  const lostSlot = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-id-2", actor: { actorType: "user", actorId: USER_M } });
-  assert.equal(first.status, "succeeded");
-  assert.equal(replay.status, "skipped");
-  assert.equal(lostSlot.output.alreadyCreated, true);
-  assert.equal(db.__dumpTable("estimates").length, 1);
-  assert.equal(db.__dumpTable("estimates")[0].created_by, "user-1", "a replay never re-attributes the estimate");
-  assert.equal(db.__dumpTable("estimate_items").length, 3);
-});
-
-test("created_by (g) — price_pending behavior is unchanged: items remain unpriced placeholders with the marker, totals stay 0", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [] });
-  const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-pp" });
+test("add_estimate_line_items — no direct estimate-table write, and no money field in the payload", async () => {
+  const db = makeRpcDb({ add_estimate_line_items_transaction: addOk });
+  const res = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: "k-add-direct" });
   assert.equal(res.status, "succeeded");
-  assert.ok(db.__dumpTable("estimate_items").every((i: any) => i.unit_price === 0 && i.metadata.price_pending === true && i.metadata.quantity_pending === true));
-  assert.equal(db.__dumpTable("estimates")[0].total, 0);
-  assert.equal(db.__dumpTable("estimates")[0].tax_rate, 0);
+  const json = JSON.stringify(db.__rpcCalls[0].args);
+  for (const forbidden of ["unit_price", "unitPrice", "quantity", "price", "total", "tax", "discount", "status"]) assert.ok(!json.includes(`"${forbidden}"`), forbidden);
 });
 
-test("created_by (h) — a database failure logs the OPERATION + Postgres code/message server-side, never the row payload / customer content; the outward message stays the safe one", async () => {
-  const base = makeDb({ estimates: [], estimate_items: [] });
-  const SECRET_TITLE = "Smith family kitchen — 123 Private Lane";
-  const failing = {
-    ...base,
-    from: (table: string) => {
-      const b = base.from(table);
-      if (table === "estimates") {
-        const realInsert = b.insert.bind(b);
-        // Drops created_by so the NOT-NULL-enforcing fake raises the same 23502 the live database did.
-        b.insert = (row: any) => realInsert({ ...row, created_by: undefined });
-      }
-      return b;
-    },
-  };
-  const logged: unknown[][] = [];
-  const prevError = console.error;
-  console.error = (...args: unknown[]) => { logged.push(args); };
-  let res: any;
-  try {
-    res = await approved(failing, "create_estimate_draft", { ...CREATE_INPUT, title: SECRET_TITLE, scope: "gate code 4821" }, { idempotencyKey: "k-log" });
-  } finally { console.error = prevError; }
-
-  assert.equal(res.status, "failed");
-  assert.equal(res.error, "Could not create the estimate draft.", "outward message unchanged");
-  const entry = logged.find((a) => String(a[0]).includes("[estimate-handlers] db error"));
-  assert.ok(entry, "a server-side log line was written");
-  const detail = entry![1] as { operation: string; code: string; message: string };
-  assert.equal(detail.operation, "create_estimate_draft.insert_estimate");
-  assert.equal(detail.code, "23502");
-  assert.match(detail.message, /created_by/);
-  assert.deepEqual(Object.keys(detail).sort(), ["code", "message", "operation"]);
-  const everything = JSON.stringify(logged);
-  for (const forbidden of [SECRET_TITLE, "gate code 4821", "Cabinet replacement", "Jane Homeowner", CONTACT_A, LEAD_A, "user-1", ORG_A]) {
-    assert.ok(!everything.includes(forbidden), `log leaked: ${forbidden}`);
-  }
-  assert.equal(base.__dumpTable("estimates").length, 0);
-});
-
-// ── "Estimate created" activity attribution (trigger writes actor_type='system' under service-role) ──
-
-/** Simulates log_estimate_activity()'s AFTER INSERT behavior for a SERVICE-ROLE write: auth.uid() is NULL, so actor is 'system'. */
-const systemCreatedTrigger = {
-  afterInsert: {
-    estimates: (row: any, store: Map<string, any[]>) => {
-      const rows = store.get("estimate_activities") ?? [];
-      rows.push({ id: globalThis.crypto.randomUUID(), org_id: row.org_id, estimate_id: row.id, version_number: row.version_number ?? 1, activity_type: "created", actor_id: null, actor_type: "system", title: "Estimate created", description: null, metadata: {} });
-      store.set("estimate_activities", rows);
-    },
-  },
-};
-const createdActivities = (db: any) => db.__dumpTable("estimate_activities").filter((a: any) => a.activity_type === "created");
-
-test("ATTRIBUTION — the trigger-written 'created' row is corrected to the approving user: still exactly ONE row, original title kept, provenance recorded honestly", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [], estimate_activities: [] }, systemCreatedTrigger);
-  const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-attr-1" });
-  assert.equal(res.status, "succeeded", JSON.stringify(res));
-  const acts = createdActivities(db);
-  assert.equal(acts.length, 1, "no duplicate 'Estimate created'");
-  assert.equal(db.__dumpTable("estimate_activities").length, 1, "and no other activity rows were invented");
-  const a = acts[0];
-  assert.equal(a.actor_type, "user");
-  assert.equal(a.actor_id, "user-1");
-  assert.equal(a.actor_id, db.__dumpTable("estimates")[0].created_by, "same verified user as created_by — nothing fabricated");
-  assert.equal(a.title, "Estimate created");
-  assert.equal(a.estimate_id, res.output.estimateId);
-  assert.equal(a.description, "Drafted by the Estimate Assistant and approved by a team member.");
-  assert.deepEqual(a.metadata, { attributed_via: "estimate_assistant_approval", originally_recorded_as: "system", ai_execution_id: "exec-1" });
-});
-
-test("ATTRIBUTION — a membership-only approver (org_memberships, no profile org) is attributed too", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [], estimate_activities: [] }, systemCreatedTrigger);
-  const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-attr-2", actor: { actorType: "user", actorId: USER_M } });
-  assert.equal(res.status, "succeeded");
-  assert.equal(createdActivities(db)[0].actor_id, USER_M);
-});
-
-test("ATTRIBUTION — a row that ALREADY names a user is never overwritten (guarded to unattributed system rows only)", async () => {
-  const userTrigger = { afterInsert: { estimates: (row: any, store: Map<string, any[]>) => { store.set("estimate_activities", [...(store.get("estimate_activities") ?? []), { id: "pre-1", org_id: row.org_id, estimate_id: row.id, activity_type: "created", actor_id: "someone-else", actor_type: "user", title: "Estimate created", description: null, metadata: {} }]); } } };
-  const db = makeDb({ estimates: [], estimate_items: [], estimate_activities: [] }, userTrigger);
-  const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-attr-3" });
-  assert.equal(res.status, "succeeded");
-  const acts = createdActivities(db);
-  assert.equal(acts.length, 1);
-  assert.equal(acts[0].actor_id, "someone-else");
-  assert.deepEqual(acts[0].metadata, {});
-});
-
-test("ATTRIBUTION — if no unattributed 'created' row exists (e.g. no trigger), the create still succeeds and NOTHING is fabricated or inserted", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [], estimate_activities: [] }); // no simulated trigger
-  const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-attr-4" });
-  assert.equal(res.status, "succeeded");
-  assert.equal(db.__dumpTable("estimate_activities").length, 0);
-});
-
-test("ATTRIBUTION — only THIS org's and THIS estimate's row is touched: other estimates' system rows (and other orgs') stay exactly as they were", async () => {
-  const foreign = [
-    { id: "f1", org_id: ORG_A, estimate_id: "other-estimate-a", activity_type: "created", actor_id: null, actor_type: "system", title: "Estimate created", description: null, metadata: {} },
-    { id: "f2", org_id: ORG_B, estimate_id: "other-estimate-b", activity_type: "created", actor_id: null, actor_type: "system", title: "Estimate created", description: null, metadata: {} },
+test("add_estimate_line_items — safe error mapping: not_found (same as a foreign org) / not_draft / unknown", async () => {
+  const cases: Array<[string, string]> = [
+    ["not_found", GENERIC_NOT_FOUND],
+    ["not_draft", "This estimate is no longer a draft, so the assistant cannot change it. A team member can edit it directly."],
+    ["invalid_item", "Could not add the line items."],
   ];
-  const db = makeDb({ estimates: [], estimate_items: [], estimate_activities: foreign.map((f) => ({ ...f })) }, systemCreatedTrigger);
-  const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-attr-5" });
-  assert.equal(res.status, "succeeded");
-  const acts = db.__dumpTable("estimate_activities");
-  assert.equal(acts.length, 3);
-  for (const f of foreign) assert.deepEqual(acts.find((a: any) => a.id === f.id), f, `foreign row ${f.id} untouched`);
-  assert.equal(acts.filter((a: any) => a.actor_type === "user").length, 1);
+  for (const [code, expected] of cases) {
+    const db = makeRpcDb({ add_estimate_line_items_transaction: rpcErr(code) });
+    const res = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: `k-${code}` });
+    assert.equal(res.status, "failed", code);
+    assert.equal(res.error, expected, code);
+  }
 });
 
-test("ATTRIBUTION — best effort: an activity-update failure never fails the create; it is logged as operation + code + message ONLY", async () => {
-  const base = makeDb({ estimates: [], estimate_items: [], estimate_activities: [] }, systemCreatedTrigger);
-  const db = { ...base, from: (t: string) => { const b = base.from(t); if (t === "estimate_activities") b.update = () => ({ eq() { return this; }, is() { return this; }, select() { return this; }, then: (r: any) => r({ data: null, error: { code: "42501", message: "permission denied for table estimate_activities" } }) }); return b; } };
+test("add_estimate_line_items — replay: duplicate approval never reaches the database; a lost slot surfaces the RPC's already_applied flag", async () => {
+  let n = 0;
+  const db = makeRpcDb({ add_estimate_line_items_transaction: (a) => { n++; const r = addOk(a); r.data.already_applied = n > 1; return r; } });
+  const key = "add_estimate_line_items:dup";
+  const first = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: key });
+  const second = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: key });
+  assert.equal(first.status, "succeeded");
+  assert.equal(second.status, "skipped");
+  assert.equal(db.__rpcCalls.length, 1);
+  const lost = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: "add_estimate_line_items:other" });
+  assert.equal(lost.output.alreadyApplied, true);
+});
+
+test("add_estimate_line_items — the proposal calls no RPC (approval required)", async () => {
+  const db = makeRpcDb({ add_estimate_line_items_transaction: addOk });
+  const res = await step(db, "add_estimate_line_items", ADD_INPUT);
+  assert.equal(res.status, "awaiting_approval", JSON.stringify(res));
+  assert.equal(db.__rpcCalls.length, 0);
+});
+
+test("source guard — estimate-handlers.ts has NO direct write to estimates / estimate_items / estimate_activities and none of the removed compensation helpers", async () => {
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(path.join(repoRoot, "src/lib/agentic/estimate-handlers.ts"), "utf8").replace(/\s+/g, " ");
+  for (const table of WRITE_TABLES) {
+    assert.ok(!new RegExp(`from\\(["']${table}["']\\) ?\\. ?(insert|update|delete|upsert)`).test(src), `direct write to ${table}`);
+  }
+  assert.ok(!/import[^;]*estimate-calculations/.test(src), "handlers must not import the totals engine");
+  for (const gone of ["attributeCreatedActivity", "resolveAttributableUserId", "totalsPatch", "buildItemRows"]) {
+    assert.ok(!src.includes(gone), `leftover: ${gone}`);
+  }
+});
+
+// ── Restored invariants, at the correct (handler ↔ RPC contract) layer ─────────────────────
+// Fake-RPC tests: they prove what the handler SENDS and how it maps what comes BACK. They do not execute SQL.
+
+test("create_estimate_draft — attribution_failed (strict created-activity attribution rolled the create back) maps to the generic safe failure; nothing raw leaks and only code/message/operation are logged", async () => {
+  const db = makeRpcDb({ create_estimate_draft_transaction: () => ({ error: { code: "P0001", message: "estimate_rpc:attribution_failed SECRET-DETAIL" } }) });
   const logged: unknown[][] = [];
   const prev = console.error;
   console.error = (...a: unknown[]) => { logged.push(a); };
   let res: any;
-  try { res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-attr-6" }); } finally { console.error = prev; }
-  assert.equal(res.status, "succeeded", "the estimate was created and stays created");
-  assert.equal(base.__dumpTable("estimates").length, 1);
-  assert.equal(createdActivities(base)[0].actor_type, "system", "unchanged (still the honest trigger value)");
-  const entry = logged.find((a) => String(a[0]).includes("[estimate-handlers] db error"));
-  assert.ok(entry);
-  const d = entry![1] as any;
-  assert.deepEqual(Object.keys(d).sort(), ["code", "message", "operation"]);
-  assert.equal(d.operation, "create_estimate_draft.attribute_created_activity");
-  assert.equal(d.code, "42501");
-  const blob = JSON.stringify(logged);
-  for (const forbidden of ["user-1", "Kitchen remodel", "Jane Homeowner", ORG_A, LEAD_A]) assert.ok(!blob.includes(forbidden), `log leaked ${forbidden}`);
-});
-
-test("ATTRIBUTION — refused creates (non-user / foreign-org actor) attribute nothing and create nothing; a replayed approval never re-touches the activity", async () => {
-  const db = makeDb({ estimates: [], estimate_items: [], estimate_activities: [] }, systemCreatedTrigger);
-  for (const actor of [{ actorType: "agent", actorId: "user-1" }, { actorType: "user", actorId: USER_B }]) {
-    const r = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: `k-attr-${actor.actorType}`, actor });
-    assert.equal(r.status, "failed");
-  }
-  assert.equal(db.__dumpTable("estimates").length, 0);
-  assert.equal(db.__dumpTable("estimate_activities").length, 0);
-
-  const first = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-attr-7" });
-  const afterFirst = JSON.stringify(db.__dumpTable("estimate_activities"));
-  const replay = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-attr-7" });
-  const lostSlot = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-attr-8", actor: { actorType: "user", actorId: USER_M } });
-  assert.equal(first.status, "succeeded");
-  assert.equal(replay.status, "skipped");
-  assert.equal(lostSlot.output.alreadyCreated, true);
-  assert.equal(JSON.stringify(db.__dumpTable("estimate_activities")), afterFirst, "no re-attribution, no duplicates");
-  assert.equal(createdActivities(db).length, 1);
-});
-
-test("ATTRIBUTION — scope: the handler only ever UPDATES the trigger row; it never inserts into estimate_activities, and an ordinary (non-handler) insert keeps the trigger's own attribution", async () => {
-  const base = makeDb({ estimates: [], estimate_items: [], estimate_activities: [] }, systemCreatedTrigger);
-  let activityInserts = 0;
-  const db = { ...base, from: (t: string) => { const b = base.from(t); if (t === "estimate_activities") { const ins = b.insert.bind(b); b.insert = (...a: any[]) => { activityInserts += 1; return ins(...a); }; } return b; } };
-  await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-attr-9" });
-  assert.equal(activityInserts, 0);
-
-  // An estimate inserted by something other than this handler (e.g. a browser user) is not touched by it.
-  const plain = makeDb({ estimates: [], estimate_items: [], estimate_activities: [] }, systemCreatedTrigger);
-  await plain.from("estimates").insert({ org_id: ORG_A, client_id: CONTACT_A, title: "Manual", status: "draft", created_by: "user-1" }).select("id").single();
-  assert.equal(createdActivities(plain)[0].actor_type, "system", "the simulated trigger's own value is left alone by the handler path");
-});
-
-// ── add_estimate_line_items ─────────────────────────────────────────────
-
-const ADD_INPUT = { estimateId: EST_A, items: [{ name: "Tile backsplash", itemType: "material" }] };
-
-test("TEST 14 — add_estimate_line_items requires approval: the proposal writes NOTHING to the estimate or its items", async () => {
-  const db = makeDb();
-  const before = { e: dump(db, "estimates"), i: dump(db, "estimate_items") };
-  const res = await step(db, "add_estimate_line_items", ADD_INPUT);
-  assert.equal(res.status, "awaiting_approval", JSON.stringify(res));
-  assert.equal(dump(db, "estimates"), before.e);
-  assert.equal(dump(db, "estimate_items"), before.i);
-});
-
-test("TEST 15 — approved add: existing items/prices untouched, new row is an UNPRICED placeholder, header totals recomputed by the shared engine (existing figures preserved), total === client_total", async () => {
-  const db = makeDb();
-  const res = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: "add_estimate_line_items:appr-1" });
-  assert.equal(res.status, "succeeded", JSON.stringify(res));
-  assert.equal(res.output.estimateId, EST_A);
-  assert.equal(res.output.addedItemIds.length, 1);
-  assert.equal(res.output.itemCount, 2);
-  assert.equal(res.output.totalsUpdated, true);
-  assert.equal(res.output.total, 220, "adding an unpriced placeholder cannot change the total");
-
-  const items = db.__dumpTable("estimate_items");
-  const original = items.find((i: any) => i.id === "item-a1");
-  assert.equal(original.unit_price, 100, "existing price untouched");
-  assert.equal(original.quantity, 2);
-  const added = items.find((i: any) => i.name === "Tile backsplash");
-  assert.equal(added.unit_price, 0);
-  assert.equal(added.metadata.price_pending, true);
-  assert.equal(added.position, 1, "appended after the existing max position");
-
-  const e = db.__dumpTable("estimates")[0];
-  assert.equal(e.subtotal, 200);
-  assert.equal(e.tax_total, 20);
-  assert.equal(e.total, 220);
-  assert.equal(e.client_total, e.total);
-  assert.equal(e.status, "draft", "status never changed");
-  assert.equal(e.tax_rate, 10, "tax rate never touched");
-});
-
-test("TEST 16 — duplicate approval of add: replay inserts NO second row; and a lost slot is still safe via the execution-stamped guard", async () => {
-  const db = makeDb();
-  const key = "add_estimate_line_items:appr-dup";
-  const first = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: key });
-  const second = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: key });
-  assert.equal(second.status, "skipped");
-  assert.equal(db.__dumpTable("estimate_items").filter((i: any) => i.name === "Tile backsplash").length, 1);
-
-  const third = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: "add_estimate_line_items:other-key" });
-  assert.equal(third.status, "succeeded");
-  assert.equal(third.output.alreadyApplied, true);
-  assert.deepEqual(third.output.addedItemIds, first.output.addedItemIds);
-  assert.equal(db.__dumpTable("estimate_items").filter((i: any) => i.name === "Tile backsplash").length, 1);
-});
-
-test("add skips a name already on the estimate (case/whitespace-insensitive) and still reports success with the skipped name", async () => {
-  const db = makeDb();
-  const res = await approved(db, "add_estimate_line_items", { estimateId: EST_A, items: [{ name: "  base   CABINETS " }, { name: "Island" }] }, { idempotencyKey: "k-dedupe" });
-  assert.equal(res.status, "succeeded");
-  // The input schema trims names, so the reported name is the trimmed one.
-  assert.deepEqual(res.output.skippedDuplicateNames, ["base   CABINETS"]);
-  assert.equal(res.output.addedItemIds.length, 1);
-  assert.equal(db.__dumpTable("estimate_items").length, 2);
-});
-
-test("add refuses an estimate that is no longer a draft (sent/ready/approved…) and writes nothing", async () => {
-  for (const status of ["ready", "sent", "viewed", "approved", "converted", "changes_requested"]) {
-    const db = makeDb({ estimates: [pricedEstimateRow({ status })] });
-    const before = dump(db, "estimate_items");
-    const res = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: `k-${status}` });
-    assert.equal(res.status, "failed", status);
-    assert.equal(dump(db, "estimate_items"), before, status);
-  }
-});
-
-test("TEST 17 — add to another org's estimate fails with the SAME generic message as a nonexistent id, and inserts nothing", async () => {
-  const db = makeDb({ estimates: [pricedEstimateRow(), pricedEstimateRow({ id: EST_B, org_id: ORG_B })] });
-  const cross = await approved(db, "add_estimate_line_items", { estimateId: EST_B, items: [{ name: "x item" }] }, { idempotencyKey: "k-x1" });
-  const ghost = await approved(db, "add_estimate_line_items", { estimateId: "99999999-9999-4999-8999-999999999999", items: [{ name: "x item" }] }, { idempotencyKey: "k-x2" });
-  assert.equal(cross.status, "failed");
-  assert.equal(cross.error, GENERIC_NOT_FOUND);
-  assert.equal(ghost.error, GENERIC_NOT_FOUND);
-  assert.equal(db.__dumpTable("estimate_items").length, 1);
-});
-
-test("legacy 'quick estimate' guard: a stored total with ZERO item rows is NOT zeroed by adding the first placeholder rows", async () => {
-  const db = makeDb({
-    estimates: [pricedEstimateRow({ subtotal: 4600, tax_total: 400, total: 5000, client_total: 5000, balance_due: 5000 })],
-    estimate_items: [],
-  });
-  const res = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: "k-quick" });
-  assert.equal(res.status, "succeeded");
-  assert.equal(res.output.totalsUpdated, false);
-  assert.equal(res.output.total, 5000);
-  const e = db.__dumpTable("estimates")[0];
-  assert.equal(e.total, 5000);
-  assert.equal(e.subtotal, 4600);
-});
-
-test("add compensates: if the totals update fails, the just-inserted items are removed (no orphan rows)", async () => {
-  const base = makeDb();
-  const db = {
-    ...base,
-    from: (table: string) => {
-      const b = base.from(table);
-      if (table === "estimates") b.update = () => ({ eq() { return this; }, then: (res: any) => res({ data: null, error: { message: "boom" } }) });
-      return b;
-    },
-  };
-  const res = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: "k-comp2" });
+  try { res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-attr-failed" }); } finally { console.error = prev; }
   assert.equal(res.status, "failed");
-  assert.deepEqual(base.__dumpTable("estimate_items").map((i: any) => i.name), ["Base cabinets"]);
+  assert.equal(res.error, "Could not create the estimate draft.");
+  assert.ok(!JSON.stringify(res).includes("SECRET-DETAIL") && !JSON.stringify(res).includes("estimate_rpc"));
+  const entry = logged.find((a) => String(a[0]).includes("[estimate-handlers] db error"));
+  assert.ok(entry, "the failure is logged server-side");
+  assert.deepEqual(Object.keys(entry![1] as object).sort(), ["code", "message", "operation"]);
+  assert.equal(db.__rpcCalls.length, 1, "no retry, no fallback write");
 });
 
-test("totals are recomputed by the SHARED engine over existing priced items + optional/heading rules (a deselected optional item adds nothing)", async () => {
-  const db = makeDb({
-    estimate_items: [
-      itemRow(),
-      itemRow({ id: "item-a2", name: "Optional island", unit_price: 1000, quantity: 1, total: 1000, position: 1, optional: true, selected_by_customer: false }),
-    ],
-  });
-  const res = await approved(db, "add_estimate_line_items", ADD_INPUT, { idempotencyKey: "k-engine" });
-  assert.equal(res.status, "succeeded");
-  const e = db.__dumpTable("estimates")[0];
-  assert.equal(e.subtotal, 200, "deselected optional item excluded, exactly as the editor's engine does");
-  assert.equal(e.total, 220);
+test("create_estimate_draft — a membership-only approver (org_memberships, no profile org) is forwarded as p_created_by; the handler does not pre-judge membership (SQL decides, and a foreign/unknown approver comes back as attribution_required)", async () => {
+  const ok = makeRpcDb({ create_estimate_draft_transaction: createOk });
+  const viaMembership = await approved(ok, "create_estimate_draft", CREATE_INPUT, { actor: { actorType: "user", actorId: USER_M }, idempotencyKey: "k-member" });
+  assert.equal(viaMembership.status, "succeeded", JSON.stringify(viaMembership));
+  assert.equal(ok.__rpcCalls[0].args.p_created_by, USER_M);
+  assert.equal(ok.__rpcCalls[0].args.p_org_id, ORG_A, "tenant is still the trusted context org, never the approver's own org");
+
+  const foreign = makeRpcDb({ create_estimate_draft_transaction: rpcErr("attribution_required") });
+  const res = await approved(foreign, "create_estimate_draft", CREATE_INPUT, { actor: { actorType: "user", actorId: USER_B }, idempotencyKey: "k-foreign" });
+  assert.equal(res.status, "failed");
+  assert.equal(res.error, "An estimate must be attributed to a team member.");
+  assert.equal(foreign.__rpcCalls[0].args.p_org_id, ORG_A);
+  assert.equal(foreign.__rpcCalls[0].args.p_created_by, USER_B);
+});
+
+test("create_estimate_draft — cross-org relationship refusal: foreign contact/lead/project ids are forwarded as-is with the TRUSTED org, and a not_found comes back as the SAME generic message as a nonexistent id", async () => {
+  for (const input of [
+    { ...CREATE_INPUT, contactId: CONTACT_B, leadId: undefined },
+    { ...CREATE_INPUT, leadId: LEAD_B },
+    { ...CREATE_INPUT, projectId: PROJECT_B },
+  ]) {
+    const db = makeRpcDb({ create_estimate_draft_transaction: rpcErr("not_found") });
+    const res = await approved(db, "create_estimate_draft", input, { idempotencyKey: `k-x-${Math.random()}` });
+    assert.equal(res.error, GENERIC_NOT_FOUND);
+    assert.equal(db.__rpcCalls[0].args.p_org_id, ORG_A);
+  }
+  // A missing contact is its own safe message (not an org-probing signal).
+  const none = makeRpcDb({ create_estimate_draft_transaction: rpcErr("contact_required") });
+  const res = await approved(none, "create_estimate_draft", { title: "T", leadId: LEAD_A }, { idempotencyKey: "k-nocontact" });
+  assert.equal(res.error, "An estimate needs a linked customer contact, and none is on file yet.");
+});
+
+test("add_estimate_line_items — cross-org estimate refusal: the foreign estimate id is sent WITH the trusted org and not_found is the same generic message as a nonexistent estimate", async () => {
+  const foreign = makeRpcDb({ add_estimate_line_items_transaction: rpcErr("not_found") });
+  const a = await approved(foreign, "add_estimate_line_items", { estimateId: EST_B, items: [{ name: "Backsplash" }] }, { idempotencyKey: "k-add-foreign" });
+  const missing = makeRpcDb({ add_estimate_line_items_transaction: rpcErr("not_found") });
+  const b = await approved(missing, "add_estimate_line_items", { estimateId: "99999999-9999-4999-8999-999999999999", items: [{ name: "Backsplash" }] }, { idempotencyKey: "k-add-missing" });
+  assert.equal(a.error, GENERIC_NOT_FOUND);
+  assert.equal(a.error, b.error);
+  assert.equal(foreign.__rpcCalls[0].args.p_org_id, ORG_A);
+  assert.equal(foreign.__rpcCalls[0].args.p_estimate_id, EST_B);
+});
+
+test("price_pending behavior unchanged — a created draft reports every item as price-pending with a zero total, and the same shared rule still classifies stored rows", async () => {
+  const db = makeRpcDb({ create_estimate_draft_transaction: createOk });
+  const res = await approved(db, "create_estimate_draft", CREATE_INPUT, { idempotencyKey: "k-pp" });
+  assert.equal(res.output.itemCount, 3);
+  assert.equal(res.output.pricePendingItemCount, res.output.itemCount);
+  assert.equal(res.output.total, 0);
+  // The row shape the SQL writes (unit_price 0 + metadata.price_pending true) is pending under the shared gate; a reviewed $0 is not.
+  assert.equal(X_isPending(itemRow({ unit_price: 0, total: 0, metadata: { ai_proposed: true, price_pending: true, quantity_pending: true } })), true);
+  assert.equal(X_isPending(itemRow({ unit_price: 0, total: 0, metadata: {} })), false);
+  assert.equal(X_isPending(itemRow({ unit_price: 50, total: 50, metadata: { price_pending: true } })), false);
+  assert.equal(X_isPending(itemRow({ unit_price: 0, total: 0, is_heading: true, metadata: { price_pending: true } })), false);
 });

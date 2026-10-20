@@ -386,29 +386,44 @@ test("the final-call prompt after a proposal states NOTHING was created and carr
   assert.match(finalUser, /Do not say an estimate exists/);
 });
 
-test("TEST 15/16 — FULL CYCLE: owner approves -> exactly one estimate + items via the trusted handler; a double approval (replay) creates nothing more", async () => {
+test("TEST 15/16 — FULL CYCLE: owner approves -> exactly ONE transactional RPC call bound to trusted ids; a double approval (replay) never reaches the database again", async () => {
   const db = makeDb();
   const { result } = await run(db, "Can you prepare an estimate for the kitchen?", [handoffToEstimate, proposeDraft, "The team will review."]);
   const approval = db.__dumpTable("agent_approval_requests")[0];
   const key = `create_estimate_draft:${approval.id}`; // agent-approve-action.ts idempotencyKeyFor() — format pinned in tests/netlify-functions/agent-approve-action.test.ts
 
+  // The handler is a thin caller of create_estimate_draft_transaction. The fake RECORDS the call and answers with the
+  // shape the SQL function returns; the all-or-nothing behavior itself is a PL/pgSQL property verified separately
+  // (supabase/verification/estimate_transactional_rpcs_verification.sql), NOT here.
+  const rpcCalls: Array<{ fn: string; args: any }> = [];
+  const rpcDb: any = {
+    ...db,
+    rpc: async (fn: string, args: any) => { rpcCalls.push({ fn, args }); return { data: { estimate_id: EST_1, number: "EST-000001", status: "draft", item_count: args.p_items.length, already_created: false }, error: null }; },
+  };
+
   const approvedInput = approval.proposed_input;
-  const first = await S.executeApprovedStep({ supabase: db, orgId: ORG_A, actor: { actorType: "user", actorId: "owner-1" }, executionId: approval.execution_id, stepId: approval.execution_step_id, actionKey: "create_estimate_draft", approvedInput, idempotencyKey: key });
+  const first = await S.executeApprovedStep({ supabase: rpcDb, orgId: ORG_A, actor: { actorType: "user", actorId: "owner-1" }, executionId: approval.execution_id, stepId: approval.execution_step_id, actionKey: "create_estimate_draft", approvedInput, idempotencyKey: key });
   assert.equal(first.status, "succeeded", JSON.stringify(first));
   assert.equal(first.output.status, "draft");
   assert.equal(first.output.itemCount, 3);
   assert.equal(first.output.total, 0, "no invented price");
 
-  const second = await S.executeApprovedStep({ supabase: db, orgId: ORG_A, actor: { actorType: "user", actorId: "owner-1" }, executionId: approval.execution_id, stepId: approval.execution_step_id, actionKey: "create_estimate_draft", approvedInput, idempotencyKey: key });
+  const second = await S.executeApprovedStep({ supabase: rpcDb, orgId: ORG_A, actor: { actorType: "user", actorId: "owner-1" }, executionId: approval.execution_id, stepId: approval.execution_step_id, actionKey: "create_estimate_draft", approvedInput, idempotencyKey: key });
   assert.equal(second.status, "skipped");
 
-  const estimates = db.__dumpTable("estimates");
-  assert.equal(estimates.length, 1);
-  assert.equal(estimates[0].status, "draft", "never sent / approved / converted");
-  assert.equal(estimates[0].org_id, ORG_A);
-  assert.equal(db.__dumpTable("estimate_items").length, 3);
-  assert.ok(db.__dumpTable("estimate_items").every((i: any) => i.unit_price === 0 && i.metadata.price_pending === true));
-  assert.equal(db.__dumpTable("deals" ).length, 0);
+  assert.equal(rpcCalls.length, 1, "the replay is suppressed before the database function is called again");
+  assert.equal(rpcCalls[0].fn, "create_estimate_draft_transaction");
+  assert.equal(rpcCalls[0].args.p_org_id, ORG_A, "tenant comes from trusted server context");
+  assert.equal(rpcCalls[0].args.p_created_by, "owner-1", "attribution is the verified approver");
+  assert.equal(rpcCalls[0].args.p_execution_id, approval.execution_id);
+  assert.equal(rpcCalls[0].args.p_client_id, CONTACT_1);
+  assert.equal(rpcCalls[0].args.p_lead_id, LEAD_1);
+  assert.equal(rpcCalls[0].args.p_items.length, 3);
+  assert.ok(rpcCalls[0].args.p_items.every((i: any) => Object.keys(i).every((k) => ["name", "description", "itemType"].includes(k))), "no money field crosses the boundary");
+  // The TypeScript layer itself wrote nothing to the estimate tables.
+  assert.equal(db.__dumpTable("estimates").length, 0);
+  assert.equal(db.__dumpTable("estimate_items").length, 0);
+  assert.equal(db.__dumpTable("deals").length, 0);
   assert.equal(db.__dumpTable("invoices").length, 0);
 });
 
