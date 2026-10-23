@@ -60,6 +60,19 @@ export function buildContextLines(context: AIResolvedContext): string[] {
   if (context.project) {
     contextLines.push(`Project: ${context.project.name} (${context.project.status})`);
   }
+  // An estimate that ALREADY exists for this customer. Deliberately carries no dollar figure: agents other than
+  // the Estimate Assistant must never quote money, and the Estimate Assistant reads the full estimate itself.
+  const existing = context.existingEstimate;
+  if (existing?.state === "found") {
+    const lines = typeof existing.itemCount === "number" ? `, ${existing.itemCount} line item${existing.itemCount === 1 ? "" : "s"}` : "";
+    const pricing = existing.pricePending ? `, pricing still pending on ${existing.pricePendingItemCount ?? "some"} line${existing.pricePendingItemCount === 1 ? "" : "s"}` : "";
+    contextLines.push(
+      `Existing estimate on file: ${existing.number ?? "(unnumbered)"} "${existing.title ?? "Untitled estimate"}", status ${existing.status ?? "unknown"}${lines}${pricing}. The Estimate Assistant owns any question about it or change to it.`,
+    );
+  } else if (existing?.state === "ambiguous") {
+    const list = (existing.candidates ?? []).map((c) => `${c.number ?? "(unnumbered)"} "${c.title}" (${c.status})`).join("; ");
+    contextLines.push(`Several active estimates are on file for this customer: ${list}. It is not known which one the customer means — never guess.`);
+  }
   if (context.conversation?.recentMessages?.length) {
     // Already bounded by context-builder.ts's RECENT_MESSAGE_LIMIT (10) —
     // formatted compactly as plain text lines, not a JSON dump.
