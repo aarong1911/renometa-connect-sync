@@ -115,6 +115,7 @@ import {
   summarizeProposalSubmitted,
 } from "./agents/estimate-assistant";
 import type { EstimateContextOutput } from "../../../../src/lib/agentic/estimate-handlers";
+import { classifyExistingEstimateIntent } from "./existing-estimate-intent";
 import {
   SCHEDULING_OFFER_CHANNELS,
   clearOfferedSlots,
@@ -433,6 +434,8 @@ type AIContextPresenceSummary = {
   recentMessageCount: number;
   /** Count of ACTIVE Business Knowledge entries in context — never their text. */
   businessKnowledgeCount: number;
+  /** Whether an estimate already existed for this customer/lead/project (state only — never ids or figures). */
+  existingEstimate?: "found" | "ambiguous";
 };
 
 function summarizeContextPresence(context: AIResolvedContext): AIContextPresenceSummary {
@@ -443,7 +446,18 @@ function summarizeContextPresence(context: AIResolvedContext): AIContextPresence
     project: !!context.project,
     recentMessageCount: context.conversation?.recentMessages?.length ?? 0,
     businessKnowledgeCount: context.businessKnowledge?.entries.length ?? 0,
+    ...(context.existingEstimate ? { existingEstimate: context.existingEstimate.state } : {}),
   };
+}
+
+/** The ONLY way an estimate id reaches the Estimate Assistant from a handoff: the one the Context Builder resolved from
+ * trusted org + entity ids (state "found"). Never from a model decision, never from customer text. An ambiguous result
+ * carries no id (the Estimate Assistant re-resolves, sees the ambiguity, and asks which estimate is meant), and an id
+ * the trusted caller already supplied is never overridden. */
+function withResolvedEstimate(trustedContext: AITrustedContext, context: AIResolvedContext): AITrustedContext {
+  const existing = context.existingEstimate;
+  if (trustedContext.estimateId || !existing || existing.state !== "found" || !existing.estimateId) return trustedContext;
+  return { ...trustedContext, estimateId: existing.estimateId };
 }
 
 /** The routing decision, safe to persist in full — AIRouteDecision.reason
@@ -608,6 +622,7 @@ export async function orchestrateAI(params: OrchestrateAIParams): Promise<AIRunR
       contactId: trustedContext.contactId,
       leadId: trustedContext.leadId,
       projectId: trustedContext.projectId,
+      estimateId: trustedContext.estimateId,
       conversationKey: trustedContext.conversationKey,
     });
 
@@ -817,6 +832,45 @@ async function runLeadQualificationTurn(params: {
   const { supabase, trustedContext, event, context, activeAgentKey, modelProvider, executionId, agentConfig, inputSummary, handoff, seedUsage, now } = params;
   const allowSchedulingHandoff = params.allowSchedulingHandoff ?? true;
 
+  // ── Existing-estimate backstop (deterministic, BEFORE any model call) ───────────────────────────────────
+  // When the Context Builder already resolved an estimate for this customer AND the customer's current message is
+  // plainly asking to change it ("add a vanity to the existing estimate"), generic qualification must not continue:
+  // hand the turn to the Estimate Assistant now. Nothing here comes from the model: the estimate is the one the server
+  // resolved (withResolvedEstimate), and the Estimate Assistant still reads it through get_estimate_context and can only
+  // PROPOSE an approval-gated change. Narrow on purpose (see existing-estimate-intent.ts); every other phrasing still
+  // reaches the model, which is told about the existing estimate in its context.
+  // "change" applies to one OR several resolved estimates (the Estimate Assistant then asks which one when it is ambiguous);
+  // a read-only "reference" (e.g. "what is on my estimate?") applies ONLY when exactly one estimate was resolved, so an
+  // ambiguous situation is never forced beyond what it already was.
+  const existingIntent = context.existingEstimate ? classifyExistingEstimateIntent(event.content.text) : null;
+  const forceEstimateHandoff =
+    existingIntent === "change" || (existingIntent === "reference" && context.existingEstimate?.state === "found");
+  if (context.existingEstimate && allowSchedulingHandoff && forceEstimateHandoff) {
+    const estimateConfig = SYSTEM_AGENTS.estimate_assistant;
+    const hasTrustedSubject = !!(trustedContext.leadId || trustedContext.contactId || trustedContext.projectId || trustedContext.estimateId);
+    if (estimateConfig && hasTrustedSubject) {
+      const existingHandoff: AIAgentHandoff = {
+        fromAgent: "lead_qualification",
+        toAgent: "estimate_assistant",
+        reason: existingIntent === "reference" ? "The customer is asking about an estimate that already exists for them." : "The customer asked to change an estimate that already exists for them.",
+        summary: "An estimate already exists for this customer. They are asking about or asking to change it, not to start a new one.",
+      };
+      const estimateResult = await runEstimateAssistantTurn({
+        supabase,
+        trustedContext: withResolvedEstimate(trustedContext, context),
+        event,
+        context,
+        modelProvider,
+        executionId,
+        agentConfig: estimateConfig,
+        inputSummary: { ...inputSummary, handoff: { fromAgent: "lead_qualification", toAgent: "estimate_assistant", reason: existingHandoff.reason } },
+        handoff: existingHandoff,
+        seedUsage,
+      });
+      return { ...estimateResult, handoff: existingHandoff };
+    }
+  }
+
   // ── Model call: structured decision ──────────────────────────────────
   const decisionRequest = buildLeadQualificationDecisionRequest(agentConfig.instructions, context, event, handoff);
 
@@ -948,7 +1002,7 @@ async function runLeadQualificationTurn(params: {
       }
       const estimateResult = await runEstimateAssistantTurn({
         supabase,
-        trustedContext,
+        trustedContext: withResolvedEstimate(trustedContext, context),
         event,
         context,
         modelProvider,

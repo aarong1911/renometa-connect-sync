@@ -361,11 +361,48 @@ export type AIBusinessKnowledge = {
   entries: AIBusinessKnowledgeEntry[];
 };
 
+/**
+ * Trusted summary of the estimate that ALREADY exists for the current customer/lead/project, resolved by the Context
+ * Builder with the same lookup rules as get_estimate_context (src/lib/agentic/estimate-lookup.ts): an explicit trusted
+ * estimateId, else project > lead > contact; archived/cancelled estimates are ignored.
+ *
+ * Every id here is server-resolved from the trusted org + entity ids — NEVER from a model or from customer text.
+ * Absent (`undefined`) means "no active estimate was found OR the lookup was unavailable"; the Estimate Assistant
+ * re-reads the estimate itself through the audited get_estimate_context action before proposing anything.
+ */
+export type AIExistingEstimateSummary = {
+  /** "found" = exactly one active estimate at the winning scope. "ambiguous" = several (no id is exposed: callers
+   * must ask the customer/team which one is meant, never guess). */
+  state: "found" | "ambiguous";
+  matchedBy: "estimate_id" | "project" | "lead" | "contact";
+  /** Present ONLY when state === "found". */
+  estimateId?: string;
+  number?: string | null;
+  title?: string;
+  status?: string;
+  contactId?: string | null;
+  leadId?: string | null;
+  projectId?: string | null;
+  /** Non-heading line items. */
+  itemCount?: number;
+  /** True while at least one line is still an unpriced placeholder (the shared isPricePendingItem rule). */
+  pricePending?: boolean;
+  pricePendingItemCount?: number;
+  /** The total AS STORED on the estimate (never recomputed, never inferred). */
+  total?: number;
+  /** Whether the Estimate Assistant may propose edits (draft only). */
+  editableByAssistant?: boolean;
+  /** state === "ambiguous" only: the matching active estimates, WITHOUT ids, so a clarifying question can name them. */
+  candidates?: Array<{ number: string | null; title: string; status: string }>;
+};
+
 export type AIResolvedContext = {
   organization: AIOrganizationSummary;
   contact?: AIContactSummary;
   lead?: AILeadSummary;
   project?: AIProjectSummary;
+  /** An estimate that already exists for this customer/lead/project (see AIExistingEstimateSummary). */
+  existingEstimate?: AIExistingEstimateSummary;
   conversation?: AIConversationSummary;
   /** Trusted Business Knowledge for the current org. Optional only so
    * hand-built contexts in older tests still type-check; the real

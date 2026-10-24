@@ -66,6 +66,8 @@
 import { z } from "zod";
 import type { ActionHandler } from "./types";
 import { isPricePendingItem } from "../estimate-pricing-gate";
+import { AI_EDITABLE_ESTIMATE_STATUSES, lookupCurrentEstimate, type EstimateLookup } from "./estimate-lookup";
+export { AI_EDITABLE_ESTIMATE_STATUSES };
 
 // ── Shared constants ─────────────────────────────────────────────────────
 
@@ -74,14 +76,6 @@ import { isPricePendingItem } from "../estimate-pricing-gate";
  * purpose (a discount is a price decision the assistant must never make). */
 export const ESTIMATE_DRAFT_ITEM_TYPES = ["labor", "material", "service", "equipment", "allowance", "fee", "custom"] as const;
 export type EstimateDraftItemType = (typeof ESTIMATE_DRAFT_ITEM_TYPES)[number];
-
-/** The assistant may only mutate an estimate that is still a plain draft.
- * A "ready" estimate has been internally reviewed (editing it silently would
- * invalidate that review); sent/viewed/approved/etc. are customer-facing or
- * contractual. Those need a human in the editor (which versions properly). */
-export const AI_EDITABLE_ESTIMATE_STATUSES: ReadonlySet<string> = new Set(["draft"]);
-
-const INACTIVE_ESTIMATE_STATUSES: ReadonlySet<string> = new Set(["archived", "cancelled"]);
 
 export const MAX_DRAFT_ITEMS = 25;
 const CONTEXT_MAX_ITEMS = 40;
@@ -298,8 +292,6 @@ function mapItemRow(row: any): EstimateContextItem {
   };
 }
 
-type EstimateLookup = { kind: "error" } | { kind: "none" } | { kind: "found"; row: any; matchedBy: NonNullable<EstimateContextOutput["matchedBy"]>; ambiguous: boolean };
-
 /** Resolves WHICH estimate this run is about, strictly org-scoped. An
  * explicit trusted estimateId wins; otherwise the most specific trusted
  * entity (project, then lead, then contact) is used. Archived/cancelled
@@ -308,39 +300,9 @@ async function resolveEstimateRow(
   ctx: Parameters<ActionHandler>[0],
   input: GetEstimateContextInput,
 ): Promise<EstimateLookup> {
-  if (input.estimateId) {
-    const { data, error } = await ctx.supabase
-      .from("estimates")
-      .select(ESTIMATE_CONTEXT_COLUMNS)
-      .eq("id", input.estimateId)
-      .eq("org_id", ctx.orgId)
-      .maybeSingle();
-    if (error) return { kind: "error" };
-    if (!data) return { kind: "none" };
-    return { kind: "found", row: data, matchedBy: "estimate_id", ambiguous: false };
-  }
-
-  const scopes: Array<{ column: string; id: string | undefined; matchedBy: "project" | "lead" | "contact" }> = [
-    { column: "project_id", id: input.projectId, matchedBy: "project" },
-    { column: "lead_id", id: input.leadId, matchedBy: "lead" },
-    { column: "client_id", id: input.contactId, matchedBy: "contact" },
-  ];
-  for (const scope of scopes) {
-    if (!scope.id) continue;
-    const { data, error } = await ctx.supabase
-      .from("estimates")
-      .select(ESTIMATE_CONTEXT_COLUMNS)
-      .eq(scope.column, scope.id)
-      .eq("org_id", ctx.orgId)
-      .order("created_at", { ascending: false })
-      .limit(5);
-    if (error) return { kind: "error" };
-    const active = (data ?? []).filter((r: any) => !INACTIVE_ESTIMATE_STATUSES.has(r.status));
-    if (active.length > 0) {
-      return { kind: "found", row: active[0], matchedBy: scope.matchedBy, ambiguous: active.length > 1 };
-    }
-  }
-  return { kind: "none" };
+  // The lookup rules (priority, org scoping, which statuses are inactive) live in estimate-lookup.ts so the
+  // Context Builder uses the identical definition of "the current estimate".
+  return lookupCurrentEstimate(ctx.supabase, ctx.orgId, input, ESTIMATE_CONTEXT_COLUMNS);
 }
 
 // ── get_estimate_context (read-only) ─────────────────────────────────────

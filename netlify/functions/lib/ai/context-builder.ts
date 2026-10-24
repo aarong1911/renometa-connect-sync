@@ -31,6 +31,7 @@ import type {
   AIConversationMessageSummary,
   AIConversationSummary,
   AIContactSummary,
+  AIExistingEstimateSummary,
   AILeadSummary,
   AIOrganizationSummary,
   AIProjectSummary,
@@ -42,6 +43,9 @@ import type {
 // src/lib/agentic/scheduling-availability.ts's SlotCandidate type, which
 // IS a cross-boundary import; this one is not).
 import { readOfferedSlots, SCHEDULING_OFFER_CHANNELS, type SchedulingOfferChannel } from "../scheduling-offer-state";
+import { lookupCurrentEstimate } from "../../../../src/lib/agentic/estimate-lookup";
+import { isPricePendingItem } from "../../../../src/lib/estimate-pricing-gate";
+import { AI_EDITABLE_ESTIMATE_STATUSES } from "../../../../src/lib/agentic/estimate-lookup";
 
 /** Channels backed today by sms_meta_messages (per the AI-1 audit: there is
  * no canonical `conversations` table; SMS/WhatsApp/Messenger/Instagram
@@ -97,6 +101,8 @@ export type BuildAIContextParams = {
   leadId?: string;
   /** Trusted project id, if the caller has already resolved one. */
   projectId?: string;
+  /** Trusted estimate id, if the caller has already resolved (and org-verified) one. Never from a model. */
+  estimateId?: string;
   /** Opaque conversation grouping key, if the caller has one (see
    * AITrustedContext.conversationKey in ./types.ts). For the
    * message-backed channels this file supports, the real grouping key in
@@ -290,6 +296,80 @@ async function fetchProjectSummary(
   };
 }
 
+// ── Existing estimate ───────────────────────────────────────────────────
+//
+// Resolves the estimate that ALREADY exists for this customer/lead/project, with EXACTLY the lookup rules the Estimate
+// Assistant's get_estimate_context action uses (src/lib/agentic/estimate-lookup.ts: trusted estimateId, else project >
+// lead > contact; archived/cancelled ignored; several active estimates at one scope = ambiguous). Lead Qualification
+// needs to SEE this before it decides whether to keep qualifying or hand off.
+//
+// Unlike the entity fetchers above this is BEST-EFFORT: an estimate lookup failure must never take down an unrelated
+// conversation, so any error is logged and the summary is simply absent (the Estimate Assistant re-reads the estimate
+// through the audited get_estimate_context action before it proposes anything, so nothing is decided from this alone).
+// READ ONLY, org-scoped, no model input.
+const EXISTING_ESTIMATE_COLUMNS = "id, number, title, status, client_id, lead_id, project_id, total, created_at";
+const EXISTING_ESTIMATE_MAX_CANDIDATES = 5;
+
+async function fetchExistingEstimateSummary(
+  supabase: SupabaseClient,
+  orgId: string,
+  scope: { estimateId?: string; projectId?: string; leadId?: string; contactId?: string },
+): Promise<AIExistingEstimateSummary | undefined> {
+  if (!scope.estimateId && !scope.projectId && !scope.leadId && !scope.contactId) return undefined;
+  try {
+    const lookup = await lookupCurrentEstimate(supabase, orgId, scope, EXISTING_ESTIMATE_COLUMNS);
+    if (lookup.kind === "error") {
+      console.error("[ai/context-builder] fetchExistingEstimateSummary: estimate lookup failed (continuing without it).");
+      return undefined;
+    }
+    if (lookup.kind !== "found") return undefined;
+
+    if (lookup.ambiguous) {
+      return {
+        state: "ambiguous",
+        matchedBy: lookup.matchedBy,
+        candidates: lookup.candidates.slice(0, EXISTING_ESTIMATE_MAX_CANDIDATES).map((r: any) => ({
+          number: typeof r.number === "string" ? r.number : null,
+          title: typeof r.title === "string" && r.title.trim() ? r.title.trim() : "Untitled estimate",
+          status: String(r.status ?? "unknown"),
+        })),
+      };
+    }
+
+    const row = lookup.row;
+    const summary: AIExistingEstimateSummary = {
+      state: "found",
+      matchedBy: lookup.matchedBy,
+      estimateId: row.id,
+      number: typeof row.number === "string" ? row.number : null,
+      title: typeof row.title === "string" && row.title.trim() ? row.title.trim() : "Untitled estimate",
+      status: String(row.status ?? "unknown"),
+      contactId: row.client_id ?? null,
+      leadId: row.lead_id ?? null,
+      projectId: row.project_id ?? null,
+      total: Number.isFinite(Number(row.total)) ? Number(row.total) : 0,
+      editableByAssistant: AI_EDITABLE_ESTIMATE_STATUSES.has(String(row.status)),
+    };
+
+    const { data: items, error: itemsError } = await supabase
+      .from("estimate_items")
+      .select("is_heading, unit_price, metadata")
+      .eq("estimate_id", row.id)
+      .limit(500);
+    if (!itemsError) {
+      const lines = ((items ?? []) as any[]).filter((i) => !i.is_heading);
+      const pending = lines.filter((i) => isPricePendingItem(i)).length;
+      summary.itemCount = lines.length;
+      summary.pricePendingItemCount = pending;
+      summary.pricePending = pending > 0;
+    }
+    return summary;
+  } catch (err) {
+    console.error("[ai/context-builder] fetchExistingEstimateSummary failed (continuing without it):", err);
+    return undefined;
+  }
+}
+
 // ── Conversation ─────────────────────────────────────────────────────────
 //
 // Deliberately conservative, per this task's scope: only the four
@@ -462,14 +542,15 @@ async function fetchBusinessKnowledge(supabase: SupabaseClient, orgId: string): 
  * Promise.all here.
  */
 export async function buildAIContext(params: BuildAIContextParams): Promise<AIResolvedContext> {
-  const { supabase, orgId, channel, contactId, leadId, projectId, conversationKey } = params;
+  const { supabase, orgId, channel, contactId, leadId, projectId, estimateId, conversationKey } = params;
   const now = params.now ?? new Date();
 
-  const [organization, contact, lead, project, conversation, schedulingOfferActive, businessKnowledge] = await Promise.all([
+  const [organization, contact, lead, project, existingEstimate, conversation, schedulingOfferActive, businessKnowledge] = await Promise.all([
     fetchOrganizationSummary(supabase, orgId),
     contactId ? fetchContactSummary(supabase, orgId, contactId) : Promise.resolve(undefined),
     leadId ? fetchLeadSummary(supabase, orgId, leadId) : Promise.resolve(undefined),
     projectId ? fetchProjectSummary(supabase, orgId, projectId) : Promise.resolve(undefined),
+    fetchExistingEstimateSummary(supabase, orgId, { estimateId, projectId, leadId, contactId }),
     fetchConversationSummary(supabase, orgId, channel, contactId, conversationKey),
     resolveSchedulingOfferActive(supabase, orgId, channel, contactId, now),
     fetchBusinessKnowledge(supabase, orgId),
@@ -486,5 +567,5 @@ export async function buildAIContext(params: BuildAIContextParams): Promise<AIRe
     ? { ...(conversation ?? { channel }), schedulingOfferActive: true }
     : conversation;
 
-  return { organization, contact, lead, project, conversation: finalConversation, businessKnowledge, channel };
+  return { organization, contact, lead, project, ...(existingEstimate ? { existingEstimate } : {}), conversation: finalConversation, businessKnowledge, channel };
 }
