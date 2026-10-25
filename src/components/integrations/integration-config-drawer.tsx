@@ -2,6 +2,7 @@
 import {
   Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription,
 } from "@/components/ui/sheet";
+import { StripeSetupInstructions } from "@/components/integrations/stripe-setup-instructions";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -872,7 +873,7 @@ export function IntegrationConfigDrawer({
       return [{ key: "apiKey", label: "API Key", placeholder: "Enter Jotform API key", type: "password", secret: true, minLength: 8 }];
     }
     if (int.id === "stripe") {
-      return [{ key: "secretKey", label: "Secret Key", placeholder: "sk_live_…", type: "password", secret: true, minLength: 20 }];
+      return [{ key: "secretKey", label: "Secret Key", placeholder: "sk_live_… or sk_test_…", type: "password", secret: true, minLength: 20 }];
     }
     return [
       { key: "apiKey",    label: "API Key",    placeholder: "Enter API key",    type: "password", secret: true, minLength: 8 },
@@ -1502,6 +1503,7 @@ export function IntegrationConfigDrawer({
                       <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer" className="underline">myaccount.google.com/apppasswords</a>.</>
                     )}
                   </p>
+                  {int.id === "stripe" && <StripeSetupInstructions />}
                   {getApiKeyFields().map((f) => (
                     <div key={f.key} className="space-y-1.5">
                       <Label className="text-xs">{f.label}</Label>
