@@ -12,6 +12,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { AgenticPreviewPanel } from "@/components/ai-center/agentic-preview-panel";
 import { AITestConsole } from "@/components/ai-center/ai-test-console";
+import { resolveRequestedTab, useTestConsoleAccess } from "@/lib/test-console-access";
 import { AIEmergencyPauseControl } from "@/components/ai-center/ai-emergency-pause-control";
 import { LeadQualificationSettingsControl } from "@/components/ai-center/lead-qualification-settings-control";
 import { AIApprovalsTab } from "@/components/ai-center/ai-approvals-tab";
@@ -228,7 +229,11 @@ function AgentsPage() {
   const { agentId: urlAgentId, tab: urlTab } = Route.useSearch();
   const navigate = Route.useNavigate();
 
-  const [topTab, setTopTab] = useState<TopTab>(urlTab ?? "agents");
+  // Test Console is internal: visible only to allowlisted users (server decides). Never rendered otherwise.
+  const testConsoleAccess = useTestConsoleAccess();
+  const consoleAllowed = testConsoleAccess === "allowed";
+  const visibleTabs = TOP_TABS.filter((t) => t.value !== "console" || consoleAllowed);
+  const [topTab, setTopTab] = useState<TopTab>(resolveRequestedTab<TopTab>(urlTab, testConsoleAccess, "agents"));
   const [selectedId, setSelectedId] = useState<string | null>(urlAgentId ?? null);
 
   const { instances, loading } = useAICenterAgents();
@@ -262,9 +267,13 @@ function AgentsPage() {
   // Sync URL search params
   useEffect(() => { setSelectedId(urlAgentId ?? null); }, [urlAgentId]);
   useEffect(() => {
-    const next = urlTab ?? "agents";
+    // A ?tab=console request from a user who is not allowed falls back to the default tab (and the param is dropped).
+    if (urlTab === "console" && testConsoleAccess === "denied") {
+      navigate({ search: { agentId: urlAgentId, tab: undefined }, replace: true });
+    }
+    const next = resolveRequestedTab<TopTab>(urlTab, testConsoleAccess, "agents");
     if (next !== topTab) setTopTab(next);
-  }, [urlTab, topTab]);
+  }, [urlTab, topTab, testConsoleAccess]);
 
   const openAgent = (id: string) => {
     setSelectedId(id);
@@ -378,7 +387,7 @@ function AgentsPage() {
 
       <Tabs value={topTab} onValueChange={handleTopTabChange}>
         <TabsList className="h-10 gap-1 bg-secondary/60 p-1">
-          {TOP_TABS.map((t) => (
+          {visibleTabs.map((t) => (
             <TabsTrigger
               key={t.value}
               value={t.value}
@@ -497,9 +506,11 @@ function AgentsPage() {
           <AIApprovalsTab onPendingCountChange={setPendingApprovalCount} />
         </TabsContent>
 
-        <TabsContent value="console" className="mt-3">
-          <AITestConsole />
-        </TabsContent>
+        {consoleAllowed && (
+          <TabsContent value="console" className="mt-3">
+            <AITestConsole />
+          </TabsContent>
+        )}
       </Tabs>
     </div>
   );

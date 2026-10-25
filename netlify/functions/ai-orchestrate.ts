@@ -60,6 +60,7 @@ import { createClient } from "@supabase/supabase-js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { resolveOrgFromBearerToken } from "./lib/resolve-org";
+import { TEST_CONSOLE_DENIED_MESSAGE, isTestConsoleUser } from "./lib/test-console-access";
 import { orchestrateAI } from "./lib/ai/orchestrator";
 import { AI_CHANNELS, type AIChannelEvent, type AITrustedContext } from "./lib/ai/types";
 
@@ -218,6 +219,12 @@ export const handler: Handler = async (event) => {
   const resolved = await resolveOrgFromBearerToken(supabaseAdmin, authHeader);
   if (!resolved) return json(401, { error: "Unauthorized" });
   const { userId, orgId } = resolved;
+
+  // ── Test Console gate (internal tool) ───────────────────────────────────
+  // The ONLY HTTP caller of this endpoint is the AI Center Test Console (production channels — SMS, WhatsApp, Lead Qualification
+  // dispatch — call orchestrateAI() in-process and never come through here), so the whole endpoint is internal-only. Authenticated
+  // is not enough: the verified user must be on the server-side allowlist. Generic 403; nothing about the allowlist is revealed.
+  if (!isTestConsoleUser(userId)) return json(403, { error: TEST_CONSOLE_DENIED_MESSAGE });
 
   // ── Request size / parsing ──────────────────────────────────────────
   const rawBody = event.body ?? "";
