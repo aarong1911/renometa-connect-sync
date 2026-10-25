@@ -115,6 +115,12 @@ import {
   summarizeProposalSubmitted,
 } from "./agents/estimate-assistant";
 import type { EstimateContextOutput } from "../../../../src/lib/agentic/estimate-handlers";
+import { bindTrustedPricingInput, MAX_PRICING_ITEMS, PRICING_ITEM_TYPES, type PricingSuggestionsOutput } from "../../../../src/lib/agentic/pricing-handlers";
+import { buildStaffPricingIntelligence, describeStaffPricingOutcomeForAssistant, unavailableStaffPricing, type StaffPricingIntelligence } from "../../../../src/lib/pricing/staff-pricing";
+import {
+  GENERIC_PRICE_SOURCE_REPLACEMENT_REPLY, STAFF_GUIDANCE_REPLACEMENT_REPLY, UNSUPPORTED_PRICE_SOURCE_CLAIM,
+  createPricingProvenance, detectPricingGuidanceRequest, isGroundedStaffPayload, isStaffInitiated, selectUnpricedGuidanceItems,
+} from "./pricing-provenance";
 import { classifyExistingEstimateIntent } from "./existing-estimate-intent";
 import {
   SCHEDULING_OFFER_CHANNELS,
@@ -525,6 +531,9 @@ type AIExecutionInputSummary = {
   handoff?: AIHandoffSummary;
   clarification?: AIClarificationSummary;
   estimate?: AIEstimateSummary;
+  /** Pricing Intelligence P3 — STAFF-ONLY advisory price suggestions for this run (rendered only by the staff Run Inspector;
+   * never part of a reply, never put in a model prompt). Ids/names/costs are never included. */
+  pricingIntelligence?: StaffPricingIntelligence;
 };
 
 /** Estimate Assistant Foundation: a compact audit record of what the
@@ -544,6 +553,10 @@ type AIEstimateSummary = {
   projectId?: string;
   proposal?: "create_estimate_draft" | "add_estimate_line_items";
   priceGuardTriggered?: boolean;
+  /** Why a reply's figure was blocked (audit only). "staff_pricing_figure" = the reply tried to repeat a staff-only suggestion. */
+  priceGuardReason?: "ungrounded" | "staff_pricing_figure" | "commitment";
+  /** A reply claiming "no price book, so every price must come from you" was replaced (organization-history pricing exists). */
+  unsupportedPriceClaimBlocked?: boolean;
   /** Structured-decision validation outcome — VALUE-FREE: statuses, schema field
    * paths and Zod issue codes only. Never the raw model output, field values,
    * customer text, ids or prompt content. */
@@ -843,8 +856,12 @@ async function runLeadQualificationTurn(params: {
   // a read-only "reference" (e.g. "what is on my estimate?") applies ONLY when exactly one estimate was resolved, so an
   // ambiguous situation is never forced beyond what it already was.
   const existingIntent = context.existingEstimate ? classifyExistingEstimateIntent(event.content.text) : null;
+  // A STAFF pricing-guidance request about a uniquely resolved estimate also belongs to the Estimate Assistant (it has no estimate
+  // noun/verb, e.g. "Give me pricing suggestions for the unpriced items"). Customer-channel events are never staff-initiated.
+  const staffPricingGuidance =
+    context.existingEstimate?.state === "found" && isStaffInitiated(trustedContext.actor, event.channel) && detectPricingGuidanceRequest(event.content.text);
   const forceEstimateHandoff =
-    existingIntent === "change" || (existingIntent === "reference" && context.existingEstimate?.state === "found");
+    existingIntent === "change" || (existingIntent === "reference" && context.existingEstimate?.state === "found") || staffPricingGuidance;
   if (context.existingEstimate && allowSchedulingHandoff && forceEstimateHandoff) {
     const estimateConfig = SYSTEM_AGENTS.estimate_assistant;
     const hasTrustedSubject = !!(trustedContext.leadId || trustedContext.contactId || trustedContext.projectId || trustedContext.estimateId);
@@ -852,7 +869,9 @@ async function runLeadQualificationTurn(params: {
       const existingHandoff: AIAgentHandoff = {
         fromAgent: "lead_qualification",
         toAgent: "estimate_assistant",
-        reason: existingIntent === "reference" ? "The customer is asking about an estimate that already exists for them." : "The customer asked to change an estimate that already exists for them.",
+        reason: staffPricingGuidance && existingIntent === null
+          ? "Staff asked for pricing guidance on an estimate that already exists."
+          : existingIntent === "reference" ? "The customer is asking about an estimate that already exists for them." : "The customer asked to change an estimate that already exists for them.",
         summary: "An estimate already exists for this customer. They are asking about or asking to change it, not to start a new one.",
       };
       const estimateResult = await runEstimateAssistantTurn({
@@ -1370,6 +1389,27 @@ async function runReceptionTurn(params: {
   inputSummary: AIExecutionInputSummary;
 }): Promise<AIRunResult> {
   const { supabase, trustedContext, event, context, modelProvider, executionId, agentConfig, inputSummary } = params;
+
+  // Staff pricing guidance on an existing estimate (the AI Center Test Console routes to Reception first): hand straight to Lead
+  // Qualification, whose deterministic backstop then hands to the Estimate Assistant — no Reception model call is needed or allowed
+  // to answer pricing questions itself. Customer-channel events are never staff-initiated.
+  if (context.existingEstimate?.state === "found" && isStaffInitiated(trustedContext.actor, event.channel) && detectPricingGuidanceRequest(event.content.text)) {
+    const lq = SYSTEM_AGENTS.lead_qualification;
+    if (lq) {
+      const staffHandoff: AIAgentHandoff = {
+        fromAgent: "reception",
+        toAgent: "lead_qualification",
+        reason: "Staff asked for pricing guidance on an estimate that already exists.",
+        summary: "A team member is asking for pricing guidance on this customer's existing estimate.",
+      };
+      const routed = await runLeadQualificationTurn({
+        supabase, trustedContext, event, context, activeAgentKey: "lead_qualification", modelProvider, executionId, agentConfig: lq,
+        inputSummary: { ...inputSummary, handoff: { fromAgent: "reception", toAgent: "lead_qualification", reason: staffHandoff.reason } },
+        handoff: staffHandoff,
+      });
+      return { ...routed, handoff: staffHandoff };
+    }
+  }
 
   const decisionRequest = buildReceptionDecisionRequest(agentConfig.instructions, context, event);
 
@@ -2286,12 +2326,90 @@ async function runEstimateAssistantTurn(params: {
 
   // Derived context: everything Business Knowledge / CRM already resolved,
   // plus the one estimate read. Nothing is fetched twice.
-  const estimateContext: AIResolvedContext = { ...context, estimate };
+  let estimateContext: AIResolvedContext = { ...context, estimate };
+
+  // Pricing guidance is a STAFF capability: an authenticated human (Test Console / ai-orchestrate) or the internal channel. A
+  // customer-channel message never triggers it, however it is worded.
+  const staffGuidance = isStaffInitiated(trustedContext.actor, event.channel) && detectPricingGuidanceRequest(event.content.text);
+
+  // Pricing Intelligence P3: the figures of THIS run's pricing result (if any). Used only to LABEL a blocked customer reply for
+  // the audit trail — guardEstimateReply never allows a tool figure in a reply.
+  let staffFigures: ReadonlySet<number> | undefined;
 
   const guard = (text: string): string => {
-    const g = guardEstimateReply(text, estimateContext, event);
-    if (g.replaced) inputSummary = { ...inputSummary, estimate: { ...(inputSummary.estimate ?? estimateSummary), priceGuardTriggered: true } };
-    return g.text;
+    const g = guardEstimateReply(text, estimateContext, event, staffFigures);
+    if (g.replaced) {
+      inputSummary = {
+        ...inputSummary,
+        estimate: { ...(inputSummary.estimate ?? estimateSummary), priceGuardTriggered: true, ...(g.reason ? { priceGuardReason: g.reason } : {}) },
+      };
+    }
+    let out = g.text;
+    // The assistant must never claim "no price book, so every price must come from you": organization-history pricing exists.
+    if (UNSUPPORTED_PRICE_SOURCE_CLAIM.test(out)) {
+      out = staffGuidance ? STAFF_GUIDANCE_REPLACEMENT_REPLY : GENERIC_PRICE_SOURCE_REPLACEMENT_REPLY;
+      inputSummary = { ...inputSummary, estimate: { ...(inputSummary.estimate ?? estimateSummary), unsupportedPriceClaimBlocked: true } };
+    }
+    return out;
+  };
+
+  /**
+   * Pricing Intelligence P3 — STAFF-ONLY. Calls the read-only get_pricing_suggestions action for the given items and stores the
+   * result on the execution record for the Run Inspector. It NEVER changes the reply, never feeds a model prompt, never writes an
+   * estimate, and a failure here never fails the run.
+   *
+   * TRUST: the model only ever supplies item descriptors (name/description/itemType/unit) — they go through
+   * bindTrustedPricingInput, whose STRICT model schema rejects any id/org/price. Every id (estimate, project, lead, contact) is
+   * taken from the runtime trusted context / the server-read estimate; the org is ctx.orgId inside executeAITool.
+   */
+  let pricingRan = false;
+  const runStaffPricing = async (
+    requested: Array<{ name: string; description?: string | null; itemType?: string | null; unit?: string | null }>,
+    sequence: number,
+    options?: { zeroPriceCountsAsUnpriced?: boolean },
+  ): Promise<void> => {
+    const items = requested
+      .map((r) => ({
+        name: r.name.trim().slice(0, 200),
+        ...(r.description && r.description.trim() ? { description: r.description.trim().slice(0, 1000) } : {}),
+        ...(r.itemType && (PRICING_ITEM_TYPES as readonly string[]).includes(r.itemType) ? { itemType: r.itemType } : {}),
+        ...(r.unit && r.unit.trim() ? { unit: r.unit.trim().slice(0, 40) } : {}),
+      }))
+      .filter((r) => r.name.length > 0)
+      .slice(0, MAX_PRICING_ITEMS);
+    if (items.length === 0) return;
+    pricingRan = true;
+    const unavailable = () => { inputSummary = { ...inputSummary, pricingIntelligence: unavailableStaffPricing(executionId, items.length) }; };
+    try {
+      const bound = bindTrustedPricingInput(
+        { items },
+        {
+          estimateId: estimate?.found && !estimate.ambiguous ? estimate.estimate?.id : trustedContext.estimateId,
+          projectId: trustedContext.projectId,
+          leadId: trustedContext.leadId,
+          contactId: trustedContext.contactId,
+        },
+        options,
+      );
+      const priced = await executeAITool(
+        { toolName: "get_pricing_suggestions", input: bound },
+        {
+          supabase, orgId, actor: trustedContext.actor, executionId, sequence, autonomyLevel,
+          targetEntityType: primaryTargetEntity(trustedContext).targetEntityType ?? undefined,
+          targetEntityId: primaryTargetEntity(trustedContext).targetEntityId ?? undefined,
+        },
+      );
+      if (priced.status !== "completed" || !priced.output) { unavailable(); return; }
+      const output = priced.output as PricingSuggestionsOutput;
+      const payload = buildStaffPricingIntelligence({ runId: executionId, requestedItems: items.length, toolOutput: output });
+      const provenance = createPricingProvenance(executionId, output);
+      if (!isGroundedStaffPayload(payload, provenance)) { unavailable(); return; }
+      staffFigures = provenance.figures;
+      inputSummary = { ...inputSummary, pricingIntelligence: payload };
+    } catch (err) {
+      console.error(`[ai/orchestrator] estimate_assistant staff pricing failed (execution ${executionId}):`, err instanceof Error ? err.message : "unknown");
+      unavailable();
+    }
   };
 
   /** One response-only model call after a proposal/outcome is known. */
@@ -2324,6 +2442,22 @@ async function runEstimateAssistantTurn(params: {
       issues: issues.map(({ path, code }) => ({ path, code })),
     });
   };
+
+  // ── Staff pricing guidance: run the pricing lookup BEFORE the assistant decides what to say ──────────────────────
+  // An explicit staff request resolves ONE estimate with unpriced lines (price_pending placeholders AND $0 lines a person added
+  // with a blank price): get_estimate_context -> get_pricing_suggestions, deterministically, before any model call. The model is
+  // then told (without any figure) that the lookup already ran, so it cannot substitute its own pricing questions or claim there
+  // is no pricing source. Read-only; the result is staff-only (see runStaffPricing).
+  let pricingRanBeforeDecision = false;
+  if (staffGuidance && estimate?.found && !estimate.ambiguous) {
+    const unpriced = selectUnpricedGuidanceItems(estimate.items ?? []).map((i) => ({ name: i.name, itemType: i.itemType, unit: i.unit }));
+    if (unpriced.length > 0) {
+      await runStaffPricing(unpriced, 2, { zeroPriceCountsAsUnpriced: true });
+      pricingRanBeforeDecision = pricingRan;
+      const payload = inputSummary.pricingIntelligence;
+      if (payload) estimateContext = { ...estimateContext, staffPricingOutcome: describeStaffPricingOutcomeForAssistant(payload) };
+    }
+  }
 
   let decisionResponse;
   try {
@@ -2402,9 +2536,12 @@ async function runEstimateAssistantTurn(params: {
   let targetEntityId: string;
   let approvalSummary: string;
   let refusal: string | undefined;
+  /** Items to give staff-only pricing context for once the proposal is submitted (names only; never prices). */
+  let pricingItems: Array<{ name: string; description?: string | null; itemType?: string | null }> = [];
 
   if (decision.type === "propose_estimate_draft") {
     itemNames = estimateItemNames(decision.items);
+    pricingItems = (decision.items ?? []).map((i) => ({ name: i.name, description: i.description, itemType: i.itemType }));
     if (!estimate) {
       refusal = "The existing estimate could not be checked just now, so no estimate draft was proposed. Tell the customer the team will follow up on the estimate; do not say anything was prepared.";
     } else if (estimate.found) {
@@ -2423,6 +2560,7 @@ async function runEstimateAssistantTurn(params: {
     const existingNames = new Set(estimateItemNames(estimate?.items).map((n) => n.trim().toLowerCase()));
     const newItems = decision.items.filter((i) => !existingNames.has(i.name.trim().toLowerCase()));
     itemNames = estimateItemNames(newItems);
+    pricingItems = newItems.map((i) => ({ name: i.name, description: i.description, itemType: i.itemType }));
     if (!estimate || !est) {
       refusal = "There is no existing estimate that can be edited, so no line items were proposed. Describe only what the Estimate context actually lists.";
     } else if (estimate.ambiguous) {
@@ -2448,7 +2586,7 @@ async function runEstimateAssistantTurn(params: {
   // actions), never a write.
   const proposeResult = await executeAITool(
     { toolName: proposalKind, input: rawInput },
-    { supabase, orgId, actor: trustedContext.actor, executionId, sequence: 2, autonomyLevel, targetEntityType, targetEntityId, approvalSummary },
+    { supabase, orgId, actor: trustedContext.actor, executionId, sequence: pricingRanBeforeDecision ? 3 : 2, autonomyLevel, targetEntityType, targetEntityId, approvalSummary },
   );
   toolResults.push(proposeResult);
   inputSummary = {
@@ -2458,6 +2596,8 @@ async function runEstimateAssistantTurn(params: {
   };
 
   if (proposeResult.status === "approval_required") {
+    // Staff-only pricing context for the SUBMITTED proposal (sequence 3: the proposal keeps sequence 2). Never affects the reply.
+    if (!pricingRan) await runStaffPricing(pricingItems, 3);
     return await respondWithOutcome(
       summarizeProposalSubmitted(proposalKind === "create_estimate_draft" ? "draft" : "add_items", itemNames),
       "awaiting_approval",

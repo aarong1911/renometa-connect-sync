@@ -422,6 +422,12 @@ export type AIResolvedContext = {
    * exists"; that is `{ found: false }`.
    */
   estimate?: EstimateContextOutput;
+  /**
+   * Pricing Intelligence P3: a deterministic, NON-NUMERIC sentence set only on a STAFF pricing-guidance turn, after the pricing
+   * lookup has run (counts and missing-input names, never a price). Lets the assistant answer without inventing its own pricing
+   * questions. Never set on customer turns.
+   */
+  staffPricingOutcome?: string;
   channel: AIChannel;
 };
 

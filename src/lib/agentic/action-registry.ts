@@ -34,6 +34,7 @@ import {
   getEstimateContext, createEstimateDraft, addEstimateLineItems,
   getEstimateContextInput, createEstimateDraftInput, addEstimateLineItemsInput,
 } from "./estimate-handlers";
+import { getPricingSuggestions, getPricingSuggestionsInput } from "./pricing-handlers";
 
 // ── Zod input schemas ────────────────────────────────────────────────────
 
@@ -273,6 +274,27 @@ export const ACTION_REGISTRY: Record<string, ActionDefinition<any, any>> = {
     retryPolicy: DEFAULT_RETRY,
     isExecutable: true,
     handler: getEstimateContext,
+  },
+
+  // Pricing Intelligence v1 (P2). READ-ONLY, org-scoped, staff-only pricing SUGGESTIONS from the organization's own
+  // approved/sent history (see pricing-handlers.ts and src/lib/pricing/). No writes, no approval, no outbound effect, and no
+  // model-generated market pricing. The registered input carries trusted ids bound by server code; a model only ever supplies
+  // { items } (getPricingSuggestionsModelInput).
+  get_pricing_suggestions: {
+    key: "get_pricing_suggestions",
+    displayName: "Get pricing suggestions",
+    description: "Suggests unit prices for estimate line items from this organization's own past approved and sent estimates and approved change orders, with a range, confidence and the evidence behind it. Read-only and staff-only: it changes nothing and its numbers are never customer quotes.",
+    category: "estimate",
+    riskLevel: "read",
+    supportedActorTypes: ["user", "agent", "workflow", "system"],
+    inputSchema: getPricingSuggestionsInput,
+    requiresApproval: false,
+    minimumAutonomyLevel: 1,
+    idempotent: true,
+    timeoutMs: 15000,
+    retryPolicy: DEFAULT_RETRY,
+    isExecutable: true,
+    handler: getPricingSuggestions,
   },
 
   // ── Low-risk writes ──────────────────────────────────────────────────────

@@ -372,7 +372,8 @@ test("TEST 5 + 14 — structure WITHOUT price: a draft proposal creates a pendin
   assert.doesNotMatch(result.responseText, /has been (created|sent|prepared)/i);
 
   const st = await steps(db, result.executionId);
-  assert.deepEqual(st.map((s) => [s.sequence, s.action_key, s.status]), [[1, "get_estimate_context", "succeeded"], [2, "create_estimate_draft", "awaiting_approval"]]);
+  assert.deepEqual(st.map((s) => [s.sequence, s.action_key, s.status]), [[1, "get_estimate_context", "succeeded"], [2, "create_estimate_draft", "awaiting_approval"], [3, "get_pricing_suggestions", "succeeded"]]);
+  // (P3) the proposal keeps sequence 2; the staff-only, read-only pricing read is the additive sequence 3.
   const row = await execRow(db, result.executionId);
   assert.equal(row.status, "awaiting_approval");
   assert.equal(row.input_summary.estimate.proposal, "create_estimate_draft");

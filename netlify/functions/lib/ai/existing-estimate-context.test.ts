@@ -291,7 +291,7 @@ test("PRODUCTION CASE — 'Add a vanity installation line item to the existing b
   assert.ok(!/Lead Qualification|qualification question/i.test(modelProvider.requests[0].system.split("\n").slice(0, 3).join(" ")));
 
   const st = await steps(db, result.executionId);
-  assert.deepEqual(st.map((s) => [s.sequence, s.action_key]), [[1, "get_estimate_context"], [2, "add_estimate_line_items"]], "the audited estimate read happens BEFORE the proposal");
+  assert.deepEqual(st.map((s) => [s.sequence, s.action_key]), [[1, "get_estimate_context"], [2, "add_estimate_line_items"], [3, "get_pricing_suggestions"]], "the audited estimate read happens BEFORE the proposal; the staff-only pricing read follows it");
   assert.ok(!st.some((s) => s.action_key === "create_estimate_draft"));
 
   const approvals = db.__dumpTable("agent_approval_requests");
@@ -333,7 +333,7 @@ test("NO existing estimate — the create_estimate_draft path is preserved (and 
   const created = await run(db, "Can you prepare an estimate for the bathroom remodel?", [handoffToEstimate, proposeDraft, "The team will review."]);
   assert.equal(created.result.agentKey, "estimate_assistant");
   assert.equal(db.__dumpTable("agent_approval_requests")[0].action_key, "create_estimate_draft");
-  assert.deepEqual((await steps(db, created.result.executionId)).map((s) => s.action_key), ["get_estimate_context", "create_estimate_draft"]);
+  assert.deepEqual((await steps(db, created.result.executionId)).map((s) => s.action_key), ["get_estimate_context", "create_estimate_draft", "get_pricing_suggestions"]);
 
   // Same words as the production case, but nothing exists: no deterministic handoff, the normal Lead Qualification decision runs.
   const db2 = makeDb();

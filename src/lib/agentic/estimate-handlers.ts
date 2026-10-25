@@ -82,14 +82,12 @@ const CONTEXT_MAX_ITEMS = 40;
 const CONTEXT_MAX_TEXT = 1500;
 const CONTEXT_MAX_ITEM_TEXT = 300;
 
-/** Stated to the model verbatim whenever pricing is discussed. Today no price
- * book / catalog / labor-rate / estimate-template-with-prices source exists
- * for AI to read (audited: estimate_items are the only priced rows, and they
- * are per-estimate, not a reusable catalog). When one is added, this is the
- * single place to flip — see the phase report's "trusted pricing" section. */
+/** Stated to the model verbatim whenever pricing is discussed. No price book / catalog exists yet, but that does NOT mean there is
+ * no pricing source: Pricing Intelligence suggests prices from the organization's own history (staff-only, advisory). The
+ * assistant itself still never sets, infers or quotes a price. When a catalog is added, this is the single place to flip. */
 export const ESTIMATE_PRICING_AVAILABILITY = {
   trustedCatalogAvailable: false as const,
-  note: "No trusted price book, catalog, or labor-rate source is configured for this business. Every unit price and quantity must be entered by the business owner — never estimated or inferred.",
+  note: "The assistant never sets or infers a price itself: prices are entered or approved by the business owner. Staff-only price suggestions drawn from this organization's own past estimates and change orders may be attached to a run separately (Pricing Intelligence); they are advisory, never final, and never quoted to a customer.",
 };
 
 const GENERIC_NOT_FOUND = "The requested record was not found in this organization.";
