@@ -73,6 +73,9 @@ const AI_TOOL_ALLOWLIST: ReadonlySet<string> = new Set([
   "get_estimate_context",
   "create_estimate_draft",
   "add_estimate_line_items",
+  // Pricing Intelligence v1 (P2): read-only, staff-only pricing suggestions. Reachable only through the Estimate
+  // Assistant's own allowlist; the orchestrator does not call it yet.
+  "get_pricing_suggestions",
 ]);
 
 // ── Manual argument descriptors ─────────────────────────────────────────
@@ -111,6 +114,11 @@ const ARGUMENT_DESCRIPTORS: Record<string, AIToolArgumentDescriptor[]> = {
     { name: "projectId", type: "string", required: false, description: "UUID of the project whose estimate to load." },
     { name: "leadId", type: "string", required: false, description: "UUID of the lead whose estimate to load." },
     { name: "contactId", type: "string", required: false, description: "UUID of the contact whose estimate to load." },
+  ],
+  // Model-visible arguments are ITEMS ONLY. The org and every trusted id (estimate / project / lead / contact) are bound by
+  // server code from the runtime context; a model can never supply them, and no price is accepted.
+  get_pricing_suggestions: [
+    { name: "items", type: "string", required: true, description: "1-10 line items to price: { name, description?, itemType?, unit?, quantity? }. No prices and no ids." },
   ],
   create_estimate_draft: [
     { name: "title", type: "string", required: true, description: "Estimate title (max 200 chars)." },

@@ -65,6 +65,8 @@ export const ESTIMATE_ASSISTANT_TOOL_ALLOWLIST: ReadonlySet<string> = new Set([
   "get_estimate_context",
   "create_estimate_draft",
   "add_estimate_line_items",
+  // Pricing Intelligence v1 (P2): read-only. Available for isolated testing; the orchestrator does not call it yet.
+  "get_pricing_suggestions",
 ]);
 
 export const GENERIC_FALLBACK_RESPONSE =
@@ -339,19 +341,30 @@ const COMMITMENT_RE =
  *   (b) vouched for ONLY by the customer yet phrased as acceptance (e.g.
  *       "Yes, we can do it for $18,000").
  * Applied to EVERY reply path, including the non-JSON fallback. This is a
- * second line of defense behind the prompt rules — it never relaxes them. */
+ * second line of defense behind the prompt rules — it never relaxes them.
+ *
+ * STAFF-ONLY PRICING (Pricing Intelligence P3): suggested prices from the read-only pricing tool are NOT grounded data for a
+ * customer reply, so they are not in the allowed sets above and a reply containing one is replaced like any other invented
+ * figure. `staffOnlyFigures` (the figures of THIS run's pricing result) is used ONLY to label that block (`reason:
+ * "staff_pricing_figure"`) for the audit trail. It never allows anything: this guard has no "tool figures are fine" mode. */
+export type EstimateReplyGuardResult = { text: string; replaced: boolean; reason?: "ungrounded" | "staff_pricing_figure" | "commitment" };
+
 export function guardEstimateReply(
   text: string,
   context: AIResolvedContext,
   event: AIChannelEvent,
-): { text: string; replaced: boolean } {
+  staffOnlyFigures?: ReadonlySet<number>,
+): EstimateReplyGuardResult {
   const mentioned = extractMoneyAmounts(text);
   if (mentioned.length === 0) return { text, replaced: false };
   const { trusted, customer } = collectGroundedAmounts(context, event);
   const ungrounded = mentioned.some((n) => !trusted.has(cents(n)) && !customer.has(cents(n)));
-  if (ungrounded) return { text: PRICE_SAFE_RESPONSE, replaced: true };
+  if (ungrounded) {
+    const staffFigure = !!staffOnlyFigures && mentioned.some((n) => !trusted.has(cents(n)) && !customer.has(cents(n)) && staffOnlyFigures.has(cents(n)));
+    return { text: PRICE_SAFE_RESPONSE, replaced: true, reason: staffFigure ? "staff_pricing_figure" : "ungrounded" };
+  }
   const customerOnly = mentioned.some((n) => !trusted.has(cents(n)));
-  if (customerOnly && COMMITMENT_RE.test(text)) return { text: PRICE_SAFE_RESPONSE, replaced: true };
+  if (customerOnly && COMMITMENT_RE.test(text)) return { text: PRICE_SAFE_RESPONSE, replaced: true, reason: "commitment" };
   return { text, replaced: false };
 }
 
@@ -409,7 +422,7 @@ export function computeEstimateReadiness(context: AIResolvedContext): EstimateRe
   if (!lead?.projectType && !(hasEstimate && est!.estimate!.scope)) missing.push("Project scope — what work is actually being requested");
   if (!lead?.location && !context.project) missing.push("Property address / location");
   if (!ESTIMATE_PRICING_AVAILABILITY.trustedCatalogAvailable) {
-    missing.push("Trusted pricing — no price book or catalog is configured, so every unit price must come from the business owner");
+    missing.push("Confirmed unit prices — set or approved by the business owner (the assistant never sets prices; staff-only history-based suggestions may be attached separately)");
   }
   if (!hasEstimate || (est!.items ?? []).every((i) => i.isHeading || i.pricePending)) {
     missing.push("Measurements / quantities");
@@ -454,6 +467,7 @@ export function buildEstimateContextBlock(context: AIResolvedContext): string {
     }
   }
   lines.push(`- Pricing source: ${ESTIMATE_PRICING_AVAILABILITY.note}`);
+  if (context.staffPricingOutcome) lines.push(`- Staff pricing lookup: ${context.staffPricingOutcome}`);
 
   const readiness = computeEstimateReadiness(context);
   lines.push("", "Known facts for the estimate (computed by the system):");
@@ -478,6 +492,8 @@ export const ESTIMATE_ASSISTANT_RULES = [
   "Distinguish KNOWN facts from PROPOSED structure. When information is missing, say specifically what you still need (for example cabinet selection, countertop material, measurements, and pricing) — you may name several missing inputs in one reply, taken from the system's \"still missing\" list. Do not pad the reply with questions the CRM already answers.",
   "You never create, change, or send anything yourself, and you never accept, approve, discount, or collect money. A team member reviews and approves any estimate change before it exists. You cannot schedule appointments.",
   "Never mention internal cost, margin, markup, contingency, internal notes, record ids, tool names, or approval mechanics to the customer.",
+  "NEVER say or imply that \"there is no price book, so every price must come from you\": organization-history pricing exists even without a price book, and the SYSTEM (not you) looks it up. Do not substitute your own pricing questions for that lookup, and do not ask staff to supply prices when a Staff pricing lookup line says it already ran.",
+  "PRICING SUGGESTIONS ARE INTERNAL AND ADVISORY: the business may attach staff-only historical price suggestions to a run. They are never shown to you, never a quote, and never final. Never state, hint at, or round a suggested price to the customer, never claim a price is final, never overwrite or contradict a reviewed/manual price, and never guess a market price yourself. If there is not enough history, that is an internal note for staff — tell the customer only that the team will confirm pricing.",
 ].join(" ");
 
 function audienceGuidance(channel: AIChannel): string {

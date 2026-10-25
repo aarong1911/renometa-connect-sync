@@ -44,6 +44,7 @@ import { cn } from "@/lib/utils";
 import { supabase } from "@/lib/supabase";
 import { getOrgId } from "@/lib/contacts-store";
 import { formatEstimatedCostUsd } from "@/lib/agentic/usage";
+import { describeStaffPricing, readStaffPricingIntelligence } from "@/lib/pricing/staff-pricing";
 import { RUN_INSPECTOR_SOURCES, isRunInspectorRuntimeRow } from "@/lib/agentic/run-inspector-predicate";
 import { toggleExecutionSelection, isRowExpanded } from "@/components/ai-center/run-inspector-selection";
 
@@ -89,6 +90,7 @@ type RunEstimateSummary = {
   projectId?: string;
   proposal?: string;
   priceGuardTriggered?: boolean;
+  priceGuardReason?: string;
   /** Value-free structured-decision validation record (statuses / field paths / Zod codes only). */
   decisionValidation?: {
     initial?: { status?: string; normalized?: boolean; issues?: Array<{ path?: string; code?: string }> };
@@ -129,6 +131,8 @@ type RunInputSummary = {
   handoff?: unknown;
   clarification?: RunClarificationSummary;
   estimate?: RunEstimateSummary;
+  /** Pricing Intelligence P3 — STAFF-ONLY advisory suggestions (validated by readStaffPricingIntelligence; jsonb read back from the DB). */
+  pricingIntelligence?: unknown;
 };
 
 type RunOutputSummary = {
@@ -460,6 +464,8 @@ function ExecutionDetail({ row, usage }: { row: ExecutionRow; usage?: UsageInfo 
   const context = input.context;
   const handoff = getValidHandoff(input.handoff);
   const estimate = input.estimate && typeof input.estimate === "object" ? input.estimate : undefined;
+  const pricingPayload = readStaffPricingIntelligence(input.pricingIntelligence);
+  const pricing = pricingPayload ? describeStaffPricing(pricingPayload) : null;
 
   return (
     // No outer Card here — this now renders inline directly beneath its own
@@ -530,7 +536,9 @@ function ExecutionDetail({ row, usage }: { row: ExecutionRow; usage?: UsageInfo 
             <p className="text-[11px] text-muted-foreground">Decision validation: {describeDecisionValidation(estimate.decisionValidation)}</p>
           )}
           {estimate.priceGuardTriggered && (
-            <Badge variant="outline" className="h-5 rounded text-[10px]">Unsupported price blocked in reply</Badge>
+            <Badge variant="outline" className="h-5 rounded text-[10px]">
+              {estimate.priceGuardReason === "staff_pricing_figure" ? "Staff-only suggested price blocked in reply" : "Unsupported price blocked in reply"}
+            </Badge>
           )}
           {(estimate.estimateId || estimate.projectId) && (
             <p className="font-mono text-[10px] text-muted-foreground">
@@ -538,6 +546,51 @@ function ExecutionDetail({ row, usage }: { row: ExecutionRow; usage?: UsageInfo 
               {estimate.estimateId && estimate.projectId && " · "}
               {estimate.projectId && <>project {estimate.projectId}</>}
             </p>
+          )}
+        </div>
+      )}
+
+      {pricing && (
+        <div className="space-y-2" data-testid="pricing-intelligence">
+          <div className="flex items-center gap-2">
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Pricing Intelligence</div>
+            <Badge variant="outline" className="h-5 rounded text-[10px]">Staff only</Badge>
+          </div>
+          {!pricing.available ? (
+            <p className="text-[11px] text-muted-foreground">{pricing.note}</p>
+          ) : (
+            <>
+              {pricing.rows.map((row, i) => (
+                <div key={`${row.itemName}-${i}`} className="space-y-1 rounded-md border border-border/60 p-2">
+                  <div className="text-xs font-medium">{row.itemName}</div>
+                  {row.status === "suggested" ? (
+                    <>
+                      <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+                        <Field label="Suggested unit price" value={row.price ?? "—"} />
+                        <Field label="Range" value={row.range ?? "—"} />
+                        <Field label="Confidence" value={<span className="capitalize">{row.confidence ?? "—"}</span>} />
+                        <Field label="Source" value={row.source ?? "—"} />
+                        <Field label="Samples" value={row.sampleCount ?? "—"} />
+                        <Field label="Same project type" value={row.sameProjectTypeCount ?? "—"} />
+                        {row.total && <Field label="Suggested total" value={row.total} />}
+                      </div>
+                      <p className="text-[11px] font-medium text-muted-foreground">{row.message}</p>
+                      {row.assumptions.length > 0 && (
+                        <ul className="list-disc space-y-0.5 pl-4 text-[11px] text-muted-foreground">
+                          {row.assumptions.map((a, j) => <li key={j}>{a}</li>)}
+                        </ul>
+                      )}
+                      {row.missingInputs.length > 0 && (
+                        <p className="text-[11px] text-muted-foreground">Missing inputs: {row.missingInputs.join(", ")}</p>
+                      )}
+                    </>
+                  ) : (
+                    <p className="text-[11px] text-muted-foreground">{row.message}</p>
+                  )}
+                </div>
+              ))}
+              <p className="text-[11px] text-muted-foreground">{pricing.note}</p>
+            </>
           )}
         </div>
       )}

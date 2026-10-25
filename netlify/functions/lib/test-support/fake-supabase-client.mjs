@@ -92,7 +92,7 @@ function parseCondition(item) {
   if (item.startsWith("and(") && item.endsWith(")")) {
     return { op: "and", conds: splitTopLevel(item.slice(4, -1)).map(parseCondition) };
   }
-  const m = item.match(/^(.+?)\.(eq|is|lt|gt)\.(.*)$/);
+  const m = item.match(/^(.+?)\.(eq|is|lt|gt|gte|lte)\.(.*)$/);
   if (!m) throw new Error("not implemented in fake-supabase-client: or() item " + item);
   return { col: m[1], op: m[2], val: m[3] };
 }
@@ -123,6 +123,7 @@ class FakeQueryBuilder {
     this.upsertOpts = null;
     this.orderSpec = null;
     this.limitN = null;
+    this.rangeSpec = null;
   }
 
   eq(col, val) { this.filters.push({ col, op: "eq", val }); return this; }
@@ -149,6 +150,12 @@ class FakeQueryBuilder {
 
   limit(n) {
     this.limitN = n;
+    return this;
+  }
+
+  // PostgREST-style inclusive row window (used by paged readers). Applied after ordering, like limit().
+  range(from, to) {
+    this.rangeSpec = { from, to };
     return this;
   }
 
@@ -225,6 +232,7 @@ class FakeQueryBuilder {
         return ascending ? cmp : -cmp;
       });
     }
+    if (this.rangeSpec) matched = matched.slice(this.rangeSpec.from, this.rangeSpec.to + 1);
     if (this.limitN != null) matched = matched.slice(0, this.limitN);
     return matched;
   }

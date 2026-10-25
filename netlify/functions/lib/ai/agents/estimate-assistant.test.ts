@@ -38,7 +38,7 @@ const S: any = await import(pathToFileURL(path.join(outDir, "subject.mjs")).href
 const AGENT_INSTRUCTIONS = "You are the Estimate Assistant.";
 const EST_ID = "dddddddd-dddd-4ddd-8ddd-ddddddddddd1";
 
-const noEstimate = { found: false, pricing: { trustedCatalogAvailable: false, note: "No trusted price book, catalog, or labor-rate source is configured for this business. Every unit price and quantity must be entered by the business owner — never estimated or inferred." } };
+const noEstimate = { found: false, pricing: { trustedCatalogAvailable: false, note: "The assistant never sets or infers a price itself: prices are entered or approved by the business owner. Staff-only price suggestions drawn from this organization's own past estimates and change orders may be attached to a run separately (Pricing Intelligence); they are advisory, never final, and never quoted to a customer." } };
 
 function estimateWith(items: any[], overrides: Record<string, unknown> = {}) {
   return {
@@ -72,8 +72,8 @@ const decisionText = (ctx: any, event: any, handoff?: any) => {
 
 // ── Decision contract ────────────────────────────────────────────────────
 
-test("tool allowlist is exactly the three estimate actions", () => {
-  assert.deepEqual([...S.ESTIMATE_ASSISTANT_TOOL_ALLOWLIST].sort(), ["add_estimate_line_items", "create_estimate_draft", "get_estimate_context"]);
+test("tool allowlist is exactly the three estimate actions plus the read-only pricing suggestions tool", () => {
+  assert.deepEqual([...S.ESTIMATE_ASSISTANT_TOOL_ALLOWLIST].sort(), ["add_estimate_line_items", "create_estimate_draft", "get_estimate_context", "get_pricing_suggestions"]);
 });
 
 test("valid respond / propose / clarify decisions parse", () => {
@@ -133,10 +133,12 @@ test("trusted input binding: ids come ONLY from the trusted context, never the d
 test("TEST 2 — kitchen scope, NO trusted pricing: prompt tells the model pricing is unavailable and lists what is missing; the prompt itself contains no dollar figure", () => {
   const ctx = baseContext({ estimate: noEstimate });
   const text = decisionText(ctx, evt("Can you prepare an estimate?"));
-  assert.match(text, /No trusted price book, catalog, or labor-rate source is configured/);
+  assert.match(text, /The assistant never sets or infers a price itself/);
+  assert.match(text, /Staff-only price suggestions drawn from this organization/);
+  assert.doesNotMatch(text.replace(/NEVER say or imply that[^.]*./g, ""), /no price book|every unit price must come from the business owner/i, "the unsupported price-book conclusion is gone (only the PROHIBITION of it remains)");
   assert.match(text, /Existing estimate: none found/);
   assert.match(text, /No estimate exists yet for this customer\/project/);
-  assert.match(text, /Trusted pricing — no price book or catalog is configured/);
+  assert.match(text, /Confirmed unit prices — set or approved by the business owner/);
   assert.match(text, /Measurements \/ quantities/);
   assert.match(text, /Project type \/ scope mentioned by the customer: Kitchen remodel/);
   assert.ok(!/\$\d/.test(text), "no dollar figure may appear anywhere in this prompt");
@@ -188,7 +190,7 @@ test("computeEstimateReadiness: known vs missing is deterministic (no estimate �
   const none = S.computeEstimateReadiness(baseContext({ estimate: noEstimate, lead: { id: "l", status: "new" } }));
   assert.ok(none.missing.some((m: string) => /Project scope/.test(m)));
   assert.ok(none.missing.some((m: string) => /Property address/.test(m)));
-  assert.ok(none.missing.some((m: string) => /Trusted pricing/.test(m)));
+  assert.ok(none.missing.some((m: string) => /Confirmed unit prices/.test(m)));
   assert.ok(none.missing.some((m: string) => /Measurements/.test(m)));
   const full = S.computeEstimateReadiness(baseContext({ estimate: estimateWith([priced("Cabinets", 100)], { total: 100 }), lead: { id: "l", status: "new", projectType: "Kitchen", location: "Austin" } }));
   assert.ok(!full.missing.some((m: string) => /Unit price and quantity/.test(m)));
