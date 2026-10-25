@@ -150,7 +150,7 @@ test("REPRODUCTION — staff ask for pricing suggestions on EST-000008 (blank-pr
   assert.equal(p.requestedItems, 2);
   assert.deepEqual(p.suggestions.map((s: any) => [s.itemName, s.status]), [["Vanity installation", "suggested"], ["Tile backsplash", "no_history"]]);
   assert.equal(p.suggestions[0].suggestedUnitPrice, 612);
-  assert.equal(p.suggestions[1].message, "No reliable historical pricing found.");
+  assert.equal(p.suggestions[1].message, "No reliable pricing found.");
 });
 
 test("REPRODUCTION — the pricing read happens BEFORE the assistant's own decision, so the model cannot substitute its own pricing questions", async () => {
@@ -161,8 +161,8 @@ test("REPRODUCTION — the pricing read happens BEFORE the assistant's own decis
   const decisionPrompt = modelProvider.requests.map((r: any) => `${r.system}\n${r.messages.map((m: any) => m.content).join("\n")}`).find((t: string) => /Estimate Assistant/.test(t));
   assert.ok(decisionPrompt, "the Estimate Assistant decision prompt exists");
   assert.match(decisionPrompt, /Pricing Intelligence has ALREADY run/i, "the model is told the lookup already ran");
-  assert.match(decisionPrompt, /1 of 2 requested lines have organization-history price suggestions/);
-  assert.match(decisionPrompt, /1 have no reliable historical pricing/);
+  assert.match(decisionPrompt, /1 of 2 requested lines have price suggestions/);
+  assert.match(decisionPrompt, /1 have no reliable pricing/);
 });
 
 // ── Phrases ──────────────────────────────────────────────────────────────
@@ -253,13 +253,13 @@ test("The assistant does not ask staff for prices instead of looking them up: th
 
 // ── No-history, leakage ──────────────────────────────────────────────────
 
-test("NO HISTORY — with no organization history the staff panel says 'No reliable historical pricing found.' for every line, and nothing is guessed", async () => {
+test("NO HISTORY — with no organization history the staff panel says 'No reliable pricing found.' for every line, and nothing is guessed", async () => {
   const db = makeDb({ estimates: [est8()], estimate_items: [manualLine("Vanity installation"), manualLine("Tile backsplash", { item_type: "material" })] });
   const { result, modelProvider } = await runConsole(db, "Give me pricing suggestions for the unpriced items.", GUIDANCE_SCRIPTS);
   const p = (await execRow(db, result.executionId)).input_summary.pricingIntelligence;
-  assert.deepEqual(p.suggestions.map((s: any) => s.message), ["No reliable historical pricing found.", "No reliable historical pricing found."]);
+  assert.deepEqual(p.suggestions.map((s: any) => s.message), ["No reliable pricing found.", "No reliable pricing found."]);
   assert.ok(p.suggestions.every((s: any) => s.suggestedUnitPrice === null && s.confidence === "none"));
-  assert.match(prompts(modelProvider), /0 of 2 requested lines have organization-history price suggestions/);
+  assert.match(prompts(modelProvider), /0 of 2 requested lines have price suggestions/);
 });
 
 test("NO LEAKAGE — the suggested figures never reach the reply or any prompt, and a reply that repeats one is blocked", async () => {

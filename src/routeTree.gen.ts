@@ -32,6 +32,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as ProjectsIndexRouteImport } from './routes/projects.index'
 import { Route as SettingsTemplatesRouteImport } from './routes/settings.templates'
 import { Route as SettingsTeamRouteImport } from './routes/settings.team'
+import { Route as SettingsPriceBookRouteImport } from './routes/settings.price-book'
 import { Route as SettingsPipelinesRouteImport } from './routes/settings.pipelines'
 import { Route as SettingsPermissionsRouteImport } from './routes/settings.permissions'
 import { Route as SettingsNotificationsRouteImport } from './routes/settings.notifications'
@@ -180,6 +181,11 @@ const SettingsTemplatesRoute = SettingsTemplatesRouteImport.update({
 const SettingsTeamRoute = SettingsTeamRouteImport.update({
   id: '/team',
   path: '/team',
+  getParentRoute: () => SettingsRoute,
+} as any)
+const SettingsPriceBookRoute = SettingsPriceBookRouteImport.update({
+  id: '/price-book',
+  path: '/price-book',
   getParentRoute: () => SettingsRoute,
 } as any)
 const SettingsPipelinesRoute = SettingsPipelinesRouteImport.update({
@@ -407,6 +413,7 @@ export interface FileRoutesByFullPath {
   '/settings/notifications': typeof SettingsNotificationsRoute
   '/settings/permissions': typeof SettingsPermissionsRoute
   '/settings/pipelines': typeof SettingsPipelinesRoute
+  '/settings/price-book': typeof SettingsPriceBookRoute
   '/settings/team': typeof SettingsTeamRoute
   '/settings/templates': typeof SettingsTemplatesRoute
   '/projects/': typeof ProjectsIndexRoute
@@ -465,6 +472,7 @@ export interface FileRoutesByTo {
   '/settings/notifications': typeof SettingsNotificationsRoute
   '/settings/permissions': typeof SettingsPermissionsRoute
   '/settings/pipelines': typeof SettingsPipelinesRoute
+  '/settings/price-book': typeof SettingsPriceBookRoute
   '/settings/team': typeof SettingsTeamRoute
   '/settings/templates': typeof SettingsTemplatesRoute
   '/projects': typeof ProjectsIndexRoute
@@ -525,6 +533,7 @@ export interface FileRoutesById {
   '/settings/notifications': typeof SettingsNotificationsRoute
   '/settings/permissions': typeof SettingsPermissionsRoute
   '/settings/pipelines': typeof SettingsPipelinesRoute
+  '/settings/price-book': typeof SettingsPriceBookRoute
   '/settings/team': typeof SettingsTeamRoute
   '/settings/templates': typeof SettingsTemplatesRoute
   '/projects/': typeof ProjectsIndexRoute
@@ -586,6 +595,7 @@ export interface FileRouteTypes {
     | '/settings/notifications'
     | '/settings/permissions'
     | '/settings/pipelines'
+    | '/settings/price-book'
     | '/settings/team'
     | '/settings/templates'
     | '/projects/'
@@ -644,6 +654,7 @@ export interface FileRouteTypes {
     | '/settings/notifications'
     | '/settings/permissions'
     | '/settings/pipelines'
+    | '/settings/price-book'
     | '/settings/team'
     | '/settings/templates'
     | '/projects'
@@ -703,6 +714,7 @@ export interface FileRouteTypes {
     | '/settings/notifications'
     | '/settings/permissions'
     | '/settings/pipelines'
+    | '/settings/price-book'
     | '/settings/team'
     | '/settings/templates'
     | '/projects/'
@@ -909,6 +921,13 @@ declare module '@tanstack/react-router' {
       path: '/team'
       fullPath: '/settings/team'
       preLoaderRoute: typeof SettingsTeamRouteImport
+      parentRoute: typeof SettingsRoute
+    }
+    '/settings/price-book': {
+      id: '/settings/price-book'
+      path: '/price-book'
+      fullPath: '/settings/price-book'
+      preLoaderRoute: typeof SettingsPriceBookRouteImport
       parentRoute: typeof SettingsRoute
     }
     '/settings/pipelines': {
@@ -1199,6 +1218,7 @@ interface SettingsRouteChildren {
   SettingsNotificationsRoute: typeof SettingsNotificationsRoute
   SettingsPermissionsRoute: typeof SettingsPermissionsRoute
   SettingsPipelinesRoute: typeof SettingsPipelinesRoute
+  SettingsPriceBookRoute: typeof SettingsPriceBookRoute
   SettingsTeamRoute: typeof SettingsTeamRoute
   SettingsTemplatesRoute: typeof SettingsTemplatesRoute
 }
@@ -1214,6 +1234,7 @@ const SettingsRouteChildren: SettingsRouteChildren = {
   SettingsNotificationsRoute: SettingsNotificationsRoute,
   SettingsPermissionsRoute: SettingsPermissionsRoute,
   SettingsPipelinesRoute: SettingsPipelinesRoute,
+  SettingsPriceBookRoute: SettingsPriceBookRoute,
   SettingsTeamRoute: SettingsTeamRoute,
   SettingsTemplatesRoute: SettingsTemplatesRoute,
 }
