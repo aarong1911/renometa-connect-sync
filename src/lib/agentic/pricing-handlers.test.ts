@@ -394,7 +394,7 @@ test("OUTPUT — aggregate only: no customer / contact / project names, no datab
   const json = JSON.stringify(res.output);
   for (const forbidden of ["SENTINEL", "98765", "4321", "77777", PROJECT_A, LEAD_A, ...ests.map((e) => e.id), co.id]) assert.ok(!json.includes(forbidden), `output leaked: ${forbidden}`);
   assert.deepEqual(Object.keys(res.output).sort(), ["basis", "currentEstimateLines", "pricingNote", "staffOnly", "suggestions"]);
-  assert.deepEqual(Object.keys(res.output.basis).sort(), ["changeOrderEvidenceAvailable", "changeOrderEvidenceLines", "currentEstimateStatus", "estimateEvidenceLines", "evidenceWindowMonths", "projectType", "projectTypeSource", "truncated"]);
+  assert.deepEqual(Object.keys(res.output.basis).sort(), ["changeOrderEvidenceAvailable", "changeOrderEvidenceLines", "currentEstimateStatus", "estimateEvidenceLines", "evidenceWindowMonths", "priceBookAvailable", "priceBookItems", "projectType", "projectTypeSource", "truncated"]);
   assert.ok(res.output.suggestions.every((s: any) => ["org_history", "none"].includes(s.pricingSource)), "no model-generated market pricing");
 });
 
@@ -426,4 +426,54 @@ test("SCOPE — the orchestrator reaches the tool ONLY through the single staff-
   assert.ok(orch.includes("bindTrustedPricingInput("), "ids are bound by the trusted binder");
   const prompts = readFileSync(path.join(repoRoot, "netlify/functions/lib/ai/agents/estimate-assistant.ts"), "utf8");
   assert.ok(!/pricingIntelligence|suggestedUnitPrice|lowEstimate|highEstimate/.test(prompts.replace(/\/\/[^\n]*/g, "")), "no pricing figure or payload is wired into the Estimate Assistant prompt builders");
+});
+
+// ── P4: Price Book through the Estimate Assistant tool ───────────────────
+
+const catalogRow = (over: Record<string, unknown> = {}) => ({
+  id: uid("pb"), org_id: ORG_A, name: "Vanity installation", normalized_name: "vanity installation", aliases: [], project_types: [], item_type: "labor", unit: "each",
+  sell_unit_price: 450, low_unit_price: null, high_unit_price: null, reviewed_at: "2026-09-01T00:00:00Z", active: true,
+  internal_unit_cost: 77777, default_markup_percent: 4321, notes: "SENTINEL-NOTE", reviewed_by: "SENTINEL-USER", ...over,
+});
+
+test("PRICE BOOK — the tool transparently prefers the org's price book over history; staff-only fields never reach the model-visible output", async () => {
+  const h = history(ORG_A, 5);
+  const db = makeDb({ estimates: h.estimates, estimate_items: h.items, pricing_catalog_items: [catalogRow()] });
+  const res = await tool(db, { items: [{ ...ITEM, quantity: 2 }] });
+  assert.equal(res.status, "completed", JSON.stringify(res));
+  const s = res.output.suggestions[0];
+  assert.equal(s.pricingSource, "price_book");
+  assert.equal(s.suggestedUnitPrice, 450);
+  assert.equal(s.suggestedTotal, 900);
+  assert.equal(res.output.basis.priceBookItems, 1);
+  assert.equal(res.output.basis.priceBookAvailable, true);
+  const json = JSON.stringify(res);
+  for (const forbidden of ["77777", "4321", "SENTINEL", "pb-"]) assert.ok(!json.includes(forbidden), `tool output leaked ${forbidden}`);
+});
+
+test("PRICE BOOK — another organization's price book is never used; history still works when the book is empty", async () => {
+  const h = history(ORG_A, 5);
+  const db = makeDb({ estimates: h.estimates, estimate_items: h.items, pricing_catalog_items: [catalogRow({ org_id: ORG_B, sell_unit_price: 9999 })] });
+  const res = await tool(db, { items: [ITEM] });
+  assert.equal(res.output.suggestions[0].pricingSource, "org_history");
+  assert.ok(!JSON.stringify(res).includes("9999"));
+});
+
+test("PRICE BOOK — an inactive entry is ignored; a missing price book table degrades to history, not an error", async () => {
+  const h = history(ORG_A, 5);
+  const inactive = makeDb({ estimates: h.estimates, estimate_items: h.items, pricing_catalog_items: [catalogRow({ active: false })] });
+  assert.equal((await tool(inactive, { items: [ITEM] })).output.suggestions[0].pricingSource, "org_history");
+  // makeDb without the pricing_catalog_items table: the fake fails loudly on unknown tables, which the reader must absorb.
+  const noTable = makeDb({ estimates: h.estimates, estimate_items: h.items });
+  const res = await tool(noTable, { items: [ITEM] });
+  assert.equal(res.status, "completed");
+  assert.equal(res.output.suggestions[0].pricingSource, "org_history");
+});
+
+test("PRICE BOOK — the model still cannot supply a price, cost, markup, catalog id or org through the tool input", async () => {
+  const db = makeDb({ pricing_catalog_items: [catalogRow()] });
+  for (const extra of [{ unitPrice: 1 }, { internalUnitCost: 1 }, { markup: 1 }, { catalogItemId: "x" }, { orgId: ORG_B }]) {
+    const res = await tool(db, { items: [{ ...ITEM, ...extra }] });
+    assert.notEqual(res.status, "completed", `accepted ${Object.keys(extra)[0]}`);
+  }
 });

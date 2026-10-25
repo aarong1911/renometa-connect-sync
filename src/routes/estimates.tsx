@@ -55,6 +55,7 @@ import {
   type EstimateStatus, type EstimateItemType, type EstimateItemUnit, type DiscountType, type DepositType, type WorkType,
 } from "@/lib/estimate-status";
 import { calculateEstimate, round2, type CalcLineItem } from "@/lib/estimate-calculations";
+import { SuggestPricingPanel } from "@/components/pricing/suggest-pricing-panel";
 import { UNPRICED_ESTIMATE_ERROR, UNPRICED_ESTIMATE_HINT, isPricePendingItem } from "@/lib/estimate-pricing-gate";
 import {
   asMetadataObject, buildItemMetadata, duplicateEstimateMetadata, duplicateItemMetadata,
@@ -1753,6 +1754,7 @@ function EstimateDetailSheet({
           {unpriced && ["draft", "ready", "sent", "viewed", "changes_requested", "expired"].includes(estimate.status) && (
             <p className="text-xs text-amber-700 dark:text-amber-400">{UNPRICED_ESTIMATE_HINT}</p>
           )}
+          {["draft", "ready", "sent", "viewed", "changes_requested", "expired"].includes(estimate.status) && <SuggestPricingPanel estimateId={estimate.id} />}
           {/* Lifecycle actions — status-gated per the canonical transition map */}
           <div className="flex flex-wrap gap-2">
             {estimate.status === "draft" && (

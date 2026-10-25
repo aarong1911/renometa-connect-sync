@@ -28,7 +28,7 @@ const UNIT_ALIASES: Record<string, CanonicalUnit> = {
   // time
   hr: "hour", hrs: "hour", hour: "hour", hours: "hour",
   // lump sum
-  ls: "lump_sum", "lump sum": "lump_sum", lumpsum: "lump_sum", lump: "lump_sum",
+  ls: "lump_sum", "lump sum": "lump_sum", lumpsum: "lump_sum", lump: "lump_sum", "lump_sum": "lump_sum",
 };
 
 /**
@@ -48,6 +48,12 @@ export function normalizeUnit(raw: string | null | undefined): CanonicalUnit {
   const compact = cleaned.replace(/\s+/g, "");
   if (UNIT_ALIASES[compact]) return UNIT_ALIASES[compact];
   return `other:${cleaned}`;
+}
+
+/** The form a canonical unit is STORED / DISPLAYED in (normalizeUnit(unitStorageForm(u)) === u for every canonical unit). */
+export function unitStorageForm(unit: CanonicalUnit): string {
+  if (unit === "lump_sum") return "lump sum";
+  return unit.startsWith("other:") ? unit.slice(6) : unit;
 }
 
 /** Units are compatible only when they are the same canonical unit. */

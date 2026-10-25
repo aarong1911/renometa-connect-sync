@@ -174,7 +174,7 @@ test("CALLED — new estimate pricing guidance: a proposed DRAFT also gets a sta
   assert.equal(p.requestedItems, 2);
   assert.equal(p.suggestions[0].status, "suggested");
   assert.equal(p.suggestions[1].status, "no_history");
-  assert.equal(p.suggestions[1].message, "No reliable historical pricing found.");
+  assert.equal(p.suggestions[1].message, "No reliable pricing found.");
   assert.equal(p.suggestions[1].suggestedUnitPrice, null);
   const snap = (await steps(db, result.executionId))[2].input_snapshot;
   assert.equal(snap.estimateId, undefined, "no estimate exists yet, so none is bound");
@@ -355,12 +355,12 @@ test("REGRESSION — adding the staff-only read changes nothing else: the add pr
   assert.equal(JSON.stringify([db.__dumpTable("estimates"), db.__dumpTable("estimate_items")]), before, "pricing read + proposal wrote nothing");
 });
 
-test("REGRESSION — with no estimate and no history the create path still proposes create_estimate_draft and pricing says 'No reliable historical pricing found.'", async () => {
+test("REGRESSION — with no estimate and no history the create path still proposes create_estimate_draft and pricing says 'No reliable pricing found.'", async () => {
   const db = makeDb();
   const { result } = await run(db, "Can you prepare an estimate for the bathroom remodel?", [handoffToEstimate, proposeDraft, "The team will review."]);
   assert.equal(db.__dumpTable("agent_approval_requests")[0].action_key, "create_estimate_draft");
   const p = await payloadOf(db, result.executionId);
-  assert.deepEqual(p.suggestions.map((s: any) => s.message), ["No reliable historical pricing found.", "No reliable historical pricing found."]);
+  assert.deepEqual(p.suggestions.map((s: any) => s.message), ["No reliable pricing found.", "No reliable pricing found."]);
   assert.equal(result.status, "awaiting_approval");
 });
 

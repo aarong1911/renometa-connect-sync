@@ -104,6 +104,10 @@ export type PricingEvidenceSummary = {
   maxDate: string | null;
   sameProjectTypeCount: number;
   matchTier: MatchTier | null;
+  /** Price Book (P4) results only: which kind of evidence this is, whether the item was reviewed, and whether it targets the project type. */
+  kind?: "org_history" | "price_book";
+  reviewed?: boolean;
+  projectTypeSpecific?: boolean;
   /** Extras for staff display / debugging. */
   scope: "same_project_type" | "org_wide" | null;
   outliersRemoved: number;
@@ -126,7 +130,7 @@ export type PricingSuggestion = {
   lowTotal: number | null;
   highTotal: number | null;
   confidence: Confidence;
-  pricingSource: "org_history" | "none";
+  pricingSource: "price_book" | "org_history" | "none";
   evidence: PricingEvidenceSummary;
   assumptions: string[];
   missingInputs: string[];

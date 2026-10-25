@@ -3,7 +3,7 @@ import { createFileRoute, Outlet, Link, useLocation } from "@tanstack/react-rout
 import { PageHeader } from "@/components/layout/app-shell";
 import {
   Building2, Users, Plug, CreditCard, Wand2, Palette, Key, Bell,
-  FileText, Pin, GitBranch, ShieldCheck, Settings as SettingsIcon, CalendarClock,
+  FileText, BookOpen, Pin, GitBranch, ShieldCheck, Settings as SettingsIcon, CalendarClock,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { OrganizationSettings } from "@/components/organization/organization-settings";
@@ -19,6 +19,7 @@ const sections = [
   { to: "/settings/appointments", label: "Appointments",  icon: CalendarClock },
   { to: "/settings/integrations", label: "Integrations",  icon: Plug },
   { to: "/settings/billing",      label: "Plans & Billing", icon: CreditCard },
+  { to: "/settings/price-book",   label: "Price Book",   icon: BookOpen },
   { to: "/settings/templates",    label: "Templates",     icon: FileText },
   { to: "/settings/custom-fields",label: "Custom Fields", icon: Wand2 },
   { to: "/settings/branding",     label: "Branding",      icon: Palette },

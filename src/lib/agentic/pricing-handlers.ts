@@ -26,7 +26,9 @@ import type { ActionHandler } from "./types";
 import { lookupCurrentEstimate } from "./estimate-lookup";
 import { isPricePendingItem } from "../estimate-pricing-gate";
 import { matchLineItem } from "../pricing/line-item-normalizer";
-import { EVIDENCE_WINDOW_MONTHS, suggestPricing, type PricingSuggestion } from "../pricing/pricing-engine";
+import { EVIDENCE_WINDOW_MONTHS, type PricingSuggestion } from "../pricing/pricing-engine";
+import { suggestPricingWithPriceBook } from "../pricing/pricing-suggestions";
+import { readPriceBook } from "../pricing/price-book-reader";
 import { classifyProjectTypeFromText, normalizeProjectType } from "../pricing/project-type";
 import { readPricingEvidence } from "../pricing/pricing-evidence-reader";
 
@@ -102,6 +104,10 @@ export type PricingSuggestionsOutput = {
     evidenceWindowMonths: number;
     estimateEvidenceLines: number;
     changeOrderEvidenceLines: number;
+    /** Active Price Book entries available to the matcher (a count only — never entries, ids, costs or notes). */
+    priceBookItems: number;
+    /** false when the price book could not be read (e.g. the table does not exist yet); history is then used on its own. */
+    priceBookAvailable: boolean;
     changeOrderEvidenceAvailable: boolean;
     truncated: boolean;
   };
@@ -172,9 +178,12 @@ export function createGetPricingSuggestions(deps: HandlerDeps): ActionHandler<Ge
       // 2. org-scoped evidence → pure engine
       const read = await readPricingEvidence(ctx.supabase, ctx.orgId, now);
       if (!read.ok) return { ok: false, error: PRICING_FAILED };
+      // Price Book first (org-scoped, active entries only, no cost/markup/notes/ids selected), then history, never blended.
+      const priceBook = await readPriceBook(ctx.supabase, ctx.orgId);
 
-      const suggestions = suggestPricing(
+      const suggestions = suggestPricingWithPriceBook(
         input.items.map((i) => ({ name: i.name, description: i.description ?? null, itemType: i.itemType ?? null, unit: i.unit ?? null, quantity: i.quantity ?? null })),
+        priceBook.items,
         read.evidence,
         { now, projectType },
       );
@@ -219,6 +228,8 @@ export function createGetPricingSuggestions(deps: HandlerDeps): ActionHandler<Ge
             evidenceWindowMonths: EVIDENCE_WINDOW_MONTHS,
             estimateEvidenceLines: read.diagnostics.estimateLinesEligible,
             changeOrderEvidenceLines: read.diagnostics.changeOrderItemsEligible,
+            priceBookItems: priceBook.items.length,
+            priceBookAvailable: priceBook.available,
             changeOrderEvidenceAvailable: read.diagnostics.changeOrderEvidenceAvailable,
             truncated: read.diagnostics.truncated,
           },

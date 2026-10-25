@@ -79,10 +79,10 @@ test("REVIEWED lines are SUPPRESSED: a priced line or a reviewed $0 line gets 'E
   }
 });
 
-test("SPARSE history says so plainly: 'No reliable historical pricing found.' and carries no guessed price", () => {
+test("SPARSE history says so plainly: 'No reliable pricing found.' and carries no guessed price", () => {
   const s = build([none("Crown molding")], ["not_on_estimate"]).suggestions[0];
   assert.equal(s.status, "no_history");
-  assert.equal(s.message, "No reliable historical pricing found.");
+  assert.equal(s.message, "No reliable pricing found.");
   assert.equal(s.suggestedUnitPrice, null);
   assert.equal(s.confidence, "none");
   assert.equal(s.pricingSource, "none");
@@ -134,9 +134,9 @@ test("view-model — suggested rows render item, price, range, confidence, sampl
   assert.equal(view.available, true);
 });
 
-test("view-model — 'none' confidence shows 'No reliable historical pricing found.' and reviewed lines show 'Existing reviewed price retained.' with NO figures", () => {
+test("view-model — 'none' confidence shows 'No reliable pricing found.' and reviewed lines show 'Existing reviewed price retained.' with NO figures", () => {
   const view = P.describeStaffPricing(build([none("Crown molding"), suggestion()], ["not_on_estimate", "priced"]));
-  assert.equal(view.rows[0].message, "No reliable historical pricing found.");
+  assert.equal(view.rows[0].message, "No reliable pricing found.");
   assert.equal(view.rows[1].message, "Existing reviewed price retained.");
   for (const r of view.rows) {
     assert.equal(r.price, null);
@@ -157,11 +157,13 @@ test("view-model — an unavailable run shows a neutral note and no rows", () =>
 test("the Run Inspector renders the payload through the validated reader + view-model, and the customer-facing proposal UI never references it", () => {
   const inspector = readFileSync(path.join(repoRoot, "src/components/ai-center/ai-run-inspector.tsx"), "utf8");
   assert.match(inspector, /readStaffPricingIntelligence\(input\.pricingIntelligence\)/);
-  assert.match(inspector, /describeStaffPricing\(/);
+  assert.match(inspector, /StaffPricingView/);
   assert.match(inspector, /Pricing Intelligence/);
-  assert.match(inspector, />Staff only</);
-  assert.match(inspector, /label="Same project type"/);
-  assert.match(inspector, /label="Source"/);
+  const view = readFileSync(path.join(repoRoot, "src/components/pricing/staff-pricing-view.tsx"), "utf8");
+  assert.match(view, /describeStaffPricing[(]/);
+  assert.match(view, />Staff only</);
+  assert.match(view, /label="Same project type"/);
+  assert.match(view, /label="Source"/);
   for (const customerFacing of ["src/lib/ai-estimate-proposal.ts", "src/components/ai-center/ai-approvals-tab.tsx"]) {
     const src = readFileSync(path.join(repoRoot, customerFacing), "utf8");
     assert.ok(!/pricingIntelligence|staff-pricing/.test(src), `${customerFacing} must not reference staff pricing`);
