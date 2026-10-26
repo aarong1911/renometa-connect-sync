@@ -359,3 +359,74 @@ test("migration — additive, RLS enabled, constraints + guard trigger present, 
   assert.ok(!/for delete/i.test(sql.replace(/--.*$/gm, "")), "no delete policy (soft disable only)");
   assert.match(sql, /org_memberships/);
 });
+
+// ── P4.1: an explicit estimate-line unit is a KNOWN unit (regression: "each" was treated as missing) ──
+
+async function suggestOne(line: Record<string, unknown>, bookOver: Record<string, unknown> = {}, extraTables: Record<string, any[]> = {}) {
+  const db = makeDb({
+    estimates: [estimateRow()],
+    estimate_items: [itemRow({ name: "Mirror Installation", unit_price: 0, ...line })],
+    pricing_catalog_items: [book({ name: "Mirror Installation", normalized_name: "mirror installation", unit: "each", sell_unit_price: 250, project_types: [], ...bookOver })],
+    ...extraTables,
+  });
+  const r = await S.suggestPricingForEstimate(db, CTX_A, EST, { now: NOW });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.kind, "suggestions");
+  return r.pricing.suggestions[0];
+}
+
+test("P4.1 explicit 'each' (qty 1) — price book match, total = sell x qty, high confidence, NO unit assumption, NO missing unit", async () => {
+  const s = await suggestOne({ unit: "each", quantity: 1 });
+  assert.equal(s.pricingSource, "price_book");
+  assert.equal(s.suggestedUnitPrice, 250);
+  assert.equal(s.suggestedTotal, 250);
+  assert.equal(s.confidence, "high");
+  assert.deepEqual(s.missingInputs.filter((m: string) => m === "unit"), []);
+  assert.ok(!s.assumptions.some((a: string) => /No unit was specified/.test(a)), JSON.stringify(s.assumptions));
+});
+
+test("P4.1 explicit alias 'ea' normalizes to 'each' and matches a price book 'each' entry", async () => {
+  const s = await suggestOne({ unit: "ea", quantity: 2 });
+  assert.equal(s.pricingSource, "price_book");
+  assert.equal(s.suggestedTotal, 500);
+  assert.ok(!s.missingInputs.includes("unit"));
+  assert.ok(!s.assumptions.some((a: string) => /No unit was specified/.test(a)));
+});
+
+test("P4.1 truly missing unit (null / blank) — safe fallback to the price book unit, 'unit' reported missing, assumption kept", async () => {
+  for (const unit of [null, "", "   "]) {
+    const s = await suggestOne({ unit, quantity: 1 });
+    assert.equal(s.pricingSource, "price_book", String(unit));
+    assert.ok(s.missingInputs.includes("unit"), String(unit));
+    assert.ok(s.assumptions.some((a: string) => /No unit was specified/.test(a)), String(unit));
+  }
+});
+
+test("P4.1 incompatible explicit unit — 'sqft' line never matches an 'each' entry and the price book unit is NOT substituted", async () => {
+  const s = await suggestOne({ unit: "sqft", quantity: 1 });
+  assert.notEqual(s.pricingSource, "price_book");
+  assert.equal(s.status, "no_history");
+  assert.equal(s.suggestedUnitPrice, null);
+  assert.ok(!s.assumptions.some((a: string) => /No unit was specified|price book's unit/.test(a)));
+});
+
+test("P4.1 explicit compatible unit + missing quantity — unit price suggested, total null, only 'quantity' is missing", async () => {
+  const s = await suggestOne({ unit: "each", quantity: 0 });
+  assert.equal(s.suggestedUnitPrice, 250);
+  assert.equal(s.suggestedTotal, null);
+  assert.deepEqual(s.missingInputs.filter((m: string) => ["quantity", "unit"].includes(m)), ["quantity"]);
+});
+
+test("P4.1 other explicit units still match their own price book unit (sqft, lump_sum) and reject mismatches", async () => {
+  const sqft = await suggestOne({ unit: "sf", quantity: 10 }, { unit: "sqft", sell_unit_price: 8 });
+  assert.equal(sqft.pricingSource, "price_book");
+  assert.equal(sqft.suggestedTotal, 80);
+  assert.ok(!sqft.missingInputs.includes("unit"));
+  const mismatch = await suggestOne({ unit: "hour", quantity: 1 }, { unit: "sqft" });
+  assert.notEqual(mismatch.pricingSource, "price_book");
+});
+
+test("P4.1 the entry point no longer special-cases 'each' (source)", () => {
+  const src = read("netlify/functions/lib/estimate-suggest-pricing.ts");
+  assert.ok(!/toLowerCase\(\)\s*===\s*["']each["']/.test(src), "no 'each' special case");
+});
