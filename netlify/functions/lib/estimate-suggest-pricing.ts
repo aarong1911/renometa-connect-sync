@@ -31,10 +31,12 @@ export type SuggestPricingResult =
   | { ok: true; kind: "suggestions"; pricing: StaffPricingIntelligence; requestedItems: number; capped: boolean }
   | { ok: false; status: 404 | 409 | 500; error: string };
 
-/** A blank unit or the editor's default "each" is not a real unit signal: treat it as an open unit for matching. */
+/** A unit is an open/missing signal ONLY when the estimate line truly has no usable unit (null / blank). Any non-blank unit —
+ * including "each" and "ea" — is an explicit known unit: the matcher normalizes it with the shared unit normalizer and keeps
+ * Price Book unit compatibility strict (an incompatible explicit unit rejects the entry; the Price Book unit is never substituted). */
 function unitSignal(unit: string | null | undefined): string | undefined {
   const u = (unit ?? "").trim();
-  return u === "" || u.toLowerCase() === "each" ? undefined : u;
+  return u === "" ? undefined : u;
 }
 
 export async function suggestPricingForEstimate(
