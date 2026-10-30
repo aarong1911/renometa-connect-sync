@@ -56,6 +56,7 @@ import {
 } from "@/lib/estimate-status";
 import { calculateEstimate, round2, type CalcLineItem } from "@/lib/estimate-calculations";
 import { SuggestPricingPanel } from "@/components/pricing/suggest-pricing-panel";
+import { EstimatePreviewLineItems, groupBySection } from "@/components/estimates/estimate-preview-line-items";
 import { UNPRICED_ESTIMATE_ERROR, UNPRICED_ESTIMATE_HINT, isPricePendingItem } from "@/lib/estimate-pricing-gate";
 import {
   asMetadataObject, buildItemMetadata, duplicateEstimateMetadata, duplicateItemMetadata,
@@ -1466,22 +1467,6 @@ function moneyRaw(n: number) {
   return new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n || 0);
 }
 
-/** Groups a flat item list into sections at each is_heading row — the print/view analogue of the editor's section headings. */
-function groupBySection(items: EstimateItem[]): { heading: string | null; items: EstimateItem[] }[] {
-  const groups: { heading: string | null; items: EstimateItem[] }[] = [];
-  let current: { heading: string | null; items: EstimateItem[] } = { heading: null, items: [] };
-  for (const it of items) {
-    if (it.is_heading) {
-      if (current.items.length || current.heading) groups.push(current);
-      current = { heading: it.name, items: [] };
-    } else {
-      current.items.push(it);
-    }
-  }
-  if (current.items.length || current.heading) groups.push(current);
-  return groups.filter(g => g.items.length > 0 || g.heading);
-}
-
 async function openPrintWindow(estimate: Estimate, org: OrgInfo | null, contact: ContactInfo | null) {
   const w = window.open("", "_blank");
   if (!w) { toast.error("Allow popups to download PDF"); return; }
@@ -1601,7 +1586,6 @@ function EstimateViewDialog({ estimate, org, onClose }: { estimate: Estimate | n
   }, [estimate?.client_id]);
 
   if (!estimate) return null;
-  const groups = groupBySection(estimate.estimate_items);
 
   return (
     <Dialog open={!!estimate} onOpenChange={o => !o && onClose()}>
@@ -1646,24 +1630,7 @@ function EstimateViewDialog({ estimate, org, onClose }: { estimate: Estimate | n
                 <tr className="border-b border-border"><th className="py-2 pl-3 pr-2 text-left">Description</th><th className="py-2 pr-2 text-right">Qty</th><th className="py-2 pr-2 text-right">Unit Price</th><th className="py-2 pr-3 text-right">Total</th></tr>
               </thead>
               <tbody>
-                {estimate.estimate_items.length === 0 ? (
-                  <tr><td colSpan={4} className="py-6 text-center text-muted-foreground">No line items</td></tr>
-                ) : groups.map((g, gi) => (
-                  <>
-                    {g.heading && <tr key={`h-${gi}`} className="border-b border-border bg-secondary/40"><td colSpan={4} className="py-1.5 pl-3 pr-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{g.heading}</td></tr>}
-                    {g.items.map(item => (
-                      <tr key={item.id} className="border-b border-border last:border-0">
-                        <td className="py-2 pl-3 pr-2">
-                          <div className="font-medium">{item.name}{item.optional && <Badge variant="outline" className="ml-1.5 h-4 rounded px-1 text-[9px] align-middle">optional</Badge>}</div>
-                          {item.description && <div className="text-[11px] text-muted-foreground">{item.description}</div>}
-                        </td>
-                        <td className="py-2 pr-2 text-right tabular-nums">{item.quantity}{item.unit ? ` ${item.unit}` : ""}</td>
-                        <td className="py-2 pr-2 text-right tabular-nums">{formatMoney(item.unit_price)}</td>
-                        <td className="py-2 pr-3 text-right tabular-nums font-medium">{formatMoney(item.total)}</td>
-                      </tr>
-                    ))}
-                  </>
-                ))}
+                <EstimatePreviewLineItems items={estimate.estimate_items} formatMoney={formatMoney} />
               </tbody>
             </table>
           </div>
