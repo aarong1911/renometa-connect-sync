@@ -23,6 +23,8 @@ import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
 
+import { activatePendingChangeOrderLink } from "./lib/change-order-pending-link";
+
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!,
@@ -55,11 +57,35 @@ export const handler: Handler = async (event) => {
 
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
 
-  const { data: tokenRow, error: tokenError } = await supabaseAdmin
+  const loadToken = () => supabaseAdmin
     .from("project_change_order_access_tokens")
     .select("id, change_order_id, version, expires_at, revoked_at, first_used_at, recipient_email")
     .eq("token_hash", tokenHash)
     .maybeSingle();
+
+  let { data: tokenRow, error: tokenError } = await loadToken();
+
+  // A link from an emailed Change Order that hasn't been made live yet (the
+  // send's final step failed or hasn't finished — see
+  // lib/change-order-pending-link.ts). Only the delivered email holds this
+  // token, so opening it completes the send. Links that were never pending
+  // (every pre-existing one) get `not_pending` and behave exactly as before.
+  if (!tokenError && !tokenRow) {
+    const activation = await activatePendingChangeOrderLink(supabaseAdmin, tokenHash);
+    if (activation.status === "activated" || activation.status === "already_active") {
+      ({ data: tokenRow, error: tokenError } = await loadToken());
+    } else if (activation.status === "expired") {
+      return {
+        statusCode: 410, headers: HEADERS,
+        body: JSON.stringify({ error: "This approval link has expired. Please contact your contractor for an updated link." }),
+      };
+    } else if (activation.status === "discarded" || activation.status === "changed" || activation.status === "not_sendable") {
+      return {
+        statusCode: 410, headers: HEADERS,
+        body: JSON.stringify({ error: "This approval link is no longer active. The Change Order may have been updated, replaced, or cancelled. Please contact your contractor for an updated link." }),
+      };
+    }
+  }
 
   if (tokenError || !tokenRow) return notFound();
   // Customer-facing UX fix: a revoked token most commonly means the

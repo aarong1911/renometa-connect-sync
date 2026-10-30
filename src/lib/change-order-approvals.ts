@@ -8,6 +8,7 @@
 // change-order-action.ts.
 
 import { supabase } from "@/lib/supabase";
+import { EmailSendRequestError, parseEmailSendAction } from "@/lib/email-send-errors";
 
 async function authHeader(): Promise<Record<string, string>> {
   const { data: { session } } = await supabase.auth.getSession();
@@ -17,24 +18,36 @@ async function authHeader(): Promise<Record<string, string>> {
 export type SendChangeOrderResult = {
   ok: boolean;
   status: string;
-  totalAmount: number;
-  approvalUrl: string;
+  totalAmount: number | null;
+  /** Null when an earlier, already-emailed send was finished — the customer already has the link. */
+  approvalUrl: string | null;
   emailDelivered: boolean;
   emailError: string | null;
   recipientEmail: string | null;
-  sentAt: string;
+  fromEmail: string | null;
+  sentAt: string | null;
+  /** False when Gmail accepted the email but the Change Order couldn't be marked sent yet (see warning). */
+  recorded?: boolean;
+  warning?: string;
+  /** This request finished recording an earlier send instead of emailing again. */
+  recoveredEarlierSend?: boolean;
 };
 
-/** Authenticated (Connect) call — recalculates totals server-side, snapshots the version, mints a secure token, and best-effort emails the customer. Always returns a Copy Approval Link-capable URL even if email delivery fails. */
-export async function sendChangeOrderForApproval(changeOrderId: string): Promise<SendChangeOrderResult> {
+/** Authenticated (Connect) call — recalculates totals server-side, snapshots the version, mints a secure token, and emails the customer from the org's connected Gmail account; the Change Order is marked sent only after Gmail accepts. Throws EmailSendRequestError when the customer has an email address and Gmail isn't usable, rejects the message, or can't confirm it — the Change Order is then left unsent. */
+export async function sendChangeOrderForApproval(changeOrderId: string, opts: { confirmResend?: boolean } = {}): Promise<SendChangeOrderResult> {
   const headers = await authHeader();
   const res = await fetch("/.netlify/functions/change-order-send", {
     method: "POST",
     headers: { "Content-Type": "application/json", ...headers },
-    body: JSON.stringify({ changeOrderId }),
+    body: JSON.stringify({ changeOrderId, ...(opts.confirmResend ? { confirmResend: true } : {}) }),
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data?.error || "Could not send this Change Order for approval.");
+  if (!res.ok) {
+    throw new EmailSendRequestError(
+      { error: data?.error, code: data?.code, action: parseEmailSendAction(data?.action), canConfirmResend: data?.canConfirmResend === true },
+      "Could not send this Change Order for approval.",
+    );
+  }
   return data as SendChangeOrderResult;
 }
 

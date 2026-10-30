@@ -13,6 +13,7 @@
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { syncEstimateDeal, logDealSyncWarning } from "../lib/estimate-deal-sync";
+import { recoverDeliveredProposal } from "./lib/estimate-send-completion";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -21,6 +22,9 @@ const supabaseAdmin = createClient(
 );
 
 const HEADERS = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
+
+const workflowBaseUrl = () =>
+  (process.env.URL ?? process.env.CONNECT_APP_URL ?? process.env.APP_URL ?? "http://localhost:9999").replace(/\/+$/, "");
 
 export const handler: Handler = async (event) => {
   if (event.httpMethod !== "GET") return { statusCode: 405, headers: HEADERS, body: "Method Not Allowed" };
@@ -41,6 +45,7 @@ export const handler: Handler = async (event) => {
       deposit_type, deposit_value, deposit_amount, balance_due,
       valid_until, scope, exclusions, assumptions, customer_note, terms,
       client_name, first_viewed_at, view_count,
+      client_id, project_id, metadata,
       client:contacts!client_id(full_name, email, phone, address),
       company:companies(name, address, city, state, zip)
     `)
@@ -53,8 +58,16 @@ export const handler: Handler = async (event) => {
 
   // A proposal is only ever reachable once it's actually been sent — a
   // draft/ready estimate's token (if one somehow existed) must not leak.
+  // One exception, with trusted evidence only: Gmail accepted the proposal
+  // email but marking the estimate sent failed. recoverDeliveredProposal
+  // asks Gmail (the org's own account) to confirm the delivered message and,
+  // only then, completes the send exactly as estimate-send would.
   if (!["sent", "viewed", "changes_requested", "approved", "rejected", "expired"].includes(estimate.status)) {
-    return { statusCode: 404, headers: HEADERS, body: JSON.stringify({ error: "Proposal not found" }) };
+    const recovered = await recoverDeliveredProposal(supabaseAdmin, estimate as any, { workflowBaseUrl: workflowBaseUrl() });
+    if (!recovered) {
+      return { statusCode: 404, headers: HEADERS, body: JSON.stringify({ error: "Proposal not found" }) };
+    }
+    estimate.status = recovered;
   }
 
   const [{ data: items }, { data: org }] = await Promise.all([

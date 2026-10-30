@@ -19,9 +19,17 @@
 // captured here from Netlify's own request context (never from anything
 // the client body could set) and passed through as best-effort audit
 // context only, never represented as verified identity.
+//
+// A link from an emailed Change Order that hasn't been made live yet (see
+// lib/change-order-pending-link.ts) is activated first — normally the
+// approval page load (change-order-data.ts) already did this. Activation is
+// idempotent and a no-op for every other link; the RPCs still do all of the
+// validation.
 
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
+
+import { activatePendingChangeOrderLink, hashApprovalToken } from "./lib/change-order-pending-link";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -65,6 +73,8 @@ export const handler: Handler = async (event) => {
   const userAgent = event.headers["user-agent"] ?? null;
 
   try {
+    await activatePendingChangeOrderLink(supabaseAdmin, hashApprovalToken(token));
+
     if (action === "approve") {
       const { data, error } = await supabaseAdmin.rpc("approve_project_change_order", {
         p_token: token,

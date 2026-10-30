@@ -105,6 +105,66 @@ export async function persistSmtpSentEmail(
   }
 }
 
+export type GmailApiSentEmailInput = {
+  orgId: string;
+  gmailMessageId: string;
+  gmailThreadId: string | null;
+  rfcMessageId: string;
+  fromEmail: string | null;
+  to: string;
+  subject: string;
+  body: string;
+  now?: Date;
+};
+
+/**
+ * Row for a message sent through the Gmail API (lib/gmail-send.ts). Unlike
+ * the SMTP path this already has Gmail's real message + thread ids, so it is
+ * keyed exactly as gmail-sync.ts will later upsert it (onConflict "id") —
+ * no temporary id and no re-key step.
+ */
+export function buildGmailApiSentRow(input: GmailApiSentEmailInput): Record<string, unknown> {
+  return {
+    id: input.gmailMessageId,
+    org_id: input.orgId,
+    thread_id: input.gmailThreadId || input.gmailMessageId,
+    internal_date: (input.now ?? new Date()).toISOString(),
+    snippet: input.body.slice(0, 200),
+    body_text: input.body,
+    from_email: input.fromEmail,
+    to_emails: [input.to],
+    subject: input.subject,
+    labels: ["SENT"],
+    direction: "out",
+    rfc_message_id: normalizeRfcMessageId(input.rfcMessageId),
+    provider_message_id: input.gmailMessageId,
+  };
+}
+
+/** Called ONLY after Gmail accepted the message. Never throws (see persistSmtpSentEmail). */
+export async function persistGmailApiSentEmail(
+  supabase: SupabaseClient,
+  input: GmailApiSentEmailInput,
+): Promise<{ persisted: boolean }> {
+  const row = buildGmailApiSentRow(input);
+  try {
+    let { error } = await supabase.from("gmail_messages").insert(row);
+    if (error && error.code !== "23505" && /body_text/i.test(error.message ?? "")) {
+      const { body_text: _omit, ...withoutBody } = row;
+      ({ error } = await supabase.from("gmail_messages").insert(withoutBody));
+    }
+    // 23505: a sync already imported this exact Gmail message.
+    if (error && error.code !== "23505") {
+      console.error("[gmail-sent-reconcile] gmail api row insert failed:", error.message);
+      return { persisted: false };
+    }
+    return { persisted: true };
+  } catch (e: any) {
+    console.error("[gmail-sent-reconcile] gmail api row insert threw:", e?.message);
+    return { persisted: false };
+  }
+}
+
 /**
  * Re-keys temporary SMTP rows to the real Gmail id for messages in this sync
  * batch. Org-isolated, outbound-only (SENT label + smtp: id), idempotent,
