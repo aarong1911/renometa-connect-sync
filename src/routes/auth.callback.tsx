@@ -8,6 +8,7 @@ import {
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
 import { getOrgProfile } from "@/lib/auth";
+import { RESET_PASSWORD_PATH, readRecoveryState } from "@/lib/password-recovery";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -79,6 +80,13 @@ function AuthCallback() {
     // supplies an invitations-table token. Branch on whether a token is
     // present BEFORE assuming this is an invite-acceptance visit.
     if (!token) {
+      // A password-recovery link sent before the dedicated page existed lands here (redirectTo was /auth/callback?type=recovery). It is NOT a
+      // sign-in: hand it to /reset-password, which needs a recovery session and asks for a new password. (type=recovery is only a hint; the
+      // pending marker captured at startup is what is trusted.)
+      if (readRecoveryState() === "active" || new URLSearchParams(window.location.search).get("type") === "recovery") {
+        navigate({ to: RESET_PASSWORD_PATH, replace: true });
+        return;
+      }
       handleOAuthReturn();
       return;
     }

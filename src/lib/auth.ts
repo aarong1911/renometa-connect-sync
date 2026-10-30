@@ -1,5 +1,6 @@
 // src/lib/auth.ts
 import { supabase } from "./supabase";
+import { clearRecoveryPendingNow, recoveryRedirectUrl } from "./password-recovery";
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -81,9 +82,17 @@ export async function signInWithApple() {
 
 export async function resetPassword(email: string) {
   const { error } = await supabase.auth.resetPasswordForEmail(email, {
-    redirectTo: `${window.location.origin}/auth/callback?type=recovery`,
+    // The dedicated reset page on the canonical production host (previews/localhost use their own origin). Must be listed under
+    // Supabase → Authentication → URL Configuration → Redirect URLs.
+    redirectTo: recoveryRedirectUrl(window.location),
   });
   if (error) throw error;
+}
+
+/** A recovery that was never completed must not linger as an ordinary login: clear the marker and drop the (local) session. */
+export async function abandonExpiredRecoverySession() {
+  clearRecoveryPendingNow();
+  await supabase.auth.signOut({ scope: "local" });
 }
 
 // ── Sign Out ───────────────────────────────────────────────

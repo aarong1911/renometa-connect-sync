@@ -12,10 +12,12 @@ import type { Session } from "@supabase/supabase-js";
 import {
   useCurrentUserRole, canAccessRoute, ROLE_DEFAULT_ROUTE, ROLE_EXTERNAL_REDIRECT,
 } from "@/lib/permissions";
+import { RESET_PASSWORD_PATH, readRecoveryState, recoveryRouteDecision } from "@/lib/password-recovery";
+import { abandonExpiredRecoverySession } from "@/lib/auth";
 
 interface RouterContext { queryClient: QueryClient }
 
-const PUBLIC_ROUTES  = ["/signin", "/signup", "/forgot-password", "/auth/callback"];
+const PUBLIC_ROUTES  = ["/signin", "/signup", "/forgot-password", "/auth/callback", "/reset-password"];
 const PORTAL_ROUTES  = ["/portal", "/proposal", "/change-order", "/invoice"];
 
 function NotFoundComponent() {
@@ -54,9 +56,17 @@ function RootComponent() {
   const isPublicRoute = PUBLIC_ROUTES.some(r => pathname.startsWith(r));
   const isPortalRoute = PORTAL_ROUTES.some(r => pathname.startsWith(r));
 
+  // PASSWORD RECOVERY takes precedence over every ordinary redirect below. A recovery link yields a real session, so without this the user
+  // would be treated as signed in and sent to the dashboard (the original bug). While a recovery is pending, only /reset-password may render;
+  // a recovery left unfinished past its TTL is abandoned (its session signed out) instead of lingering as a login.
+  const holdForRecovery = checked && recoveryRouteDecision({ hasSession: !!session, state: readRecoveryState(), pathname }) === "go_reset";
+
   // Redirect unauthenticated users
   useEffect(() => {
     if (!checked) return;
+    const recovery = recoveryRouteDecision({ hasSession: !!session, state: readRecoveryState(), pathname });
+    if (recovery === "abandon") { void abandonExpiredRecoverySession(); return; }
+    if (recovery === "go_reset") { navigate({ to: RESET_PASSWORD_PATH, replace: true }); return; }
     if (!session && !isPublicRoute && !isPortalRoute) navigate({ to: "/signin" });
     else if (session && pathname === "/signin") navigate({ to: "/" });
   }, [checked, session, pathname, isPublicRoute, isPortalRoute, navigate]);
@@ -69,6 +79,13 @@ function RootComponent() {
     );
   }
   if (!session && !isPublicRoute && !isPortalRoute) return null;
+  if (holdForRecovery) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-canvas">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      </div>
+    );
+  }
 
   return (
     <QueryClientProvider client={queryClient}>
