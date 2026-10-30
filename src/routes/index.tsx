@@ -40,6 +40,7 @@ import { NewDealDialog } from "@/components/sales/new-deal-dialog";
 import { normalizePipelineStage } from "@/lib/pipeline-phases";
 import { useMarketingCampaigns } from "@/lib/marketing-campaigns-store";
 import { computeEffectiveEstimateTotals } from "@/lib/estimate-totals";
+import { loadRecentDealActivityItems } from "@/lib/command-center-deal-activity";
 import {
   APPOINTMENT_STATUS_LABELS, APPOINTMENT_STATUS_TINT,
   type AppointmentStatus,
@@ -872,7 +873,7 @@ function DashboardPage() {
         }
       }
 
-      const [{ data: recentLeads }, { data: recentCalls }, { data: recentInvoices }, { data: recentDealEvents }, { data: recentProjects }] = await Promise.all([
+      const [{ data: recentLeads }, { data: recentCalls }, { data: recentInvoices }, recentDealItems, { data: recentProjects }] = await Promise.all([
         // id/avatar_url/avatar_key added to the join (S2 avatar audit) — a
         // real Contact identity + its canonical avatar, not just a display
         // name, so Recent Activity can render the SAME avatar Inbox/
@@ -885,15 +886,9 @@ function DashboardPage() {
         // correctly gets no ContactAvatar below (falls to the Phone icon).
         supabase.from("voice_calls").select("id, started_at, caller_number, direction, summary, contact_id, contacts!contact_id(avatar_url, avatar_key)").eq("tenant_id", orgId).order("started_at", { ascending: false }).limit(2),
         supabase.from("invoices").select("id, created_at, total_amount, contacts!client_id(id, full_name, avatar_url, avatar_key)").eq("org_id", orgId).eq("status", "paid").order("created_at", { ascending: false }).limit(2),
-        // Deal lifecycle — REAL persisted events from deal_activities (the
-        // same event log Pipeline Pulse reads, written by deals-store.ts's
-        // logDealActivity() on every actual create/win/lose). Only the three
-        // meaningful business milestones (created/won/lost) surface in the
-        // feed — never `updated`/`contact_linked`/`stage_changed` noise. The
-        // deal→contact join yields the canonical ContactAvatar identity for
-        // the row; a deal with no primary contact falls back to the deal
-        // name + the entity icon.
-        supabase.from("deal_activities").select("id, activity_type, title, description, occurred_at, deals!deal_id(name, contact_id, contacts!contact_id(id, full_name, avatar_url, avatar_key))").eq("org_id", orgId).in("activity_type", ["created", "won", "lost"]).order("occurred_at", { ascending: false }).limit(4),
+        // Deal created/won/lost — see lib/command-center-deal-activity.ts
+        // (deals has `title`, not `name`; never throws).
+        loadRecentDealActivityItems(supabase, orgId!),
         // Project creation — `projects.created_at` is a real persisted
         // timestamp (NOT `updated_at`, which would fabricate a "created"
         // event from unrelated later edits). There is no project_activities
@@ -924,17 +919,7 @@ function DashboardPage() {
         const contact = (inv as any).contacts;
         items.push({ id: `i${inv.id}`, who: contact?.full_name ?? "Client", t: "Invoice paid", s: fmtK(Number(inv.total_amount ?? 0)), when: "", at: inv.created_at, kind: "invoice", contactId: contact?.id, avatarUrl: contact?.avatar_url ?? null, avatarKey: contact?.avatar_key ?? null });
       }
-      // Deal created / won / lost — real deal_activities rows (see the query
-      // above). `who` prefers the linked Contact's name so it reads like the
-      // other Contact-anchored rows; the avatar comes from that same joined
-      // contacts row (canonical S2 identity), or the entity icon when the
-      // deal has no primary contact.
-      for (const d of recentDealEvents ?? []) {
-        const deal = (d as any).deals;
-        const contact = deal?.contacts;
-        const label = d.activity_type === "won" ? "Deal won" : d.activity_type === "lost" ? "Deal lost" : "Deal created";
-        items.push({ id: `d${d.id}`, who: contact?.full_name ?? deal?.name ?? "Deal", t: label, s: contact?.full_name ? (deal?.name ?? "") : "", when: "", at: d.occurred_at, kind: "deal", contactId: contact?.id, avatarUrl: contact?.avatar_url ?? null, avatarKey: contact?.avatar_key ?? null });
-      }
+      items.push(...recentDealItems);
       // Project created — real `projects.created_at` (never `updated_at`).
       for (const p of recentProjects ?? []) {
         const contact = (p as any).contacts;
