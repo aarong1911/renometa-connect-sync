@@ -13,6 +13,7 @@ import { Route as TasksRouteImport } from './routes/tasks'
 import { Route as SignupRouteImport } from './routes/signup'
 import { Route as SigninRouteImport } from './routes/signin'
 import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as ResetPasswordRouteImport } from './routes/reset-password'
 import { Route as PortalRouteImport } from './routes/portal'
 import { Route as PipelineRouteImport } from './routes/pipeline'
 import { Route as OnboardingRouteImport } from './routes/onboarding'
@@ -86,6 +87,11 @@ const SigninRoute = SigninRouteImport.update({
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ResetPasswordRoute = ResetPasswordRouteImport.update({
+  id: '/reset-password',
+  path: '/reset-password',
   getParentRoute: () => rootRouteImport,
 } as any)
 const PortalRoute = PortalRouteImport.update({
@@ -378,6 +384,7 @@ export interface FileRoutesByFullPath {
   '/onboarding': typeof OnboardingRoute
   '/pipeline': typeof PipelineRoute
   '/portal': typeof PortalRoute
+  '/reset-password': typeof ResetPasswordRoute
   '/settings': typeof SettingsRouteWithChildren
   '/signin': typeof SigninRoute
   '/signup': typeof SignupRoute
@@ -438,6 +445,7 @@ export interface FileRoutesByTo {
   '/onboarding': typeof OnboardingRoute
   '/pipeline': typeof PipelineRoute
   '/portal': typeof PortalRoute
+  '/reset-password': typeof ResetPasswordRoute
   '/settings': typeof SettingsRouteWithChildren
   '/signin': typeof SigninRoute
   '/signup': typeof SignupRoute
@@ -498,6 +506,7 @@ export interface FileRoutesById {
   '/onboarding': typeof OnboardingRoute
   '/pipeline': typeof PipelineRoute
   '/portal': typeof PortalRoute
+  '/reset-password': typeof ResetPasswordRoute
   '/settings': typeof SettingsRouteWithChildren
   '/signin': typeof SigninRoute
   '/signup': typeof SignupRoute
@@ -560,6 +569,7 @@ export interface FileRouteTypes {
     | '/onboarding'
     | '/pipeline'
     | '/portal'
+    | '/reset-password'
     | '/settings'
     | '/signin'
     | '/signup'
@@ -620,6 +630,7 @@ export interface FileRouteTypes {
     | '/onboarding'
     | '/pipeline'
     | '/portal'
+    | '/reset-password'
     | '/settings'
     | '/signin'
     | '/signup'
@@ -679,6 +690,7 @@ export interface FileRouteTypes {
     | '/onboarding'
     | '/pipeline'
     | '/portal'
+    | '/reset-password'
     | '/settings'
     | '/signin'
     | '/signup'
@@ -740,6 +752,7 @@ export interface RootRouteChildren {
   OnboardingRoute: typeof OnboardingRoute
   PipelineRoute: typeof PipelineRoute
   PortalRoute: typeof PortalRoute
+  ResetPasswordRoute: typeof ResetPasswordRoute
   SettingsRoute: typeof SettingsRouteWithChildren
   SigninRoute: typeof SigninRoute
   SignupRoute: typeof SignupRoute
@@ -788,6 +801,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/reset-password': {
+      id: '/reset-password'
+      path: '/reset-password'
+      fullPath: '/reset-password'
+      preLoaderRoute: typeof ResetPasswordRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/portal': {
@@ -1273,6 +1293,7 @@ const rootRouteChildren: RootRouteChildren = {
   OnboardingRoute: OnboardingRoute,
   PipelineRoute: PipelineRoute,
   PortalRoute: PortalRoute,
+  ResetPasswordRoute: ResetPasswordRoute,
   SettingsRoute: SettingsRouteWithChildren,
   SigninRoute: SigninRoute,
   SignupRoute: SignupRoute,

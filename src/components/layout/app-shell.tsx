@@ -23,6 +23,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     pathname === "/signin" ||
     pathname === "/signup" ||
     pathname === "/forgot-password" ||
+    pathname === "/reset-password" ||
     pathname === "/onboarding" ||
     pathname.startsWith("/auth/");
 
