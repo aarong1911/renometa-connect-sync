@@ -4,7 +4,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Link2, Search, Plug, CheckCircle2, Circle, AlertTriangle, Loader2 } from "lucide-react";
+import { Search, Plug, CheckCircle2, Circle, AlertTriangle, Loader2 } from "lucide-react";
 import { INTEGRATIONS, CATEGORIES, type Integration, type CategoryId } from "@/lib/integrations-data";
 import { MOCK_MODE } from "@/lib/mock-mode";
 import { IntegrationConfigDrawer } from "@/components/integrations/integration-config-drawer";
@@ -25,6 +25,7 @@ import { supabase } from "@/lib/supabase";
 import { getOrgId } from "@/lib/org-id";
 import { describeGmailOAuthReturn, type GmailConnectionStatus } from "@/lib/gmail-connection-health";
 import { GmailConnectionPanel } from "@/components/integrations/gmail-connection-panel";
+import { IntegrationIcon } from "@/components/integrations/integration-icon";
 
 export const Route = createFileRoute("/settings/integrations")({
   component: IntegrationsSettings,
@@ -148,7 +149,18 @@ function IntegrationsSettings() {
   }, []);
 
   useEffect(() => {
-    if (MOCK_MODE) { setGmailStatusLoading(false); return; }
+    if (MOCK_MODE) {
+      // Screenshots show the same Google card as production — Gmail never
+      // falls back to the generic card (or its SMTP drawer) in mock mode.
+      const now = new Date().toISOString();
+      setGmailStatus({
+        connected: true, accountEmail: "demo@renometa.com", hasRefreshToken: true, tokenExpiresAt: null,
+        lastSyncAt: now, lastSyncStatus: "ok", syncError: null, syncHealth: "ok",
+        lastSuccessfulSyncAt: now, lastFailedSyncAt: null,
+      });
+      setGmailStatusLoading(false);
+      return;
+    }
     fetchGmailStatus();
   }, [fetchGmailStatus]);
 
@@ -604,12 +616,10 @@ function IntegrationsSettings() {
                   className="flex flex-col rounded-lg border border-border/70 bg-card p-3.5 transition-shadow hover:shadow-(--shadow-elev-2)"
                 >
                   <div className="flex items-start gap-3">
-                    <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-secondary ring-1 ring-black/5">
-                      <Link2 className="h-4 w-4 text-muted-foreground" />
-                    </div>
+                    <IntegrationIcon id={i.id} />
                     <div className="min-w-0 flex-1">
-                      <span className="truncate text-[13px] font-semibold text-foreground">{i.name}</span>
-                      <p className="mt-0.5 text-[11px] text-muted-foreground">{i.vendor}</p>
+                      <h3 className="truncate text-[13px] font-semibold text-foreground" title={i.name}>{i.name}</h3>
+                      <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{i.vendor}</p>
                     </div>
                   </div>
 
@@ -637,12 +647,12 @@ function IntegrationsSettings() {
                     </div>
                   )}
 
-                  {/* Gmail: one "Connect with Google" path (inbox sync +
-                      estimate/change-order sending), with authorization and
-                      sync health shown separately. Legacy SMTP lives in a
-                      collapsed Advanced section, only for orgs that already
-                      have it — see gmail-connection-panel.tsx. */}
-                  {i.id === "gmail" && !MOCK_MODE ? (
+                  {/* Gmail: the only Gmail UI on this page — one "Connect
+                      with Google" path for inbox sync and all contractor
+                      email, also in mock mode. Disconnect and the legacy
+                      SMTP drawer (orgs that already have SMTP only) sit
+                      behind Manage — see gmail-connection-panel.tsx. */}
+                  {i.id === "gmail" ? (
                     <GmailConnectionPanel
                       status={gmailStatus}
                       loading={gmailStatusLoading}
@@ -654,8 +664,7 @@ function IntegrationsSettings() {
                       onDisconnect={() => setGmailDisconnectConfirmOpen(true)}
                       onRetryStatus={fetchGmailStatus}
                       smtpEmail={gmailSmtpEmail}
-                      onManageSmtp={() => openDrawer(i)}
-                      onRemoveSmtp={() => setGmailSmtpDisconnectConfirmOpen(true)}
+                      onOpenLegacySettings={() => openDrawer(i)}
                       formatTimestamp={fmtGmailTimestamp}
                     />
                   ) : i.id === "google-calendar" && !MOCK_MODE ? (
@@ -808,7 +817,7 @@ function IntegrationsSettings() {
                       <div className="flex gap-2">
                         {i.connected ? (
                           <>
-                            <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => openDrawer(i)}>Configure</Button>
+                            <Button variant="neutral" size="sm" className="h-7 text-xs" onClick={() => openDrawer(i)}>Configure</Button>
                             <Button variant="ghost" size="sm" className="h-7 text-xs text-muted-foreground" onClick={() => setDisconnectTarget(i)}>Disconnect</Button>
                           </>
                         ) : (
@@ -862,6 +871,10 @@ function IntegrationsSettings() {
         googleAdsForceSelection={googleAdsForceSelection}
         onGoogleAdsForceSelectionConsumed={() => setGoogleAdsForceSelection(false)}
         onGoogleAdsStatusRefresh={fetchGoogleAdsStatus}
+        onGmailSmtpRemoveRequest={() => {
+          setDrawerOpen(false);
+          setGmailSmtpDisconnectConfirmOpen(true);
+        }}
       />
 
       <AlertDialog open={!!disconnectTarget} onOpenChange={(open) => !open && setDisconnectTarget(null)}>

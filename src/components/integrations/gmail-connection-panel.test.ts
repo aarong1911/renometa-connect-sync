@@ -3,11 +3,11 @@
 // Run:  node --test src/components/integrations/gmail-connection-panel.test.ts
 //
 // The Gmail card on Settings → Integrations, rendered for each kind of org:
-// healthy Google connection, Google needing reconnect, legacy SMTP only, and
-// no email connection at all. The normal card is Google-only — legacy SMTP
-// management sits behind a collapsed "Advanced" section that only orgs which
-// already have SMTP ever see, and no App Password form or instruction is part
-// of Google onboarding.
+// healthy Google connection, Google needing reconnect, a failing sync, legacy
+// SMTP only, and no email connection at all. The card is Google-only and
+// compact: Disconnect and the legacy SMTP drawer sit behind "Manage", legacy
+// SMTP is only offered to orgs that already have it, and no App Password
+// form or instruction is part of Google onboarding.
 
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
@@ -28,18 +28,16 @@ await esbuild.build({
     contents: `
       import { renderToStaticMarkup } from "react-dom/server";
       import { createElement } from "react";
-      import { GmailConnectionPanel, LegacyEmailSettings } from "./src/components/integrations/gmail-connection-panel";
+      import { GmailConnectionPanel } from "./src/components/integrations/gmail-connection-panel";
+      export * from "./src/components/integrations/gmail-connection-panel";
       const noop = () => {};
       const base = {
         status: null, loading: false, statusError: null, connecting: false, syncing: false,
         onConnect: noop, onSync: noop, onDisconnect: noop, onRetryStatus: noop,
-        smtpEmail: null, onManageSmtp: noop, onRemoveSmtp: noop,
+        smtpEmail: null, onOpenLegacySettings: noop,
         formatTimestamp: (iso) => iso ?? "Never",
       };
       export const renderPanel = (over) => renderToStaticMarkup(createElement(GmailConnectionPanel, { ...base, ...over }));
-      export const renderLegacy = (over) => renderToStaticMarkup(createElement(LegacyEmailSettings, {
-        email: "office@contractor.test", googleSending: true, onManage: noop, onRemove: noop, ...over,
-      }));
     `,
     resolveDir: repoRoot, loader: "tsx",
   },
@@ -57,120 +55,142 @@ const SMTP = "office@contractor.test";
 const text = (html: string) => html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
 const buttons = (html: string) => [...html.matchAll(/<button[^>]*>([\s\S]*?)<\/button>/g)].map((m) => text(m[1]).trim());
 
-// Nothing in the card may suggest Google needs an App Password or SMTP form.
-function assertNoAppPasswordForm(html: string) {
-  assert.doesNotMatch(html, /App Password/i);
-  assert.doesNotMatch(html, /apppasswords/i);
-  assert.doesNotMatch(html, /<input/i);
-  assert.doesNotMatch(html, /type="password"/i);
+// Nothing in the card may ask for SMTP credentials or an App Password.
+function assertNoSmtpSetup(html: string) {
+  assert.doesNotMatch(html, /App Password|apppasswords/i);
+  assert.doesNotMatch(html, /Add credentials|Update credentials|SMTP/i);
+  assert.doesNotMatch(html, /Sync Inbox \(OAuth\)|Send Email \(SMTP\)|Account: Unknown/i);
+  assert.doesNotMatch(html, /<input|type="password"/i);
 }
 
-test("connected Google — account, authorization, sync, Sync now, Disconnect and the enabled features", () => {
+test("connected — account, authorization, sync health, last sync; Sync now + Manage, no red Disconnect", () => {
   const html = S.renderPanel({ status: status() });
   const t = text(html);
   assert.match(t, /owner@contractor\.test/);
   assert.match(t, /Authorization Authorized/);
   assert.match(t, /Inbox sync Working/);
   assert.match(t, /Last synced 2026-10-30T12:00:00\.000Z/);
-  assert.match(t, /Features enabled/);
-  for (const feature of ["Conversations", "Estimates", "Change orders", "Small email campaigns"]) assert.ok(t.includes(feature), feature);
-  assert.deepEqual(buttons(html), ["Sync now", "Disconnect"]);
-  assertNoAppPasswordForm(html);
-  assert.doesNotMatch(t, /SMTP|Advanced/);
+  assert.deepEqual(buttons(html), ["Sync now", "Manage"]);
+  assert.match(html, /aria-label="Manage Gmail connection"/);
+  assert.doesNotMatch(html, /variant="destructive"|bg-destructive text/);
+  assertNoSmtpSetup(html);
 });
 
-test("connected Google on an org that still has SMTP — no SMTP panel, only a collapsed Advanced entry", () => {
+test("connected with legacy SMTP saved — the card still shows no SMTP controls", () => {
   const html = S.renderPanel({ status: status(), smtpEmail: SMTP });
-  const t = text(html);
-  assert.deepEqual(buttons(html), ["Sync now", "Disconnect", "Advanced: legacy email settings"]);
-  assert.match(html, /aria-expanded="false"/);
-  // Collapsed: no SMTP address, status, Update or Remove.
-  assert.doesNotMatch(t, /office@contractor\.test|Legacy SMTP sending|Standby|Update|Remove/);
-  assertNoAppPasswordForm(html);
+  assert.deepEqual(buttons(html), ["Sync now", "Manage"]);
+  assert.doesNotMatch(text(html), /office@contractor\.test|Legacy/);
+  assertNoSmtpSetup(html);
 });
 
-test("Advanced section expanded — legacy SMTP management stays available to the owner", () => {
-  const standby = S.renderLegacy({ defaultOpen: true, googleSending: true });
-  assert.match(standby, /aria-expanded="true"/);
-  assert.match(text(standby), /Legacy SMTP sending Standby/);
-  assert.match(text(standby), /office@contractor\.test/);
-  assert.match(text(standby), /Not required for Google/);
-  assert.deepEqual(buttons(standby), ["Advanced: legacy email settings", "Update", "Remove"]);
-  assertNoAppPasswordForm(standby);
-
-  const inUse = S.renderLegacy({ defaultOpen: true, googleSending: false });
-  assert.match(text(inUse), /Legacy SMTP sending In use/);
-  assert.match(text(inUse), /until your Google account is connected/);
+test("connected without a known address — 'Connected Google account', never 'Unknown'", () => {
+  const html = S.renderPanel({ status: status({ accountEmail: null }) });
+  assert.match(text(html), /Connected Google account/);
+  assert.doesNotMatch(text(html), /Unknown/);
 });
 
-test("Google needs reconnecting — Reconnect and Disconnect, sync paused, no features claimed", () => {
-  const html = S.renderPanel({ status: status({ hasRefreshToken: false }) });
-  const t = text(html);
-  assert.match(t, /Authorization Reconnect needed/);
-  assert.match(t, /Inbox sync Paused/);
-  assert.deepEqual(buttons(html), ["Reconnect Google", "Disconnect"]);
-  assert.doesNotMatch(t, /Features enabled|Sync now/);
-  assertNoAppPasswordForm(html);
+test("authorization and sync health are independent", () => {
+  const failing = text(S.renderPanel({ status: status({ syncHealth: "failing", syncError: "Gmail API 500" }) }));
+  assert.match(failing, /Authorization Authorized/);
+  assert.match(failing, /Inbox sync Failing/);
+  assert.match(failing, /Gmail API 500/);
+  assert.match(failing, /reconnecting won(&#x27;|')t help/);
 
-  // With SMTP, the user is told where replies go meanwhile; SMTP controls stay collapsed.
-  const withSmtp = S.renderPanel({ status: status({ hasRefreshToken: false }), smtpEmail: SMTP });
-  assert.match(text(withSmtp), /Until then, replies and campaigns send from office@contractor\.test\./);
-  assert.deepEqual(buttons(withSmtp), ["Reconnect Google", "Disconnect", "Advanced: legacy email settings"]);
+  const waiting = text(S.renderPanel({ status: status({ syncHealth: "pending", lastSuccessfulSyncAt: null }) }));
+  assert.match(waiting, /Authorization Authorized/);
+  assert.match(waiting, /Inbox sync Waiting/);
+  assert.match(waiting, /Last synced Never/);
+
+  const reconnectHtml = S.renderPanel({ status: status({ hasRefreshToken: false }) });
+  assert.match(text(reconnectHtml), /Authorization Reconnect needed/);
+  assert.match(text(reconnectHtml), /Inbox sync Paused/);
+  assert.deepEqual(buttons(reconnectHtml), ["Reconnect Google", "Manage"]);
 });
 
-test("legacy SMTP only — Connect with Google is the one primary action; SMTP is mentioned, not managed", () => {
-  const html = S.renderPanel({ status: status({ connected: false }), smtpEmail: SMTP });
-  const t = text(html);
-  assert.match(t, /Replies and campaigns currently send from office@contractor\.test ?\./);
-  assert.deepEqual(buttons(html), ["Connect with Google", "Advanced: legacy email settings"]);
-  assert.doesNotMatch(t, /Update|Remove|Legacy SMTP sending/);
-  assertNoAppPasswordForm(html);
+test("Manage menu — Disconnect always; legacy email settings only for orgs that have SMTP", () => {
+  assert.deepEqual(S.gmailManageActions({ state: "connected", hasSmtp: false }).map((a: any) => a.id), ["disconnect"]);
+  assert.deepEqual(S.gmailManageActions({ state: "connected", hasSmtp: true }).map((a: any) => a.id), ["legacy", "disconnect"]);
+  assert.deepEqual(S.gmailManageActions({ state: "reconnect", hasSmtp: true }).map((a: any) => a.id), ["legacy", "disconnect"]);
+  for (const s of ["loading", "status_error", "not_connected"]) assert.deepEqual(S.gmailManageActions({ state: s, hasSmtp: true }), []);
+  const disconnect = S.gmailManageActions({ state: "connected", hasSmtp: false })[0];
+  assert.equal(disconnect.destructive, true);
+  assert.equal(S.gmailManageActions({ state: "connected", hasSmtp: true })[0].label, "Advanced: legacy email settings");
 });
 
-test("no connection (new org) — one Connect with Google button, permissions note, no SMTP or Advanced", () => {
+test("not connected (new org) — two benefits, one Connect with Google, one short permission sentence", () => {
   for (const s of [null, status({ connected: false })]) {
     const html = S.renderPanel({ status: s });
     const t = text(html);
+    assert.match(t, /Sync customer emails into Conversations/);
+    assert.match(t, /Send replies, estimates, change orders and campaigns/);
     assert.deepEqual(buttons(html), ["Connect with Google"]);
-    assert.match(t, /Google will ask you to let RenoMeta/);
-    assert.match(html, /href="https:\/\/renometa\.com\/privacy-policy"[^>]*rel="noopener noreferrer"/);
-    assert.doesNotMatch(t, /SMTP|Advanced|currently send from/);
-    assertNoAppPasswordForm(html);
+    assert.match(t, /RenoMeta requests permission to read and send email\. Learn how we use Google data/);
+    assert.match(html, /href="https:\/\/renometa\.com\/privacy-policy" target="_blank" rel="noopener noreferrer"/);
+    assert.doesNotMatch(t, /Legacy|currently send from/);
+    assertNoSmtpSetup(html);
   }
 });
 
-test("loading and status error — never show SMTP controls or the Advanced entry while unknown", () => {
+test("legacy SMTP only — keeps working, Connect with Google is the upgrade, owners can still open legacy settings", () => {
+  const html = S.renderPanel({ status: status({ connected: false }), smtpEmail: SMTP });
+  const t = text(html);
+  assert.match(t, /Replies and campaigns currently send from office@contractor\.test/);
+  assert.deepEqual(buttons(html), ["Legacy email settings", "Connect with Google"]);
+  assert.doesNotMatch(html, /App Password|<input/i);
+});
+
+test("loading and status error — no SMTP controls while the connection is unknown", () => {
   const loading = S.renderPanel({ status: null, loading: true, smtpEmail: SMTP });
   assert.match(text(loading), /Checking your Google connection/);
   assert.deepEqual(buttons(loading), []);
-
   const failed = S.renderPanel({ status: null, statusError: "Network error", smtpEmail: SMTP });
-  assert.deepEqual(buttons(failed), ["Try again", "Advanced: legacy email settings"]);
-  assertNoAppPasswordForm(failed);
+  assert.deepEqual(buttons(failed), ["Try again", "Legacy email settings"]);
+  assertNoSmtpSetup(failed);
 });
 
-test("mobile — action rows wrap, long addresses truncate or break, features stack on narrow screens", () => {
-  const html = S.renderPanel({ status: status({ accountEmail: "a-very-long-mailbox-name@an-extremely-long-contractor-domain.test" }), smtpEmail: SMTP });
-  assert.match(html, /class="flex flex-wrap gap-2"/);
-  assert.match(html, /min-w-0 truncate[^"]*" title="a-very-long-mailbox-name@/);
-  assert.match(html, /grid grid-cols-1 gap-1 sm:grid-cols-2/);
-  const legacy = S.renderPanel({ status: status({ connected: false }), smtpEmail: SMTP });
-  assert.match(legacy, /break-all/);
+test("layout — pinned to the card footer, wrapping actions, safe truncation on long addresses", () => {
+  const long = "a-very-long-mailbox-name@an-extremely-long-contractor-domain.test";
+  const html = S.renderPanel({ status: status({ accountEmail: long }) });
+  assert.match(html, /^<div class="mt-auto /);
+  assert.match(html, /class="flex flex-wrap items-center gap-2"/);
+  assert.match(html, new RegExp(`class="min-w-0 truncate" title="${long}"`));
+  assert.match(S.renderPanel({ status: null, smtpEmail: SMTP }), /break-all/);
 });
 
-test("wiring — the SMTP drawer and remove dialog are labeled legacy and say Google doesn't need them", () => {
-  const drawer = readFileSync(path.join(repoRoot, "src/components/integrations/integration-config-drawer.tsx"), "utf8");
+const route = readFileSync(path.join(repoRoot, "src/routes/settings.integrations.tsx"), "utf8");
+const drawer = readFileSync(path.join(repoRoot, "src/components/integrations/integration-config-drawer.tsx"), "utf8");
+const strip = (src: string) => src.replace(/^\s*\/\/.*$/gm, "").replace(/\{\/\*[\s\S]*?\*\/\}/g, "");
+
+test("wiring — Gmail always renders the Google panel (mock mode included); legacy UI strings are gone", () => {
+  assert.match(route, /\{i\.id === "gmail" \? \(\s*<GmailConnectionPanel/);
+  assert.doesNotMatch(route, /i\.id === "gmail" && !MOCK_MODE/);
+  assert.match(route, /onOpenLegacySettings=\{\(\) => openDrawer\(i\)\}/);
+  for (const legacy of [/Send Email \(SMTP\)/, /Sync Inbox \(OAuth\)/, /Add credentials/, /"Unknown"/, /Requires a Gmail App Password/]) {
+    assert.doesNotMatch(strip(route), legacy);
+  }
+  const catalog = readFileSync(path.join(repoRoot, "src/lib/integrations-data.ts"), "utf8");
+  const gmail = catalog.split("\n").find((l) => l.includes('id: "gmail"'))!;
+  assert.match(gmail, /description: "Connect Gmail to manage customer emails directly in RenoMeta\."/);
+  assert.match(gmail, /syncBadges: \["Conversations", "Estimates", "Campaigns"\]/);
+  assert.doesNotMatch(gmail, /App Password/i);
+});
+
+test("wiring — the SMTP drawer is labeled legacy and removing SMTP still asks for confirmation", () => {
   assert.match(drawer, /int\.id === "gmail" \? "Advanced: legacy email settings"/);
   assert.match(drawer, /It isn't needed when your Google account is connected/);
-  const route = readFileSync(path.join(repoRoot, "src/routes/settings.integrations.tsx"), "utf8");
-  assert.match(route, /onManageSmtp=\{\(\) => openDrawer\(i\)\}/);
-  assert.match(route, /onRemoveSmtp=\{\(\) => setGmailSmtpDisconnectConfirmOpen\(true\)\}/);
+  assert.match(drawer, /onClick=\{int\.id === "gmail" && onGmailSmtpRemoveRequest \? onGmailSmtpRemoveRequest : handleDisconnect\}/);
+  assert.match(route, /onGmailSmtpRemoveRequest=\{\(\) => \{\s*setDrawerOpen\(false\);\s*setGmailSmtpDisconnectConfirmOpen\(true\);/);
   assert.match(route, /This deletes the saved SMTP credentials for/);
-  assert.doesNotMatch(route.replace(/^\s*\/\/.*$/gm, ""), /App Password/);
+  assert.doesNotMatch(strip(route), /App Password/);
 });
 
-test("wiring — SMTP changes stay owner-only server-side", () => {
-  for (const fn of ["smtp-config-save.ts", "smtp-disconnect.ts"]) {
+test("security — SMTP passwords never reach the browser; integration changes stay owner-only server-side", () => {
+  const status = readFileSync(path.join(repoRoot, "netlify/functions/smtp-config-status.ts"), "utf8");
+  const body = status.slice(status.indexOf("body: JSON.stringify({"));
+  assert.doesNotMatch(body.slice(0, body.indexOf("})")), /appPassword:|password:|secret/i);
+  // The drawer pre-fills only the address, never the password.
+  assert.match(drawer, /if \(json\.email\) setFields\(\{ email: json\.email \}\);/);
+  for (const fn of ["smtp-config-save.ts", "smtp-disconnect.ts", "gmail-oauth-start.ts", "gmail-disconnect.ts"]) {
     const src = readFileSync(path.join(repoRoot, "netlify/functions", fn), "utf8");
     assert.match(src, /resolveIntegrationManager\(/, fn);
   }

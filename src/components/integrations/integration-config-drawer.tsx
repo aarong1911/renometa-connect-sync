@@ -8,7 +8,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
-import { Link2, Copy, ExternalLink, Loader2, CheckCircle2, AlertTriangle, RefreshCw } from "lucide-react";
+import { Copy, ExternalLink, Loader2, CheckCircle2, AlertTriangle, RefreshCw } from "lucide-react";
+import { IntegrationIcon } from "@/components/integrations/integration-icon";
 import { toast } from "sonner";
 import { useState, useCallback, useEffect, useRef } from "react";
 import type { Integration } from "@/lib/integrations-data";
@@ -44,6 +45,9 @@ interface Props {
   googleAdsForceSelection?: boolean;
   onGoogleAdsForceSelectionConsumed?: () => void;
   onGoogleAdsStatusRefresh?: () => void;
+  // Gmail only: removing legacy SMTP goes through the page's confirmation
+  // dialog instead of disconnecting straight from the drawer.
+  onGmailSmtpRemoveRequest?: () => void;
 }
 
 // Map integration id → key inside integration_settings JSON
@@ -253,6 +257,7 @@ function MetaLeadAdsStatusPanel() {
 export function IntegrationConfigDrawer({
   integration, open, onOpenChange, onConnect, onDisconnect,
   googleAdsStatus, googleAdsForceSelection, onGoogleAdsForceSelectionConsumed, onGoogleAdsStatusRefresh,
+  onGmailSmtpRemoveRequest,
 }: Props) {
   const [fields, setFields] = useState<Record<string, string>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -1043,9 +1048,7 @@ export function IntegrationConfigDrawer({
       <SheetContent className="w-full sm:max-w-md overflow-y-auto">
         <SheetHeader className="pb-4">
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border bg-secondary">
-              <Link2 className="h-5 w-5 text-muted-foreground" />
-            </div>
+            <IntegrationIcon id={int.id} size="md" />
             <div>
               <SheetTitle className="text-base">{int.id === "gmail" ? "Advanced: legacy email settings" : int.name}</SheetTitle>
               <SheetDescription className="text-xs">{integration.vendor}</SheetDescription>
@@ -1063,11 +1066,14 @@ export function IntegrationConfigDrawer({
               : integration.description}
           </p>
 
-          <div className="flex flex-wrap gap-1.5">
-            {integration.syncBadges.map((b) => (
-              <Badge key={b} variant="secondary" className="text-[10px] h-5 px-1.5 rounded-full">{b}</Badge>
-            ))}
-          </div>
+          {/* Gmail's chips describe the Google connection, not this SMTP drawer. */}
+          {int.id !== "gmail" && (
+            <div className="flex flex-wrap gap-1.5">
+              {integration.syncBadges.map((b) => (
+                <Badge key={b} variant="secondary" className="text-[10px] h-5 px-1.5 rounded-full">{b}</Badge>
+              ))}
+            </div>
+          )}
 
           {integration.connectMethod === "oauth" && META_IDS.has(int.id) && (
             <div className="space-y-3 rounded-lg border border-border p-4">
@@ -1493,9 +1499,15 @@ export function IntegrationConfigDrawer({
                   <Button variant="outline" size="sm" className="w-full" onClick={() => setReconfiguring(true)}>
                     Update credentials
                   </Button>
-                  <Button variant="ghost" size="sm" className="w-full text-destructive hover:text-destructive" onClick={handleDisconnect} disabled={saving}>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="w-full text-destructive hover:text-destructive"
+                    onClick={int.id === "gmail" && onGmailSmtpRemoveRequest ? onGmailSmtpRemoveRequest : handleDisconnect}
+                    disabled={saving}
+                  >
                     {saving ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
-                    Disconnect
+                    {int.id === "gmail" ? "Remove legacy SMTP" : "Disconnect"}
                   </Button>
                 </div>
               ) : (

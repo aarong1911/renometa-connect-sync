@@ -74,7 +74,7 @@ test("wiring: App Password setup is not part of the normal onboarding copy", () 
 
 test("wiring: the panel no longer claims replies or campaigns skip the Google connection", () => {
   assert.doesNotMatch(panel, /don't use your Google connection/);
-  assert.match(panel, /Replies, estimates, change orders and email campaigns send from your own Gmail address/);
+  assert.match(panel, /Send replies, estimates, change orders and campaigns/);
 });
 
 test("wiring: the Gmail 'connected' count comes from the OAuth status, never the legacy SMTP settings key", () => {
