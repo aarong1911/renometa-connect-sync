@@ -639,8 +639,9 @@ function IntegrationsSettings() {
 
                   {/* Gmail: one "Connect with Google" path (inbox sync +
                       estimate/change-order sending), with authorization and
-                      sync health shown separately. Legacy SMTP sending lives
-                      inside the panel — see gmail-connection-panel.tsx. */}
+                      sync health shown separately. Legacy SMTP lives in a
+                      collapsed Advanced section, only for orgs that already
+                      have it — see gmail-connection-panel.tsx. */}
                   {i.id === "gmail" && !MOCK_MODE ? (
                     <GmailConnectionPanel
                       status={gmailStatus}
@@ -958,7 +959,7 @@ function IntegrationsSettings() {
               Remove legacy SMTP sending?
             </AlertDialogTitle>
             <AlertDialogDescription>
-              This deletes the saved Gmail App Password for {gmailSmtpEmail ?? "this account"}. {gmailStatus?.connected
+              This deletes the saved SMTP credentials for {gmailSmtpEmail ?? "this account"}. {gmailStatus?.connected
                 ? "Your Google account keeps sending everything — replies, estimates, change orders and campaigns."
                 : "Conversations replies and email campaigns stop sending until you connect your Google account."}
             </AlertDialogDescription>

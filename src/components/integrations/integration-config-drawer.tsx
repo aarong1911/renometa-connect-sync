@@ -1047,7 +1047,7 @@ export function IntegrationConfigDrawer({
               <Link2 className="h-5 w-5 text-muted-foreground" />
             </div>
             <div>
-              <SheetTitle className="text-base">{int.id === "gmail" ? "Gmail — legacy SMTP sending" : int.name}</SheetTitle>
+              <SheetTitle className="text-base">{int.id === "gmail" ? "Advanced: legacy email settings" : int.name}</SheetTitle>
               <SheetDescription className="text-xs">{integration.vendor}</SheetDescription>
             </div>
           </div>
@@ -1059,7 +1059,7 @@ export function IntegrationConfigDrawer({
               used for replies and campaigns while Google can't send. */}
           <p className="text-sm text-muted-foreground">
             {int.id === "gmail"
-              ? "Legacy sending with a Gmail App Password. RenoMeta uses it for Conversations replies and email campaigns only while your Google account isn't connected or needs reconnecting. Estimates and change orders always use your Google connection."
+              ? "Legacy SMTP sending, kept for organizations that set it up before Connect with Google. It isn't needed when your Google account is connected — Google handles inbox sync, Conversations, estimates, change orders and campaigns. RenoMeta uses SMTP for replies and campaigns only while Google isn't connected or needs reconnecting."
               : integration.description}
           </p>
 

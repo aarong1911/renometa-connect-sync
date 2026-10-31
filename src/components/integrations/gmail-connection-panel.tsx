@@ -11,14 +11,16 @@
 // lib/gmail-connection-health.ts): only a genuine credential failure asks
 // for a reconnect; a sync that fails for any other reason keeps "Sync now".
 //
-// Legacy SMTP (Gmail App Password) is only shown to orgs that already have
-// it — it's used for replies and campaigns while their Google account isn't
-// connected. New orgs are never offered App Password setup.
+// Legacy SMTP is never part of the normal card. Orgs that already have it
+// get a collapsed "Advanced: legacy email settings" section; it's used for
+// replies and campaigns only while their Google account can't send. New orgs
+// never see it, and nothing here suggests an App Password is needed.
 //
 // Presentational only — the route owns the fetches, handlers and confirm
 // dialogs, so the Disconnect confirmation stays a single AlertDialog.
 
-import { AlertTriangle, CheckCircle2, Circle, Loader2, Mail, RefreshCw } from "lucide-react";
+import { useState } from "react";
+import { AlertTriangle, CheckCircle2, ChevronDown, Circle, Loader2, Mail, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { gmailCardState, type GmailConnectionStatus } from "@/lib/gmail-connection-health";
@@ -68,6 +70,12 @@ export function GmailConnectionPanel(props: Props) {
             <Benefit>Customer emails appear in Conversations</Benefit>
             <Benefit>Replies, estimates, change orders and email campaigns send from your own Gmail address</Benefit>
           </ul>
+          {props.smtpEmail && (
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              Replies and campaigns currently send from <span className="break-all font-medium text-foreground">{props.smtpEmail}</span>.
+              Connect Google to sync your inbox and send estimates and change orders too.
+            </p>
+          )}
           <Button size="sm" className="h-8 w-full" disabled={connecting} onClick={props.onConnect}>
             {connecting ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
             {connecting ? "Opening Google…" : "Connect with Google"}
@@ -116,7 +124,20 @@ export function GmailConnectionPanel(props: Props) {
             <p className="rounded-md border border-warning/20 bg-warning-soft p-2 text-[11px] leading-relaxed text-warning">
               Google access for this account expired or was revoked, so inbox sync and estimate emails are paused.
               Reconnect the same account to resume — nothing already synced is lost.
+              {props.smtpEmail ? ` Until then, replies and campaigns send from ${props.smtpEmail}.` : ""}
             </p>
+          )}
+
+          {state === "connected" && (
+            <div className="space-y-1">
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Features enabled</p>
+              <ul className="grid grid-cols-1 gap-1 sm:grid-cols-2">
+                <Benefit>Conversations</Benefit>
+                <Benefit>Estimates</Benefit>
+                <Benefit>Change orders</Benefit>
+                <Benefit>Small email campaigns</Benefit>
+              </ul>
+            </div>
           )}
 
           {state === "connected" && status.syncHealth === "failing" && (
@@ -155,7 +176,9 @@ export function GmailConnectionPanel(props: Props) {
         </div>
       )}
 
-      <LegacySmtpSection email={props.smtpEmail} googleSending={state === "connected"} onManage={props.onManageSmtp} onRemove={props.onRemoveSmtp} />
+      {state !== "loading" && props.smtpEmail && (
+        <LegacyEmailSettings email={props.smtpEmail} googleSending={state === "connected"} onManage={props.onManageSmtp} onRemove={props.onRemoveSmtp} />
+      )}
     </div>
   );
 }
@@ -204,30 +227,53 @@ function PermissionsNote() {
   );
 }
 
-// Only for orgs that already have SMTP. send-inbox-message.ts and the
-// campaign worker use it only while the Google connection can't send.
-function LegacySmtpSection({ email, googleSending, onManage, onRemove }: { email: string | null; googleSending: boolean; onManage: () => void; onRemove: () => void }) {
-  if (!email) return null;
+
+// Advanced / legacy — only rendered for orgs that already have SMTP saved, and
+// collapsed by default so the normal card stays Google-only.
+// send-inbox-message.ts and the campaign worker use SMTP only while the Google
+// connection can't send; estimates and change orders never use it.
+export function LegacyEmailSettings({ email, googleSending, onManage, onRemove, defaultOpen = false }: {
+  email: string;
+  googleSending: boolean;
+  onManage: () => void;
+  onRemove: () => void;
+  defaultOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
   return (
-    <div className="space-y-1.5 rounded-md border border-border bg-muted/50 p-2.5">
-      <div className="flex items-center justify-between gap-2">
-        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Legacy SMTP sending</p>
-        {googleSending ? (
-          <StatusPill tone="muted" icon={<Circle className="h-2 w-2" />}>Standby</StatusPill>
-        ) : (
-          <StatusPill tone="success" icon={<CheckCircle2 className="h-2.5 w-2.5" />}>In use</StatusPill>
-        )}
-      </div>
-      <p className="truncate text-[11px] text-foreground" title={email}>{email}</p>
-      <p className="text-[10.5px] leading-relaxed text-muted-foreground">
-        {googleSending
-          ? "Not in use — your Google account sends everything. Kept only as a backup for replies and campaigns if Google ever needs reconnecting."
-          : "Sending your Conversations replies and email campaigns until your Google account is connected. Estimates and change orders need Google."}
-      </p>
-      <div className="flex flex-wrap gap-2">
-        <Button variant="neutral" size="sm" className="h-7 text-xs" onClick={onManage}>Update</Button>
-        <Button variant="destructive" size="sm" className="h-7 text-xs" onClick={onRemove}>Remove</Button>
-      </div>
+    <div className="border-t border-border/70 pt-2">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between gap-2 rounded-sm text-left text-[11px] text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <span>Advanced: legacy email settings</span>
+        <ChevronDown className={cn("h-3.5 w-3.5 shrink-0 transition-transform", open && "rotate-180")} />
+      </button>
+      {open && (
+        <div className="mt-2 space-y-1.5 rounded-md border border-border bg-muted/50 p-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Legacy SMTP sending</p>
+            {googleSending ? (
+              <StatusPill tone="muted" icon={<Circle className="h-2 w-2" />}>Standby</StatusPill>
+            ) : (
+              <StatusPill tone="success" icon={<CheckCircle2 className="h-2.5 w-2.5" />}>In use</StatusPill>
+            )}
+          </div>
+          <p className="truncate text-[11px] text-foreground" title={email}>{email}</p>
+          <p className="text-[10.5px] leading-relaxed text-muted-foreground">
+            {googleSending
+              ? "Not in use — your Google account sends everything. Kept only as a backup for replies and campaigns if Google ever needs reconnecting."
+              : "Sending your Conversations replies and email campaigns until your Google account is connected. Estimates and change orders need Google."}
+            {" "}Not required for Google — Connect with Google covers inbox sync and all sending.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="neutral" size="sm" className="h-7 text-xs" onClick={onManage}>Update</Button>
+            <Button variant="destructive" size="sm" className="h-7 text-xs" onClick={onRemove}>Remove</Button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

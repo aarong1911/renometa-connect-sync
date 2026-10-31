@@ -64,15 +64,11 @@ test("wiring: the Gmail card renders the one-click panel wired to the real OAuth
   assert.match(panel, /Sync now/);
 });
 
+// Rendered states are covered by components/integrations/gmail-connection-panel.test.ts.
 test("wiring: App Password setup is not part of the normal onboarding copy", () => {
   const gmailEntry = catalog.split("\n").find((l) => l.includes('id: "gmail"'))!;
   assert.doesNotMatch(gmailEntry, /App Password/i);
-  // The only App Password mention in the panel is inside the legacy section.
-  const legacyStart = panel.indexOf("function LegacySmtpSection");
-  assert.ok(legacyStart > 0);
-  assert.doesNotMatch(panel.slice(0, legacyStart).replace(/^\s*\/\/.*$/gm, ""), /App Password/);
-  // Orgs without SMTP are never offered App Password setup at all.
-  assert.match(panel, /function LegacySmtpSection[\s\S]*?\{\s*if \(!email\) return null;/);
+  assert.doesNotMatch(panel.replace(/^\s*\/\/.*$/gm, ""), /App Password/);
   assert.doesNotMatch(panel, /Set up SMTP/i);
 });
 
