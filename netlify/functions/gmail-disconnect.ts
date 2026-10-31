@@ -10,6 +10,7 @@
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import { decryptBytea } from "./lib/gmail-token-crypto";
+import { resolveIntegrationManager } from "./lib/resolve-org";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -29,32 +30,13 @@ export const handler: Handler = async (event) => {
     return { statusCode: 405, headers: CORS, body: JSON.stringify({ error: "Method not allowed" }) };
   }
 
-  const authToken = event.headers.authorization?.slice(7);
-  if (!authToken) {
-    return { statusCode: 401, headers: CORS, body: JSON.stringify({ error: "Unauthorized" }) };
+  // Owner only — disconnecting stops sync and estimate/change-order email
+  // for the whole organization.
+  const resolved = await resolveIntegrationManager(supabaseAdmin, event.headers.authorization);
+  if (!resolved.ok) {
+    return { statusCode: resolved.statusCode, headers: CORS, body: JSON.stringify({ error: resolved.error }) };
   }
-  const { data: { user } } = await supabaseAdmin.auth.getUser(authToken);
-  if (!user) {
-    return { statusCode: 401, headers: CORS, body: JSON.stringify({ error: "Invalid token" }) };
-  }
-
-  const { data: profile } = await supabaseAdmin
-    .from("profiles")
-    .select("organization_id")
-    .eq("id", user.id)
-    .maybeSingle();
-  let orgId: string | null = profile?.organization_id ?? null;
-  if (!orgId) {
-    const { data: membership } = await supabaseAdmin
-      .from("org_memberships")
-      .select("org_id")
-      .eq("member_id", user.id)
-      .maybeSingle();
-    orgId = membership?.org_id ?? null;
-  }
-  if (!orgId) {
-    return { statusCode: 403, headers: CORS, body: JSON.stringify({ error: "No organization found for this user" }) };
-  }
+  const { orgId } = resolved;
 
   const { data: integration, error: loadErr } = await supabaseAdmin
     .from("integrations")
@@ -97,7 +79,10 @@ export const handler: Handler = async (event) => {
       sync_error: null,
       updated_at: new Date().toISOString(),
     })
-    .eq("id", integration.id);
+    .eq("id", integration.id)
+    // Defense in depth: the row was loaded org-filtered, but never let the
+    // write itself reach another tenant's row.
+    .eq("org_id", orgId);
 
   if (updateErr) {
     console.error("[gmail-disconnect] update failed:", updateErr.message);

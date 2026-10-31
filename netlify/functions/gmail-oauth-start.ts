@@ -20,6 +20,7 @@ import { createClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
 import { buildGmailRedirectUri, logGmailOAuthEnvDiagnostics } from "./lib/gmail-oauth-shared";
 import { getAppConfig } from "./lib/app-config-store";
+import { resolveIntegrationManager } from "./lib/resolve-org";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -43,34 +44,14 @@ export const handler: Handler = async (event) => {
     return { statusCode: 405, headers: CORS, body: JSON.stringify({ error: "Method not allowed" }) };
   }
 
-  const authToken = event.headers.authorization?.slice(7);
-  if (!authToken) {
-    return { statusCode: 401, headers: CORS, body: JSON.stringify({ error: "Unauthorized" }) };
+  // Org resolved server-side (profiles.organization_id first,
+  // org_memberships fallback — same precedence as gmail-sync.ts), and only
+  // the org owner may connect or replace the org's Gmail account.
+  const resolved = await resolveIntegrationManager(supabaseAdmin, event.headers.authorization);
+  if (!resolved.ok) {
+    return { statusCode: resolved.statusCode, headers: CORS, body: JSON.stringify({ error: resolved.error }) };
   }
-  const { data: { user } } = await supabaseAdmin.auth.getUser(authToken);
-  if (!user) {
-    return { statusCode: 401, headers: CORS, body: JSON.stringify({ error: "Invalid token" }) };
-  }
-
-  // Resolve org — profiles.organization_id first, org_memberships fallback,
-  // same precedence used by gmail-sync.ts and the rest of the app.
-  const { data: profile } = await supabaseAdmin
-    .from("profiles")
-    .select("organization_id")
-    .eq("id", user.id)
-    .maybeSingle();
-  let orgId: string | null = profile?.organization_id ?? null;
-  if (!orgId) {
-    const { data: membership } = await supabaseAdmin
-      .from("org_memberships")
-      .select("org_id")
-      .eq("member_id", user.id)
-      .maybeSingle();
-    orgId = membership?.org_id ?? null;
-  }
-  if (!orgId) {
-    return { statusCode: 403, headers: CORS, body: JSON.stringify({ error: "No organization found for this user" }) };
-  }
+  const { orgId, userId } = resolved;
 
   // Env-footprint reduction (2026-09) — see google-ads-config.ts's header;
   // supabaseAdmin already exists at module scope above.
@@ -87,7 +68,7 @@ export const handler: Handler = async (event) => {
     state,
     provider: "gmail",
     org_id: orgId,
-    user_id: user.id,
+    user_id: userId,
     expires_at: expiresAt,
   });
   if (insertErr) {

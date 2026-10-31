@@ -1,7 +1,9 @@
 // netlify/functions/lib/gmail-sent-reconcile.ts
 //
 // Immediate persistence + later reconciliation of outbound emails sent from
-// Conversations (send-inbox-message.ts, Gmail SMTP via nodemailer).
+// Conversations (send-inbox-message.ts) — over legacy Gmail SMTP via
+// nodemailer (temporary "smtp:" rows, re-keyed by sync) or the Gmail API
+// (rows keyed by the real Gmail id from the start).
 //
 // Identifiers — kept strictly separate:
 //   - RFC Message-ID   nodemailer's `sendResult.messageId` ("<…@…>"). Stored,
@@ -114,6 +116,9 @@ export type GmailApiSentEmailInput = {
   to: string;
   subject: string;
   body: string;
+  /** Conversations replies only — the threading headers that were sent. */
+  inReplyTo?: string | null;
+  references?: string | null;
   now?: Date;
 };
 
@@ -138,6 +143,8 @@ export function buildGmailApiSentRow(input: GmailApiSentEmailInput): Record<stri
     direction: "out",
     rfc_message_id: normalizeRfcMessageId(input.rfcMessageId),
     provider_message_id: input.gmailMessageId,
+    ...(input.inReplyTo ? { in_reply_to: input.inReplyTo } : {}),
+    ...(input.references ? { references_header: input.references } : {}),
   };
 }
 

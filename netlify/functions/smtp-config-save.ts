@@ -11,7 +11,7 @@
 
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
-import { resolveOrgFromBearerToken } from "./lib/resolve-org";
+import { resolveIntegrationManager } from "./lib/resolve-org";
 import { setOrgSecret } from "./lib/org-secret-store";
 
 const supabaseAdmin = createClient(
@@ -34,9 +34,10 @@ export const handler: Handler = async (event) => {
     return { statusCode: 405, headers: CORS, body: JSON.stringify({ error: "Method not allowed" }) };
   }
 
-  const resolved = await resolveOrgFromBearerToken(supabaseAdmin, event.headers.authorization);
-  if (!resolved) {
-    return { statusCode: 401, headers: CORS, body: JSON.stringify({ error: "Unauthorized" }) };
+  // Owner only — these credentials send mail as the whole organization.
+  const resolved = await resolveIntegrationManager(supabaseAdmin, event.headers.authorization);
+  if (!resolved.ok) {
+    return { statusCode: resolved.statusCode, headers: CORS, body: JSON.stringify({ error: resolved.error }) };
   }
   const { orgId } = resolved;
 
