@@ -19,6 +19,10 @@ import { createClient } from "@supabase/supabase-js";
 import { isCustomerActionable } from "../../src/lib/estimate-status";
 import { calculateEstimate, type CalcLineItem } from "../../src/lib/estimate-calculations";
 import { syncEstimateDeal, logDealSyncWarning, type DealSyncTrigger } from "../lib/estimate-deal-sync";
+import { recoverDeliveredProposal } from "./lib/estimate-send-completion";
+
+const workflowBaseUrl = () =>
+  (process.env.URL ?? process.env.CONNECT_APP_URL ?? process.env.APP_URL ?? "http://localhost:9999").replace(/\/+$/, "");
 
 /** Advisory, non-blocking Deal sync — a customer's approve/reject/request-changes action must always succeed even when Deal sync has trouble. */
 async function syncDealNonBlocking(estimateId: string, orgId: string, trigger: DealSyncTrigger) {
@@ -46,9 +50,16 @@ async function loadEstimate(token: string) {
   if (!token || token.length < 32) return null;
   const { data } = await supabaseAdmin
     .from("estimates")
-    .select("id, org_id, status, version_number, deposit_type, deposit_value, discount_type, discount_value, tax_rate")
+    .select("id, org_id, status, number, version_number, deposit_type, deposit_value, discount_type, discount_value, tax_rate, client_id, project_id, metadata, total, deposit_amount")
     .eq("public_token", token)
     .maybeSingle();
+  // Same Gmail-confirmed recovery as proposal-data.ts, for a customer who
+  // acts before the page load got to complete it. No-op unless the estimate
+  // is still draft/ready AND Gmail confirms the proposal email was delivered.
+  if (data && (data.status === "draft" || data.status === "ready")) {
+    const recovered = await recoverDeliveredProposal(supabaseAdmin, data as any, { workflowBaseUrl: workflowBaseUrl() });
+    if (recovered) data.status = recovered;
+  }
   return data;
 }
 

@@ -34,7 +34,8 @@ async function resolveOrgId(client: QueryableClient, userId: string): Promise<st
   return (membership?.org_id as string | undefined) ?? null;
 }
 
-async function resolveRole(client: QueryableClient, userId: string, orgId: string): Promise<Role | null> {
+/** The member's role in this org (org_memberships — the same source the app's role guard uses), or null. */
+export async function resolveMemberRole(client: QueryableClient, userId: string, orgId: string): Promise<Role | null> {
   const { data } = await client.from("org_memberships").select("role").eq("member_id", userId).eq("org_id", orgId).maybeSingle();
   return (data?.role as Role | undefined) ?? null;
 }
@@ -51,22 +52,62 @@ export async function resolveChangeOrderPermission(
   orgId: string,
   action: PermissionAction,
 ): Promise<boolean> {
-  const role = await resolveRole(client, userId, orgId);
+  return resolveFeaturePermission(client, userId, orgId, CHANGE_ORDERS_FEATURE_ID, action);
+}
+
+/** Same resolver for any feature id in permission-features.ts (e.g. "estimates"). */
+export async function resolveFeaturePermission(
+  client: QueryableClient,
+  userId: string,
+  orgId: string,
+  featureId: string,
+  action: PermissionAction,
+): Promise<boolean> {
+  const role = await resolveMemberRole(client, userId, orgId);
   if (!role) return false;
 
-  const roleDefault = getRoleDefaultPermission(role, CHANGE_ORDERS_FEATURE_ID, action);
+  const roleDefault = getRoleDefaultPermission(role, featureId, action);
 
   const { data: override } = await client
     .from("member_permissions")
     .select("granted")
     .eq("org_id", orgId)
     .eq("member_id", userId)
-    .eq("feature", CHANGE_ORDERS_FEATURE_ID)
+    .eq("feature", featureId)
     .eq("action", action)
     .maybeSingle();
 
   if (override && typeof override.granted === "boolean") return override.granted;
   return roleDefault;
+}
+
+/**
+ * Sending an estimate proposal. Before contractor Gmail sending, estimate-send
+ * only required org membership, and every internal role with the /estimates
+ * page can reach Send — including accountants, whose estimates "edit" default
+ * is false. That boundary is kept: anyone who can view estimates may send,
+ * unless the owner has set an explicit estimates "edit" override for that
+ * member, which then decides (an explicit false blocks sending).
+ */
+export async function resolveEstimateSendPermission(
+  client: QueryableClient,
+  userId: string,
+  orgId: string,
+): Promise<boolean> {
+  const role = await resolveMemberRole(client, userId, orgId);
+  if (!role) return false;
+
+  const { data: override } = await client
+    .from("member_permissions")
+    .select("granted")
+    .eq("org_id", orgId)
+    .eq("member_id", userId)
+    .eq("feature", "estimates")
+    .eq("action", "edit")
+    .maybeSingle();
+
+  if (override && typeof override.granted === "boolean") return override.granted;
+  return resolveFeaturePermission(client, userId, orgId, "estimates", "view");
 }
 
 /** Semantic action names used by the Change Orders feature, mapped onto the generic view/create/edit/delete vocabulary. */

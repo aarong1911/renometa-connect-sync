@@ -4,24 +4,28 @@
 // Phase 10.4 — authenticated estimate proposal delivery.
 //
 // Flow:
-// 1. Authenticate the current user.
+// 1. Authenticate the current user and check they may send estimates
+//    (resolveEstimateSendPermission — same boundary as before Gmail sending).
 // 2. Confirm the estimate belongs to the user's organization.
 // 3. Load the customer and estimate items.
 // 4. Recalculate all totals server-side.
-// 5. Persist the secure proposal token and calculated totals.
-// 6. Send the proposal email through Amazon SES.
-// 7. Mark the estimate as sent only after SES confirms delivery.
-// 8. Record one sent/re-sent activity.
-// 9. Trigger estimate_sent workflows.
+// 5. Preflight the org's connected Gmail account (lib/gmail-send.ts) —
+//    not connected / expired / missing send scope fails here, before any write.
+// 6. Claim the send (lib/email-send-claim.ts) so a double submit can't email
+//    twice. An earlier ambiguous send is reconciled against Gmail's Sent mail
+//    first; an earlier unrecorded one is finished without re-emailing.
+// 7. Persist the secure proposal token and calculated totals.
+// 8. Send the proposal email FROM the contractor's Gmail account.
+// 9. Mark the estimate as sent only after Gmail accepts the message.
+// 10. Record one sent/re-sent activity (with Gmail message/thread ids) and
+//     the outbound row in gmail_messages for the contact's email thread.
+// 11. Trigger estimate_sent workflows.
 //
-// The proposal email path intentionally does not use Gmail SMTP.
+// Customer proposals are never sent through AWS SES or from a renometa.com
+// address — with no usable Gmail connection the send is refused with a
+// structured `email_not_connected` / `email_reconnect_required` error.
 
 import type { Handler, HandlerEvent, HandlerResponse } from "@netlify/functions";
-import {
-  SESv2Client,
-  SendEmailCommand,
-  type SendEmailCommandInput,
-} from "@aws-sdk/client-sesv2";
 import { createClient, type PostgrestError } from "@supabase/supabase-js";
 import crypto from "node:crypto";
 
@@ -29,38 +33,36 @@ import {
   calculateEstimate,
   type CalcLineItem,
 } from "../../src/lib/estimate-calculations";
-import {
-  isCustomerActionable,
-  type EstimateStatus,
-} from "../../src/lib/estimate-status";
+import { type EstimateStatus } from "../../src/lib/estimate-status";
 import {
   UNPRICED_ESTIMATE_ERROR,
   hasPricePendingItems,
   type PricingGateItem,
 } from "../../src/lib/estimate-pricing-gate";
-import { syncEstimateDeal, logDealSyncWarning } from "../lib/estimate-deal-sync";
+import { resolveEstimateSendPermission, resolveMemberRole } from "../../src/lib/change-order-permissions";
+import {
+  GmailSendError,
+  isValidRecipientEmail,
+  resolveGmailSender,
+  sendGmailMessage,
+  type GmailSender,
+} from "./lib/gmail-send";
+import {
+  acquireEmailSendClaim,
+  reconcileUnconfirmedSend,
+  releaseEmailSendClaim,
+  takeOverEmailSendClaim,
+  unconfirmedDeliveryMessage,
+  updateEmailSendClaim,
+} from "./lib/email-send-claim";
+import { persistGmailApiSentEmail } from "./lib/gmail-sent-reconcile";
+import { completeEstimateSend } from "./lib/estimate-send-completion";
 
 const SUPABASE_URL =
   process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL ?? "";
 
 const SUPABASE_SERVICE_ROLE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
-
-const AWS_REGION =
-  process.env.AWS_REGION ??
-  process.env.AWS_DEFAULT_REGION ??
-  "us-west-2";
-
-const SES_FROM_EMAIL =
-  process.env.SES_FROM_EMAIL ??
-  process.env.SMTP_FROM_EMAIL ??
-  process.env.FROM_EMAIL ??
-  "info@connect.renometa.com";
-
-const SES_REPLY_TO_EMAIL =
-  process.env.SES_REPLY_TO_EMAIL ??
-  process.env.REPLY_TO_EMAIL ??
-  SES_FROM_EMAIL;
 
 const admin = createClient(
   SUPABASE_URL,
@@ -72,10 +74,6 @@ const admin = createClient(
     },
   },
 );
-
-const ses = new SESv2Client({
-  region: AWS_REGION,
-});
 
 type EstimateRow = {
   id: string;
@@ -91,6 +89,7 @@ type EstimateRow = {
   discount_value: number | string | null;
   tax_rate: number | string | null;
   client_id: string;
+  project_id: string | null;
 };
 
 type ContactRow = {
@@ -122,6 +121,8 @@ type EstimateItemRow = {
 
 type RequestBody = {
   estimateId?: string;
+  /** The user saw "couldn't confirm the earlier send" and chose to send anyway. */
+  confirmResend?: boolean;
 };
 
 type SerializableError = {
@@ -346,15 +347,13 @@ function buildCalcItems(
   }));
 }
 
-async function sendProposalEmail(input: {
-  to: string;
-  senderName: string;
+function buildProposalEmail(input: {
   organizationName: string;
   customerName: string;
   estimateNumber: string | null;
   estimateTitle: string | null;
   proposalUrl: string;
-}): Promise<void> {
+}): { subject: string; html: string; text: string } {
   const safeCustomerName = escapeHtml(
     input.customerName || "there",
   );
@@ -373,11 +372,13 @@ async function sendProposalEmail(input: {
 
   const safeProposalUrl = escapeHtml(input.proposalUrl);
 
+  // Plain text: the subject is a MIME header (RFC 2047-encoded by
+  // lib/gmail-send.ts), not HTML, so it must not carry HTML entities.
   const subjectParts = [
-    safeEstimateNumber
-      ? `Proposal ${safeEstimateNumber}`
+    input.estimateNumber
+      ? `Proposal ${input.estimateNumber}`
       : "New proposal",
-    `from ${safeOrganizationName}`,
+    `from ${input.organizationName}`,
   ];
 
   const subject = subjectParts.join(" ");
@@ -461,43 +462,17 @@ async function sendProposalEmail(input: {
     .filter((line): line is string => line !== null)
     .join("\n");
 
-  const message: SendEmailCommandInput = {
-    FromEmailAddress: `"${input.senderName}" <${SES_FROM_EMAIL}>`,
-    Destination: {
-      ToAddresses: [input.to],
-    },
-    ReplyToAddresses: SES_REPLY_TO_EMAIL
-      ? [SES_REPLY_TO_EMAIL]
-      : undefined,
-    Content: {
-      Simple: {
-        Subject: {
-          Data: subject,
-          Charset: "UTF-8",
-        },
-        Body: {
-          Html: {
-            Data: html,
-            Charset: "UTF-8",
-          },
-          Text: {
-            Data: text,
-            Charset: "UTF-8",
-          },
-        },
-      },
-    },
-  };
+  return { subject, html, text };
+}
 
-  const response = await ses.send(
-    new SendEmailCommand(message),
+function gmailErrorResponse(
+  error: GmailSendError,
+  canManageIntegrations: boolean,
+): HandlerResponse {
+  return json(
+    error.httpStatus,
+    error.toResponseBody({ canManageIntegrations }),
   );
-
-  console.info("[estimate-send] SES accepted email", {
-    messageId: response.MessageId ?? null,
-    recipientDomain:
-      input.to.split("@")[1]?.toLowerCase() ?? null,
-  });
 }
 
 export const handler: Handler = async (
@@ -526,17 +501,6 @@ export const handler: Handler = async (
     });
   }
 
-  if (!SES_FROM_EMAIL) {
-    console.error(
-      "[estimate-send] SES sender email is missing",
-    );
-
-    return json(500, {
-      error:
-        "The proposal email sender is not configured.",
-    });
-  }
-
   const accessToken = getBearerToken(event);
 
   if (!accessToken) {
@@ -561,7 +525,7 @@ export const handler: Handler = async (
     });
   }
 
-  const { estimateId } = parseRequestBody(event);
+  const { estimateId, confirmResend } = parseRequestBody(event);
 
   if (!estimateId) {
     return json(400, {
@@ -607,6 +571,22 @@ export const handler: Handler = async (
       });
     }
 
+    // Role defaults + member_permissions overrides, preserving the pre-Gmail
+    // boundary (every role with estimates access, accountants included).
+    const canSend = await resolveEstimateSendPermission(
+      admin,
+      user.id,
+      orgId,
+    );
+
+    if (!canSend) {
+      return json(403, {
+        error:
+          "You do not have permission to send estimates.",
+        code: "forbidden",
+      });
+    }
+
     const {
       data: estimate,
       error: estimateError,
@@ -627,6 +607,7 @@ export const handler: Handler = async (
           "discount_value",
           "tax_rate",
           "client_id",
+          "project_id",
         ].join(","),
       )
       .eq("id", estimateId)
@@ -684,6 +665,14 @@ export const handler: Handler = async (
       return json(400, {
         error:
           "This estimate's customer has no email address on file.",
+      });
+    }
+
+    if (!isValidRecipientEmail(recipientEmail)) {
+      return json(400, {
+        error:
+          "This estimate's customer email address is not valid.",
+        code: "invalid_recipient",
       });
     }
 
@@ -803,82 +792,215 @@ export const handler: Handler = async (
       });
     }
 
-    const publicToken =
-      estimate.public_token ||
-      crypto.randomBytes(32).toString("hex");
+    // Gmail preflight after every validation/pricing check but before the
+    // first write: no connection, an expired/revoked one, or one without the
+    // send scope leaves the estimate and its send state exactly as they were.
+    let gmailSender: GmailSender;
 
-    const isFirstSend =
-      !isCustomerActionable(estimate.status) &&
-      estimate.status !== "changes_requested";
+    try {
+      gmailSender = await resolveGmailSender(admin, orgId);
+    } catch (preflightError) {
+      if (preflightError instanceof GmailSendError) {
+        console.warn("[estimate-send] Gmail sender unavailable", {
+          estimateId: estimate.id,
+          code: preflightError.code,
+        });
 
-    // Save the secure token and canonical totals first.
-    // Do not mark the estimate as sent until SES confirms delivery.
-    const {
-      error: preparationError,
-    } = await admin
-      .from("estimates")
-      .update({
-        public_token: publicToken,
-        subtotal: totals.subtotal,
-        discount_total: totals.discountTotal,
-        tax_total: totals.taxTotal,
-        total: totals.total,
-        client_total: totals.total,
-        deposit_amount: totals.depositAmount,
-        balance_due: totals.balanceDue,
-      })
-      .eq("id", estimate.id)
-      .eq("org_id", orgId);
+        // Only the owner can open Settings → Integrations; everyone else is
+        // told to ask them rather than shown a button they can't use.
+        const role = await resolveMemberRole(admin, user.id, orgId);
 
-    if (preparationError) {
-      logDatabaseError(
-        "Estimate preparation update failed",
-        preparationError,
-      );
+        return gmailErrorResponse(preflightError, role === "owner");
+      }
 
-      return json(500, {
-        error:
-          "Could not prepare the estimate for sending.",
-        code: preparationError.code ?? null,
+      throw preflightError;
+    }
+
+    let claim = await acquireEmailSendClaim(admin, "estimates", {
+      id: estimate.id,
+      orgId,
+      userId: user.id,
+      version: estimate.version_number,
+    });
+
+    let claimId: string;
+    let publicToken: string;
+    let delivery: {
+      gmailMessageId: string;
+      gmailThreadId: string | null;
+      fromEmail: string | null;
+      sentAt: string;
+    };
+    let recoveredUnrecordedSend = false;
+    let historyRecorded = false;
+
+    // An earlier send whose outcome Gmail never confirmed: look for it in the
+    // account's Sent mail before anything is emailed again.
+    if (!claim.ok && claim.code === "email_delivery_unconfirmed") {
+      const outcome = await reconcileUnconfirmedSend(admin, "estimates", {
+        id: estimate.id,
+        orgId,
+        userId: user.id,
+        refusal: claim,
+        sender: gmailSender,
+        confirmResend: confirmResend === true,
       });
+
+      if (outcome.kind === "delivered") {
+        claim = {
+          ok: false,
+          code: "email_sent_unrecorded",
+          claimId: outcome.claimId,
+          sendId: claim.sendId,
+          gmailMessageId: outcome.gmailMessageId,
+          gmailThreadId: outcome.gmailThreadId,
+          fromEmail: gmailSender.accountEmail,
+          sentAt: outcome.sentAt,
+          tokenHash: null,
+          tokenExpiresAt: null,
+        };
+      } else if (outcome.kind === "not_sent") {
+        claim = { ok: true, claimId: outcome.claimId };
+      } else if (outcome.kind === "unconfirmed") {
+        return json(409, {
+          error: unconfirmedDeliveryMessage("proposal", outcome),
+          code: "email_delivery_unconfirmed",
+          canConfirmResend: outcome.canConfirmResend,
+          sentFolderChecked: outcome.sentFolderChecked,
+        });
+      } else {
+        claim = { ok: false, code: "email_send_in_progress" };
+      }
+    }
+
+    if (!claim.ok) {
+      const recoveryClaimId =
+        claim.code === "email_sent_unrecorded" && estimate.public_token
+          ? await takeOverEmailSendClaim(
+              admin,
+              "estimates",
+              {
+                id: estimate.id,
+                orgId,
+                claimId: claim.claimId,
+                userId: user.id,
+              },
+              { state: "sent_unrecorded" },
+            )
+          : null;
+
+      if (
+        claim.code === "email_sent_unrecorded" &&
+        estimate.public_token &&
+        recoveryClaimId
+      ) {
+        // Gmail already accepted this proposal on an earlier request whose
+        // database update failed. Finish recording it — never email the
+        // customer a second time. Taking the claim over first means only one
+        // of several concurrent retries records it.
+        claimId = recoveryClaimId;
+        publicToken = estimate.public_token;
+        delivery = {
+          gmailMessageId: claim.gmailMessageId,
+          gmailThreadId: claim.gmailThreadId,
+          fromEmail: claim.fromEmail,
+          sentAt: claim.sentAt ?? new Date().toISOString(),
+        };
+        recoveredUnrecordedSend = true;
+      } else if (
+        claim.code === "email_send_in_progress" ||
+        claim.code === "email_sent_unrecorded"
+      ) {
+        return json(409, {
+          error:
+            "This proposal is already being sent. Check your Gmail Sent folder before trying again.",
+          code: "email_send_in_progress",
+        });
+      } else if (claim.code === "email_recently_sent") {
+        return json(409, {
+          error:
+            "This proposal was just sent. Wait a minute before sending it again.",
+          code: "email_recently_sent",
+        });
+      } else {
+        return json(500, {
+          error:
+            "Could not prepare the estimate for sending.",
+        });
+      }
+    } else {
+      claimId = claim.claimId;
+      publicToken =
+        estimate.public_token ||
+        crypto.randomBytes(32).toString("hex");
+
+      // Save the secure token and canonical totals first.
+      // Do not mark the estimate as sent until Gmail accepts the message.
+      const {
+        error: preparationError,
+      } = await admin
+        .from("estimates")
+        .update({
+          public_token: publicToken,
+          subtotal: totals.subtotal,
+          discount_total: totals.discountTotal,
+          tax_total: totals.taxTotal,
+          total: totals.total,
+          client_total: totals.total,
+          deposit_amount: totals.depositAmount,
+          balance_due: totals.balanceDue,
+        })
+        .eq("id", estimate.id)
+        .eq("org_id", orgId);
+
+      if (preparationError) {
+        logDatabaseError(
+          "Estimate preparation update failed",
+          preparationError,
+        );
+
+        await releaseEmailSendClaim(admin, "estimates", {
+          id: estimate.id,
+          orgId,
+          claimId,
+        });
+
+        return json(500, {
+          error:
+            "Could not prepare the estimate for sending.",
+          code: preparationError.code ?? null,
+        });
+      }
+
+      delivery = {
+        gmailMessageId: "",
+        gmailThreadId: null,
+        fromEmail: gmailSender.accountEmail,
+        sentAt: "",
+      };
     }
 
     const proposalUrl = `${getAppBaseUrl(
       event,
     )}/proposal/${publicToken}`;
 
-    const organizationName =
-      organization?.public_name?.trim() ||
-      organization?.name?.trim() ||
-      "Your contractor";
+    if (!recoveredUnrecordedSend) {
+      const organizationName =
+        organization?.public_name?.trim() ||
+        organization?.name?.trim() ||
+        "Your contractor";
 
-    const senderName =
-      [profile?.first_name, profile?.last_name]
-        .filter(
-          (value): value is string =>
-            Boolean(value?.trim()),
-        )
-        .join(" ")
-        .trim() ||
-      organizationName ||
-      "RenoMeta Connect";
+      const senderName =
+        [profile?.first_name, profile?.last_name]
+          .filter(
+            (value): value is string =>
+              Boolean(value?.trim()),
+          )
+          .join(" ")
+          .trim() ||
+        organizationName;
 
-    try {
-      console.info(
-        "[estimate-send] Sending proposal through SES",
-        {
-          estimateId: estimate.id,
-          region: AWS_REGION,
-          fromEmail: SES_FROM_EMAIL,
-          recipientDomain:
-            recipientEmail.split("@")[1]?.toLowerCase() ??
-            null,
-        },
-      );
-
-      await sendProposalEmail({
-        to: recipientEmail,
-        senderName,
+      const content = buildProposalEmail({
         organizationName,
         customerName:
           customer?.full_name?.trim() || "there",
@@ -886,152 +1008,164 @@ export const handler: Handler = async (
         estimateTitle: estimate.title,
         proposalUrl,
       });
-    } catch (emailError) {
-  const serialized = serializeError(emailError);
 
-  console.error("[estimate-send] SES delivery failed", {
-    ...serialized,
-    region: AWS_REGION,
-    fromEmail: SES_FROM_EMAIL,
-    hasAwsAccessKey: Boolean(process.env.AWS_ACCESS_KEY_ID),
-    hasAwsSecretKey: Boolean(process.env.AWS_SECRET_ACCESS_KEY),
-  });
+      try {
+        console.info(
+          "[estimate-send] Sending proposal through the org's Gmail account",
+          {
+            estimateId: estimate.id,
+            integrationId: gmailSender.integrationId,
+            recipientDomain:
+              recipientEmail.split("@")[1]?.toLowerCase() ??
+              null,
+          },
+        );
 
-  return json(500, {
-    error:
-      "The estimate was saved, but the proposal email was not delivered.",
-    name: serialized.name,
-    code: serialized.code,
-    details: serialized.message,
-    region: AWS_REGION,
-    fromEmail: SES_FROM_EMAIL,
-    hasAwsAccessKey: Boolean(
-      process.env.AWS_ACCESS_KEY_ID,
-    ),
-    hasAwsSecretKey: Boolean(
-      process.env.AWS_SECRET_ACCESS_KEY,
-    ),
-    proposalUrl,
-  });
-}
+        const sent = await sendGmailMessage(gmailSender, {
+          fromName: senderName,
+          fromEmail: gmailSender.accountEmail,
+          to: recipientEmail,
+          subject: content.subject,
+          html: content.html,
+          text: content.text,
+          sendId: claimId,
+        });
 
-    const sentAt = new Date().toISOString();
+        delivery = {
+          gmailMessageId: sent.gmailMessageId,
+          gmailThreadId: sent.gmailThreadId,
+          fromEmail: gmailSender.accountEmail,
+          sentAt: new Date().toISOString(),
+        };
 
-    const nextStatus =
-      estimate.status === "draft" ||
-      estimate.status === "ready"
-        ? "sent"
-        : estimate.status;
+        // The outbound message in the contact's email thread. Best-effort:
+        // the email is already delivered, and gmail-sync imports it anyway.
+        const history = await persistGmailApiSentEmail(admin, {
+          orgId,
+          gmailMessageId: sent.gmailMessageId,
+          gmailThreadId: sent.gmailThreadId,
+          rfcMessageId: sent.rfcMessageId,
+          fromEmail: gmailSender.accountEmail,
+          to: recipientEmail,
+          subject: content.subject,
+          body: content.text,
+        });
+        historyRecorded = history.persisted;
+      } catch (emailError) {
+        if (!(emailError instanceof GmailSendError)) {
+          // Unknown failure inside the send: Gmail may have accepted it, so
+          // the claim is kept (blocks an immediate duplicate) and rethrown.
+          throw emailError;
+        }
 
-    const {
-      error: sentUpdateError,
-    } = await admin
-      .from("estimates")
-      .update({
-        status: nextStatus,
-        sent_at: sentAt,
-      })
-      .eq("id", estimate.id)
-      .eq("org_id", orgId);
-
-    if (sentUpdateError) {
-      logDatabaseError(
-        "Email delivered but sent-state update failed",
-        sentUpdateError,
-      );
-
-      return json(500, {
-        error:
-          "The proposal email was delivered, but the estimate status could not be updated.",
-        proposalUrl,
-      });
-    }
-
-    const {
-      error: activityError,
-    } = await admin
-      .from("estimate_activities")
-      .insert({
-        org_id: orgId,
-        estimate_id: estimate.id,
-        version_number: estimate.version_number,
-        activity_type: "sent",
-        actor_type: "user",
-        actor_id: user.id,
-        title: isFirstSend
-          ? "Proposal sent"
-          : "Proposal re-sent",
-        description: `Sent to ${recipientEmail}`,
-        metadata: {
-          delivery_channel: "email",
-          sent_at: sentAt,
-        },
-      });
-
-    if (activityError) {
-      // Do not report the email as failed after confirmed delivery.
-      logDatabaseError(
-        "Sent activity insert failed",
-        activityError,
-      );
-    }
-
-    const workflowUrl = `${
-      process.env.URL ??
-      getAppBaseUrl(event)
-    }/.netlify/functions/execute-workflow`;
-
-    void fetch(workflowUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        orgId,
-        triggerType: "estimate_sent",
-        triggerData: {
+        console.error("[estimate-send] Gmail delivery failed", {
           estimateId: estimate.id,
-          estimateNumber: estimate.number,
-          version: estimate.version_number,
-          status: nextStatus,
-          total: totals.total,
-          depositAmount: totals.depositAmount,
-          clientId: estimate.client_id,
-          ownerId: user.id,
-          occurredAt: sentAt,
-        },
-      }),
-    }).catch((workflowError: unknown) => {
-      console.warn(
-        "[estimate-send] Workflow trigger failed",
-        serializeError(workflowError),
-      );
+          code: emailError.code,
+          maybeSent: emailError.maybeSent,
+        });
+
+        // A definite failure sent nothing, so the user may retry at once. An
+        // ambiguous one is held for reconciliation against Sent mail on the
+        // next attempt — never assumed failed, never resent automatically.
+        if (emailError.maybeSent) {
+          await updateEmailSendClaim(
+            admin,
+            "estimates",
+            { id: estimate.id, orgId, claimId },
+            { state: "delivery_unknown" },
+          );
+        } else {
+          await releaseEmailSendClaim(admin, "estimates", {
+            id: estimate.id,
+            orgId,
+            claimId,
+          });
+        }
+
+        const role = emailError.action
+          ? await resolveMemberRole(admin, user.id, orgId)
+          : null;
+
+        return json(emailError.httpStatus, {
+          ...emailError.toResponseBody({
+            canManageIntegrations: role === "owner",
+          }),
+          proposalUrl,
+        });
+      }
+    }
+
+    const sentAt = delivery.sentAt;
+
+    // Mark sent (same UPDATE that closes the claim), activity, workflow,
+    // Deal sync — shared with the customer-view recovery in
+    // lib/estimate-send-completion.ts.
+    const finalized = await completeEstimateSend(admin, {
+      estimate,
+      claimId,
+      delivery,
+      recipientEmail,
+      actorUserId: user.id,
+      totals: { total: totals.total, depositAmount: totals.depositAmount },
+      recordedAfterRetry: recoveredUnrecordedSend,
+      workflowBaseUrl: process.env.URL ?? getAppBaseUrl(event),
     });
 
-    // Deal sync is advisory: the email already delivered and the estimate
-    // is already marked sent above, so a sync failure here must never turn
-    // this successful send into an error response — it's logged and the
-    // response still reports success either way.
-    try {
-      const syncResult = await syncEstimateDeal(admin, {
-        estimateId: estimate.id, orgId, trigger: "sent", actorUserId: user.id,
-      });
-      if (!syncResult.ok) {
-        logDealSyncWarning("sent -> deal sync failed (non-blocking)", { estimateId: estimate.id, orgId, error: syncResult.error });
+    if (!finalized.ok) {
+      console.error(
+        "[estimate-send] Email delivered but sent-state update failed",
+        { estimateId: estimate.id, reason: finalized.error },
+      );
+
+      // Remember the delivery so the next Send finishes recording instead
+      // of emailing the customer again (see lib/email-send-claim.ts).
+      if (!recoveredUnrecordedSend) {
+        await updateEmailSendClaim(
+          admin,
+          "estimates",
+          { id: estimate.id, orgId, claimId },
+          {
+            state: "sent_unrecorded",
+            gmailMessageId: delivery.gmailMessageId,
+            gmailThreadId: delivery.gmailThreadId,
+            fromEmail: delivery.fromEmail,
+            sentAt,
+          },
+        );
       }
-    } catch (syncError) {
-      logDealSyncWarning("sent -> deal sync threw (non-blocking)", { estimateId: estimate.id, orgId, error: serializeError(syncError).message });
+
+      // Success, because Gmail accepted the message — reporting a failure
+      // here would invite a duplicate resend.
+      return json(200, {
+        ok: true,
+        recorded: false,
+        code: "email_sent_not_recorded",
+        warning:
+          "The proposal email was sent from your Gmail account, but RenoMeta could not update the estimate. Click Send again to finish recording it — the customer will not get a second email.",
+        publicToken,
+        proposalUrl,
+        status: estimate.status,
+        gmailMessageId: delivery.gmailMessageId,
+        gmailThreadId: delivery.gmailThreadId,
+        fromEmail: delivery.fromEmail,
+        sentAt,
+      });
     }
 
     return json(200, {
       ok: true,
       publicToken,
       proposalUrl,
-      status: nextStatus,
+      status: finalized.nextStatus,
       total: totals.total,
       depositAmount: totals.depositAmount,
       balanceDue: totals.balanceDue,
       sentAt,
+      recorded: true,
+      historyRecorded,
+      gmailMessageId: delivery.gmailMessageId,
+      gmailThreadId: delivery.gmailThreadId,
+      fromEmail: delivery.fromEmail,
     });
   } catch (error) {
     const serialized = serializeError(error);

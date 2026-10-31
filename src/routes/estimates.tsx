@@ -39,6 +39,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
+import { type EmailSendFailure, parseEmailSendAction, toastEmailSendFailure } from "@/lib/email-send-errors";
 import { supabase } from "@/lib/supabase";
 import { AddressAutocomplete } from "@/components/ui/address-autocomplete";
 import { useContacts } from "@/lib/contacts-store";
@@ -350,18 +351,21 @@ export async function fetchEstimateById(orgId: string, estimateId: string): Prom
   return mapEstimateRow(r, items, (contactRes.data as any)?.full_name ?? null, (companyRes.data as any)?.name ?? null, ownerName);
 }
 
-/** Posts to estimate-send.ts: ensures a public_token, recalculates totals server-side, transitions draft/ready -> sent, and emails the client their proposal link. */
-async function sendEstimateProposal(estimateId: string): Promise<{ ok: boolean; proposalUrl?: string; error?: string }> {
+/** Posts to estimate-send.ts: ensures a public_token, recalculates totals server-side, transitions draft/ready -> sent, and emails the client their proposal link from the org's connected Gmail account. */
+async function sendEstimateProposal(estimateId: string, opts: { confirmResend?: boolean } = {}): Promise<{ ok: boolean; proposalUrl?: string; warning?: string } & EmailSendFailure> {
   const { data: { session } } = await supabase.auth.getSession();
   if (!session) return { ok: false, error: "Not signed in" };
   const res = await fetch("/.netlify/functions/estimate-send", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
-    body: JSON.stringify({ estimateId }),
+    body: JSON.stringify({ estimateId, ...(opts.confirmResend ? { confirmResend: true } : {}) }),
   });
   const d = await res.json().catch(() => ({}));
-  if (!res.ok || d.error) return { ok: false, error: d.error || "Failed to send proposal" };
-  return { ok: true, proposalUrl: d.proposalUrl };
+  if (!res.ok || d.error) {
+    return { ok: false, error: d.error || "Failed to send proposal", code: d.code, action: parseEmailSendAction(d.action), canConfirmResend: d.canConfirmResend === true };
+  }
+  // Gmail accepted the email but the estimate update failed — not an error (a retry finishes recording without re-emailing).
+  return { ok: true, proposalUrl: d.proposalUrl, warning: typeof d.warning === "string" ? d.warning : undefined };
 }
 
 // ── Customer / Account picker (shared shape with New Project's picker) ────────
@@ -919,9 +923,23 @@ export function EstimateFormSheet({
 
       if (sendAfter) {
         phase = "send proposal";
-        const result = await sendEstimateProposal(estimateId);
-        if (!result.ok) toast.error(result.error ?? "Estimate saved, but sending failed");
-        else toast.success("Proposal sent to client");
+        const sentId = estimateId;
+        const result = await sendEstimateProposal(sentId);
+        if (!result.ok) {
+          // "Send anyway" (after an unconfirmed earlier send) runs after this sheet has closed.
+          toastEmailSendFailure(result, "Estimate saved, but sending failed", {
+            onConfirmResend: () => void sendEstimateProposal(sentId, { confirmResend: true }).then((retry) => {
+              if (!retry.ok) toastEmailSendFailure(retry, "Failed to send proposal");
+              else if (retry.warning) toast.warning(retry.warning);
+              else toast.success("Proposal sent to client");
+              onSaved();
+            }),
+          });
+        } else if (result.warning) {
+          toast.warning(result.warning);
+        } else {
+          toast.success("Proposal sent to client");
+        }
       }
 
       onSaved();
@@ -2055,13 +2073,14 @@ function EstimatesPage() {
   };
 
   const [sendingId, setSendingId] = useState<string | null>(null);
-  const handleSend = async (id: string) => {
+  const handleSend = async (id: string, confirmResend = false) => {
     // Early, friendlier refusal; the server (estimate-send.ts) is authoritative.
     const target = estimates.find((x) => x.id === id);
     if (target?.estimate_items.some((i) => i.price_pending)) { toast.error(UNPRICED_ESTIMATE_ERROR); return; }
     setSendingId(id);
-    const result = await sendEstimateProposal(id);
-    if (!result.ok) toast.error(result.error ?? "Failed to send proposal");
+    const result = await sendEstimateProposal(id, { confirmResend });
+    if (!result.ok) toastEmailSendFailure(result, "Failed to send proposal", { onConfirmResend: () => void handleSend(id, true) });
+    else if (result.warning) toast.warning(result.warning);
     else {
       toast.success("Proposal sent to client");
       setSelected(s => (s?.id === id ? { ...s, status: "sent" } : s));

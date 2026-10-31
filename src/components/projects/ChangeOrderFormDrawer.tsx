@@ -44,6 +44,7 @@ import {
   type ChangeOrder, type ChangeOrderLineItem, type ChangeOrderApproval, type EffectiveChangeOrderLineage,
 } from "@/lib/project-change-orders";
 import { sendChangeOrderForApproval } from "@/lib/change-order-approvals";
+import { EmailSendRequestError, toastEmailSendFailure } from "@/lib/email-send-errors";
 import { checkChangeOrderPermission } from "@/lib/change-order-permissions";
 import { getOrgId } from "@/lib/contacts-store";
 import { supabase } from "@/lib/supabase";
@@ -372,24 +373,32 @@ export function ChangeOrderFormDrawer({ changeOrderId, projectId, open, onOpenCh
     }
   }
 
-  async function handleSend(isResend: boolean) {
+  async function handleSend(isResend: boolean, confirmResend = false) {
     if (!co) return;
     setBusy(true);
     try {
-      const result = await sendChangeOrderForApproval(co.id);
-      await navigator.clipboard.writeText(result.approvalUrl).catch(() => {});
-      toast.success(
-        isResend
-          ? `Approval link copied${result.emailDelivered ? " and resent by email" : ""}`
-          : `Sent${result.emailDelivered ? " by email" : ""} — approval link copied to clipboard`,
-      );
-      if (!result.emailDelivered && result.recipientEmail) {
-        toast.warning("Email delivery failed — share the copied link with the customer directly.");
+      const result = await sendChangeOrderForApproval(co.id, { confirmResend });
+      if (result.recorded === false && result.warning) {
+        // Gmail accepted the email; marking the Change Order sent is still pending.
+        toast.warning(result.warning);
+      } else if (result.recoveredEarlierSend) {
+        toast.success(`Change Order recorded as sent — the customer already has the email${result.fromEmail ? ` from ${result.fromEmail}` : ""}`);
+      } else {
+        if (result.approvalUrl) await navigator.clipboard.writeText(result.approvalUrl).catch(() => {});
+        toast.success(
+          isResend
+            ? `Approval link copied${result.emailDelivered ? " and resent by email" : ""}`
+            : `Sent${result.emailDelivered ? " by email" : ""} — approval link copied to clipboard`,
+        );
       }
       await load();
       onChanged();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not send this Change Order");
+      if (err instanceof EmailSendRequestError) {
+        toastEmailSendFailure(err.toFailure(), "Could not send this Change Order", { onConfirmResend: () => void handleSend(isResend, true) });
+      } else {
+        toast.error(err instanceof Error ? err.message : "Could not send this Change Order");
+      }
     } finally {
       setBusy(false);
     }

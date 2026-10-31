@@ -5,10 +5,9 @@
 // Estimate Assistant safety hardening — the SEND GATE. Drives the REAL
 // netlify/functions/estimate-send.ts handler (the one function that creates
 // the public proposal token, emails the customer and marks an estimate sent)
-// with `@supabase/supabase-js` aliased to the in-memory fake client and
-// `@aws-sdk/client-sesv2` aliased to a recording stub. No live Supabase, no
-// SES, no network (global fetch — used for the advisory workflow trigger — is
-// a recording stub).
+// with `@supabase/supabase-js` aliased to the in-memory fake client. No live
+// Supabase, no Gmail, no network: global fetch is a recording stub that also
+// answers Google tokeninfo / Gmail send (support/gmail-stub.ts).
 //
 // Proves: an estimate with ANY `price_pending` line is refused before a
 // token/row update/email/activity/workflow event; a fully priced estimate
@@ -27,19 +26,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 process.env.SUPABASE_URL = "http://127.0.0.1:1";
 process.env.SUPABASE_SERVICE_ROLE_KEY = "test-key";
 process.env.CONNECT_APP_URL = "https://connect.test";
+const { gmailStub, gmailIntegration, installFetchStub } = await import("./support/gmail-stub.ts");
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..", "..");
 const outDir = mkdtempSync(path.join(tmpdir(), "estimate-send-gate-"));
 after(() => rmSync(outDir, { recursive: true, force: true }));
 
-const fetchCalls: string[] = [];
-const realFetch = globalThis.fetch;
-globalThis.fetch = (async (url: unknown) => { fetchCalls.push(String(url)); return new Response("{}", { status: 200 }); }) as typeof fetch;
-after(() => { globalThis.fetch = realFetch; });
-
-const sesSent: unknown[] = [];
-(globalThis as any).__SES_SENT = sesSent;
+after(installFetchStub());
 
 const noisy = ["log", "warn", "error", "info"] as const;
 const saved = noisy.map((k) => (console as any)[k]);
@@ -51,7 +45,6 @@ const fakeModules = {
   name: "fake-externals",
   setup(build: any) {
     build.onResolve({ filter: /^@supabase\/supabase-js$/ }, () => ({ path: "supabase", namespace: "fake" }));
-    build.onResolve({ filter: /^@aws-sdk\/client-sesv2$/ }, () => ({ path: "ses", namespace: "fake" }));
     build.onLoad({ filter: /^supabase$/, namespace: "fake" }, () => ({
       loader: "js",
       contents: `
@@ -61,12 +54,6 @@ const fakeModules = {
             from: (t) => globalThis.__TEST_DB.from(t),
           };
         }`,
-    }));
-    build.onLoad({ filter: /^ses$/, namespace: "fake" }, () => ({
-      loader: "js",
-      contents: `
-        export class SendEmailCommand { constructor(input) { this.input = input; } }
-        export class SESv2Client { async send(cmd) { globalThis.__SES_SENT.push(cmd.input); return { MessageId: "msg-1" }; } }`,
     }));
   },
 };
@@ -111,6 +98,10 @@ function setDb(overrides: Record<string, any[]> = {}, status = "draft") {
   const db = createFakeSupabaseClient(
     {
       profiles: [{ id: USER, organization_id: ORG, first_name: "Owen", last_name: "Owner" }],
+      org_memberships: [{ org_id: ORG, member_id: USER, role: "owner" }],
+      member_permissions: [],
+      integrations: [gmailIntegration(ORG)],
+      gmail_messages: [],
       organizations: [{ id: ORG, name: "Acme Remodeling", public_name: null, ai_center_settings: {} }],
       contacts: [{ id: CONTACT, org_id: ORG, full_name: "Jane Homeowner", email: "jane@example.com", phone: null }],
       leads: [{ id: LEAD, org_id: ORG, contact_id: CONTACT }],
@@ -130,8 +121,7 @@ function setDb(overrides: Record<string, any[]> = {}, status = "draft") {
   );
   (globalThis as any).__TEST_DB = db;
   (globalThis as any).__TEST_USER_ID = USER;
-  sesSent.length = 0;
-  fetchCalls.length = 0;
+  gmailStub.reset();
   return db;
 }
 
@@ -146,9 +136,9 @@ function assertNothingWentOut(db: any) {
   assert.equal(e.public_token, null, "no public proposal token may be created");
   assert.equal(e.sent_at, undefined, "sent_at must not be set");
   assert.equal(e.total, 0, "no canonical-totals 'preparation' write either");
-  assert.equal(sesSent.length, 0, "no email may be sent");
+  assert.equal(gmailStub.sentMime.length, 0, "no email may be sent");
   assert.equal(db.__dumpTable("estimate_activities").length, 0, "no 'sent' activity may imply success");
-  assert.equal(fetchCalls.length, 0, "no estimate_sent workflow trigger");
+  assert.equal(gmailStub.workflowCalls.length, 0, "no estimate_sent workflow trigger");
 }
 
 // ── pure gate semantics ─────────────────────────────────────────────────
@@ -188,7 +178,7 @@ test("A2 — the gate applies in every sendable status: ready, and a RE-send of 
     const r = await send();
     assert.equal(r.status, 422, status);
     assert.equal(estimateRow(db).status, status, `${status}: status unchanged`);
-    assert.equal(sesSent.length, 0, status);
+    assert.equal(gmailStub.sentMime.length, 0, status);
     assert.equal(estimateRow(db).public_token, null, status);
   }
 });
@@ -218,7 +208,7 @@ test("B — a fully priced estimate sends exactly as before: 200, token, email, 
   assert.equal(e.total, 200);
   assert.equal(e.public_token, r.body.publicToken);
   assert.ok(e.sent_at);
-  assert.equal(sesSent.length, 1);
+  assert.equal(gmailStub.sentMime.length, 1);
   assert.equal(db.__dumpTable("estimate_activities").filter((a: any) => a.activity_type === "sent").length, 1);
 });
 
@@ -229,7 +219,7 @@ test("C — a legitimate $0 line (unmarked) is NOT blocked solely because it equ
   const r = await send();
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.equal(estimateRow(db).status, "sent");
-  assert.equal(sesSent.length, 1);
+  assert.equal(gmailStub.sentMime.length, 1);
 });
 
 test("C2 — a stale price_pending marker on a row that now has a real price does not block", async () => {
@@ -252,7 +242,7 @@ test("D — a draft holding AI placeholder lines (rows shaped exactly like creat
   assert.equal(blocked.body.error, UNPRICED_ERROR);
   assert.equal(db.__dumpTable("estimates")[0].status, "draft");
   assert.equal(db.__dumpTable("estimates")[0].public_token ?? null, null);
-  assert.equal(sesSent.length, 0);
+  assert.equal(gmailStub.sentMime.length, 0);
 
   // Owner prices SOME lines — still blocked until ALL are priced.
   const price = (name: string, p: number) => db.from("estimate_items").update({ unit_price: p, total: p, metadata: {} }).eq("estimate_id", estimateId).eq("name", name);
