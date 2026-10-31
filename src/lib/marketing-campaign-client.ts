@@ -32,7 +32,8 @@ export async function previewAudience(input: { channel: "email" | "sms"; segment
   return data;
 }
 
-export type SendCampaignResult = { ok: true; campaign: any; recipientsQueued: number; recipientsExcluded: number };
+/** `notice`: e.g. a Gmail daily-limit warning for a large email campaign (see marketing-campaign-send.ts). */
+export type SendCampaignResult = { ok: true; campaign: any; recipientsQueued: number; recipientsExcluded: number; notice?: string };
 
 export async function sendCampaign(input: { campaignId: string; mode: "now" | "schedule"; scheduledAt?: string }): Promise<SendCampaignResult> {
   const res = await fetch("/.netlify/functions/marketing-campaign-send", {

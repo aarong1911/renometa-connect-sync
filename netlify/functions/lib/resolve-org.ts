@@ -1,8 +1,8 @@
 // netlify/functions/lib/resolve-org.ts
 //
-// Shared bearer-token -> organization resolution for the new SMTP secret
-// endpoints (smtp-config-save.ts, smtp-config-status.ts,
-// smtp-disconnect.ts). Same precedence already used throughout this repo
+// Shared bearer-token -> organization resolution for the SMTP secret
+// endpoints (smtp-config-status.ts; smtp-config-save.ts and
+// smtp-disconnect.ts now use resolveIntegrationManager below). Same precedence already used throughout this repo
 // (profiles.organization_id first, org_memberships fallback) — extracted
 // here only for these new endpoints so they don't each carry their own
 // copy; existing functions' own inline copies are left untouched.
@@ -126,6 +126,47 @@ export async function resolveOrgAndAuthority(
   // coarse flag, fail-closed (only an exact 'owner' match authorizes).
   const fallbackRole = profile?.role === "owner" ? "owner" : (profile?.role ?? null);
   return { orgId, isOwnerOrAdmin: fallbackRole === "owner", role: fallbackRole };
+}
+
+export const INTEGRATION_OWNER_ONLY_ERROR = "Only your organization owner can change this connection.";
+/** No org_memberships row and no legacy profiles.role — the account has no role in its org at all. */
+export const INTEGRATION_NO_ROLE_ERROR =
+  "Your account isn't set up with a role in this organization, so it can't change this connection. Contact RenoMeta support to restore your owner access.";
+
+export type ResolvedIntegrationManager =
+  | { ok: true; userId: string; orgId: string }
+  | { ok: false; statusCode: 401 | 403; error: string };
+
+// Gate for endpoints that change an org-wide integration connection
+// (Gmail OAuth connect/disconnect, Gmail SMTP save/disconnect). Settings →
+// Integrations is owner-only in the app (src/lib/permissions.ts), and
+// lib/gmail-send.ts already tells every other role to ask the owner — this
+// enforces the same rule server-side, so a non-owner calling the endpoint
+// directly can't connect, replace, or remove the org's mailbox. Read-only
+// status endpoints and gmail-sync stay open to every org member.
+//
+// "Owner" is exactly what resolveOrgAndAuthority returns: org_memberships
+// .role = 'owner' for the caller's org, or — only when the caller has no
+// membership row there at all — the legacy profiles.role = 'owner'. It
+// deliberately does NOT accept organizations.created_by: that column is
+// writable through the browser's organizations updates (RLS not in this
+// repo), so trusting it could let any member who can edit the org row make
+// themselves owner. Orgs whose owner lacks a membership row need their
+// membership restored, not a looser check here.
+export async function resolveIntegrationManager(
+  supabaseAdmin: SupabaseClient,
+  authHeader: string | undefined,
+): Promise<ResolvedIntegrationManager> {
+  const token = authHeader?.slice(7);
+  if (!token) return { ok: false, statusCode: 401, error: "Unauthorized" };
+  const { data: { user } } = await supabaseAdmin.auth.getUser(token);
+  if (!user) return { ok: false, statusCode: 401, error: "Invalid token" };
+
+  const { orgId, role } = await resolveOrgAndAuthority(supabaseAdmin, user.id);
+  if (!orgId) return { ok: false, statusCode: 403, error: "No organization found for this user" };
+  if (!role) return { ok: false, statusCode: 403, error: INTEGRATION_NO_ROLE_ERROR };
+  if (role !== "owner") return { ok: false, statusCode: 403, error: INTEGRATION_OWNER_ONLY_ERROR };
+  return { ok: true, userId: user.id, orgId };
 }
 
 // Re-confirms a user still belongs to a SPECIFIC org, server-side — for

@@ -1047,14 +1047,21 @@ export function IntegrationConfigDrawer({
               <Link2 className="h-5 w-5 text-muted-foreground" />
             </div>
             <div>
-              <SheetTitle className="text-base">{int.name}</SheetTitle>
+              <SheetTitle className="text-base">{int.id === "gmail" ? "Gmail — legacy SMTP sending" : int.name}</SheetTitle>
               <SheetDescription className="text-xs">{integration.vendor}</SheetDescription>
             </div>
           </div>
         </SheetHeader>
 
         <div className="space-y-5 px-1">
-          <p className="text-sm text-muted-foreground">{integration.description}</p>
+          {/* Gmail's main connection is "Connect with Google" on the card;
+              this drawer only edits an existing org's legacy App Password,
+              used for replies and campaigns while Google can't send. */}
+          <p className="text-sm text-muted-foreground">
+            {int.id === "gmail"
+              ? "Legacy sending with a Gmail App Password. RenoMeta uses it for Conversations replies and email campaigns only while your Google account isn't connected or needs reconnecting. Estimates and change orders always use your Google connection."
+              : integration.description}
+          </p>
 
           <div className="flex flex-wrap gap-1.5">
             {integration.syncBadges.map((b) => (

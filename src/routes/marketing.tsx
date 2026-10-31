@@ -4002,10 +4002,12 @@ function CreateCampaignSheet({ open, editingCampaign, onClose, onManageAudiences
         const res = await sendCampaign({ campaignId: campaign.id, mode: "now" });
         upsertCampaignFromRow(res.campaign);
         toast.success(`Queued for ${res.recipientsQueued} recipients`);
+        if (res.notice) toast.warning(res.notice, { duration: 12000 });
       } else if (mode === "later") {
         const res = await sendCampaign({ campaignId: campaign.id, mode: "schedule", scheduledAt: new Date(scheduledFor).toISOString() });
         upsertCampaignFromRow(res.campaign);
         toast.success(`Scheduled for ${new Date(scheduledFor).toLocaleString()}`);
+        if (res.notice) toast.warning(res.notice, { duration: 12000 });
       } else {
         toast.success("Saved as draft");
       }

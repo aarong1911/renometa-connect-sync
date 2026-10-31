@@ -4,7 +4,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Link2, Search, Plug, CheckCircle2, Circle, AlertTriangle, RefreshCw, Loader2 } from "lucide-react";
+import { Link2, Search, Plug, CheckCircle2, Circle, AlertTriangle, Loader2 } from "lucide-react";
 import { INTEGRATIONS, CATEGORIES, type Integration, type CategoryId } from "@/lib/integrations-data";
 import { MOCK_MODE } from "@/lib/mock-mode";
 import { IntegrationConfigDrawer } from "@/components/integrations/integration-config-drawer";
@@ -23,7 +23,8 @@ import {
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
 import { getOrgId } from "@/lib/org-id";
-import { gmailNeedsReconnect as gmailNeedsReconnectFor, type GmailSyncHealth } from "@/lib/gmail-connection-health";
+import { describeGmailOAuthReturn, type GmailConnectionStatus } from "@/lib/gmail-connection-health";
+import { GmailConnectionPanel } from "@/components/integrations/gmail-connection-panel";
 
 export const Route = createFileRoute("/settings/integrations")({
   component: IntegrationsSettings,
@@ -97,15 +98,13 @@ function IntegrationsSettings() {
         throw new Error(err.error ?? "Disconnect failed");
       }
       setGmailSmtpEmail(null);
-      updateConnectionStatus("gmail", false);
-      toast.success("Gmail sending credentials disconnected");
+      toast.success("Legacy SMTP sending removed");
       setGmailSmtpDisconnectConfirmOpen(false);
     } catch (err: any) {
-      toast.error(`Failed to disconnect: ${err.message}`);
+      toast.error(`Failed to remove SMTP sending: ${err.message}`);
     } finally {
       setGmailSmtpDisconnecting(false);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ── Gmail "SYNC INBOX" state (OAuth) ────────────────────────────────────
@@ -114,30 +113,15 @@ function IntegrationsSettings() {
   // apikey concept) — this reads the real OAuth `integrations` table via
   // gmail-connection-status.ts, and drives Connect/Reconnect/Sync/
   // Disconnect for the Gmail card specifically.
-  type GmailStatus = {
-    connected: boolean;
-    accountEmail: string | null;
-    hasRefreshToken: boolean;
-    tokenExpiresAt: string | null;
-    lastSyncAt: string | null;
-    lastSyncStatus: string | null;
-    syncError: string | null;
-    // Sync health, reported separately from the OAuth connection above.
-    syncHealth: GmailSyncHealth | null;
-    lastSuccessfulSyncAt: string | null;
-    lastFailedSyncAt: string | null;
-  };
-  const [gmailStatus, setGmailStatus] = useState<GmailStatus | null>(null);
+  // The OAuth connection is what the Gmail card's Connected/Not connected
+  // count reflects — the legacy SMTP setup is shown inside the card only.
+  const [gmailStatus, setGmailStatus] = useState<GmailConnectionStatus | null>(null);
   const [gmailStatusLoading, setGmailStatusLoading] = useState(true);
   const [gmailStatusError, setGmailStatusError] = useState<string | null>(null);
   const [gmailSyncing, setGmailSyncing] = useState(false);
   const [gmailConnecting, setGmailConnecting] = useState(false);
   const [gmailDisconnecting, setGmailDisconnecting] = useState(false);
   const [gmailDisconnectConfirmOpen, setGmailDisconnectConfirmOpen] = useState(false);
-
-  // An expired access token alone no longer counts: gmail-sync renews it with
-  // the refresh token (see gmailNeedsReconnect).
-  const gmailNeedsReconnect = !!gmailStatus && gmailNeedsReconnectFor(gmailStatus);
 
   const fetchGmailStatus = useCallback(async () => {
     setGmailStatusLoading(true);
@@ -153,7 +137,9 @@ function IntegrationsSettings() {
         setGmailStatusError(err.error ?? "Failed to load Gmail status");
         return;
       }
-      setGmailStatus(await res.json());
+      const status: GmailConnectionStatus = await res.json();
+      setGmailStatus(status);
+      setIntegrations((prev) => prev.map((i) => (i.id === "gmail" ? { ...i, connected: status.connected === true } : i)));
     } catch {
       setGmailStatusError("Network error loading Gmail status");
     } finally {
@@ -166,19 +152,20 @@ function IntegrationsSettings() {
     fetchGmailStatus();
   }, [fetchGmailStatus]);
 
-  // gmail-oauth-callback.ts redirects back here with ?gmail=success|error
-  // (+ ?gmail_message=...) after the OAuth round trip — surface that once,
-  // refresh real status, then strip the params so a refresh doesn't re-show it.
+  // gmail-oauth-callback.ts redirects back here with
+  // ?gmail=success|partial|error (+ ?gmail_message=...) after the OAuth round
+  // trip — surface that once, refresh real status, then strip the params so a
+  // refresh doesn't re-show it.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const result = params.get("gmail");
     if (!result) return;
-    const message = params.get("gmail_message");
-    if (result === "success") {
-      toast.success("Gmail connected");
-      fetchGmailStatus();
-    } else if (result === "error") {
-      toast.error(message || "Gmail connection failed");
+    const outcome = describeGmailOAuthReturn(result, params.get("gmail_message"));
+    if (outcome) {
+      if (outcome.tone === "success") toast.success(outcome.text);
+      else if (outcome.tone === "warning") toast.warning(outcome.text, { duration: 10000 });
+      else toast.error(outcome.text, { duration: 10000 });
+      if (outcome.tone !== "error") fetchGmailStatus();
     }
     params.delete("gmail");
     params.delete("gmail_message");
@@ -360,6 +347,9 @@ function IntegrationsSettings() {
           // `integration_settings.google_ads` key, and this heuristic would
           // always read it as disconnected, clobbering the real status.
           if (i.id === "google-ads") return i;
+          // gmail is driven by the OAuth connection (fetchGmailStatus); the
+          // integration_settings.gmail key only describes legacy SMTP.
+          if (i.id === "gmail") return i;
           if (metaProductMap[i.id]) {
             return { ...i, connected: connectedProducts.includes(metaProductMap[i.id]) };
           }
@@ -647,138 +637,26 @@ function IntegrationsSettings() {
                     </div>
                   )}
 
-                  {/* Gmail has TWO independent capabilities that must never
-                      be conflated: sending mail (SMTP App Password, read
-                      directly by send-inbox-message.ts) and inbox sync
-                      (real OAuth connection via gmail-connection-status.ts).
-                      A reconnect-needed OAuth state must never read as
-                      "email sending is broken" — each gets its own status
-                      badge and actions. */}
+                  {/* Gmail: one "Connect with Google" path (inbox sync +
+                      estimate/change-order sending), with authorization and
+                      sync health shown separately. Legacy SMTP sending lives
+                      inside the panel — see gmail-connection-panel.tsx. */}
                   {i.id === "gmail" && !MOCK_MODE ? (
-                    <div className="mt-3 space-y-2">
-                      {/* SEND EMAIL */}
-                      <div className="rounded-md border border-border bg-muted/50 p-2.5">
-                        <div className="mb-1.5 flex items-center justify-between gap-2">
-                          <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Send Email (SMTP)</p>
-                          <span className={cn(
-                            "inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-semibold ring-1",
-                            gmailSmtpConfigured ? "bg-success-soft text-success ring-success/20" : "bg-secondary text-muted-foreground ring-border",
-                          )}>
-                            {gmailSmtpConfigured ? <CheckCircle2 className="h-2.5 w-2.5" /> : <Circle className="h-2 w-2" />}
-                            {gmailSmtpConfigured ? "Configured" : "Not configured"}
-                          </span>
-                        </div>
-                        {gmailSmtpConfigured && <p className="mb-1.5 truncate text-[11px] text-foreground">{gmailSmtpEmail}</p>}
-                        <div className="flex gap-2">
-                          <Button variant="outline" size="sm" className="h-6 px-2 text-[11px]" onClick={() => openDrawer(i)}>
-                            {gmailSmtpConfigured ? "Update credentials" : "Add credentials"}
-                          </Button>
-                          {gmailSmtpConfigured && (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-6 px-2 text-[11px] text-muted-foreground"
-                              onClick={() => setGmailSmtpDisconnectConfirmOpen(true)}
-                            >
-                              Disconnect
-                            </Button>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* SYNC INBOX */}
-                      <div className="rounded-md border border-border bg-muted/50 p-2.5">
-                        <div className="mb-1.5 flex items-center justify-between gap-2">
-                          <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Sync Inbox (OAuth)</p>
-                          <span className={cn(
-                            "inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-semibold ring-1",
-                            gmailStatus?.connected
-                              ? gmailNeedsReconnect
-                                ? "bg-warning-soft text-warning ring-warning/20"
-                                : "bg-success-soft text-success ring-success/20"
-                              : "bg-secondary text-muted-foreground ring-border",
-                          )}>
-                            {gmailStatus?.connected
-                              ? gmailNeedsReconnect
-                                ? <AlertTriangle className="h-2.5 w-2.5" />
-                                : <CheckCircle2 className="h-2.5 w-2.5" />
-                              : <Circle className="h-2 w-2" />}
-                            {gmailStatus?.connected ? (gmailNeedsReconnect ? "Needs reconnect" : "Connected") : "Not connected"}
-                          </span>
-                        </div>
-                        {gmailStatusLoading ? (
-                          <p className="mb-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground"><Loader2 className="h-3 w-3 animate-spin" /> Loading…</p>
-                        ) : gmailStatusError ? (
-                          <p className="mb-1.5 text-[11px] text-destructive">{gmailStatusError}</p>
-                        ) : gmailStatus?.connected ? (
-                          <div className="mb-1.5 space-y-0.5 text-[11px] text-foreground">
-                            <p><span className="font-semibold">Account:</span> {gmailStatus.accountEmail ?? "Unknown"}</p>
-                            <p className="flex items-center gap-1">
-                              <span className="font-semibold">Sync:</span>
-                              {gmailStatus.syncHealth === "ok" ? (
-                                <span className="inline-flex items-center gap-1 text-success"><CheckCircle2 className="h-3 w-3" /> Working</span>
-                              ) : gmailStatus.syncHealth === "failing" || gmailStatus.syncHealth === "auth_error" ? (
-                                <span className="inline-flex items-center gap-1 text-destructive"><AlertTriangle className="h-3 w-3" /> Failing</span>
-                              ) : (
-                                <span className="text-muted-foreground">Waiting for the first sync</span>
-                              )}
-                            </p>
-                            <p>
-                              <span className="font-semibold">Last successful sync:</span> {fmtGmailTimestamp(gmailStatus.lastSuccessfulSyncAt)}
-                            </p>
-                            {gmailStatus.lastFailedSyncAt && (
-                              <p>
-                                <span className="font-semibold">Last failed attempt:</span> {fmtGmailTimestamp(gmailStatus.lastFailedSyncAt)}
-                              </p>
-                            )}
-                            {gmailStatus.syncError && <p className="text-destructive">{gmailStatus.syncError}</p>}
-                            {gmailNeedsReconnect && (
-                              <p className="flex items-center gap-1 text-warning">
-                                <AlertTriangle className="h-3 w-3" /> Reconnect to keep syncing
-                              </p>
-                            )}
-                          </div>
-                        ) : (
-                          <p className="mb-1.5 text-[11px] text-muted-foreground">Not connected yet.</p>
-                        )}
-                        <div className="flex gap-2">
-                          {gmailStatus?.connected && !gmailNeedsReconnect && (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              className="h-6 px-2 text-[11px]"
-                              disabled={gmailSyncing}
-                              onClick={handleSyncGmail}
-                              title="Manually pull recent Gmail messages into Conversations"
-                            >
-                              {gmailSyncing ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : <RefreshCw className="mr-1 h-3 w-3" />}
-                              {gmailSyncing ? "Syncing…" : "Sync Gmail"}
-                            </Button>
-                          )}
-                          {(!gmailStatus?.connected || gmailNeedsReconnect) && (
-                            <Button
-                              size="sm"
-                              className="h-6 px-2 text-[11px]"
-                              disabled={gmailConnecting}
-                              onClick={handleConnectGmail}
-                            >
-                              {gmailConnecting ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : null}
-                              {gmailConnecting ? "Connecting…" : gmailStatus?.connected ? "Reconnect Gmail" : "Connect Gmail"}
-                            </Button>
-                          )}
-                          {gmailStatus?.connected && (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-6 px-2 text-[11px] text-muted-foreground"
-                              onClick={() => setGmailDisconnectConfirmOpen(true)}
-                            >
-                              Disconnect
-                            </Button>
-                          )}
-                        </div>
-                      </div>
-                    </div>
+                    <GmailConnectionPanel
+                      status={gmailStatus}
+                      loading={gmailStatusLoading}
+                      statusError={gmailStatusError}
+                      connecting={gmailConnecting}
+                      syncing={gmailSyncing}
+                      onConnect={handleConnectGmail}
+                      onSync={handleSyncGmail}
+                      onDisconnect={() => setGmailDisconnectConfirmOpen(true)}
+                      onRetryStatus={fetchGmailStatus}
+                      smtpEmail={gmailSmtpEmail}
+                      onManageSmtp={() => openDrawer(i)}
+                      onRemoveSmtp={() => setGmailSmtpDisconnectConfirmOpen(true)}
+                      formatTimestamp={fmtGmailTimestamp}
+                    />
                   ) : i.id === "google-calendar" && !MOCK_MODE ? (
                     /* Phase 10.3 — read-only. No OAuth connect/callback flow
                        exists in this repo for Google Calendar; the app
@@ -958,16 +836,20 @@ function IntegrationsSettings() {
         open={drawerOpen}
         onOpenChange={setDrawerOpen}
         onDisconnect={(integration) => {
-          updateConnectionStatus(integration.id, false);
+          // For gmail the drawer only edits legacy SMTP sending — the card's
+          // connected state belongs to the Google (OAuth) connection.
           if (integration.id === "gmail") setGmailSmtpEmail(null);
+          else updateConnectionStatus(integration.id, false);
           setDrawerOpen(false);
         }}
         onConnect={(integration) => {
-          handleConnect(integration);
-          if (integration.id === "gmail") {
-            // The drawer just saved organizations.integration_settings.gmail
-            // — refetch so the card's configured-email display updates
-            // without a full page reload.
+          if (integration.id !== "gmail") {
+            handleConnect(integration);
+          } else {
+            // The drawer already toasted "credentials saved" and wrote
+            // organizations.integration_settings.gmail — refetch so the
+            // card's SMTP email updates without a full page reload.
+            setDrawerOpen(false);
             getOrgId().then(async (orgId) => {
               if (!orgId) return;
               const { data: org } = await supabase.from("organizations").select("integration_settings").eq("id", orgId).maybeSingle();
@@ -1006,10 +888,25 @@ function IntegrationsSettings() {
           <AlertDialogHeader>
             <AlertDialogTitle className="flex items-center gap-2">
               <AlertTriangle className="h-4 w-4 text-destructive" />
-              Disconnect Gmail inbox sync?
+              Disconnect Google account?
             </AlertDialogTitle>
-            <AlertDialogDescription>
-              This revokes RenoMeta Connect's OAuth access to {gmailStatus?.accountEmail ?? "this Gmail account"} and stops future inbox syncing. Previously synced email history is kept, and sending email via SMTP is not affected — you can reconnect at any time.
+            <AlertDialogDescription asChild>
+              <div className="space-y-2">
+                <p>
+                  RenoMeta's access to <span className="font-medium text-foreground break-all">{gmailStatus?.accountEmail ?? "this Google account"}</span> will be revoked for your whole organization.
+                </p>
+                <ul className="list-disc space-y-1 pl-5">
+                  <li>New email stops syncing into Conversations.</li>
+                  <li>Replies, estimates, change orders and email campaigns can't be sent from this account until you reconnect.</li>
+                  <li>
+                    {gmailSmtpEmail
+                      ? "Replies and campaigns will send from your legacy SMTP account instead."
+                      : "Email campaigns that are still sending pause until you reconnect."}
+                  </li>
+                  <li>Email already synced stays in RenoMeta.</li>
+                </ul>
+                <p>You can reconnect at any time.</p>
+              </div>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1058,10 +955,12 @@ function IntegrationsSettings() {
           <AlertDialogHeader>
             <AlertDialogTitle className="flex items-center gap-2">
               <AlertTriangle className="h-4 w-4 text-destructive" />
-              Disconnect Gmail sending?
+              Remove legacy SMTP sending?
             </AlertDialogTitle>
             <AlertDialogDescription>
-              This removes the saved Gmail App Password for {gmailSmtpEmail ?? "this account"} — Conversations will no longer be able to send email until new credentials are added. Inbox sync (if connected) is not affected.
+              This deletes the saved Gmail App Password for {gmailSmtpEmail ?? "this account"}. {gmailStatus?.connected
+                ? "Your Google account keeps sending everything — replies, estimates, change orders and campaigns."
+                : "Conversations replies and email campaigns stop sending until you connect your Google account."}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

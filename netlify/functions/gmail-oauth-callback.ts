@@ -20,6 +20,33 @@ import { encryptToBytea } from "./lib/gmail-token-crypto";
 import { buildGmailRedirectUri, logGmailOAuthEnvDiagnostics } from "./lib/gmail-oauth-shared";
 import { getAppConfigs } from "./lib/app-config-store";
 import { GMAIL_SYNC_AUTH_ERROR } from "./lib/gmail-sync-health";
+import { INTEGRATION_OWNER_ONLY_ERROR, resolveOrgAndAuthority } from "./lib/resolve-org";
+import { fetchGmailAccountEmail } from "./lib/gmail-send";
+
+// Google's consent screen lets the user untick individual permissions. The
+// connection is still saved (whatever was granted keeps working), but the
+// user is told right away which feature won't work instead of finding out
+// on their first estimate send. Compares against the scopes this app
+// actually requested (GOOGLE_GMAIL_SCOPES) — never a hard-coded list.
+export function missingGmailScopes(requested: string | undefined, granted: unknown): string[] {
+  if (typeof granted !== "string") return [];
+  const grantedSet = new Set(granted.split(/\s+/).filter(Boolean));
+  return (requested ?? "")
+    .split(/\s+/)
+    .filter((s) => s.includes("/auth/gmail."))
+    .filter((s) => !grantedSet.has(s));
+}
+
+function partialGrantMessage(missing: string[]): string {
+  const cantRead = missing.some((s) => s.endsWith("/gmail.readonly"));
+  const cantSend = missing.some((s) => s.endsWith("/gmail.send"));
+  const what =
+    cantRead && cantSend ? "read or send email"
+    : cantRead ? "read email, so inbox sync won't work"
+    : cantSend ? "send email, so estimates and change orders can't be emailed"
+    : "use every Gmail feature";
+  return `Google connected, but permission to ${what}. Click Reconnect and leave every Gmail box checked.`;
+}
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -35,7 +62,7 @@ const supabaseAdmin = createClient(
 // setup missing every one of these vars would just redirect to production
 // instead of silently defaulting to the wrong scheme/host for a real user.
 function settingsRedirect(
-  status: "success" | "error",
+  status: "success" | "partial" | "error",
   message?: string,
 ) {
   const base =
@@ -102,6 +129,14 @@ export const handler: Handler = async (event) => {
   }
   const orgId: string = stateRow.org_id;
 
+  // The state was minted for the org owner (gmail-oauth-start.ts) up to 10
+  // minutes ago — re-check they still own this org before saving a mailbox
+  // for everyone in it.
+  const authority = stateRow.user_id ? await resolveOrgAndAuthority(supabaseAdmin, stateRow.user_id) : null;
+  if (!authority || authority.orgId !== orgId || authority.role !== "owner") {
+    return settingsRedirect("error", INTEGRATION_OWNER_ONLY_ERROR);
+  }
+
   // Env-footprint reduction (2026-09) — see google-ads-config.ts's header;
   // supabaseAdmin already exists at module scope, so these are not
   // bootstrap secrets and resolve via app_config_secrets instead.
@@ -155,20 +190,19 @@ export const handler: Handler = async (event) => {
       return settingsRedirect("error", "Google did not return an access token");
     }
 
-    // Connected account email — used for display only, never for auth.
+    // Connected account email — shown in Settings/Conversations, used as the
+    // From address, and as the Gmail sync cursor's account check. Never
+    // used for auth.
     //
-    // Current GOOGLE_GMAIL_SCOPES (see .env) is gmail.readonly + gmail.send
-    // only — no openid/email/profile scope is requested, and this function
+    // The legacy oauth2/v2/userinfo endpoint only reliably returns `email`
+    // when an identity scope (email/openid) was granted, and this function
     // never requests one on its own (broadening scope requires new user
-    // consent, which is out of scope here). The legacy
-    // oauth2/v2/userinfo endpoint has nonetheless always returned `email`
-    // for this app under those scopes (see accountEmail below, populated
-    // successfully for every existing connection) — it may also return
-    // `picture` without needing an explicit `profile` scope grant, since
-    // that field reflects public Google Account profile data rather than
-    // Gmail API access. Captured opportunistically here: if Google includes
-    // it, it's stored; if not, `accountPictureUrl` stays null and nothing
-    // else changes. This is not a new API call and not a scope change.
+    // consent). At least one production connection was saved with a NULL
+    // email, so when userinfo has none, Gmail's own users.getProfile is
+    // asked instead — it returns the mailbox address under gmail.readonly,
+    // which the app already requests. `picture` is captured from userinfo
+    // opportunistically; if absent, `accountPictureUrl` stays null. No
+    // scope change.
     let accountEmail: string | null = null;
     let accountPictureUrl: string | null = null;
     try {
@@ -185,6 +219,8 @@ export const handler: Handler = async (event) => {
     } catch (e: any) {
       console.warn("[gmail-oauth-callback] userinfo fetch failed:", e.message);
     }
+    if (!accountEmail) accountEmail = await fetchGmailAccountEmail(accessToken);
+    if (!accountEmail) console.warn("[gmail-oauth-callback] connected account address could not be determined");
 
     const { data: existing } = await supabaseAdmin
       .from("integrations")
@@ -251,6 +287,11 @@ export const handler: Handler = async (event) => {
       }
     }
 
+    const missing = missingGmailScopes(process.env.GOOGLE_GMAIL_SCOPES, tokenJson.scope);
+    if (missing.length > 0) {
+      console.warn("[gmail-oauth-callback] connected without some requested Gmail scopes", { missing });
+      return settingsRedirect("partial", partialGrantMessage(missing));
+    }
     return settingsRedirect("success");
   } catch (err: any) {
     console.error("[gmail-oauth-callback] unhandled error:", err.message);

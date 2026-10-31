@@ -3,10 +3,27 @@ import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import nodemailer from "nodemailer";
 import crypto from "node:crypto";
-import { getOrgSecret, setOrgSecret } from "./lib/org-secret-store";
+import { setOrgSecret } from "./lib/org-secret-store";
 import { getMetaPageAccessToken, MetaPageTokenMissingError } from "./lib/meta-page-access";
 import { MetaGraphApiError } from "./lib/meta-graph-api";
-import { persistSmtpSentEmail, type SmtpSentEmailInput } from "./lib/gmail-sent-reconcile";
+import {
+  persistGmailApiSentEmail,
+  persistSmtpSentEmail,
+  SMTP_THREAD_ID_PREFIX,
+  type SmtpSentEmailInput,
+} from "./lib/gmail-sent-reconcile";
+import {
+  findSentGmailMessage,
+  formatFromHeader,
+  GmailSendError,
+  isValidRecipientEmail,
+  sendGmailMessage,
+  type GmailSender,
+  type GmailSendResult,
+  type OutgoingEmail,
+} from "./lib/gmail-send";
+import { resolveContractorEmailRoute, smtpFallbackNotice, type ContractorEmailRoute } from "./lib/contractor-email";
+import { resolveOrgAndAuthority } from "./lib/resolve-org";
 
 const CORS = {
   "Content-Type": "application/json",
@@ -42,6 +59,66 @@ function toE164(raw: string): string {
   if (digits.length === 10) return `+1${digits}`;
   if (digits.length === 11 && digits[0] === "1") return `+${digits}`;
   return raw.startsWith("+") ? raw : `+${digits}`;
+}
+
+/** "Re: <subject>" for a reply, without stacking prefixes. */
+export function replySubject(threadSubject: string): string {
+  const s = threadSubject.trim();
+  return /^re:/i.test(s) ? s : `Re: ${s}`;
+}
+
+/**
+ * Structured Gmail error body (code / action / maybeSent — see GmailSendError).
+ * Only the org owner is offered the Connect/Reconnect link; everyone else is
+ * told to ask the owner, matching estimate and change-order sends.
+ */
+async function gmailErrorResponse(err: GmailSendError, userId: string) {
+  const { role } = await resolveOrgAndAuthority(supabaseAdmin, userId);
+  return {
+    statusCode: err.httpStatus,
+    headers: CORS,
+    body: JSON.stringify(err.toResponseBody({ canManageIntegrations: role === "owner" })),
+  };
+}
+
+/**
+ * One Conversations reply through the Gmail API, never sent twice by this
+ * function:
+ *   - A definite rejection while filing into an existing thread (e.g. a
+ *     thread synced from a different Google account) is retried ONCE as a new
+ *     thread — Gmail refused the first attempt, so nothing went out.
+ *   - An ambiguous result (5xx, network, no id) is looked up in Sent mail by
+ *     its X-RenoMeta-Send-Id. Found -> treated as sent. Not found -> reported
+ *     as "may have been sent" (maybeSent) and never resent automatically.
+ */
+export async function sendConversationViaGmail(
+  sender: GmailSender,
+  outgoing: OutgoingEmail,
+  gmailThreadId: string | null,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ sent: GmailSendResult } | { error: GmailSendError }> {
+  const claimedAt = new Date();
+  const attempt = async (threadId: string | null) => {
+    try {
+      return { sent: await sendGmailMessage(sender, outgoing, fetchImpl, { gmailThreadId: threadId }) };
+    } catch (err) {
+      if (err instanceof GmailSendError) return { error: err };
+      throw err;
+    }
+  };
+
+  let result: { sent: GmailSendResult } | { error: GmailSendError } = await attempt(gmailThreadId);
+  if ("error" in result && gmailThreadId && result.error.code === "email_provider_rejected") {
+    result = await attempt(null);
+  }
+  if ("error" in result && result.error.maybeSent && outgoing.sendId) {
+    const lookup = await findSentGmailMessage(sender, { sendId: outgoing.sendId, claimedAt }, fetchImpl);
+    if (lookup.status === "found") {
+      // The Message-ID Gmail stored isn't known here; gmail-sync fills it in.
+      return { sent: { gmailMessageId: lookup.gmailMessageId, gmailThreadId: lookup.gmailThreadId, rfcMessageId: "" } };
+    }
+  }
+  return result;
 }
 
 export const handler: Handler = async (event) => {
@@ -104,9 +181,14 @@ export const handler: Handler = async (event) => {
   // Populated from each provider's own send response below — never
   // fabricated, left null if a provider response doesn't include one.
   let providerMessageId: string | null = null;
-  // Email only: set right after sendMail() succeeds; persisted into
-  // gmail_messages below (see lib/gmail-sent-reconcile.ts).
-  let emailToPersist: SmtpSentEmailInput | null = null;
+  // Email only: set right after the provider accepted the message; persisted
+  // into gmail_messages below (see lib/gmail-sent-reconcile.ts).
+  let persistEmail: (() => Promise<{ persisted: boolean }>) | null = null;
+  // Email only: the RFC Message-ID of what was sent (the client keys its
+  // local echo on it), and a notice when legacy SMTP sent instead of Gmail.
+  let emailRfcMessageId: string | null = null;
+  let emailNotice: string | null = null;
+  let emailProvider: "gmail" | "smtp" | null = null;
 
   try {
     if (channel === "sms") {
@@ -152,49 +234,17 @@ export const handler: Handler = async (event) => {
       const twilioResult: any = await res.json().catch(() => ({}));
       providerMessageId = twilioResult?.sid ?? null;
     } else if (channel === "email") {
-      // Fetch org's Gmail email + (legacy, possibly still-plaintext)
-      // integration_settings in one read.
-      const { data: orgForEmail } = await supabaseAdmin
-        .from("organizations")
-        .select("integration_settings")
-        .eq("id", orgId)
-        .maybeSingle();
-
-      const gmail = orgForEmail?.integration_settings?.gmail;
-      if (!gmail?.email) {
-        return {
-          statusCode: 422,
-          headers: CORS,
-          body: JSON.stringify({ error: "Gmail not configured — go to Settings → Integrations → Gmail to add your credentials" }),
-        };
+      // Which account sends: the org's Google connection (Gmail API) when it
+      // is usable, otherwise legacy SMTP — see lib/contractor-email.ts. A
+      // missing/broken connection with no SMTP to fall back to is reported
+      // with connect/reconnect guidance before anything is sent.
+      let route: ContractorEmailRoute;
+      try {
+        route = await resolveContractorEmailRoute(supabaseAdmin, orgId);
+      } catch (err) {
+        if (err instanceof GmailSendError) return await gmailErrorResponse(err, user.id);
+        throw err;
       }
-
-      // Password source, in order: the encrypted secret table (current,
-      // correct storage — see org-secret-store.ts), then a legacy
-      // plaintext password still sitting in integration_settings.gmail
-      // (pre-migration orgs). Never log which path was used beyond this
-      // boolean — never the value itself, encrypted or plaintext.
-      let smtpPassPlain = await getOrgSecret(supabaseAdmin, orgId, "gmail", "smtp_app_password");
-      const usedLegacyPlaintext = !smtpPassPlain && !!gmail.appPassword;
-      if (!smtpPassPlain && gmail.appPassword) {
-        smtpPassPlain = String(gmail.appPassword);
-      }
-      if (!smtpPassPlain) {
-        return {
-          statusCode: 422,
-          headers: CORS,
-          body: JSON.stringify({ error: "Gmail not configured — go to Settings → Integrations → Gmail to add your credentials" }),
-        };
-      }
-
-      // Google's UI displays an App Password as "xxxx xxxx xxxx xxxx" (16
-      // real characters + 3 spaces = 19) for readability when the user
-      // copies it — but Gmail's SMTP AUTH expects the bare 16-character
-      // value with no spaces. Stripped here regardless of source (secret
-      // table or legacy plaintext) so an already-bad stored value still
-      // works without needing a data migration first.
-      const smtpUser = gmail.email.trim();
-      const smtpPass = smtpPassPlain.replace(/\s+/g, "");
 
       // Standards-based reply threading: only attempted when the client
       // tells us this is a reply to an existing Gmail thread. A lookup
@@ -202,16 +252,19 @@ export const handler: Handler = async (event) => {
       // is best-effort on top of a send that already works without it.
       let inReplyTo: string | undefined;
       let referencesHeader: string | undefined;
+      let threadSubject: string | null = null;
+      let threadKnown = false;
       if (email_thread_id) {
         try {
           const { data: threadRows } = await supabaseAdmin
             .from("gmail_messages")
-            .select("rfc_message_id, references_header, labels, internal_date")
+            .select("rfc_message_id, references_header, labels, internal_date, subject")
             .eq("org_id", orgId)
             .eq("thread_id", email_thread_id)
             .order("internal_date", { ascending: false });
 
           const rows = (threadRows ?? []) as any[];
+          threadKnown = rows.length > 0;
           const isOutboundRow = (r: any) => Array.isArray(r.labels) && r.labels.includes("SENT");
           // Newest INBOUND message with a real Message-ID first; if none,
           // fall back to the newest message of any direction that has one.
@@ -226,65 +279,120 @@ export const handler: Handler = async (event) => {
               .join(" ")
               .trim() || undefined;
           }
+          threadSubject = rows.find((r) => typeof r.subject === "string" && r.subject.trim())?.subject ?? null;
         } catch (threadLookupErr: any) {
           console.warn("[send-inbox-message] threading header lookup failed (sending without):", threadLookupErr.message);
         }
       }
 
-      const transporter = nodemailer.createTransport({
-        service: "gmail",
-        auth: { user: smtpUser, pass: smtpPass },
-      });
-      const sendResult = await transporter.sendMail({
-        from: `${from_name ?? "RenoMeta Connect"} <${smtpUser}>`,
-        to,
-        subject: subject || "(no subject)",
-        text: body,
-        ...(inReplyTo ? { inReplyTo } : {}),
-        ...(referencesHeader ? { references: referencesHeader } : {}),
-      });
-      // Nodemailer's own generated (or provider-echoed) RFC Message-ID for
-      // this exact send — this is the "outbound identity" Gmail sync will
-      // later match against (see gmail-sync.ts's rfc_message_id column) to
-      // update this row instead of creating a duplicate.
-      providerMessageId = sendResult?.messageId ?? null;
-      if (providerMessageId) {
-        emailToPersist = {
-          orgId,
-          messageId: providerMessageId,
-          threadId: email_thread_id ?? null,
-          fromEmail: `${from_name ?? "RenoMeta Connect"} <${smtpUser}>`,
+      if (route.provider === "smtp") {
+        // Legacy SMTP (App Password) — unchanged behavior for orgs without a
+        // usable Google connection. The password is already whitespace-free
+        // (see loadSmtpCredentials) and never logged.
+        const smtpUser = route.smtp.email;
+        const smtpPass = route.smtp.password;
+        emailNotice = smtpFallbackNotice(route.gmailIssue);
+
+        const transporter = nodemailer.createTransport({
+          service: "gmail",
+          auth: { user: smtpUser, pass: smtpPass },
+        });
+        const sendResult = await transporter.sendMail({
+          from: `${from_name ?? "RenoMeta Connect"} <${smtpUser}>`,
           to,
           subject: subject || "(no subject)",
+          text: body,
+          ...(inReplyTo ? { inReplyTo } : {}),
+          ...(referencesHeader ? { references: referencesHeader } : {}),
+        });
+        // Nodemailer's own generated (or provider-echoed) RFC Message-ID for
+        // this exact send — this is the "outbound identity" Gmail sync will
+        // later match against (see gmail-sync.ts's rfc_message_id column) to
+        // update this row instead of creating a duplicate.
+        providerMessageId = sendResult?.messageId ?? null;
+        emailRfcMessageId = providerMessageId;
+        emailProvider = "smtp";
+        if (providerMessageId) {
+          const smtpRow: SmtpSentEmailInput = {
+            orgId,
+            messageId: providerMessageId,
+            threadId: email_thread_id ?? null,
+            fromEmail: `${from_name ?? "RenoMeta Connect"} <${smtpUser}>`,
+            to,
+            subject: subject || "(no subject)",
+            body,
+            inReplyTo: inReplyTo ?? null,
+            references: referencesHeader ?? null,
+          };
+          persistEmail = () => persistSmtpSentEmail(supabaseAdmin, smtpRow);
+        }
+
+        // Legacy-plaintext migration — only after the send has genuinely
+        // succeeded (a failed send shouldn't trigger a storage migration for
+        // a credential that just proved to not work). Best-effort: a
+        // migration failure here must not turn a successful send into an
+        // error response.
+        if (route.smtp.usedLegacyPlaintext) {
+          try {
+            const migrateResult = await setOrgSecret(supabaseAdmin, orgId, "gmail", "smtp_app_password", smtpPass);
+            if (migrateResult.ok) {
+              const { data: latestOrg } = await supabaseAdmin
+                .from("organizations")
+                .select("integration_settings")
+                .eq("id", orgId)
+                .maybeSingle();
+              const settings: Record<string, any> = { ...(latestOrg?.integration_settings ?? {}) };
+              if (settings.gmail) {
+                settings.gmail = { email: settings.gmail.email ?? smtpUser, configured: true };
+              }
+              await supabaseAdmin.from("organizations").update({ integration_settings: settings }).eq("id", orgId);
+            }
+          } catch (migrateErr: any) {
+            console.error("[send-inbox-message] legacy password migration failed (send still succeeded):", migrateErr.message);
+          }
+        }
+      } else {
+        // Gmail API from the org's connected Google account. Never falls back
+        // to SMTP once a send has been attempted: an unconfirmed Gmail send
+        // may already be in the customer's inbox.
+        if (!isValidRecipientEmail(to.trim())) {
+          return { statusCode: 422, headers: CORS, body: JSON.stringify({ error: "This contact's email address isn't valid — update it and try again." }) };
+        }
+        const sender = route.sender;
+        const outgoing: OutgoingEmail = {
+          fromName: from_name ?? null,
+          fromEmail: sender.accountEmail,
+          to: to.trim(),
+          // Gmail only files a reply into the thread when the subject matches.
+          subject: subject?.trim() || (inReplyTo && threadSubject ? replySubject(threadSubject) : "(no subject)"),
+          text: body,
+          sendId: crypto.randomUUID(),
+          ...(inReplyTo ? { inReplyTo } : {}),
+          ...(referencesHeader ? { references: referencesHeader } : {}),
+        };
+        // Temporary "smtp-thread:" ids belong to legacy sends Gmail hasn't synced yet.
+        const gmailThreadId = threadKnown && email_thread_id && !email_thread_id.startsWith(SMTP_THREAD_ID_PREFIX) ? email_thread_id : null;
+
+        const result = await sendConversationViaGmail(sender, outgoing, gmailThreadId);
+        if ("error" in result) return await gmailErrorResponse(result.error, user.id);
+
+        const sent = result.sent;
+        providerMessageId = sent.gmailMessageId;
+        emailRfcMessageId = sent.rfcMessageId || null;
+        emailProvider = "gmail";
+        const gmailRow = {
+          orgId,
+          gmailMessageId: sent.gmailMessageId,
+          gmailThreadId: sent.gmailThreadId,
+          rfcMessageId: sent.rfcMessageId,
+          fromEmail: sender.accountEmail ? formatFromHeader(outgoing.fromName, sender.accountEmail) : null,
+          to: outgoing.to,
+          subject: outgoing.subject,
           body,
           inReplyTo: inReplyTo ?? null,
           references: referencesHeader ?? null,
         };
-      }
-
-      // Legacy-plaintext migration — only after the send has genuinely
-      // succeeded (a failed send shouldn't trigger a storage migration for
-      // a credential that just proved to not work). Best-effort: a
-      // migration failure here must not turn a successful send into an
-      // error response.
-      if (usedLegacyPlaintext) {
-        try {
-          const migrateResult = await setOrgSecret(supabaseAdmin, orgId, "gmail", "smtp_app_password", smtpPass);
-          if (migrateResult.ok) {
-            const { data: latestOrg } = await supabaseAdmin
-              .from("organizations")
-              .select("integration_settings")
-              .eq("id", orgId)
-              .maybeSingle();
-            const settings: Record<string, any> = { ...(latestOrg?.integration_settings ?? {}) };
-            if (settings.gmail) {
-              settings.gmail = { email: settings.gmail.email ?? gmail.email, configured: true };
-            }
-            await supabaseAdmin.from("organizations").update({ integration_settings: settings }).eq("id", orgId);
-          }
-        } catch (migrateErr: any) {
-          console.error("[send-inbox-message] legacy password migration failed (send still succeeded):", migrateErr.message);
-        }
+        persistEmail = () => persistGmailApiSentEmail(supabaseAdmin, gmailRow);
       }
     } else if (channel === "whatsapp" || channel === "messenger" || channel === "instagram") {
       const productKey = channel === "whatsapp" ? "whatsapp" : channel === "messenger" ? "messenger" : "instagram";
@@ -558,16 +666,15 @@ export const handler: Handler = async (event) => {
     }
 
     if (channel === "email") {
-      // SMTP has already succeeded at this point (a failed sendMail() threw
-      // above and never reaches here, so no row is ever created for an
-      // unsent email). Persist into gmail_messages so the CRM thread shows
-      // it immediately; gmail-sync.ts re-keys it to the real Gmail id later.
-      // On any failure here the email is STILL sent — return ok:true with
-      // persisted:false (never an error, which would invite a duplicate
-      // resend) and let the client keep its local-echo fallback.
-      const outcome = emailToPersist
-        ? await persistSmtpSentEmail(supabaseAdmin, emailToPersist)
-        : { persisted: false };
+      // The provider has already accepted the message at this point (a
+      // failed send returned or threw above, so no row is ever created for
+      // an unsent email). Persist into gmail_messages so the CRM thread shows
+      // it immediately: SMTP rows get a temporary id that gmail-sync.ts
+      // re-keys later; Gmail API rows already carry the real Gmail id that
+      // sync will upsert onto. On any failure here the email is STILL sent —
+      // return ok:true with persisted:false (never an error, which would
+      // invite a duplicate resend) and let the client keep its local echo.
+      const outcome = persistEmail ? await persistEmail() : { persisted: false };
       if (!outcome.persisted) {
         persisted = false;
         persistWarning = "Email was sent, but saving it to conversation history failed. It will appear after the next Gmail sync.";
@@ -583,11 +690,15 @@ export const handler: Handler = async (event) => {
         ...(sentAsTemplate ? { templateName: templateNameUsed } : {}),
         persisted,
         ...(persistWarning ? { warning: persistWarning } : {}),
-        // Email-specific: nodemailer's RFC Message-ID for this send, so the
-        // client can attach it to its optimistic local echo — this is the
-        // strong-identity key gmail-sync.ts's rfc_message_id column will
-        // later match against to update this row instead of duplicating it.
-        ...(channel === "email" && providerMessageId ? { smtpMessageId: providerMessageId } : {}),
+        // Email-specific: the RFC Message-ID of this send, so the client can
+        // attach it to its optimistic local echo — the strong-identity key
+        // gmail-sync.ts's rfc_message_id column later matches against to
+        // update this row instead of duplicating it. `smtpMessageId` is kept
+        // for SMTP sends so an older client keeps working during a deploy.
+        ...(emailProvider ? { emailProvider } : {}),
+        ...(emailRfcMessageId ? { rfcMessageId: emailRfcMessageId } : {}),
+        ...(emailProvider === "smtp" && emailRfcMessageId ? { smtpMessageId: emailRfcMessageId } : {}),
+        ...(emailNotice ? { notice: emailNotice } : {}),
       }),
     };
   } catch (err: any) {

@@ -19,13 +19,19 @@
 //      client from doing either of these status writes directly; only
 //      this service_role-backed function can.
 //
+// Email campaigns send from the org's connected Google account (Gmail API)
+// or, for orgs without one, legacy Gmail SMTP — see lib/contractor-email.ts.
+//
 // Actual dispatch to Twilio/Gmail happens in
 // marketing-campaign-process-queue.ts, a scheduled function that claims
 // due work in bounded batches — see that file for the idempotency model.
 
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
-import { resolveOrgFromBearerToken } from "./lib/resolve-org";
+import { resolveOrgAndAuthority, resolveOrgFromBearerToken } from "./lib/resolve-org";
+import { resolveContractorEmailRoute } from "./lib/contractor-email";
+import { GmailSendError } from "./lib/gmail-send";
+import { gmailCampaignDailyCap, largeGmailCampaignNotice } from "./lib/gmail-campaign-pacing";
 import { validateAudienceFilters, resolveAudienceContacts, splitByChannelEligibility } from "../../src/lib/marketing-audience";
 
 const CORS = {
@@ -90,18 +96,27 @@ export const handler: Handler = async (event) => {
       return { statusCode: 422, headers: CORS, body: JSON.stringify({ error: "Message content cannot be empty" }) };
     }
 
-    // Verify the org actually has a configured provider for this channel
-    // before queuing anything — matches send-inbox-message.ts's checks.
-    const { data: org } = await supabaseAdmin.from("organizations").select("integration_settings").eq("id", orgId).maybeSingle();
+    // Verify the org actually has a usable provider for this channel before
+    // queuing anything. Email uses the same routing as Conversations
+    // (lib/contractor-email.ts): the Google connection, else legacy SMTP.
+    let emailProvider: "gmail_api" | "smtp" | null = null;
     if (campaign.campaign_type === "sms") {
+      const { data: org } = await supabaseAdmin.from("organizations").select("integration_settings").eq("id", orgId).maybeSingle();
       const twilio = org?.integration_settings?.twilio;
       if (!twilio?.accountSid || !twilio?.authToken || !twilio?.phoneNumber) {
         return { statusCode: 422, headers: CORS, body: JSON.stringify({ error: "Twilio not configured — go to Settings → Integrations → Twilio" }) };
       }
     } else {
-      const gmail = org?.integration_settings?.gmail;
-      if (!gmail?.email) {
-        return { statusCode: 422, headers: CORS, body: JSON.stringify({ error: "Gmail not configured — go to Settings → Integrations → Gmail" }) };
+      try {
+        emailProvider = (await resolveContractorEmailRoute(supabaseAdmin, orgId)).provider;
+      } catch (err) {
+        if (!(err instanceof GmailSendError)) throw err;
+        const { role } = await resolveOrgAndAuthority(supabaseAdmin, resolved.userId);
+        return {
+          statusCode: err.code === "email_provider_unavailable" ? 503 : 422,
+          headers: CORS,
+          body: JSON.stringify(err.toResponseBody({ canManageIntegrations: role === "owner" })),
+        };
       }
     }
 
@@ -171,10 +186,20 @@ export const handler: Handler = async (event) => {
       .single();
     if (updateErr) throw new Error(`Failed to update campaign status: ${updateErr.message}`);
 
+    // Gmail-routed campaigns are paced to the account's daily allowance
+    // (lib/gmail-campaign-pacing.ts) — say up front when that spans days.
+    const notice = emailProvider === "gmail_api" ? largeGmailCampaignNotice(eligible.length, gmailCampaignDailyCap()) : null;
+
     return {
       statusCode: 200,
       headers: CORS,
-      body: JSON.stringify({ ok: true, campaign: updatedCampaign, recipientsQueued: eligible.length, recipientsExcluded: excluded.length }),
+      body: JSON.stringify({
+        ok: true,
+        campaign: updatedCampaign,
+        recipientsQueued: eligible.length,
+        recipientsExcluded: excluded.length,
+        ...(notice ? { notice } : {}),
+      }),
     };
   } catch (err: any) {
     console.error("[marketing-campaign-send]", err.message);
