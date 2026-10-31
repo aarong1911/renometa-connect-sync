@@ -9,6 +9,7 @@
 // touching already-working code; this is for new callers (Conversations).
 
 import { supabase } from "@/lib/supabase";
+import type { GmailSyncHealth } from "@/lib/gmail-connection-health";
 
 export type GmailSyncResult =
   // `changed` = rows the server actually wrote (new messages + body backfills).
@@ -56,6 +57,10 @@ export type GmailConnectionStatus = {
   lastSyncAt: string | null;
   lastSyncStatus: string | null;
   syncError: string | null;
+  // Sync health, separate from the connection (see gmail-connection-status.ts).
+  syncHealth: GmailSyncHealth | null;
+  lastSuccessfulSyncAt: string | null;
+  lastFailedSyncAt: string | null;
 };
 
 export async function fetchGmailConnectionStatus(): Promise<GmailConnectionStatus | null> {

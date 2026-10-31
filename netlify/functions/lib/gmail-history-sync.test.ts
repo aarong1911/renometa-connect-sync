@@ -53,12 +53,22 @@ const INTEGRATION_A = "aaaaaaaa-0000-4000-8000-aaaaaaaaaaa1";
 const ACCOUNT = "sales@renometa.com";
 const OTHER_ACCOUNT = "other@renometa.com";
 
+// Same uniqueness production enforces: the primary key, plus the partial
+// unique index gmail_messages_org_rfc_message_id_uq (20260728). strictUpsert
+// makes the bulk upsert behave like the real single ON CONFLICT statement.
 function makeDb(rows: any[] = [], integrationsRows: any[] = []) {
   return createFakeSupabaseClient(
     { gmail_messages: rows, integrations: integrationsRows },
     {},
-    { uniqueConstraints: { gmail_messages: [["id"]] } },
+    { uniqueConstraints: { gmail_messages: [["id"], ["org_id", "rfc_message_id"]] }, strictUpsert: ["gmail_messages"] },
   ) as any;
+}
+/** A Gmail message carrying an explicit Message-ID header (and optional labels / receive time). */
+function detailWithRfc(id: string, rfc: string, over: Record<string, unknown> = {}): any {
+  return detail(id, {
+    payload: { mimeType: "text/plain", headers: [{ name: "From", value: "sam@example.com" }, { name: "Message-ID", value: rfc }], body: { data: b64u(`Body of ${id}`) } },
+    ...over,
+  });
 }
 const b64u = (s: string) => Buffer.from(s).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 function detail(id: string, over: Record<string, unknown> = {}): any {
@@ -333,13 +343,17 @@ test("22. a DIFFERENT connected Gmail account cannot inherit the old account's c
 test("23. org isolation: the 'already has a body, skip fetching' optimization is scoped by org_id, never by message id alone", async () => {
   // gmail_messages.id is the bare Gmail message id (no org_id in the primary
   // key, per the existing schema) — a message id genuinely existing for
-  // another org must still be fully fetched for THIS org rather than being
-  // mistaken for "already synced" because a same-id row exists elsewhere.
+  // another org must never be mistaken for "already synced" by THIS org.
+  // Since 2026-10-31 it can't be stored for this org either (that would move
+  // org B's row), so the sync fails explicitly instead (see C13).
   const db = makeDb([{ id: "shared-id", org_id: ORG_B, thread_id: "t", body_text: "org B's body", labels: [], direction: "in" }]);
   const { api, calls } = fakeGmail({ historyPages: [{ messageIds: ["shared-id"], historyId: "150" }], messages: { "shared-id": detail("shared-id") } });
-  const r: any = await S.runGmailMessageSync(db, ORG_A, INTEGRATION_A, { historyId: "100", accountEmail: ACCOUNT }, ACCOUNT, api);
-  assert.equal(calls.getMessage.length, 1, "org A has no row of its own yet, so it must still be fetched despite org B's row existing");
-  assert.equal(r.unchanged, 0, "not counted as an org-A row that already had a body");
+  await assert.rejects(
+    S.runGmailMessageSync(db, ORG_A, INTEGRATION_A, { historyId: "100", accountEmail: ACCOUNT }, ACCOUNT, api),
+    (err: any) => err instanceof S.GmailMessageOwnedByAnotherOrgError,
+    "not reported as an org-A row that already had a body",
+  );
+  assert.equal(calls.getMessage.length, 0, "fails before fetching anything from Gmail");
 });
 
 // ── PAGINATION / API COST ────────────────────────────────────────────────────
@@ -405,6 +419,315 @@ test("30. the sync result carries every field the frontend/auto-sync contract re
     assert.ok(key in r, `missing ${key}`);
   }
   assert.equal(typeof r.changed, "number");
+});
+
+// ── MESSAGE-ID COLLISIONS (production incident, 2026-10-27) ─────────────────
+//
+// Two distinct Gmail messages can carry the same Message-ID header. Before the
+// fix the batch upsert hit gmail_messages_org_rfc_message_id_uq, the cursor
+// (correctly) stayed put, and every later sync re-fetched and failed on the
+// same batch. These run against makeDb()'s production-equivalent constraints.
+
+const RFC = "<shared-1@mailer.example.com>";
+const DUP = "duplicate_rfc_message_id";
+const withCursor = () => [{ id: INTEGRATION_A, org_id: ORG_A, gmail_history_id: "100", gmail_history_id_account_email: ACCOUNT }];
+function runIncremental(db: any, ids: string[], messages: Record<string, any>) {
+  const { api, calls } = fakeGmail({ historyPages: [{ messageIds: ids, historyId: "150" }], messages });
+  return { calls, result: S.runGmailMessageSync(db, ORG_A, INTEGRATION_A, { historyId: "100", accountEmail: ACCOUNT }, ACCOUNT, api) as Promise<any> };
+}
+const byId = (db: any) => Object.fromEntries(messagesOf(db).map((m) => [m.id, m]));
+/** Wraps db so gmail_messages upserts go through `hook(payload, opts, realUpsert)` first. */
+function interceptUpserts(db: any, hook: (payload: any[], opts: any, real: () => Promise<any>, call: number) => Promise<any>) {
+  let call = 0;
+  return {
+    ...db,
+    from(t: string) {
+      const b = db.from(t);
+      if (t === "gmail_messages") {
+        const upsert = b.upsert.bind(b);
+        b.upsert = (payload: any[], opts: any) => hook(payload, opts, () => upsert(payload, opts), ++call);
+      }
+      return b;
+    },
+  };
+}
+
+test("C1. reproduction: two Gmail messages in ONE batch with the same Message-ID are both saved and the cursor advances", async () => {
+  const db = makeDb([], withCursor());
+  const { result } = runIncremental(db, ["g-inbox", "g-spam"], {
+    "g-inbox": detailWithRfc("g-inbox", RFC, { labelIds: ["INBOX"], internalDate: "2000" }),
+    "g-spam": detailWithRfc("g-spam", RFC, { labelIds: ["SPAM"], internalDate: "1000" }),
+  });
+  const r = await result;
+  assert.equal(r.changed, 2);
+  assert.equal(r.rfcCollisions, 1);
+  assert.equal(integrationsOf(db)[0].gmail_history_id, "150", "cursor advanced after the whole batch was saved");
+  const rows = byId(db);
+  assert.equal(Object.keys(rows).length, 2, "neither distinct Gmail message is dropped or merged");
+  assert.equal(rows["g-spam"].rfc_message_id, RFC, "no SENT copy -> the earliest internal_date keeps the Message-ID");
+  assert.equal(rows["g-inbox"].rfc_message_id, null);
+  assert.equal(rows["g-inbox"][DUP], RFC, "the original header is preserved");
+});
+
+test("C2. owner preference within a batch: the SENT copy, then earliest internal_date, then smallest id", async () => {
+  const db = makeDb([], withCursor());
+  const { result } = runIncremental(db, ["b-in", "a-in", "z-sent"], {
+    "b-in": detailWithRfc("b-in", RFC, { labelIds: ["INBOX"], internalDate: "1000" }),
+    "a-in": detailWithRfc("a-in", RFC, { labelIds: ["INBOX"], internalDate: "1000" }),
+    "z-sent": detailWithRfc("z-sent", RFC, { labelIds: ["SENT"], internalDate: "9000" }),
+  });
+  await result;
+  const rows = byId(db);
+  assert.equal(rows["z-sent"].rfc_message_id, RFC, "the SENT copy wins even though it is the latest");
+  assert.equal(rows["a-in"].rfc_message_id, null);
+  assert.equal(rows["b-in"].rfc_message_id, null);
+
+  const db2 = makeDb([], withCursor());
+  await runIncremental(db2, ["b-in", "a-in"], {
+    "b-in": detailWithRfc("b-in", RFC, { labelIds: ["INBOX"], internalDate: "1000" }),
+    "a-in": detailWithRfc("a-in", RFC, { labelIds: ["INBOX"], internalDate: "1000" }),
+  }).result;
+  assert.equal(byId(db2)["a-in"].rfc_message_id, RFC, "same time -> smallest id, deterministic");
+});
+
+test("C3. an incoming Message-ID already stored under a DIFFERENT Gmail id never overwrites that row", async () => {
+  const stored = { id: "g-old", org_id: ORG_A, thread_id: "t-old", body_text: "original body", labels: ["INBOX"], direction: "in", rfc_message_id: RFC };
+  const db = makeDb([stored], withCursor());
+  const { result } = runIncremental(db, ["g-new"], { "g-new": detailWithRfc("g-new", RFC, { labelIds: ["INBOX"] }) });
+  const r = await result;
+  assert.equal(r.rfcCollisions, 1);
+  const rows = byId(db);
+  assert.deepEqual(rows["g-old"], stored, "the stored owner is untouched, even if the new copy would sort first");
+  assert.equal(rows["g-new"].rfc_message_id, null);
+  assert.equal(rows["g-new"][DUP], RFC);
+  assert.equal(integrationsOf(db)[0].gmail_history_id, "150");
+});
+
+test("C4. the same Gmail id twice in one batch (overlapping bootstrap pages) is fetched and written once", async () => {
+  const db = makeDb([], [{ id: INTEGRATION_A, org_id: ORG_A, gmail_history_id: null, gmail_history_id_account_email: null }]);
+  const { api, calls } = fakeGmail({ listPages: [{ ids: ["m1", "m2"], nextPageToken: "p2" }, { ids: ["m2", "m3"] }], messages: { m1: detail("m1"), m2: detail("m2"), m3: detail("m3") } });
+  const r: any = await S.runGmailMessageSync(db, ORG_A, INTEGRATION_A, { historyId: null, accountEmail: null }, ACCOUNT, api);
+  assert.deepEqual([...calls.getMessage].sort(), ["m1", "m2", "m3"]);
+  assert.equal(messagesOf(db).length, 3);
+  assert.equal(r.cursorAdvanced, true, "no 'ON CONFLICT ... cannot affect row a second time' failure");
+});
+
+test("C5. a self-addressed Gmail API message (one Gmail id, SENT + INBOX) is one row and keeps its Message-ID", async () => {
+  const db = makeDb([], withCursor());
+  const r: any = await runIncremental(db, ["g-self"], { "g-self": detailWithRfc("g-self", RFC, { labelIds: ["SENT", "INBOX"] }) }).result;
+  assert.equal(r.rfcCollisions, 0);
+  const rows = messagesOf(db);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].rfc_message_id, RFC);
+  assert.equal(rows[0].direction, "out");
+});
+
+test("C6. a self-addressed SMTP send (temp smtp: row + separate SENT and INBOX copies) re-keys onto the SENT copy; the INBOX copy is kept separately", async () => {
+  const smtpRow = { id: "smtp:shared-1@mailer.example.com", org_id: ORG_A, thread_id: "smtp-thread:x", snippet: "Note to self", body_text: "Note to self", labels: ["SENT"], direction: "out", rfc_message_id: RFC };
+  const db = makeDb([smtpRow], withCursor());
+  const r: any = await runIncremental(db, ["g-in", "g-sent"], {
+    "g-in": detailWithRfc("g-in", RFC, { labelIds: ["INBOX"], internalDate: "1000" }),
+    "g-sent": detailWithRfc("g-sent", RFC, { labelIds: ["SENT"], internalDate: "1000" }),
+  }).result;
+  const rows = byId(db);
+  assert.deepEqual(Object.keys(rows).sort(), ["g-in", "g-sent"], "temp row re-keyed in place, nothing duplicated");
+  assert.equal(rows["g-sent"].rfc_message_id, RFC, "the outbound copy keeps the Message-ID (inbox optimistic-send matching relies on it)");
+  assert.equal(rows["g-in"].rfc_message_id, null);
+  assert.equal(rows["g-in"][DUP], RFC);
+  assert.equal(r.rfcCollisions, 1);
+});
+
+test("C7. concurrent writer: another sync stores the same Message-ID under a different id mid-flight -> re-resolved and retried, never overwritten", async () => {
+  const base = makeDb([], withCursor());
+  const competing = { id: "g-other", org_id: ORG_A, thread_id: "t", body_text: "theirs", labels: ["INBOX"], direction: "in", rfc_message_id: RFC };
+  const db = interceptUpserts(base, async (_payload, _opts, real, call) => {
+    if (call === 1) {
+      const { error } = await base.from("gmail_messages").insert({ ...competing });
+      assert.equal(error, null);
+    }
+    return real();
+  });
+  const r: any = await runIncremental(db, ["g-mine"], { "g-mine": detailWithRfc("g-mine", RFC, { labelIds: ["INBOX"] }) }).result;
+  const rows = byId(base);
+  assert.deepEqual(rows["g-other"], competing, "the concurrent writer's row is untouched");
+  assert.equal(rows["g-mine"].rfc_message_id, null);
+  assert.equal(rows["g-mine"][DUP], RFC);
+  assert.equal(r.rfcCollisions, 1);
+  assert.equal(integrationsOf(base)[0].gmail_history_id, "150");
+});
+
+test("C8. a conflict that keeps recurring is bounded: the sync fails, nothing is half-written and the cursor stays put", async () => {
+  const base = makeDb([], withCursor());
+  let calls = 0;
+  const db = interceptUpserts(base, async () => {
+    calls++;
+    return { data: null, error: { code: "23505", message: 'duplicate key value violates unique constraint "gmail_messages_org_rfc_message_id_uq"' } };
+  });
+  await assert.rejects(runIncremental(db, ["m1"], { m1: detail("m1") }).result, /Failed to save fetched messages/);
+  assert.equal(calls, S.RFC_RESOLVE_MAX_ATTEMPTS);
+  assert.equal(messagesOf(base).length, 0);
+  assert.equal(integrationsOf(base)[0].gmail_history_id, "100");
+});
+
+test("C9. any other write failure is not retried and never advances the cursor", async () => {
+  const base = makeDb([], withCursor());
+  let calls = 0;
+  const db = interceptUpserts(base, async () => {
+    calls++;
+    return { data: null, error: { code: "23505", message: 'duplicate key value violates unique constraint "gmail_messages_pkey"' } };
+  });
+  await assert.rejects(runIncremental(db, ["m1"], { m1: detail("m1") }).result);
+  assert.equal(calls, 1);
+  assert.equal(integrationsOf(base)[0].gmail_history_id, "100");
+});
+
+test("C10. a batch that fails on one row writes none of them (atomic), so a retry starts clean", async () => {
+  // Without the fix this exact batch is what blocked production; the fake's
+  // strict upsert must reject it as a whole, like Postgres does.
+  const db = makeDb([], withCursor());
+  const { error } = await db.from("gmail_messages").upsert(
+    [
+      { id: "x1", org_id: ORG_A, thread_id: "t", rfc_message_id: RFC },
+      { id: "x2", org_id: ORG_A, thread_id: "t", rfc_message_id: RFC },
+    ],
+    { onConflict: "id" },
+  );
+  assert.equal(error?.code, "23505");
+  assert.equal(messagesOf(db).length, 0);
+});
+
+test("C11. repeated syncs are idempotent: same rows, same owner, no duplicates", async () => {
+  const msgs = {
+    "g-a": detailWithRfc("g-a", RFC, { labelIds: ["INBOX"], internalDate: "1000" }),
+    "g-b": detailWithRfc("g-b", RFC, { labelIds: ["INBOX"], internalDate: "2000" }),
+  };
+  const db = makeDb([], withCursor());
+  await runIncremental(db, ["g-a", "g-b"], msgs).result;
+  const first = messagesOf(db);
+  // A sync whose cursor write lost a race (or an invalid-cursor bootstrap)
+  // sees the same ids again; a legacy no-body row forces a re-fetch too.
+  await S.processCandidateMessages(db, ORG_A, fakeGmail({ messages: msgs }).api, ["g-a", "g-b"]);
+  assert.deepEqual(messagesOf(db), first);
+
+  const legacy = makeDb([
+    { id: "g-a", org_id: ORG_A, thread_id: "t", body_text: "kept", labels: ["INBOX"], direction: "in", rfc_message_id: RFC },
+    { id: "g-b", org_id: ORG_A, thread_id: "t", body_text: null, labels: ["INBOX"], direction: "in", rfc_message_id: null, [DUP]: RFC },
+  ]);
+  await S.processCandidateMessages(legacy, ORG_A, fakeGmail({ messages: msgs }).api, ["g-a", "g-b"]);
+  const rows = byId(legacy);
+  assert.equal(rows["g-a"].rfc_message_id, RFC, "ownership never flips on a re-fetch");
+  assert.equal(rows["g-b"].rfc_message_id, null);
+  assert.equal(rows["g-b"][DUP], RFC);
+  assert.equal(rows["g-b"].body_text, "Body of g-b", "the re-fetch still backfilled the body");
+});
+
+test("C12. multi-org isolation: the same Message-ID in another org is neither an owner nor touched", async () => {
+  const orgBRow = { id: "g-b-copy", org_id: ORG_B, thread_id: "t", body_text: "org B", labels: ["INBOX"], direction: "in", rfc_message_id: RFC };
+  const db = makeDb([orgBRow], withCursor());
+  const r: any = await runIncremental(db, ["g-a-copy"], { "g-a-copy": detailWithRfc("g-a-copy", RFC) }).result;
+  assert.equal(r.rfcCollisions, 0);
+  const rows = byId(db);
+  assert.equal(rows["g-a-copy"].rfc_message_id, RFC, "unique per org, so org A keeps its own Message-ID");
+  assert.deepEqual(rows["g-b-copy"], orgBRow);
+});
+
+// The same Gmail account connected to two orgs (production has this: one
+// mailbox in three orgs). gmail_messages.id is the primary key on its own, so
+// a plain upsert on "id" would MOVE org B's row into org A; skipping it would
+// advance org A's cursor past mail it never stored. Both are wrong — the sync
+// must fail explicitly and leave everything as it was.
+const ORG_B_SECRET = "org B's private body";
+
+test("C13. same mailbox in two orgs: a batch with another org's message fails closed — nothing written, cursor kept, org B untouched", async () => {
+  const orgBRow = { id: "shared-id", org_id: ORG_B, thread_id: "t", body_text: ORG_B_SECRET, labels: ["INBOX"], direction: "in" };
+  const db = makeDb([orgBRow], withCursor());
+  const { calls, result } = runIncremental(db, ["m1", "shared-id"], { "shared-id": detail("shared-id"), m1: detail("m1") });
+  await assert.rejects(result, (err: any) => {
+    assert.ok(err instanceof S.GmailMessageOwnedByAnotherOrgError);
+    assert.match(err.message, /another RenoMeta organization/);
+    assert.ok(!err.message.includes(ORG_B) && !err.message.includes(ORG_B_SECRET) && !err.message.includes("shared-id"), "reveals nothing about the other org");
+    return true;
+  });
+  assert.deepEqual(messagesOf(db), [orgBRow], "org B's row untouched and m1 NOT saved — the whole batch waits");
+  assert.equal(integrationsOf(db)[0].gmail_history_id, "100", "cursor not advanced, so no message is skipped for good");
+  assert.equal(calls.getMessage.length, 0);
+});
+
+test("C13b. same mailbox in two orgs, first sync (bootstrap) of the second org: fails closed and no cursor is established", async () => {
+  const orgBRow = { id: "shared-id", org_id: ORG_B, thread_id: "t", body_text: ORG_B_SECRET, labels: ["INBOX"], direction: "in" };
+  const db = makeDb([orgBRow], [{ id: INTEGRATION_A, org_id: ORG_A, gmail_history_id: null, gmail_history_id_account_email: null }]);
+  const { api, calls } = fakeGmail({ listPages: [{ ids: ["shared-id", "m1"] }], messages: { "shared-id": detail("shared-id"), m1: detail("m1") } });
+  await assert.rejects(S.runGmailMessageSync(db, ORG_A, INTEGRATION_A, { historyId: null, accountEmail: null }, ACCOUNT, api), S.GmailMessageOwnedByAnotherOrgError);
+  assert.equal(calls.getProfile, 0);
+  assert.equal(integrationsOf(db)[0].gmail_history_id, null);
+  assert.deepEqual(messagesOf(db), [orgBRow]);
+});
+
+test("C13c. same mailbox in two orgs, race: org B stores the id after org A's check -> org B's row is not overwritten and org A fails closed", async () => {
+  const base = makeDb([], withCursor());
+  const orgBRow = { id: "race-id", org_id: ORG_B, thread_id: "t", body_text: ORG_B_SECRET, labels: ["INBOX"], direction: "in" };
+  const db = interceptUpserts(base, async (_payload, _opts, real, call) => {
+    if (call === 1) assert.equal((await base.from("gmail_messages").insert({ ...orgBRow })).error, null);
+    return real();
+  });
+  await assert.rejects(runIncremental(db, ["race-id"], { "race-id": detail("race-id") }).result, S.GmailMessageOwnedByAnotherOrgError);
+  assert.deepEqual(byId(base)["race-id"], orgBRow, "ON CONFLICT (id) DO NOTHING — never moved into org A");
+  assert.equal(integrationsOf(base)[0].gmail_history_id, "100");
+});
+
+test("C13d. a message this org already holds is still updated in place (the DO NOTHING insert is only for new ids)", async () => {
+  const legacy = { id: "mine", org_id: ORG_A, thread_id: "old-thread", body_text: null, labels: ["INBOX"], direction: "in" };
+  const db = makeDb([legacy], withCursor());
+  await runIncremental(db, ["mine"], { mine: detail("mine", { threadId: "new-thread" }) }).result;
+  const row = byId(db)["mine"];
+  assert.equal(row.thread_id, "new-thread");
+  assert.equal(row.body_text, "Body of mine");
+});
+
+test("C14. before migration 20261031: a missing duplicate_rfc_message_id column still saves the batch (header just not preserved)", async () => {
+  const base = makeDb([], withCursor());
+  let calls = 0;
+  const db = interceptUpserts(base, async (payload, _opts, real) => {
+    calls++;
+    if (payload.some((row) => DUP in row)) {
+      return { data: null, error: { code: "PGRST204", message: `Could not find the '${DUP}' column of 'gmail_messages' in the schema cache` } };
+    }
+    return real();
+  });
+  await runIncremental(db, ["g-1", "g-2"], {
+    "g-1": detailWithRfc("g-1", RFC, { internalDate: "1000" }),
+    "g-2": detailWithRfc("g-2", RFC, { internalDate: "2000" }),
+  }).result;
+  assert.equal(calls, 2);
+  const rows = byId(base);
+  assert.equal(rows["g-1"].rfc_message_id, RFC);
+  assert.equal(rows["g-2"].rfc_message_id, null);
+  assert.ok(!(DUP in rows["g-2"]));
+  assert.equal(integrationsOf(base)[0].gmail_history_id, "150");
+});
+
+test("C15. a batch with no collisions never sends the new column (works before and after the migration)", async () => {
+  const base = makeDb([], withCursor());
+  const db = interceptUpserts(base, async (payload, _opts, real) => {
+    assert.ok(payload.every((row) => !(DUP in row)));
+    return real();
+  });
+  await runIncremental(db, ["m1", "m2"], { m1: detail("m1"), m2: detail("m2") }).result;
+  assert.equal(messagesOf(base).length, 2);
+});
+
+test("assignRfcOwnership: pure decision — stored owner first, rows without a Message-ID untouched", () => {
+  const rows = [
+    { id: "n1", labels: ["INBOX"], internal_date: null, rfc_message_id: null },
+    { id: "k1", labels: ["INBOX"], internal_date: "2026-01-01T00:00:00.000Z", rfc_message_id: RFC },
+  ];
+  const original = new Map(rows.map((r) => [r.id, r.rfc_message_id]));
+  const out = S.assignRfcOwnership(rows, original, new Map([[RFC, "stored-elsewhere"]]));
+  assert.equal(out.rows[0].rfc_message_id, null);
+  assert.ok(!(DUP in out.rows[0]));
+  assert.equal(out.rows[1].rfc_message_id, null);
+  assert.equal(out.rows[1][DUP], RFC);
+  assert.deepEqual(out.demoted.map((d: any) => [d.id, d.ownerId, d.ownerStored]), [["k1", "stored-elsewhere", true]]);
 });
 
 // ── helper pure functions ───────────────────────────────────────────────────

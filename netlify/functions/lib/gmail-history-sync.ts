@@ -57,6 +57,38 @@
 // the cursor to be trusted — reconnecting Gmail as a DIFFERENT account can
 // never inherit the old account's cursor (see cursorIsUsable). Reconnecting
 // the SAME account keeps its existing cursor.
+//
+// MESSAGE-ID COLLISIONS (2026-10-31): gmail_messages_org_rfc_message_id_uq
+// (20260728) allows one row per (org_id, rfc_message_id), but Gmail does not
+// promise one message per Message-ID — the same header can arrive on two
+// distinct Gmail messages (a copy delivered twice, to an alias, to Spam, or
+// the separate Sent and Inbox copies of mail sent to yourself outside the
+// Gmail API). Before this fix such a batch failed its upsert as a whole, the
+// cursor (correctly) stayed put, and every later sync re-fetched the same
+// batch and failed again — Gmail sync stopped for the org from 2026-10-27.
+// See assignRfcOwnership / upsertFetchedRows for the resolution:
+//   - Gmail's message id stays the identity; every distinct message is kept.
+//   - One row per Message-ID keeps rfc_message_id: the row already stored
+//     for the org, else (within the batch) the SENT copy, then the earliest
+//     internal_date, then the smallest id. Deterministic, so retries and
+//     overlapping syncs agree, and a stored owner never changes.
+//   - Every other copy gets rfc_message_id = null and keeps the header in
+//     duplicate_rfc_message_id (20261031); before that migration it is saved
+//     without it rather than failing.
+//   - A concurrent writer claiming the Message-ID between the lookup and the
+//     upsert (23505 on that index) is re-resolved and retried, bounded.
+//
+// SAME GMAIL ACCOUNT IN TWO ORGS (fail closed): gmail_messages.id is the bare
+// Gmail message id — the primary key has no org_id — so two orgs syncing one
+// mailbox cannot both store a message. An upsert on "id" used to MOVE the
+// other org's row into this one. Now a batch containing ids another org holds
+// fails with GmailMessageOwnedByAnotherOrgError before any write; new rows
+// are inserted with ON CONFLICT (id) DO NOTHING and verified afterwards, so a
+// race between the two orgs can't overwrite either. The cursor never moves
+// past such a batch, so nothing is silently skipped; the sync stays failed
+// (with that message) until one org disconnects. Real support for one mailbox
+// in several orgs needs a primary key of (org_id, id) plus matching changes
+// to every writer and reader of gmail_messages ids — not done here.
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { extractGmailBody, type GmailPayloadPart } from "./gmail-mime";
@@ -69,6 +101,11 @@ export const BOOTSTRAP_MAX_PAGES = Math.ceil(BOOTSTRAP_MAX_MESSAGES / BOOTSTRAP_
 export const HISTORY_PAGE_SIZE = 500; // Gmail's max for history.list; cheap event records, not full messages
 export const HISTORY_MAX_PAGES = 25; // safety cap against a pathological loop, never expected to be hit in practice
 export const DETAIL_FETCH_CONCURRENCY = 8;
+export const RFC_RESOLVE_MAX_ATTEMPTS = 3; // upsert attempts when a concurrent writer claims a Message-ID mid-flight
+const RFC_LOOKUP_CHUNK = 50; // Message-IDs per `in (...)` filter, keeps the PostgREST URL short
+
+/** Holds the Message-ID header of a copy that cannot keep it in rfc_message_id (migration 20261031). */
+export const DUPLICATE_RFC_COLUMN = "duplicate_rfc_message_id";
 
 // ── Gmail API surface this module needs, injected so tests never touch the network ──
 
@@ -194,7 +231,201 @@ function splitAddressList(raw: string | null): string[] | null {
   return parts.length > 0 ? parts : null;
 }
 
-export type ProcessOutcome = { fetched: number; inserted: number; updated: number; skipped: number; unchanged: number; changed: number };
+// ── Message-ID collisions (see the module header) ───────────────────────────
+
+/** A gmail_messages row as built from a fetched Gmail message (the fields collision handling reads). */
+export type FetchedMessageRow = {
+  id: string;
+  labels?: string[] | null;
+  internal_date?: string | null;
+  rfc_message_id?: string | null;
+  [column: string]: unknown;
+};
+
+const isSentRow = (row: FetchedMessageRow) => Array.isArray(row.labels) && row.labels.includes("SENT");
+const internalTime = (row: FetchedMessageRow) => (row.internal_date ? Date.parse(row.internal_date) : Number.POSITIVE_INFINITY);
+
+/** Which of several batch rows sharing a Message-ID keeps it: SENT copy, then earliest internal_date, then smallest id. */
+function compareRfcOwnerPreference(a: FetchedMessageRow, b: FetchedMessageRow): number {
+  const sent = Number(!isSentRow(a)) - Number(!isSentRow(b));
+  if (sent !== 0) return sent;
+  const ta = internalTime(a);
+  const tb = internalTime(b);
+  if (ta !== tb) return ta < tb ? -1 : 1;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+export type RfcDemotion = { id: string; ownerId: string; ownerStored: boolean };
+
+/**
+ * Pure: decides which row keeps each Message-ID. `originalRfc` maps row id ->
+ * the header as fetched; `storedOwners` maps Message-ID -> the id of the row
+ * already holding it for this org. Demoted rows get rfc_message_id = null and
+ * the header in DUPLICATE_RFC_COLUMN; other rows never carry that key (so a
+ * batch without collisions doesn't depend on the 20261031 column existing).
+ */
+export function assignRfcOwnership(
+  rows: FetchedMessageRow[],
+  originalRfc: Map<string, string | null>,
+  storedOwners: Map<string, string>,
+): { rows: FetchedMessageRow[]; demoted: RfcDemotion[] } {
+  const groups = new Map<string, FetchedMessageRow[]>();
+  for (const row of rows) {
+    const rfc = originalRfc.get(row.id) ?? null;
+    if (!rfc) continue;
+    groups.set(rfc, [...(groups.get(rfc) ?? []), row]);
+  }
+  const ownerOf = new Map<string, string>();
+  for (const [rfc, group] of groups) {
+    ownerOf.set(rfc, storedOwners.get(rfc) ?? [...group].sort(compareRfcOwnerPreference)[0].id);
+  }
+
+  const demoted: RfcDemotion[] = [];
+  const resolved = rows.map((row): FetchedMessageRow => {
+    const { [DUPLICATE_RFC_COLUMN]: _previous, ...base } = row;
+    const rfc = originalRfc.get(row.id) ?? null;
+    const ownerId = rfc ? ownerOf.get(rfc) : undefined;
+    if (!rfc || ownerId === row.id) return { ...base, rfc_message_id: rfc };
+    demoted.push({ id: row.id, ownerId: ownerId!, ownerStored: storedOwners.has(rfc) });
+    return { ...base, rfc_message_id: null, [DUPLICATE_RFC_COLUMN]: rfc };
+  });
+  return { rows: resolved, demoted };
+}
+
+async function loadStoredRfcOwners(supabase: SupabaseClient, orgId: string, rfcs: string[]): Promise<Map<string, string>> {
+  const owners = new Map<string, string>();
+  for (let i = 0; i < rfcs.length; i += RFC_LOOKUP_CHUNK) {
+    const { data, error } = await supabase
+      .from("gmail_messages")
+      .select("id, rfc_message_id")
+      .eq("org_id", orgId)
+      .in("rfc_message_id", rfcs.slice(i, i + RFC_LOOKUP_CHUNK));
+    if (error) throw new Error(`Could not check stored Message-IDs: ${error.message}`);
+    for (const r of (data ?? []) as Array<{ id: string; rfc_message_id: string }>) owners.set(r.rfc_message_id, r.id);
+  }
+  return owners;
+}
+
+const isRfcUniqueViolation = (error: { code?: string; message?: string }) =>
+  error.code === "23505" && /rfc_message_id/i.test(error.message ?? "");
+const isMissingDuplicateColumn = (error: { message?: string }) => (error.message ?? "").includes(DUPLICATE_RFC_COLUMN);
+const withoutDuplicateColumn = (rows: FetchedMessageRow[]) => rows.map(({ [DUPLICATE_RFC_COLUMN]: _omit, ...rest }) => rest);
+
+async function loadOwnIds(supabase: SupabaseClient, orgId: string, ids: string[]): Promise<Set<string>> {
+  const { data, error } = await supabase.from("gmail_messages").select("id").eq("org_id", orgId).in("id", ids);
+  if (error) throw new Error(`Could not check existing messages: ${error.message}`);
+  return new Set((data ?? []).map((r: { id: string }) => r.id));
+}
+
+/**
+ * One write of a resolved batch. Rows this org already holds are upserted on
+ * their id. Every other row is inserted with ON CONFLICT (id) DO NOTHING, so
+ * a Gmail id that another org stored in the meantime is never overwritten
+ * (the caller then fails closed). A unique violation on another index (the
+ * Message-ID one) still raises, as with a plain upsert.
+ */
+async function writeResolvedRows(supabase: SupabaseClient, rows: FetchedMessageRow[], ownIds: Set<string>) {
+  const fresh = rows.filter((r) => !ownIds.has(r.id));
+  const own = rows.filter((r) => ownIds.has(r.id));
+  if (fresh.length > 0) {
+    const { error } = await supabase.from("gmail_messages").upsert(fresh, { onConflict: "id", ignoreDuplicates: true });
+    if (error) return { error };
+  }
+  if (own.length > 0) {
+    const { error } = await supabase.from("gmail_messages").upsert(own, { onConflict: "id" });
+    if (error) return { error };
+  }
+  return { error: null };
+}
+
+/**
+ * Saves one fetched batch (keyed by Gmail id) without ever violating
+ * gmail_messages_org_rfc_message_id_uq or touching another org's row. Throws
+ * on any failure it can't resolve, so the caller never advances the cursor
+ * past unsaved messages. Every step is idempotent, so a retry after a
+ * partial write converges on the same rows.
+ */
+async function upsertFetchedRows(supabase: SupabaseClient, orgId: string, rows: FetchedMessageRow[]): Promise<RfcDemotion[]> {
+  const originalRfc = new Map<string, string | null>(rows.map((r) => [r.id, r.rfc_message_id ?? null]));
+  const rfcs = [...new Set([...originalRfc.values()].filter((v): v is string => !!v))];
+  const ids = rows.map((r) => r.id);
+  let duplicateColumnAvailable = true;
+
+  for (let attempt = 1; ; attempt++) {
+    const resolved = assignRfcOwnership(rows, originalRfc, await loadStoredRfcOwners(supabase, orgId, rfcs));
+    // Re-read each attempt: reconcileSmtpSentRows or a concurrent sync of this org may have just stored some of them.
+    const ownIds = await loadOwnIds(supabase, orgId, ids);
+    const payload = duplicateColumnAvailable ? resolved.rows : withoutDuplicateColumn(resolved.rows);
+    let { error } = await writeResolvedRows(supabase, payload, ownIds);
+    if (error && duplicateColumnAvailable && resolved.demoted.length > 0 && isMissingDuplicateColumn(error)) {
+      console.warn(`[gmail-history-sync] ${DUPLICATE_RFC_COLUMN} column not present yet (migration 20261031) — saving duplicate copies without their original Message-ID.`);
+      duplicateColumnAvailable = false;
+      ({ error } = await writeResolvedRows(supabase, withoutDuplicateColumn(resolved.rows), ownIds));
+    }
+    if (!error) {
+      // An insert skipped by DO NOTHING means another org now holds that id.
+      await assertNoForeignOwnership(supabase, orgId, ids.filter((id) => !ownIds.has(id)));
+      if (resolved.demoted.length > 0) {
+        // Ids and labels only — never addresses, subjects or the header itself.
+        const labelsOf = new Map(rows.map((r) => [r.id, r.labels ?? null]));
+        console.warn("[gmail-history-sync] Message-ID shared by several Gmail messages; kept on one, cleared on the others", {
+          orgId,
+          collisions: resolved.demoted.map((d) => ({ ...d, labels: labelsOf.get(d.id), ownerLabels: labelsOf.get(d.ownerId) ?? null })),
+        });
+      }
+      return resolved.demoted;
+    }
+    if (isRfcUniqueViolation(error) && attempt < RFC_RESOLVE_MAX_ATTEMPTS) {
+      console.warn("[gmail-history-sync] Message-ID claimed by a concurrent write; re-resolving the batch", { orgId, attempt });
+      continue;
+    }
+    throw new Error(`Failed to save fetched messages: ${error.message}`);
+  }
+}
+
+export type ProcessOutcome = {
+  fetched: number;
+  inserted: number;
+  updated: number;
+  skipped: number;
+  unchanged: number;
+  changed: number;
+  /** Copies stored without rfc_message_id because another Gmail message in the org holds that Message-ID. */
+  rfcCollisions: number;
+};
+
+/**
+ * Thrown when Gmail message ids in this batch are already stored for a
+ * DIFFERENT org — the same Gmail account connected to two organizations.
+ * gmail_messages.id is the bare Gmail id (no org_id in the primary key), so
+ * both orgs cannot hold the same message. The sync fails closed: nothing
+ * from the batch is attributed elsewhere, the other org's rows are never
+ * touched, and the cursor is not advanced, so no mail is silently skipped.
+ * Full support needs an (org_id, id) key — see the module header.
+ */
+export class GmailMessageOwnedByAnotherOrgError extends Error {
+  constructor(readonly count: number) {
+    super(
+      // Disconnecting the other org does NOT clear this: gmail-disconnect.ts keeps synced messages by design.
+      `This Gmail account is also synced by another RenoMeta organization, which already holds ${count} of these messages. ` +
+        "One Gmail account can't be synced by two organizations yet, so Gmail sync for this organization is paused — contact RenoMeta support. " +
+        "Nothing was saved; the next sync retries from the same point.",
+    );
+    this.name = "GmailMessageOwnedByAnotherOrgError";
+  }
+}
+
+async function assertNoForeignOwnership(supabase: SupabaseClient, orgId: string, ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const { data, error } = await supabase.from("gmail_messages").select("id").neq("org_id", orgId).in("id", ids);
+  if (error) throw new Error(`Could not check existing messages: ${error.message}`);
+  const count = (data ?? []).length;
+  if (count > 0) {
+    // Counts only — never the other org's id or any of its message data.
+    console.warn("[gmail-history-sync] Gmail ids already stored for another org; failing closed", { orgId, count });
+    throw new GmailMessageOwnedByAnotherOrgError(count);
+  }
+}
 
 /**
  * Shared tail end of both sync modes: given a set of candidate Gmail message
@@ -209,9 +440,16 @@ export async function processCandidateMessages(
   supabase: SupabaseClient,
   orgId: string,
   gmail: GmailApi,
-  candidateIds: string[],
+  candidateIdsIn: string[],
 ): Promise<ProcessOutcome> {
-  if (candidateIds.length === 0) return { fetched: 0, inserted: 0, updated: 0, skipped: 0, unchanged: 0, changed: 0 };
+  // A bootstrap can list one id on two pages when mail arrives mid-pagination;
+  // a repeated id would make the upsert touch the same row twice, which Postgres rejects.
+  const candidateIds = [...new Set(candidateIdsIn)];
+  if (candidateIds.length === 0) return { fetched: 0, inserted: 0, updated: 0, skipped: 0, unchanged: 0, changed: 0, rfcCollisions: 0 };
+
+  // Before any Gmail fetch: a batch containing another org's messages fails
+  // as a whole (see GmailMessageOwnedByAnotherOrgError).
+  await assertNoForeignOwnership(supabase, orgId, candidateIds);
 
   const { data: existingRows, error: existingErr } = await supabase
     .from("gmail_messages")
@@ -263,15 +501,17 @@ export async function processCandidateMessages(
     }
   }
 
+  let rfcCollisions = 0;
   if (rows.length > 0) {
+    // Re-key temporary SMTP rows first, so a sent message's own row is the
+    // stored owner of its Message-ID when collisions are resolved.
     await reconcileSmtpSentRows(supabase, orgId, rows);
-    const { error: upsertErr } = await supabase.from("gmail_messages").upsert(rows, { onConflict: "id" });
-    if (upsertErr) throw new Error(`Failed to save fetched messages: ${upsertErr.message}`);
+    rfcCollisions = (await upsertFetchedRows(supabase, orgId, rows)).length;
   }
 
   const inserted = rows.filter((r) => !existingIds.has(r.id)).length;
   const updated = rows.filter((r) => existingIds.has(r.id)).length;
-  return { fetched: candidateIds.length, inserted, updated, skipped, unchanged, changed: rows.length };
+  return { fetched: candidateIds.length, inserted, updated, skipped, unchanged, changed: rows.length, rfcCollisions };
 }
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────

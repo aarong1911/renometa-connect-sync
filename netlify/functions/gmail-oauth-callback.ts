@@ -19,6 +19,7 @@ import { createClient } from "@supabase/supabase-js";
 import { encryptToBytea } from "./lib/gmail-token-crypto";
 import { buildGmailRedirectUri, logGmailOAuthEnvDiagnostics } from "./lib/gmail-oauth-shared";
 import { getAppConfigs } from "./lib/app-config-store";
+import { GMAIL_SYNC_AUTH_ERROR } from "./lib/gmail-sync-health";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -187,7 +188,7 @@ export const handler: Handler = async (event) => {
 
     const { data: existing } = await supabaseAdmin
       .from("integrations")
-      .select("id, refresh_token_encrypted, config")
+      .select("id, refresh_token_encrypted, config, provider_account_email, last_sync_status")
       .eq("org_id", orgId)
       .eq("provider", "gmail")
       .maybeSingle();
@@ -219,10 +220,16 @@ export const handler: Handler = async (event) => {
       token_expires_at: expiresAt,
       provider_account_email: accountEmail,
       config: nextConfig,
-      last_sync_status: null,
-      sync_error: null,
       updated_at: new Date().toISOString(),
     };
+    // Reconnecting fixes a credential failure, and a different account's sync
+    // state no longer applies — clear those. Any other sync failure (e.g. a
+    // batch the database rejected) is not fixed by reconnecting, so it stays
+    // visible until the next sync result replaces it.
+    if (!existing || existing.last_sync_status === GMAIL_SYNC_AUTH_ERROR || existing.provider_account_email !== accountEmail) {
+      payload.last_sync_status = null;
+      payload.sync_error = null;
+    }
     // Only touch refresh_token_encrypted when Google actually returned a
     // new one — omitting the key entirely (rather than writing null)
     // leaves whatever is already stored untouched on reconnect.
