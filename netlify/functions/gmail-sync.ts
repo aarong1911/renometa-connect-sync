@@ -55,6 +55,7 @@ import {
   type GmailMessageDetail,
   type GmailProfile,
 } from "./lib/gmail-history-sync";
+import { GMAIL_SYNC_AUTH_ERROR } from "./lib/gmail-sync-health";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -213,7 +214,7 @@ export const handler: Handler = async (event) => {
   // ── Load the org's Gmail connection ───────────────────────────────────
   const { data: integrationData, error: integrationErr } = await supabaseAdmin
     .from("integrations")
-    .select("id, status, access_token_encrypted, refresh_token_encrypted, token_expires_at, provider_account_email, gmail_history_id, gmail_history_id_account_email")
+    .select("id, status, access_token_encrypted, refresh_token_encrypted, token_expires_at, provider_account_email, last_sync_status, gmail_history_id, gmail_history_id_account_email")
     .eq("org_id", orgId)
     .eq("provider", "gmail")
     .maybeSingle();
@@ -233,7 +234,7 @@ export const handler: Handler = async (event) => {
   if (!integrationRow && integrationErr && (integrationErr as any).code === "42703") {
     const { data: legacyRow, error: legacyErr } = await supabaseAdmin
       .from("integrations")
-      .select("id, status, access_token_encrypted, refresh_token_encrypted, token_expires_at, provider_account_email")
+      .select("id, status, access_token_encrypted, refresh_token_encrypted, token_expires_at, provider_account_email, last_sync_status")
       .eq("org_id", orgId)
       .eq("provider", "gmail")
       .maybeSingle();
@@ -263,9 +264,12 @@ export const handler: Handler = async (event) => {
     return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: "Failed to read the stored Gmail token" }) };
   }
 
-  const errorOut = async (statusCode: number, msg: string) => {
-    await logResult("error", msg, {});
-    await supabaseAdmin.from("integrations").update({ last_sync_at: new Date().toISOString(), last_sync_status: "error", sync_error: msg }).eq("id", integration.id);
+  // Sync health (lib/gmail-sync-health.ts): a failure leaves last_sync_at at
+  // the last SUCCESSFUL sync — the failure time is in integration_sync_logs —
+  // and marks credential failures as auth_error, the only kind reconnecting fixes.
+  const errorOut = async (statusCode: number, msg: string, kind: "error" | typeof GMAIL_SYNC_AUTH_ERROR = "error") => {
+    await logResult("error", msg, { kind });
+    await supabaseAdmin.from("integrations").update({ last_sync_status: kind, sync_error: msg }).eq("id", integration.id);
     return { statusCode, headers: CORS, body: JSON.stringify({ error: msg }) };
   };
 
@@ -274,7 +278,7 @@ export const handler: Handler = async (event) => {
   let probeRes = await gmailFetch("/profile", accessToken);
   if (probeRes.status === 401) {
     if (!integration.refresh_token_encrypted) {
-      return errorOut(409, "This Gmail connection's access token has expired and there is no refresh token on file, so it cannot be renewed automatically. Reconnect Gmail for this organization to continue syncing.");
+      return errorOut(409, "This Gmail connection's access token has expired and there is no refresh token on file, so it cannot be renewed automatically. Reconnect Gmail for this organization to continue syncing.", GMAIL_SYNC_AUTH_ERROR);
     }
     try {
       const refreshTokenPlain = decryptBytea(integration.refresh_token_encrypted);
@@ -284,7 +288,7 @@ export const handler: Handler = async (event) => {
       probeRes = await gmailFetch("/profile", accessToken);
     } catch (error: any) {
       console.error("[gmail-sync] token refresh failed:", error.message);
-      return errorOut(409, "Gmail connection has expired and could not be renewed automatically. Reconnect Gmail for this organization to continue syncing.");
+      return errorOut(409, "Gmail connection has expired and could not be renewed automatically. Reconnect Gmail for this organization to continue syncing.", GMAIL_SYNC_AUTH_ERROR);
     }
   }
   if (!probeRes.ok) {
@@ -317,7 +321,10 @@ export const handler: Handler = async (event) => {
     .update({ last_sync_at: new Date().toISOString(), last_sync_status: "ok", sync_error: null })
     .eq("id", integration.id);
 
-  if (!(silent && result.changed === 0)) {
+  // A quiet auto-sync still logs when it ends a failure streak, so the log
+  // (which sync health reads) never shows a fixed failure as the latest run.
+  const endsFailureStreak = integration.last_sync_status != null && integration.last_sync_status !== "ok";
+  if (!(silent && result.changed === 0 && !endsFailureStreak)) {
     await logResult("success", `Gmail sync (${result.mode}${result.recoveredFromInvalidCursor ? ", recovered from invalid cursor" : ""}): ${result.changed} of ${result.fetched} fetched messages written (${result.unchanged} unchanged)`, {
       mode: result.mode,
       fetched: result.fetched,
@@ -328,6 +335,7 @@ export const handler: Handler = async (event) => {
       pages: result.pages,
       cursorAdvanced: result.cursorAdvanced,
       recovered: result.recoveredFromInvalidCursor,
+      rfcCollisions: result.rfcCollisions,
     });
   }
 

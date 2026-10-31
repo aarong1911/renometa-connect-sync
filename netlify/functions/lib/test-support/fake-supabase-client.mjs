@@ -98,7 +98,7 @@ function parseCondition(item) {
 }
 
 class FakeQueryBuilder {
-  constructor(table, store, uniqueConstraints, notNullColumns, bulkNullFill, afterInsert) {
+  constructor(table, store, uniqueConstraints, notNullColumns, bulkNullFill, afterInsert, strictUpsert) {
     this.table = table;
     this.store = store;
     // AI-2E extension: an array of column-name arrays, e.g.
@@ -115,6 +115,11 @@ class FakeQueryBuilder {
     // Opt-in (options.afterInsert[table]): called as hook(newRow, store) after a successful single-row INSERT, to
     // simulate an AFTER INSERT database trigger (e.g. log_estimate_activity writing estimate_activities). Off by default.
     this.afterInsert = afterInsert ?? null;
+    // Opt-in (options.strictUpsert): upserts behave like one real `INSERT ... ON CONFLICT DO UPDATE` statement —
+    // declared unique constraints other than the conflict target are enforced (23505), a batch that names the same
+    // conflict-target row twice fails (21000), keys missing from some rows are written as NULL (PostgREST's
+    // union-of-keys column list), and a failed batch writes nothing. Off by default.
+    this.strictUpsert = !!strictUpsert;
     this.filters = [];
     this.op = null; // "insert" | "update" | "upsert" | "select" | "delete"
     this.payload = null;
@@ -352,14 +357,38 @@ class FakeQueryBuilder {
 
     if (this.op === "upsert" && Array.isArray(this.payload)) {
       // Bulk upsert (gmail-sync.ts upserts an array): apply row by row.
+      let bulkRows = this.payload;
+      let before = null;
+      if (this.strictUpsert) {
+        const conflictCols = (this.upsertOpts?.onConflict ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+        const seen = new Set();
+        for (const p of bulkRows) {
+          const key = JSON.stringify(conflictCols.map((c) => p[c] ?? null));
+          if (seen.has(key)) {
+            return { data: null, error: { code: "21000", message: "ON CONFLICT DO UPDATE command cannot affect row a second time" } };
+          }
+          seen.add(key);
+        }
+        const union = new Set();
+        for (const row of bulkRows) for (const k of Object.keys(row)) union.add(k);
+        bulkRows = bulkRows.map((row) => {
+          const filled = { ...row };
+          for (const k of union) if (filled[k] === undefined) filled[k] = null;
+          return filled;
+        });
+        before = (this.store.get(this.table) ?? []).map((r) => ({ ...r }));
+      }
       const out = [];
-      for (const p of this.payload) {
-        const one = new FakeQueryBuilder(this.table, this.store, this.uniqueConstraints, this.notNullColumns);
+      for (const p of bulkRows) {
+        const one = new FakeQueryBuilder(this.table, this.store, this.uniqueConstraints, this.notNullColumns, false, null, this.strictUpsert);
         one.op = "upsert";
         one.payload = p;
         one.upsertOpts = this.upsertOpts;
         const r = await one._execute();
-        if (r.error) return r;
+        if (r.error) {
+          if (before) this.store.set(this.table, before);
+          return r;
+        }
         out.push(...(r.data ?? []));
       }
       return { data: out, error: null };
@@ -370,6 +399,21 @@ class FakeQueryBuilder {
       let existing = null;
       if (conflictCols.length > 0) {
         existing = rows.find((r) => conflictCols.every((c) => r[c] === this.payload[c]));
+      }
+      if (this.strictUpsert && !(existing && this.upsertOpts?.ignoreDuplicates)) {
+        // The row as it would be after this statement must not collide with any OTHER row on a declared unique
+        // constraint. NULL never conflicts (same rule as the insert branch above).
+        const candidate = existing ? { ...existing, ...this.payload } : { ...this.payload };
+        for (const cols of this.uniqueConstraints) {
+          if (cols.some((c) => (candidate[c] ?? null) === null)) continue;
+          const clash = rows.find((r) => r !== existing && cols.every((c) => (r[c] ?? null) === candidate[c]));
+          if (clash) {
+            return {
+              data: null,
+              error: { code: "23505", message: `duplicate key value violates unique constraint on (${cols.join(", ")})` },
+            };
+          }
+        }
       }
       if (existing) {
         // Real Postgres `ON CONFLICT ... DO NOTHING` (ignoreDuplicates:
@@ -450,10 +494,12 @@ export function createFakeSupabaseClient(seedTables = {}, rpcHandlers = {}, opti
   const bulkNullFillTables = options.bulkInsertMissingAsNull ?? [];
   // `options.afterInsert`: { tableName: (row, store) => void } — opt-in simulated AFTER INSERT trigger.
   const afterInsertHooks = options.afterInsert ?? {};
+  // `options.strictUpsert`: ["tableName", ...] — opt-in real ON CONFLICT semantics for upserts (see the constructor).
+  const strictUpsertTables = options.strictUpsert ?? [];
 
   return {
     from(table) {
-      return new FakeQueryBuilder(table, store, uniqueConstraints[table], notNullColumns[table], bulkNullFillTables.includes(table), afterInsertHooks[table]);
+      return new FakeQueryBuilder(table, store, uniqueConstraints[table], notNullColumns[table], bulkNullFillTables.includes(table), afterInsertHooks[table], strictUpsertTables.includes(table));
     },
     async rpc(fnName, args) {
       const handler = rpcHandlers[fnName];

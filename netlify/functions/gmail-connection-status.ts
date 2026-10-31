@@ -7,9 +7,15 @@
 // `hasRefreshToken` boolean, so the client can tell a renewable connection
 // apart from one that will die once its access token expires, without ever
 // seeing token material.
+//
+// Connection and sync are reported separately: `connected`/`hasRefreshToken`
+// describe the OAuth connection; `syncHealth`, `lastSuccessfulSyncAt`,
+// `lastFailedSyncAt` and `syncError` describe whether syncing works (see
+// lib/gmail-sync-health.ts).
 
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
+import { deriveGmailSyncHealth, type GmailSyncLogEntry } from "./lib/gmail-sync-health";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -81,9 +87,31 @@ export const handler: Handler = async (event) => {
         lastSyncAt: null,
         lastSyncStatus: null,
         syncError: null,
+        syncHealth: null,
+        lastSuccessfulSyncAt: null,
+        lastFailedSyncAt: null,
       }),
     };
   }
+
+  // Best-effort: without the log rows, health falls back to the integration row alone.
+  const latestLog = async (onlySuccess: boolean): Promise<GmailSyncLogEntry | null> => {
+    let query = supabaseAdmin
+      .from("integration_sync_logs")
+      .select("status, started_at, finished_at, message, stats")
+      .eq("org_id", orgId)
+      .eq("provider", "gmail");
+    if (onlySuccess) query = query.eq("status", "success");
+    const { data, error: logErr } = await query.order("started_at", { ascending: false }).limit(1).maybeSingle();
+    if (logErr) console.error("[gmail-connection-status] sync log lookup failed:", logErr.message);
+    return (data as GmailSyncLogEntry | null) ?? null;
+  };
+  const [lastLog, lastSuccessLog] = await Promise.all([latestLog(false), latestLog(true)]);
+  const health = deriveGmailSyncHealth(
+    { last_sync_at: integration.last_sync_at ?? null, last_sync_status: integration.last_sync_status ?? null, sync_error: integration.sync_error ?? null },
+    lastLog,
+    lastSuccessLog,
+  );
 
   // Only ever this one safe, non-secret URL out of `config` — never the
   // whole config object, so nothing else stored there in the future is
@@ -103,7 +131,10 @@ export const handler: Handler = async (event) => {
       tokenExpiresAt: integration.token_expires_at ?? null,
       lastSyncAt: integration.last_sync_at ?? null,
       lastSyncStatus: integration.last_sync_status ?? null,
-      syncError: integration.sync_error ?? null,
+      syncError: health.syncError,
+      syncHealth: health.syncHealth,
+      lastSuccessfulSyncAt: health.lastSuccessfulSyncAt,
+      lastFailedSyncAt: health.lastFailedSyncAt,
     }),
   };
 };

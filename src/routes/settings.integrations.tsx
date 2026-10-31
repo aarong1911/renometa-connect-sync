@@ -23,6 +23,7 @@ import {
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
 import { getOrgId } from "@/lib/org-id";
+import { gmailNeedsReconnect as gmailNeedsReconnectFor, type GmailSyncHealth } from "@/lib/gmail-connection-health";
 
 export const Route = createFileRoute("/settings/integrations")({
   component: IntegrationsSettings,
@@ -121,6 +122,10 @@ function IntegrationsSettings() {
     lastSyncAt: string | null;
     lastSyncStatus: string | null;
     syncError: string | null;
+    // Sync health, reported separately from the OAuth connection above.
+    syncHealth: GmailSyncHealth | null;
+    lastSuccessfulSyncAt: string | null;
+    lastFailedSyncAt: string | null;
   };
   const [gmailStatus, setGmailStatus] = useState<GmailStatus | null>(null);
   const [gmailStatusLoading, setGmailStatusLoading] = useState(true);
@@ -130,10 +135,9 @@ function IntegrationsSettings() {
   const [gmailDisconnecting, setGmailDisconnecting] = useState(false);
   const [gmailDisconnectConfirmOpen, setGmailDisconnectConfirmOpen] = useState(false);
 
-  const gmailNeedsReconnect =
-    !!gmailStatus?.connected &&
-    (!gmailStatus.hasRefreshToken ||
-      (!!gmailStatus.tokenExpiresAt && new Date(gmailStatus.tokenExpiresAt).getTime() < Date.now()));
+  // An expired access token alone no longer counts: gmail-sync renews it with
+  // the refresh token (see gmailNeedsReconnect).
+  const gmailNeedsReconnect = !!gmailStatus && gmailNeedsReconnectFor(gmailStatus);
 
   const fetchGmailStatus = useCallback(async () => {
     setGmailStatusLoading(true);
@@ -243,6 +247,7 @@ function IntegrationsSettings() {
       const result = await res.json().catch(() => ({}));
       if (!res.ok) {
         toast.error(result.error ?? "Gmail sync failed");
+        fetchGmailStatus();
         return;
       }
       toast.success(
@@ -708,10 +713,24 @@ function IntegrationsSettings() {
                         ) : gmailStatus?.connected ? (
                           <div className="mb-1.5 space-y-0.5 text-[11px] text-foreground">
                             <p><span className="font-semibold">Account:</span> {gmailStatus.accountEmail ?? "Unknown"}</p>
-                            <p>
-                              <span className="font-semibold">Last sync:</span> {fmtGmailTimestamp(gmailStatus.lastSyncAt)}
-                              {gmailStatus.lastSyncStatus ? ` · ${gmailStatus.lastSyncStatus}` : ""}
+                            <p className="flex items-center gap-1">
+                              <span className="font-semibold">Sync:</span>
+                              {gmailStatus.syncHealth === "ok" ? (
+                                <span className="inline-flex items-center gap-1 text-success"><CheckCircle2 className="h-3 w-3" /> Working</span>
+                              ) : gmailStatus.syncHealth === "failing" || gmailStatus.syncHealth === "auth_error" ? (
+                                <span className="inline-flex items-center gap-1 text-destructive"><AlertTriangle className="h-3 w-3" /> Failing</span>
+                              ) : (
+                                <span className="text-muted-foreground">Waiting for the first sync</span>
+                              )}
                             </p>
+                            <p>
+                              <span className="font-semibold">Last successful sync:</span> {fmtGmailTimestamp(gmailStatus.lastSuccessfulSyncAt)}
+                            </p>
+                            {gmailStatus.lastFailedSyncAt && (
+                              <p>
+                                <span className="font-semibold">Last failed attempt:</span> {fmtGmailTimestamp(gmailStatus.lastFailedSyncAt)}
+                              </p>
+                            )}
                             {gmailStatus.syncError && <p className="text-destructive">{gmailStatus.syncError}</p>}
                             {gmailNeedsReconnect && (
                               <p className="flex items-center gap-1 text-warning">
