@@ -2,6 +2,7 @@
 // netlify/functions/accept-invite.ts
 import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
+import { resolveAcceptedTaxFields } from "./lib/invitation-lookup";
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -61,6 +62,9 @@ export const handler: Handler = async (event) => {
     },
   });
 
+  // The invitee page no longer receives the administrator's full ssn/ein: a blank field keeps what the administrator entered.
+  const taxFields = resolveAcceptedTaxFields({ ssn, ein, companyName }, invitation);
+
   // Upsert full profile
   const { error: profileErr } = await supabaseAdmin.from("profiles").upsert({
     id: userId, email,
@@ -74,9 +78,9 @@ export const handler: Handler = async (event) => {
     state:         state         || null,
     postal_code:   postalCode    || null,
     worker_type:   workerType    || "employee",
-    ssn:           ssn           || null,
-    ein:           ein           || null,
-    company_name:  companyName   || null,
+    ssn:           taxFields.ssn,
+    ein:           taxFields.ein,
+    company_name:  taxFields.company_name,
   }, { onConflict: "id" });
   if (profileErr) console.error("[accept-invite] profiles upsert failed:", JSON.stringify(profileErr));
   else console.log("[accept-invite] profile upserted");

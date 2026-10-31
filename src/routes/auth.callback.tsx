@@ -21,14 +21,16 @@ export const Route = createFileRoute("/auth/callback")({
 
 type Stage = "loading" | "setup" | "done" | "error" | "no-account";
 
+// Shape returned by netlify/functions/invitation-lookup.ts — minimal, no ids/token, tax numbers reduced to "last four" hints.
 type Invitation = {
-  id: string; email: string; role: string;
+  email: string; role: string;
   first_name: string | null; last_name: string | null;
-  organization_id: string; worker_type: string | null;
+  worker_type: string | null;
   primary_phone: string | null;
   address_line1: string | null; address_line2: string | null;
   city: string | null; state: string | null; postal_code: string | null;
-  ssn: string | null; ein: string | null; company_name: string | null;
+  company_name: string | null;
+  ssn_last4: string | null; ein_last4: string | null;
 };
 
 function AuthCallback() {
@@ -92,17 +94,23 @@ function AuthCallback() {
     }
 
     const load = async () => {
-      const { data, error } = await supabase
-        .from("invitations")
-        .select("*")
-        .eq("token", token)
-        .maybeSingle();
+      // Server-side lookup by token (the invitations table is no longer readable by the browser): one invitation, minimal fields.
+      let result: { status?: string; invitation?: Invitation } | null = null;
+      try {
+        const res = await fetch("/.netlify/functions/invitation-lookup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+        });
+        result = await res.json().catch(() => null);
+      } catch { result = null; }
 
-      if (error || !data) { setErrorMsg("Invalid invitation link."); setStage("error"); return; }
-      if (data.status !== "pending") { setErrorMsg("This invitation has already been used."); setStage("error"); return; }
-      if (new Date(data.expires_at) < new Date()) { setErrorMsg("This invitation has expired."); setStage("error"); return; }
+      if (result?.status === "used") { setErrorMsg("This invitation has already been used."); setStage("error"); return; }
+      if (result?.status === "expired") { setErrorMsg("This invitation has expired."); setStage("error"); return; }
+      if (result?.status !== "ok" || !result.invitation) { setErrorMsg("Invalid invitation link."); setStage("error"); return; }
+      const data = result.invitation;
 
-      setInvitation(data as Invitation);
+      setInvitation(data);
 
       // Pre-fill from invitation — admin may have already entered these
       setFirstName(data.first_name ?? "");
@@ -113,8 +121,10 @@ function AuthCallback() {
       setCity(data.city ?? "");
       setStateFld(data.state ?? "");
       setZip(data.postal_code ?? "");
-      setSsn(data.ssn ?? "");
-      setEin(data.ein ?? "");
+      // The administrator's full SSN/EIN is never sent to the browser. A blank field means "keep what the administrator entered"
+      // (accept-invite.ts), so the form starts empty and shows a "last four" hint instead.
+      setSsn("");
+      setEin("");
       setCompanyName(data.company_name ?? "");
 
       setStage("setup");
@@ -308,13 +318,13 @@ function AuthCallback() {
               </div>
               <div className="col-span-2 space-y-1.5">
                 <Label className="text-xs">EIN</Label>
-                <Input value={ein} onChange={e => setEin(e.target.value)} placeholder="XX-XXXXXXX" className="h-11 bg-primary-soft/50" />
+                <Input value={ein} onChange={e => setEin(e.target.value)} placeholder={invitation?.ein_last4 ? `On file (ending ${invitation.ein_last4}) — leave blank to keep` : "XX-XXXXXXX"} className="h-11 bg-primary-soft/50" />
               </div>
             </div>
           ) : (
             <div className="space-y-1.5">
               <Label className="text-xs">Social Security Number (SSN)</Label>
-              <Input value={ssn} onChange={e => setSsn(e.target.value)} placeholder="XXX-XX-XXXX" type="password" className="h-11 bg-primary-soft/50" />
+              <Input value={ssn} onChange={e => setSsn(e.target.value)} placeholder={invitation?.ssn_last4 ? `On file (ending ${invitation.ssn_last4}) — leave blank to keep` : "XXX-XX-XXXX"} type="password" className="h-11 bg-primary-soft/50" />
               <p className="text-[10px] text-muted-foreground">Stored securely for payroll purposes only.</p>
             </div>
           )}
