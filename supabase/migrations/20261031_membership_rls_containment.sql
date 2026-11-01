@@ -1,7 +1,10 @@
 -- Emergency RLS containment for organization membership, profiles and invitations.
 --
--- STATUS: UNAPPLIED. Apply as the `postgres` role, as one transaction, after running
--- supabase/verification/membership_rls_preflight.sql (read-only) and reviewing its output.
+-- STATUS: APPLIED to production manually (SQL Editor, as `postgres`) on 2026-11-01, after the read-only preflight
+-- (supabase/verification/membership_rls_preflight.sql). Production verification confirmed 14/14 rls_containment_* policies
+-- installed and RESTRICTIVE, and get_user_id_by_email EXECUTE anon=false, authenticated=false, service_role=true.
+-- This file is now historical: do not edit its SQL and do not apply it again by hand; any further change goes in a new
+-- migration. (Re-running it is harmless — see "Idempotent" below — but it must not be part of any automated replay.)
 --
 -- AUDITED LIVE SCHEMA: production schema dump of 2026-10-30 (connect-prod-20261030T154610Z-pre-pr31/schema.sql), confirmed by
 -- the 2026-10-31 production investigation. Relevant live policies (all PERMISSIVE):
@@ -48,6 +51,9 @@
 -- came only from the self-editable profiles.organization_id, closed here), the 3738b1f migrations (role check constraint,
 -- hardened handle_invited_user) — independent of this one.
 -- Idempotent: functions are CREATE OR REPLACE, policies DROP IF EXISTS + CREATE. Re-running gives the same state.
+-- Correction (comment only, kept outside the SQL): the precondition's inline note says FORCE RLS would make the helpers
+-- "recurse". Tested behavior is different: with FORCE RLS on organizations/org_memberships the owner-run helpers see no rows,
+-- so legitimate users are denied (fail closed). The precondition is still correct; only that note's wording is wrong.
 
 begin;
 
