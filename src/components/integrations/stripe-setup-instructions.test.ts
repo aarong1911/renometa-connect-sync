@@ -74,8 +74,10 @@ test("drawer — placeholder is neutral (live or test), field stays a password i
   assert.match(drawer, /key: "secretKey", label: "Secret Key", placeholder: "sk_live_… or sk_test_…", type: "password", secret: true, minLength: 20/);
   assert.match(drawer, /Save Credentials/);
   assert.match(drawer, /onClick=\{validateAndSave\}/);
-  // a saved Stripe secret is never loaded back into the form
-  assert.match(drawer, /if \(saved\.apiKey && currentId !== "stripe"\) safe\.apiKey = saved\.apiKey;/);
+  // no saved secret (Stripe or otherwise) is ever loaded back into the form —
+  // the drawer only sees the redacted status from integration-config-status
+  assert.match(drawer, /fetchIntegrationStatuses\(\)/);
+  assert.doesNotMatch(drawer, /saved\.(apiKey|secretKey|authToken|appPassword)/);
 });
 
 test("backend — no key-prefix validation exists, so test keys were already accepted and no backend change was needed", () => {

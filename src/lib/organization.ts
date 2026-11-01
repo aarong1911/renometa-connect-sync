@@ -204,7 +204,14 @@ function ensureSignOutCleanup() {
 // ── Organization profile ─────────────────────────────────────────────────
 
 async function fetchOrganizationForOrg(orgId: string): Promise<Organization> {
-  const { data: orgData, error } = await supabase.from("organizations").select("*").eq("id", orgId).maybeSingle();
+  // Explicit columns only — never "*". organizations carries server-only
+  // columns (integration_settings holds per-org integration credentials)
+  // that must not be shipped to every member on every page load.
+  const { data: orgData, error } = await supabase
+    .from("organizations")
+    .select("name, public_name, phone, website, industry, address, business_address, logo_url, crm_goals, timezone")
+    .eq("id", orgId)
+    .maybeSingle();
   if (error) {
     console.error("[org] fetchOrganizationForOrg failed:", error);
     throw error;

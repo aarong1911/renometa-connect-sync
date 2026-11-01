@@ -14,6 +14,7 @@ import { toast } from "sonner";
 import { useState, useCallback, useEffect, useRef } from "react";
 import type { Integration } from "@/lib/integrations-data";
 import { supabase } from "@/lib/supabase";
+import { fetchIntegrationStatuses, saveIntegrationConfig, disconnectIntegrationConfig } from "@/lib/integration-config-client";
 import {
   formatGoogleAdsCustomerId,
   type GoogleAdsConnectionStatusResponse,
@@ -714,24 +715,14 @@ export function IntegrationConfigDrawer({
         return;
       }
 
-      const orgId = await getOrgId();
-      if (!orgId) return;
-      const { data } = await supabase
-        .from("organizations")
-        .select("integration_settings")
-        .eq("id", orgId)
-        .maybeSingle();
-      const key = settingsKey(currentId);
-      const saved = data?.integration_settings?.[key];
-      setIsConfigured(!!saved && typeof saved === "object" && Object.keys(saved).length > 0);
-      // Pre-populate non-secret fields (phone number, account SID)
-      if (saved) {
-        const safe: Record<string, string> = {};
-        if (saved.phoneNumber) safe.phoneNumber = saved.phoneNumber;
-        if (saved.accountSid) safe.accountSid = saved.accountSid;
-        if (saved.apiKey && currentId !== "stripe") safe.apiKey = saved.apiKey;
-        setFields(safe);
-      }
+      // Redacted status only (integration-config-status.ts) — the browser
+      // never reads organizations.integration_settings, so stored secrets
+      // never reach it. `fields` carries only allowlisted non-secret values
+      // (Twilio phone number / account SID) for pre-populating the form.
+      const statuses = await fetchIntegrationStatuses();
+      const saved = statuses?.[settingsKey(currentId)];
+      setIsConfigured(!!saved?.configured);
+      if (saved?.configured) setFields({ ...saved.fields });
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, integration?.id, googleAdsForceSelection]);
@@ -941,47 +932,12 @@ export function IntegrationConfigDrawer({
         return;
       }
 
-      const orgId = await getOrgId();
-      if (!orgId) throw new Error("Not authenticated");
-
-      // Read current settings so we can merge (not overwrite other integrations)
-      const { data: orgRow } = await supabase
-        .from("organizations")
-        .select("integration_settings")
-        .eq("id", orgId)
-        .maybeSingle();
-
-      const existing: Record<string, any> = orgRow?.integration_settings ?? {};
-      const key = settingsKey(int.id);
-      const prev = existing[key] ?? {};
-
-      // Build new settings — omit blank secret fields (keep previous value)
-      const next: Record<string, string> = {};
-      for (const f of fieldDefs) {
-        let val = (fields[f.key] ?? "").trim();
-        // Google's UI displays a Gmail App Password as "xxxx xxxx xxxx xxxx"
-        // for readability — Gmail's SMTP AUTH expects the bare 16-character
-        // value with no spaces. Pasting it as shown (common) previously got
-        // saved with the spaces intact, causing SMTP auth to fail with
-        // 535-5.7.8 even though the password itself was valid. Strip all
-        // internal whitespace for this one field specifically — other
-        // integrations' secrets are untouched.
-        if (int.id === "gmail" && f.key === "appPassword") {
-          val = val.replace(/\s+/g, "");
-        }
-        if (val) {
-          next[f.key] = val;
-        } else if (f.secret && prev[f.key]) {
-          next[f.key] = prev[f.key]; // keep existing secret
-        }
-      }
-
-      const { error } = await supabase
-        .from("organizations")
-        .update({ integration_settings: { ...existing, [key]: next } })
-        .eq("id", orgId);
-
-      if (error) throw error;
+      // Merged and validated server-side (integration-config-save.ts) — the
+      // browser never reads or writes organizations.integration_settings.
+      // A blank secret field means "keep the stored secret".
+      const submitted: Record<string, string> = {};
+      for (const f of fieldDefs) submitted[f.key] = (fields[f.key] ?? "").trim();
+      await saveIntegrationConfig(settingsKey(int.id), submitted);
 
       setIsConfigured(true);
       setReconfiguring(false);
@@ -1025,13 +981,7 @@ export function IntegrationConfigDrawer({
         return;
       }
 
-      const orgId = await getOrgId();
-      if (!orgId) throw new Error("Not authenticated");
-      const { data: orgRow } = await supabase.from("organizations").select("integration_settings").eq("id", orgId).maybeSingle();
-      const existing: Record<string, any> = { ...(orgRow?.integration_settings ?? {}) };
-      delete existing[settingsKey(int.id)];
-      const { error } = await supabase.from("organizations").update({ integration_settings: existing }).eq("id", orgId);
-      if (error) throw error;
+      await disconnectIntegrationConfig(settingsKey(int.id));
       setIsConfigured(false);
       setFields({});
       onDisconnect?.(int);

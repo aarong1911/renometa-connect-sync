@@ -26,6 +26,7 @@ import { getOrgId } from "@/lib/org-id";
 import { describeGmailOAuthReturn, type GmailConnectionStatus } from "@/lib/gmail-connection-health";
 import { GmailConnectionPanel } from "@/components/integrations/gmail-connection-panel";
 import { IntegrationIcon } from "@/components/integrations/integration-icon";
+import { fetchIntegrationStatuses } from "@/lib/integration-config-client";
 
 export const Route = createFileRoute("/settings/integrations")({
   component: IntegrationsSettings,
@@ -288,12 +289,14 @@ function IntegrationsSettings() {
       const orgId = await getOrgId();
       if (!orgId) return;
 
-      const { data: org } = await supabase.from("organizations").select("integration_settings").eq("id", orgId).maybeSingle();
-      const settings: Record<string, any> = org?.integration_settings ?? {};
+      // Redacted per-integration status (integration-config-status.ts) —
+      // the browser never selects organizations.integration_settings, so
+      // stored credentials never reach it.
+      const statuses = (await fetchIntegrationStatuses()) ?? {};
       // Gmail SMTP send credentials (real — read directly by
       // send-inbox-message.ts's email branch, distinct from the OAuth
       // inbox-sync connection tracked by gmailStatus below).
-      setGmailSmtpEmail(settings.gmail?.email ?? null);
+      setGmailSmtpEmail(statuses.gmail?.fields.email ?? null);
 
       const { data: { session } } = await supabase.auth.getSession();
       let connectedProducts: string[] = [];
@@ -366,8 +369,7 @@ function IntegrationsSettings() {
             return { ...i, connected: connectedProducts.includes(metaProductMap[i.id]) };
           }
           const key = i.id.replace(/-/g, "_");
-          const saved = settings[key];
-          return { ...i, connected: !!saved && typeof saved === "object" && Object.keys(saved).length > 0 };
+          return { ...i, connected: !!statuses[key]?.configured };
         })
       );
     })();
@@ -856,14 +858,12 @@ function IntegrationsSettings() {
           if (integration.id !== "gmail") {
             handleConnect(integration);
           } else {
-            // The drawer already toasted "credentials saved" and wrote
-            // organizations.integration_settings.gmail — refetch so the
-            // card's SMTP email updates without a full page reload.
+            // The drawer already toasted "credentials saved" — refetch the
+            // redacted status so the card's SMTP email updates without a
+            // full page reload.
             setDrawerOpen(false);
-            getOrgId().then(async (orgId) => {
-              if (!orgId) return;
-              const { data: org } = await supabase.from("organizations").select("integration_settings").eq("id", orgId).maybeSingle();
-              setGmailSmtpEmail(org?.integration_settings?.gmail?.email ?? null);
+            fetchIntegrationStatuses().then((statuses) => {
+              if (statuses) setGmailSmtpEmail(statuses.gmail?.fields.email ?? null);
             });
           }
         }}
