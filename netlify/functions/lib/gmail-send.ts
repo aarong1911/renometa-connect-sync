@@ -1,7 +1,9 @@
 // netlify/functions/lib/gmail-send.ts
 //
 // Contractor-owned outbound email through the Gmail API, for customer-facing
-// documents (estimate-send.ts, change-order-send.ts). Customer email is sent
+// documents (estimate-send.ts, change-order-send.ts), Conversations replies
+// (send-inbox-message.ts) and email campaigns (marketing-campaign-process-queue.ts),
+// routed by lib/contractor-email.ts. Customer email is sent
 // FROM the contractor's own connected Gmail account — never from RenoMeta's
 // SES account or a renometa.com address, and never silently falls back to
 // one. AWS SES stays reserved for RenoMeta platform mail.
@@ -270,6 +272,27 @@ export function hasSendScope(scopes: string[]): boolean {
   return scopes.some((s) => SEND_CAPABLE_SCOPES.includes(s));
 }
 
+export const GMAIL_PROFILE_URL = "https://gmail.googleapis.com/gmail/v1/users/me/profile";
+
+/**
+ * The mailbox address of the account this access token belongs to, from
+ * Gmail itself (users.getProfile — covered by gmail.readonly, which the app
+ * already requests; no identity scope needed). Null when it can't be read.
+ * Read-only. This is the authoritative "who will Gmail send as" identity:
+ * users.messages.send always sends from the token's own mailbox.
+ */
+export async function fetchGmailAccountEmail(accessToken: string, fetchImpl: FetchLike = fetch): Promise<string | null> {
+  try {
+    const res = await fetchImpl(GMAIL_PROFILE_URL, { headers: { Authorization: `Bearer ${accessToken}` } });
+    if (!res.ok) return null;
+    const json: any = await res.json().catch(() => ({}));
+    const email = typeof json?.emailAddress === "string" ? json.emailAddress.trim() : "";
+    return email && isValidRecipientEmail(email) ? email : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Resolve the org's authorized Gmail sender and a live, send-capable access
  * token. Read-only apart from persisting a refreshed token on the org's own
@@ -332,11 +355,28 @@ export async function resolveGmailSender(
   }
   if (!hasSendScope(info.scopes)) throw scopeMissing();
 
+  // Older connections may have no stored account address (the callback's
+  // identity lookup came back empty). Ask Gmail which mailbox this token
+  // is, and record it once — only into an empty column, never overwriting.
+  let accountEmail = row.provider_account_email?.trim() || null;
+  if (!accountEmail) {
+    accountEmail = await fetchGmailAccountEmail(accessToken, fetchImpl);
+    if (accountEmail) {
+      const { error: idErr } = await admin
+        .from("integrations")
+        .update({ provider_account_email: accountEmail })
+        .eq("id", row.id)
+        .eq("org_id", row.org_id)
+        .is("provider_account_email", null);
+      if (idErr) console.error("[gmail-send] storing the connected account address failed:", idErr.message);
+    }
+  }
+
   return {
     integrationId: row.id,
     orgId: row.org_id,
     accessToken,
-    accountEmail: row.provider_account_email?.trim() || null,
+    accountEmail,
   };
 }
 
@@ -349,13 +389,19 @@ export type OutgoingEmail = {
   fromEmail: string | null;
   to: string;
   subject: string;
-  html: string;
+  /** Omitted for plain-text mail (Conversations replies, campaigns): sent as a single text/plain part. */
+  html?: string;
   text: string;
   attachments?: MimeAttachment[];
   /** Domain part for the generated RFC Message-ID. */
   messageIdDomain?: string;
   /** Written as X-RenoMeta-Send-Id so an ambiguous send can be found in Sent mail later. */
   sendId?: string;
+  /** RFC 5322 reply threading: the Message-ID being answered and the full References chain. */
+  inReplyTo?: string;
+  references?: string;
+  /** Additional single-line headers (e.g. List-Unsubscribe). Names are restricted to header-name characters. */
+  extraHeaders?: Record<string, string>;
   now?: Date;
 };
 
@@ -387,6 +433,11 @@ function base64Lines(content: Buffer | string): string {
   return b64.replace(/.{1,76}/g, (line) => `${line}\r\n`).trimEnd();
 }
 
+/** Only well-formed <id@host> tokens survive into In-Reply-To / References. */
+function messageIdList(value: string): string {
+  return (headerSafe(value).match(/<[^<>\s]+>/g) ?? []).join(" ");
+}
+
 function safeFilename(name: string): string {
   return headerSafe(name).replace(/["\\/]/g, "_") || "attachment";
 }
@@ -399,6 +450,8 @@ export function buildMimeMessage(email: OutgoingEmail): { mime: string; messageI
   const boundary = (tag: string) => `=_rm_${tag}_${crypto.randomBytes(12).toString("hex")}`;
   const domain = (email.messageIdDomain || email.fromEmail?.split("@")[1] || "renometa.com").replace(/[^A-Za-z0-9.-]/g, "");
   const messageId = `<${crypto.randomUUID()}@${domain}>`;
+  const inReplyTo = email.inReplyTo ? messageIdList(email.inReplyTo) : "";
+  const references = email.references ? messageIdList(email.references) : "";
 
   const headers = [
     // Without a From header Gmail uses the account's primary address.
@@ -407,26 +460,36 @@ export function buildMimeMessage(email: OutgoingEmail): { mime: string; messageI
     `Subject: ${encodeHeaderText(email.subject)}`,
     `Date: ${(email.now ?? new Date()).toUTCString()}`,
     `Message-ID: ${messageId}`,
+    ...(inReplyTo ? [`In-Reply-To: ${inReplyTo}`] : []),
+    ...(references ? [`References: ${references}`] : []),
     ...(email.sendId ? [`${SEND_ID_HEADER}: ${email.sendId.replace(/[^A-Za-z0-9-]/g, "")}`] : []),
+    ...Object.entries(email.extraHeaders ?? {})
+      .filter(([name]) => /^[A-Za-z0-9-]+$/.test(name))
+      .map(([name, value]) => `${name}: ${headerSafe(value)}`),
     "MIME-Version: 1.0",
   ];
 
-  const altBoundary = boundary("alt");
-  const alternative = [
-    `Content-Type: multipart/alternative; boundary="${altBoundary}"`,
-    "",
-    `--${altBoundary}`,
+  const textPart = [
     "Content-Type: text/plain; charset=UTF-8",
     "Content-Transfer-Encoding: base64",
     "",
     base64Lines(email.text),
-    `--${altBoundary}`,
-    "Content-Type: text/html; charset=UTF-8",
-    "Content-Transfer-Encoding: base64",
-    "",
-    base64Lines(email.html),
-    `--${altBoundary}--`,
   ].join("\r\n");
+  const altBoundary = boundary("alt");
+  const alternative = email.html === undefined
+    ? textPart
+    : [
+        `Content-Type: multipart/alternative; boundary="${altBoundary}"`,
+        "",
+        `--${altBoundary}`,
+        textPart,
+        `--${altBoundary}`,
+        "Content-Type: text/html; charset=UTF-8",
+        "Content-Transfer-Encoding: base64",
+        "",
+        base64Lines(email.html),
+        `--${altBoundary}--`,
+      ].join("\r\n");
 
   const attachments = email.attachments ?? [];
   let body: string;
@@ -503,11 +566,21 @@ function deliveryUnknown(): GmailSendError {
   );
 }
 
-/** One users.messages.send call. Never retried (see header). Throws GmailSendError. */
+/** Codes that mean "fix the Google connection" — reconnecting (or connecting) is the remedy. */
+export function isGmailAuthorizationError(error: GmailSendError): boolean {
+  return error.code === "email_not_connected" || error.code === "email_reconnect_required" || error.code === "email_send_scope_missing";
+}
+
+/**
+ * One users.messages.send call. Never retried (see header). Throws GmailSendError.
+ * `gmailThreadId` files the message into an existing Gmail thread of the same
+ * account (Gmail also needs matching Subject + In-Reply-To/References).
+ */
 export async function sendGmailMessage(
   sender: GmailSender,
   email: OutgoingEmail,
   fetchImpl: FetchLike = fetch,
+  opts: { gmailThreadId?: string | null } = {},
 ): Promise<GmailSendResult> {
   const { mime, messageId } = buildMimeMessage({ ...email, fromEmail: sender.accountEmail });
 
@@ -516,7 +589,7 @@ export async function sendGmailMessage(
     res = await fetchImpl(GMAIL_SEND_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${sender.accessToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ raw: toBase64Url(mime) }),
+      body: JSON.stringify(opts.gmailThreadId ? { raw: toBase64Url(mime), threadId: opts.gmailThreadId } : { raw: toBase64Url(mime) }),
     });
   } catch {
     console.error("[gmail-send] Gmail send request failed before a response");

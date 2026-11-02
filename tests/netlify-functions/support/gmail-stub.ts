@@ -12,6 +12,7 @@ import { encryptToBytea } from "../../../netlify/functions/lib/gmail-token-crypt
 
 export const GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send";
 export const GMAIL_MESSAGES_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages";
+export const GMAIL_PROFILE_URL = "https://gmail.googleapis.com/gmail/v1/users/me/profile";
 export const SEND_SCOPE = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send";
 export const OAUTH_CLIENT_ID = "client-123.apps.googleusercontent.com";
 
@@ -36,6 +37,8 @@ export type GmailStubConfig = {
   searchPageSize: number;
   /** False simulates Gmail's search-index lag: newly accepted messages aren't listed until `indexed` is set. */
   indexNewMessages: boolean;
+  /** users.getProfile's emailAddress; null answers 403 (as without a read scope). */
+  profileEmail: string | null;
 };
 export type SentMessage = { id: string; threadId: string; sendId: string | null; mime: string; indexed: boolean };
 
@@ -63,6 +66,7 @@ export const gmailStub = {
       searchStatus: 200,
       searchPageSize: 1000,
       indexNewMessages: true,
+      profileEmail: null,
       ...config,
     };
   },
@@ -80,6 +84,11 @@ export function installFetchStub(): () => void {
     }
     if (url.includes("oauth2.googleapis.com/token")) {
       return new Response(JSON.stringify(gmailStub.config.refresh.body), { status: gmailStub.config.refresh.status });
+    }
+    if (url === GMAIL_PROFILE_URL) {
+      return gmailStub.config.profileEmail
+        ? new Response(JSON.stringify({ emailAddress: gmailStub.config.profileEmail, messagesTotal: 1 }), { status: 200 })
+        : new Response(JSON.stringify({ error: { code: 403 } }), { status: 403 });
     }
     if (url === GMAIL_SEND_URL) {
       const next = gmailStub.config.send.shift();

@@ -40,7 +40,7 @@ export const CATEGORIES: { id: CategoryId | "all"; label: string }[] = [
 
 export const INTEGRATIONS: Integration[] = [
   // Communication
-  { id: "gmail", name: "Gmail", vendor: "Google", description: "Send email from your own Gmail address. Requires a Gmail App Password (Google Account → Security → 2-Step Verification → App passwords).", connectMethod: "apikey", category: "communication", syncBadges: ["Emails", "Attachments"], automations: ["Auto-log email threads to deals"], connected: false },
+  { id: "gmail", name: "Gmail", vendor: "Google", description: "Connect Gmail to manage customer emails directly in RenoMeta.", connectMethod: "apikey", category: "communication", syncBadges: ["Conversations", "Estimates", "Campaigns"], automations: ["Auto-log email threads to deals"], connected: false },
   { id: "twilio", name: "Twilio", vendor: "Twilio", description: "Business SMS/MMS & calls with tracking.", connectMethod: "apikey", category: "communication", syncBadges: ["SMS", "Calls", "Recordings"], automations: ["Instant SMS to new leads", "48/24/1-hour appointment reminders", "Missed call text-back"], connected: false },
   { id: "whatsapp", name: "WhatsApp Business (Cloud API)", vendor: "Meta", description: "Two-way WhatsApp in your Inbox. Templates for outreach & reminders.", connectMethod: "oauth", category: "communication", syncBadges: ["WhatsApp", "Media", "Templates"], automations: ["Appointment reminders via WhatsApp", "Review request 7 days after close"], connected: false },
   { id: "fb-messenger", name: "Facebook Messenger", vendor: "Meta", description: "Page DMs flow into your Inbox and attach to contacts/deals.", connectMethod: "oauth", category: "communication", syncBadges: ["Messages", "Media"], connected: false },

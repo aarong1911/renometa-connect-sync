@@ -203,7 +203,13 @@ export const handler: Handler = async (event) => {
 
   const postBody = event.httpMethod === "POST" ? parsePostBody(event) : null;
   const isForm = !!postBody?.isForm;
-  const token = event.httpMethod === "GET" ? event.queryStringParameters?.token : postBody?.token;
+  // RFC 8058 one-click unsubscribe (the List-Unsubscribe-Post header on Gmail
+  // API campaign mail): the mail provider POSTs "List-Unsubscribe=One-Click"
+  // to the URL itself, so the token is only in the query string. Still a
+  // POST — GET never mutates.
+  const token = event.httpMethod === "GET"
+    ? event.queryStringParameters?.token
+    : postBody?.token ?? event.queryStringParameters?.token;
 
   if (!token || typeof token !== "string") {
     return isForm

@@ -9,16 +9,18 @@
 // ── Idempotency / ambiguous-provider-window analysis (Phase 14.1 pre-apply
 //    hardening review, item 8) ──
 //
-// Neither provider this app uses gives this worker a safe, generic way to
-// ask "did my last attempt actually go through?" after the fact:
-//   - Twilio's Messages API has no client-supplied idempotency key — two
-//     identical POSTs create two billed messages, full stop.
+// Twilio's Messages API and Gmail SMTP give this worker no safe, generic way
+// to ask "did my last attempt actually go through?" after the fact:
+//   - Twilio has no client-supplied idempotency key — two identical POSTs
+//     create two billed messages, full stop.
 //   - Gmail SMTP (nodemailer) is a stateless per-submission protocol with
-//     no dedup/idempotency concept at all. (This app's Campaigns email path
-//     uses org-level Gmail SMTP, the same as send-inbox-message.ts — NOT
-//     Amazon SES, which estimate-send.ts/change-order-send.ts use
-//     elsewhere in this repo. Nothing here invents SES idempotency that
-//     doesn't exist, because SES isn't in this path to begin with.)
+//     no dedup/idempotency concept at all.
+// Email campaigns now send from the org's connected Google account through
+// the Gmail API when it has one (lib/contractor-email.ts), with legacy SMTP
+// kept for orgs that don't. Gmail API sends carry X-RenoMeta-Send-Id =
+// recipient id, so an ambiguous Gmail result can be looked up in the
+// account's Sent mail — only a match counts as sent; anything else still
+// fails closed below.
 //
 // Given that, the failure window is real: if this function's process dies
 // (timeout, crash, cold-start eviction) AFTER a provider call resolves
@@ -40,6 +42,17 @@
 //      decide whether to create a fresh send; the worker itself never
 //      guesses.
 //
+// Gmail retries (the only automatic retries, and only when Gmail DEFINITELY
+// did not accept the message — a rate-limit/quota refusal or Google being
+// unreachable before the send): the row goes back to 'queued' with
+// claimed_at set to a future "not before" time (bounded, increasing backoff
+// — lib/gmail-campaign-pacing.ts), and is failed terminally after the last
+// attempt. Queued rows otherwise have claimed_at = null, so the claim query's
+// "claimed_at is null or due" filter changes nothing for SMS or SMTP.
+// A Gmail authorization failure (revoked / reconnect needed) pauses the
+// whole campaign with every unsent recipient still queued; Resume continues
+// it after the owner reconnects.
+//
 // Recipient uniqueness (unique(campaign_id, contact_id) in the migration)
 // still guarantees this worker itself can never create two rows for the
 // same recipient — the risk this analysis addresses is strictly the
@@ -56,8 +69,18 @@ import type { Handler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import nodemailer from "nodemailer";
 import crypto from "node:crypto";
-import { getOrgSecret } from "./lib/org-secret-store";
 import { renderMergeTags, splitFullName } from "../../src/lib/marketing-merge-tags";
+import { resolveContractorEmailRoute, type ContractorEmailRoute, type SmtpCredentials } from "./lib/contractor-email";
+import {
+  findSentGmailMessage,
+  GmailSendError,
+  isGmailAuthorizationError,
+  isValidRecipientEmail,
+  sendGmailMessage,
+  type FetchLike,
+  type GmailSender,
+} from "./lib/gmail-send";
+import { countCampaignEmailsSentSince, gmailCampaignDailyCap, gmailRetryDelayMs } from "./lib/gmail-campaign-pacing";
 
 const BATCH_SIZE = 20;
 const STALE_SENDING_MINUTES = 10; // comfortably longer than one function invocation can run
@@ -79,6 +102,8 @@ function toE164(raw: string): string {
 
 const FALLBACK_COMPANY_NAME = "Your Company";
 
+type OrgNames = { name?: string | null; public_name?: string | null } | null | undefined;
+
 // Real send-time merge context — the same {{first_name}}/{{last_name}}/
 // {{company_name}} tags the composer's preview supports (see
 // src/lib/marketing-merge-tags.ts, shared with src/routes/marketing.tsx's
@@ -91,7 +116,7 @@ const FALLBACK_COMPANY_NAME = "Your Company";
 //     (organizations.name, falling back to public_name — same precedence
 //     src/lib/organization.ts's useOrganization() uses elsewhere in the
 //     app), never a hardcoded/demo business name.
-function buildRecipientMergeContext(recipientName: string | null, org: { name?: string | null; public_name?: string | null } | null | undefined) {
+function buildRecipientMergeContext(recipientName: string | null, org: OrgNames) {
   const { firstName, lastName } = splitFullName(recipientName);
   const companyName = org?.name?.trim() || org?.public_name?.trim() || FALLBACK_COMPANY_NAME;
   return { first_name: firstName, last_name: lastName, company_name: companyName };
@@ -131,33 +156,126 @@ async function mintUnsubscribeUrl(orgId: string, contactId: string, campaignId: 
   return `${SITE_URL}/.netlify/functions/marketing-unsubscribe?token=${token}`;
 }
 
-async function sendEmail(orgId: string, contactId: string, campaignId: string, to: string, subject: string, body: string, recipientName: string | null): Promise<{ providerMessageId: string | null }> {
-  const { data: org } = await supabaseAdmin.from("organizations").select("integration_settings, name, public_name").eq("id", orgId).maybeSingle();
-  const gmail = org?.integration_settings?.gmail;
-  if (!gmail?.email) throw new Error("Gmail not configured");
+type EmailContent = { subject: string; body: string; unsubscribeUrl: string; companyName: string | null };
 
-  let smtpPassPlain = await getOrgSecret(supabaseAdmin, orgId, "gmail", "smtp_app_password");
-  if (!smtpPassPlain && gmail.appPassword) smtpPassPlain = String(gmail.appPassword);
-  if (!smtpPassPlain) throw new Error("Gmail not configured");
-
+async function buildEmailContent(
+  orgId: string, contactId: string, campaignId: string, subject: string, body: string, recipientName: string | null, org: OrgNames,
+): Promise<EmailContent> {
   const mergeContext = buildRecipientMergeContext(recipientName, org);
-  const renderedSubject = renderMergeTags(subject, mergeContext);
-  const renderedBody = renderMergeTags(body, mergeContext);
-
   const unsubscribeUrl = await mintUnsubscribeUrl(orgId, contactId, campaignId);
-  const bodyWithFooter = `${renderedBody}\n\n---\nDon't want these emails? Unsubscribe: ${unsubscribeUrl}`;
+  return {
+    subject: renderMergeTags(subject, mergeContext),
+    body: `${renderMergeTags(body, mergeContext)}\n\n---\nDon't want these emails? Unsubscribe: ${unsubscribeUrl}`,
+    unsubscribeUrl,
+    companyName: org?.name?.trim() || org?.public_name?.trim() || null,
+  };
+}
 
+async function sendSmtpEmail(smtp: SmtpCredentials, to: string, content: EmailContent): Promise<{ providerMessageId: string | null }> {
   const transporter = nodemailer.createTransport({
     service: "gmail",
-    auth: { user: gmail.email.trim(), pass: smtpPassPlain.replace(/\s+/g, "") },
+    auth: { user: smtp.email, pass: smtp.password },
   });
   const sendResult = await transporter.sendMail({
-    from: `${gmail.senderName ?? "RenoMeta Connect"} <${gmail.email.trim()}>`,
+    from: `${smtp.senderName ?? "RenoMeta Connect"} <${smtp.email}>`,
     to,
-    subject: renderedSubject,
-    text: bodyWithFooter,
+    subject: content.subject,
+    text: content.body,
   });
   return { providerMessageId: sendResult?.messageId ?? null };
+}
+
+/** What happened to one Gmail campaign send. Only "sent" means Gmail has the message. */
+export type GmailCampaignOutcome =
+  | { kind: "sent"; providerMessageId: string }
+  /** Gmail definitely refused it (bad address, rejected content): terminal for this recipient. */
+  | { kind: "failed"; reason: string }
+  /** Gmail may have accepted it and it wasn't found in Sent mail: terminal, never retried. */
+  | { kind: "ambiguous"; reason: string }
+  /** Rate limit / quota / Google unreachable — nothing was sent; retry later. */
+  | { kind: "retry_later"; reason: string; retryAfterSeconds: number | null }
+  /** The Google connection can't send (revoked, reconnect needed) — nothing was sent; pause the campaign. */
+  | { kind: "pause_campaign"; reason: string };
+
+export async function sendCampaignEmailViaGmail(
+  sender: GmailSender,
+  input: { recipientId: string; to: string; content: EmailContent },
+  fetchImpl: FetchLike = fetch,
+): Promise<GmailCampaignOutcome> {
+  if (!isValidRecipientEmail(input.to)) return { kind: "failed", reason: "Invalid email address — not sent" };
+  const claimedAt = new Date();
+  try {
+    const sent = await sendGmailMessage(sender, {
+      fromName: input.content.companyName,
+      fromEmail: sender.accountEmail,
+      to: input.to,
+      subject: input.content.subject,
+      text: input.content.body,
+      // The recipient row id: one per recipient, reused across retries
+      // (which only follow a definite refusal), so Sent-mail lookup is exact.
+      sendId: input.recipientId,
+      // RFC 8058 one-click unsubscribe — marketing-unsubscribe.ts accepts a
+      // POST carrying the token in the URL.
+      extraHeaders: {
+        "List-Unsubscribe": `<${input.content.unsubscribeUrl}>`,
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+      },
+    }, fetchImpl);
+    return { kind: "sent", providerMessageId: sent.gmailMessageId };
+  } catch (err) {
+    if (!(err instanceof GmailSendError)) throw err;
+    if (err.maybeSent) {
+      const lookup = await findSentGmailMessage(sender, { sendId: input.recipientId, claimedAt }, fetchImpl);
+      if (lookup.status === "found") return { kind: "sent", providerMessageId: lookup.gmailMessageId };
+      return { kind: "ambiguous", reason: "Ambiguous outcome — Gmail did not confirm this send and it wasn't found in Sent mail; not auto-retried, verify manually before resending" };
+    }
+    if (isGmailAuthorizationError(err)) return { kind: "pause_campaign", reason: err.message };
+    if (err.code === "email_rate_limited" || err.code === "email_provider_unavailable") {
+      return { kind: "retry_later", reason: err.message, retryAfterSeconds: err.retryAfterSeconds };
+    }
+    return { kind: "failed", reason: err.message };
+  }
+}
+
+/**
+ * Unsubscribed/suppressed since the campaign was queued -> never sent. A
+ * failed preference read throws, so the recipient is failed (not emailed)
+ * rather than sent without the check.
+ */
+async function emailSuppressionReason(orgId: string, contactId: string): Promise<string | null> {
+  const { data, error } = await supabaseAdmin
+    .from("marketing_contact_preferences")
+    .select("email_unsubscribed, email_suppressed")
+    .eq("org_id", orgId)
+    .eq("contact_id", contactId)
+    .maybeSingle();
+  if (error) throw new Error(`preference check failed: ${error.message}`);
+  if (data?.email_unsubscribed) return "Unsubscribed before this email was sent";
+  if (data?.email_suppressed) return "Suppressed before this email was sent";
+  return null;
+}
+
+/** Put claimed-but-unsent recipients back in the queue, not before `notBefore`. Never touches attempt_count. */
+async function releaseRecipients(ids: string[], notBefore: Date | null, reason: string | null): Promise<void> {
+  if (ids.length === 0) return;
+  await supabaseAdmin
+    .from("campaign_recipients")
+    .update({
+      status: "queued",
+      claimed_by: null,
+      claimed_at: notBefore ? notBefore.toISOString() : null,
+      ...(reason ? { failure_reason: reason } : {}),
+    })
+    .in("id", ids)
+    .eq("status", "sending");
+}
+
+async function pauseCampaign(campaignId: string, fromStatus: string): Promise<void> {
+  await supabaseAdmin
+    .from("campaigns")
+    .update({ status: "paused", paused_at: new Date().toISOString(), paused_from_status: fromStatus })
+    .eq("id", campaignId)
+    .eq("status", fromStatus);
 }
 
 export const handler: Handler = async () => {
@@ -201,28 +319,73 @@ export const handler: Handler = async () => {
     return { statusCode: 200 };
   }
 
+  // Per-invocation caches: one provider resolution (and Gmail token
+  // preflight) per org, and each Gmail org's remaining daily allowance.
+  const routes = new Map<string, Promise<ContractorEmailRoute | GmailSendError>>();
+  const routeFor = (orgId: string) => {
+    let pending = routes.get(orgId);
+    if (!pending) {
+      pending = resolveContractorEmailRoute(supabaseAdmin, orgId).catch((err) => {
+        if (err instanceof GmailSendError) return err;
+        throw err;
+      });
+      routes.set(orgId, pending);
+    }
+    return pending;
+  };
+  const gmailAllowance = new Map<string, number>();
+  const orgNames = new Map<string, OrgNames>();
+
   let processed = 0;
 
   for (const campaign of activeCampaigns) {
     if (processed >= BATCH_SIZE) break;
 
+    // Email: decide the provider BEFORE claiming anything, so a broken or
+    // missing connection never moves recipients into 'sending'.
+    let route: ContractorEmailRoute | null = null;
+    let claimLimit = BATCH_SIZE - processed;
+    if (campaign.campaign_type !== "sms") {
+      const resolvedRoute = await routeFor(campaign.org_id);
+      if (resolvedRoute instanceof GmailSendError) {
+        if (isGmailAuthorizationError(resolvedRoute)) {
+          // No usable account at all (no SMTP to fall back to): pause rather
+          // than fail every recipient. Resume after reconnecting.
+          if (campaign.status === "queued" || campaign.status === "sending") await pauseCampaign(campaign.id, campaign.status);
+          console.warn("[process-queue] email campaign paused — no usable email account", { campaignId: campaign.id, code: resolvedRoute.code });
+        }
+        continue; // transient (Google/DB unavailable): try again next run
+      }
+      route = resolvedRoute;
+      if (route.provider === "gmail_api") {
+        if (!gmailAllowance.has(campaign.org_id)) {
+          const sentToday = await countCampaignEmailsSentSince(supabaseAdmin, campaign.org_id, new Date(now.getTime() - 24 * 3600_000));
+          gmailAllowance.set(campaign.org_id, Math.max(0, gmailCampaignDailyCap() - sentToday));
+        }
+        claimLimit = Math.min(claimLimit, gmailAllowance.get(campaign.org_id)!);
+        if (claimLimit <= 0) continue; // daily allowance used — the rest waits, nothing fails
+      }
+    }
+
     // Claim a bounded slice of this campaign's still-queued recipients.
     // Deliberately only 'queued' rows — a 'sending' row is either being
     // worked right now or was already swept to 'failed' above; it is
-    // NEVER reclaimed here.
+    // NEVER reclaimed here. A queued row with a future claimed_at is a
+    // Gmail retry still in backoff.
     const { data: claimable } = await supabaseAdmin
       .from("campaign_recipients")
       .select("id, contact_id, destination, contact_name, attempt_count")
       .eq("campaign_id", campaign.id)
       .eq("status", "queued")
+      .or(`claimed_at.is.null,claimed_at.lte.${now.toISOString()}`)
       .order("created_at", { ascending: true })
-      .limit(BATCH_SIZE - processed);
+      .limit(claimLimit);
 
     if (!claimable || claimable.length === 0) {
       // No more queued work for this campaign — if it was still marked
       // 'sending'/'queued', finalize it now (only once every recipient is
-      // in a terminal state — a recipient still in flight elsewhere means
-      // this campaign is not actually done yet).
+      // in a terminal state — a recipient still in flight elsewhere, or
+      // queued for a Gmail retry, means this campaign is not actually done yet).
       if (!(await hasInFlightRecipients(campaign.id))) {
         await finalizeCampaign(campaign.id);
       }
@@ -264,39 +427,99 @@ export const handler: Handler = async () => {
       .update({ status: "sending", claimed_by: WORKER_ID, claimed_at: now.toISOString() })
       .in("id", claimIds);
 
-    for (const recipient of claimable) {
+    if (route && !orgNames.has(campaign.org_id)) {
+      const { data: org } = await supabaseAdmin.from("organizations").select("name, public_name").eq("id", campaign.org_id).maybeSingle();
+      orgNames.set(campaign.org_id, org);
+    }
+
+    for (let index = 0; index < claimable.length; index += 1) {
+      const recipient = claimable[index];
       processed += 1;
       const newAttemptCount = (recipient.attempt_count ?? 0) + 1;
-      try {
-        const result = campaign.campaign_type === "sms"
-          ? await sendSms(campaign.org_id, recipient.destination, campaign.content, recipient.contact_name)
-          : await sendEmail(campaign.org_id, recipient.contact_id, campaign.id, recipient.destination, campaign.subject ?? "", campaign.content, recipient.contact_name);
-
-        await supabaseAdmin
+      const markFailed = (reason: string, attemptCount = newAttemptCount) =>
+        supabaseAdmin
           .from("campaign_recipients")
-          .update({
-            status: "sent",
-            sent_at: new Date().toISOString(),
-            provider_message_id: result.providerMessageId,
-            attempt_count: newAttemptCount,
-          })
+          .update({ status: "failed", failed_at: new Date().toISOString(), failure_reason: reason.slice(0, 500), attempt_count: attemptCount })
           .eq("id", recipient.id);
+      const markSent = (providerMessageId: string | null) =>
+        supabaseAdmin
+          .from("campaign_recipients")
+          .update({ status: "sent", sent_at: new Date().toISOString(), provider_message_id: providerMessageId, attempt_count: newAttemptCount })
+          .eq("id", recipient.id);
+
+      try {
+        if (campaign.campaign_type === "sms") {
+          const result = await sendSms(campaign.org_id, recipient.destination, campaign.content, recipient.contact_name);
+          await markSent(result.providerMessageId);
+          continue;
+        }
+
+        // Unsubscribe/suppression is enforced again at send time: a contact
+        // who opted out after the campaign was queued is never emailed.
+        const suppressed = await emailSuppressionReason(campaign.org_id, recipient.contact_id);
+        if (suppressed) {
+          await supabaseAdmin
+            .from("campaign_recipients")
+            .update({ status: "excluded", excluded_reason: suppressed })
+            .eq("id", recipient.id);
+          continue;
+        }
+
+        const content = await buildEmailContent(
+          campaign.org_id, recipient.contact_id, campaign.id, campaign.subject ?? "", campaign.content, recipient.contact_name, orgNames.get(campaign.org_id),
+        );
+
+        if (route!.provider === "smtp") {
+          const result = await sendSmtpEmail(route!.smtp, recipient.destination, content);
+          await markSent(result.providerMessageId);
+          continue;
+        }
+
+        const outcome = await sendCampaignEmailViaGmail(route!.sender, { recipientId: recipient.id, to: recipient.destination, content });
+        if (outcome.kind === "sent") {
+          gmailAllowance.set(campaign.org_id, (gmailAllowance.get(campaign.org_id) ?? 1) - 1);
+          await markSent(outcome.providerMessageId);
+          continue;
+        }
+        if (outcome.kind === "failed" || outcome.kind === "ambiguous") {
+          await markFailed(outcome.reason);
+          continue;
+        }
+
+        // retry_later / pause_campaign: nothing was sent to this recipient or
+        // anyone after it in this batch. Requeue them all and stop the batch
+        // — and this org's other campaigns for the rest of this run.
+        gmailAllowance.set(campaign.org_id, 0);
+        const rest = claimable.slice(index + 1).map((r) => r.id);
+        if (outcome.kind === "pause_campaign") {
+          await releaseRecipients([recipient.id, ...rest], null, null);
+          await pauseCampaign(campaign.id, "sending");
+          console.warn("[process-queue] email campaign paused — Google connection needs attention", { campaignId: campaign.id });
+          break;
+        }
+        const delayMs = gmailRetryDelayMs(newAttemptCount, outcome.retryAfterSeconds);
+        const notBefore = new Date(Date.now() + (delayMs ?? 5 * 60_000));
+        if (delayMs === null) {
+          await markFailed(`${outcome.reason} Gave up after ${newAttemptCount} attempts — not sent.`);
+        } else {
+          await supabaseAdmin
+            .from("campaign_recipients")
+            .update({ status: "queued", claimed_by: null, claimed_at: notBefore.toISOString(), attempt_count: newAttemptCount, failure_reason: `Retrying: ${outcome.reason}`.slice(0, 500) })
+            .eq("id", recipient.id)
+            .eq("status", "sending");
+        }
+        await releaseRecipients(rest, notBefore, null);
+        break;
       } catch (err: any) {
         // A provider call that threw is treated as a CLEAN failure (the
         // provider rejected it, or the request never left this process) —
         // not ambiguous, so it is safe to mark 'failed' immediately rather
         // than leaving it in 'sending' for the stale sweep. The stale
         // sweep exists specifically for the case this catch block never
-        // runs at all (process killed mid-flight).
-        await supabaseAdmin
-          .from("campaign_recipients")
-          .update({
-            status: "failed",
-            failed_at: new Date().toISOString(),
-            failure_reason: String(err.message ?? err).slice(0, 500),
-            attempt_count: newAttemptCount,
-          })
-          .eq("id", recipient.id);
+        // runs at all (process killed mid-flight). Gmail API sends never
+        // reach here with an ambiguous result — sendCampaignEmailViaGmail
+        // returns those as outcomes.
+        await markFailed(String(err.message ?? err));
       }
     }
 

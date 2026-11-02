@@ -8,11 +8,13 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
-import { Link2, Copy, ExternalLink, Loader2, CheckCircle2, AlertTriangle, RefreshCw } from "lucide-react";
+import { Copy, ExternalLink, Loader2, CheckCircle2, AlertTriangle, RefreshCw } from "lucide-react";
+import { IntegrationIcon } from "@/components/integrations/integration-icon";
 import { toast } from "sonner";
 import { useState, useCallback, useEffect, useRef } from "react";
 import type { Integration } from "@/lib/integrations-data";
 import { supabase } from "@/lib/supabase";
+import { fetchIntegrationStatuses, saveIntegrationConfig, disconnectIntegrationConfig } from "@/lib/integration-config-client";
 import {
   formatGoogleAdsCustomerId,
   type GoogleAdsConnectionStatusResponse,
@@ -44,6 +46,9 @@ interface Props {
   googleAdsForceSelection?: boolean;
   onGoogleAdsForceSelectionConsumed?: () => void;
   onGoogleAdsStatusRefresh?: () => void;
+  // Gmail only: removing legacy SMTP goes through the page's confirmation
+  // dialog instead of disconnecting straight from the drawer.
+  onGmailSmtpRemoveRequest?: () => void;
 }
 
 // Map integration id → key inside integration_settings JSON
@@ -253,6 +258,7 @@ function MetaLeadAdsStatusPanel() {
 export function IntegrationConfigDrawer({
   integration, open, onOpenChange, onConnect, onDisconnect,
   googleAdsStatus, googleAdsForceSelection, onGoogleAdsForceSelectionConsumed, onGoogleAdsStatusRefresh,
+  onGmailSmtpRemoveRequest,
 }: Props) {
   const [fields, setFields] = useState<Record<string, string>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -709,24 +715,14 @@ export function IntegrationConfigDrawer({
         return;
       }
 
-      const orgId = await getOrgId();
-      if (!orgId) return;
-      const { data } = await supabase
-        .from("organizations")
-        .select("integration_settings")
-        .eq("id", orgId)
-        .maybeSingle();
-      const key = settingsKey(currentId);
-      const saved = data?.integration_settings?.[key];
-      setIsConfigured(!!saved && typeof saved === "object" && Object.keys(saved).length > 0);
-      // Pre-populate non-secret fields (phone number, account SID)
-      if (saved) {
-        const safe: Record<string, string> = {};
-        if (saved.phoneNumber) safe.phoneNumber = saved.phoneNumber;
-        if (saved.accountSid) safe.accountSid = saved.accountSid;
-        if (saved.apiKey && currentId !== "stripe") safe.apiKey = saved.apiKey;
-        setFields(safe);
-      }
+      // Redacted status only (integration-config-status.ts) — the browser
+      // never reads organizations.integration_settings, so stored secrets
+      // never reach it. `fields` carries only allowlisted non-secret values
+      // (Twilio phone number / account SID) for pre-populating the form.
+      const statuses = await fetchIntegrationStatuses();
+      const saved = statuses?.[settingsKey(currentId)];
+      setIsConfigured(!!saved?.configured);
+      if (saved?.configured) setFields({ ...saved.fields });
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, integration?.id, googleAdsForceSelection]);
@@ -936,47 +932,12 @@ export function IntegrationConfigDrawer({
         return;
       }
 
-      const orgId = await getOrgId();
-      if (!orgId) throw new Error("Not authenticated");
-
-      // Read current settings so we can merge (not overwrite other integrations)
-      const { data: orgRow } = await supabase
-        .from("organizations")
-        .select("integration_settings")
-        .eq("id", orgId)
-        .maybeSingle();
-
-      const existing: Record<string, any> = orgRow?.integration_settings ?? {};
-      const key = settingsKey(int.id);
-      const prev = existing[key] ?? {};
-
-      // Build new settings — omit blank secret fields (keep previous value)
-      const next: Record<string, string> = {};
-      for (const f of fieldDefs) {
-        let val = (fields[f.key] ?? "").trim();
-        // Google's UI displays a Gmail App Password as "xxxx xxxx xxxx xxxx"
-        // for readability — Gmail's SMTP AUTH expects the bare 16-character
-        // value with no spaces. Pasting it as shown (common) previously got
-        // saved with the spaces intact, causing SMTP auth to fail with
-        // 535-5.7.8 even though the password itself was valid. Strip all
-        // internal whitespace for this one field specifically — other
-        // integrations' secrets are untouched.
-        if (int.id === "gmail" && f.key === "appPassword") {
-          val = val.replace(/\s+/g, "");
-        }
-        if (val) {
-          next[f.key] = val;
-        } else if (f.secret && prev[f.key]) {
-          next[f.key] = prev[f.key]; // keep existing secret
-        }
-      }
-
-      const { error } = await supabase
-        .from("organizations")
-        .update({ integration_settings: { ...existing, [key]: next } })
-        .eq("id", orgId);
-
-      if (error) throw error;
+      // Merged and validated server-side (integration-config-save.ts) — the
+      // browser never reads or writes organizations.integration_settings.
+      // A blank secret field means "keep the stored secret".
+      const submitted: Record<string, string> = {};
+      for (const f of fieldDefs) submitted[f.key] = (fields[f.key] ?? "").trim();
+      await saveIntegrationConfig(settingsKey(int.id), submitted);
 
       setIsConfigured(true);
       setReconfiguring(false);
@@ -1020,13 +981,7 @@ export function IntegrationConfigDrawer({
         return;
       }
 
-      const orgId = await getOrgId();
-      if (!orgId) throw new Error("Not authenticated");
-      const { data: orgRow } = await supabase.from("organizations").select("integration_settings").eq("id", orgId).maybeSingle();
-      const existing: Record<string, any> = { ...(orgRow?.integration_settings ?? {}) };
-      delete existing[settingsKey(int.id)];
-      const { error } = await supabase.from("organizations").update({ integration_settings: existing }).eq("id", orgId);
-      if (error) throw error;
+      await disconnectIntegrationConfig(settingsKey(int.id));
       setIsConfigured(false);
       setFields({});
       onDisconnect?.(int);
@@ -1043,24 +998,32 @@ export function IntegrationConfigDrawer({
       <SheetContent className="w-full sm:max-w-md overflow-y-auto">
         <SheetHeader className="pb-4">
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border bg-secondary">
-              <Link2 className="h-5 w-5 text-muted-foreground" />
-            </div>
+            <IntegrationIcon id={int.id} size="md" />
             <div>
-              <SheetTitle className="text-base">{int.name}</SheetTitle>
+              <SheetTitle className="text-base">{int.id === "gmail" ? "Advanced: legacy email settings" : int.name}</SheetTitle>
               <SheetDescription className="text-xs">{integration.vendor}</SheetDescription>
             </div>
           </div>
         </SheetHeader>
 
         <div className="space-y-5 px-1">
-          <p className="text-sm text-muted-foreground">{integration.description}</p>
+          {/* Gmail's main connection is "Connect with Google" on the card;
+              this drawer only edits an existing org's legacy App Password,
+              used for replies and campaigns while Google can't send. */}
+          <p className="text-sm text-muted-foreground">
+            {int.id === "gmail"
+              ? "Legacy SMTP sending, kept for organizations that set it up before Connect with Google. It isn't needed when your Google account is connected — Google handles inbox sync, Conversations, estimates, change orders and campaigns. RenoMeta uses SMTP for replies and campaigns only while Google isn't connected or needs reconnecting."
+              : integration.description}
+          </p>
 
-          <div className="flex flex-wrap gap-1.5">
-            {integration.syncBadges.map((b) => (
-              <Badge key={b} variant="secondary" className="text-[10px] h-5 px-1.5 rounded-full">{b}</Badge>
-            ))}
-          </div>
+          {/* Gmail's chips describe the Google connection, not this SMTP drawer. */}
+          {int.id !== "gmail" && (
+            <div className="flex flex-wrap gap-1.5">
+              {integration.syncBadges.map((b) => (
+                <Badge key={b} variant="secondary" className="text-[10px] h-5 px-1.5 rounded-full">{b}</Badge>
+              ))}
+            </div>
+          )}
 
           {integration.connectMethod === "oauth" && META_IDS.has(int.id) && (
             <div className="space-y-3 rounded-lg border border-border p-4">
@@ -1486,9 +1449,15 @@ export function IntegrationConfigDrawer({
                   <Button variant="outline" size="sm" className="w-full" onClick={() => setReconfiguring(true)}>
                     Update credentials
                   </Button>
-                  <Button variant="ghost" size="sm" className="w-full text-destructive hover:text-destructive" onClick={handleDisconnect} disabled={saving}>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="w-full text-destructive hover:text-destructive"
+                    onClick={int.id === "gmail" && onGmailSmtpRemoveRequest ? onGmailSmtpRemoveRequest : handleDisconnect}
+                    disabled={saving}
+                  >
                     {saving ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
-                    Disconnect
+                    {int.id === "gmail" ? "Remove legacy SMTP" : "Disconnect"}
                   </Button>
                 </div>
               ) : (

@@ -94,6 +94,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { FileText } from "lucide-react";
 import { toast } from "sonner";
+import { parseEmailSendAction, toastEmailSendFailure } from "@/lib/email-send-errors";
 import { supabase } from "@/lib/supabase";
 import { resolveAuthSession, useAuthSession } from "@/lib/auth-session";
 import { useVoiceConversations } from "@/lib/voice-conversations";
@@ -1204,7 +1205,31 @@ function InboxPage() {
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        toast.error(err.error ?? "Send failed");
+        if (composeChannel === "email" && err.maybeSent === true) {
+          // Gmail didn't confirm the send and it wasn't found in Sent mail
+          // yet — it may already be in the customer's inbox. Never shown as
+          // "failed" (that invites a duplicate resend); the echo reconciles
+          // away if Gmail sync later brings the real message in.
+          toast.warning(err.error ?? "Gmail didn't confirm this email — check your Gmail Sent folder before sending again.", { duration: 12000 });
+          setLocalMessages((prev) => [...prev, {
+            id: `local-email-${Date.now()}`,
+            conversationId: active.id,
+            direction: "out",
+            channel: "email",
+            body: draftText,
+            subject: subject || undefined,
+            toEmail: to,
+            at: new Date().toISOString(),
+            pendingGmailSync: true,
+          }]);
+          return;
+        }
+        if (composeChannel === "email" && typeof err.code === "string") {
+          // Connect / reconnect / ask-the-owner guidance, same as estimates.
+          toastEmailSendFailure({ error: err.error, code: err.code, action: parseEmailSendAction(err.action) }, "Send failed");
+        } else {
+          toast.error(err.error ?? "Send failed");
+        }
         // Keep the failed message visible locally so the user can see what
         // didn't go through and retry, rather than losing it silently.
         setLocalMessages((prev) => [...prev, {
@@ -1237,6 +1262,8 @@ function InboxPage() {
         } else {
           toast.success(`${channelLabel} sent`);
         }
+        // Legacy SMTP sent because the Google connection couldn't be used.
+        if (typeof result.notice === "string") toast.warning(result.notice, { duration: 10000 });
         // SMS/WhatsApp/Messenger/Instagram are backed by sms_meta_messages —
         // refresh so the real persisted row shows up. No optimistic local
         // copy is kept for these channels (see top of this function) since
@@ -1267,7 +1294,10 @@ function InboxPage() {
             toEmail: to,
             at: new Date().toISOString(),
             pendingGmailSync: true,
-            rfcMessageId: typeof result.smtpMessageId === "string" ? result.smtpMessageId : undefined,
+            rfcMessageId:
+              typeof result.rfcMessageId === "string" ? result.rfcMessageId
+              : typeof result.smtpMessageId === "string" ? result.smtpMessageId
+              : undefined,
           }]);
         }
       }
@@ -2231,12 +2261,18 @@ function InboxPage() {
                         {smsInfo.isUnusuallyLong && " · unusually long message"}
                       </span>
                     )}
+                    {/* Mirrors send-inbox-message.ts's routing (lib/contractor-email.ts):
+                        the connected Google account first, legacy SMTP otherwise. */}
+                    {/* A connected Google account sends even when its address
+                        isn't known yet — never show the SMTP address then. */}
                     {composeChannel === "email" && (
-                      smtpConfigured === true && smtpEmail
-                        ? `Will reply from ${smtpEmail}`
-                        : smtpConfigured === false
-                          ? "Gmail sending isn't configured — add an App Password in Settings → Integrations"
-                          : null
+                      gmailConnected
+                        ? (gmailAccountEmail ? `Will reply from ${gmailAccountEmail}` : "Will reply from your connected Google account")
+                        : smtpConfigured === true && smtpEmail
+                          ? `Will reply from ${smtpEmail}`
+                          : smtpConfigured === false && !gmailConnected
+                            ? "Email isn't connected yet — your organization owner can connect Google in Settings → Integrations"
+                            : null
                     )}
                     {composeChannel === "note" && "Internal · @mention to notify"}
                   </div>
