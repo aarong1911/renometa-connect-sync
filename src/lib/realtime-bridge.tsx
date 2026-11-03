@@ -217,6 +217,18 @@ import { useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
 import { useOrgId } from "@/lib/org-id";
 import { queryKeys } from "@/lib/query-keys";
+import { rejectedRealtimeTable, subscribeOptionalTable } from "@/lib/realtime-optional-subscription";
+
+// Realtime reports a rejected postgres_changes binding as a `system` message
+// with status "error"; one rejected binding fails the whole channel. Logs
+// only which table was rejected (never the full server text, which echoes
+// filter values).
+function logRejectedBinding(channel: string) {
+  return (payload: { status?: string; message?: unknown }) => {
+    if (payload?.status !== "error") return;
+    console.error(`[${channel}] binding rejected`, { table: rejectedRealtimeTable(payload.message) ?? "unknown" });
+  };
+}
 
 export function RealtimeBridge(): null {
   const orgId = useOrgId();
@@ -386,8 +398,16 @@ export function RealtimeBridge(): null {
     // own small, dedicated channel — the topology already confirmed to
     // work — while every other table stays on this shared channel
     // unchanged.
+    //
+    // 2026-11-02 root cause: this channel was failing to subscribe at all.
+    // Its `deal_activities` INSERT binding is rejected by Realtime because
+    // that table is not in the `supabase_realtime` publication, and one
+    // rejected binding fails the whole channel. `deal_activities` is now an
+    // optional, isolated subscription (see `dealActivitiesCleanup` below);
+    // only tables confirmed to be published belong on this channel.
     const channel = supabase
       .channel(`realtime-bridge-${orgId}`)
+      .on("system", {}, logRejectedBinding("realtime-bridge"))
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "conversation_states", filter: `org_id=eq.${orgId}` },
@@ -437,11 +457,6 @@ export function RealtimeBridge(): null {
         "postgres_changes",
         { event: "DELETE", schema: "public", table: "deals" },
         () => invalidateDeals(),
-      )
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "deal_activities", filter: `org_id=eq.${orgId}` },
-        () => invalidatePipelinePulse(),
       )
       .on(
         "postgres_changes",
@@ -637,6 +652,7 @@ export function RealtimeBridge(): null {
     // handlers already do via their `filter` option.
     const smsChannel = supabase
       .channel(`realtime-sms-${orgId}`)
+      .on("system", {}, logRejectedBinding("realtime-sms"))
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "sms_meta_messages" },
@@ -677,6 +693,7 @@ export function RealtimeBridge(): null {
     // no need to re-discover that the hard way a second time.
     const approvalsChannel = supabase
       .channel(`realtime-ai-approvals-${orgId}`)
+      .on("system", {}, logRejectedBinding("realtime-ai-approvals"))
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "agent_approval_requests" },
@@ -717,10 +734,24 @@ export function RealtimeBridge(): null {
         }
       });
 
+    // Pipeline Pulse freshness from deal_activities INSERTs — optional and
+    // isolated: the table is not in the `supabase_realtime` publication
+    // today, so this channel is rejected, logs once, and removes itself
+    // without affecting the channels above. Starts working on its own if
+    // the table is ever published. Never add it back to the shared channel.
+    const dealActivitiesCleanup = subscribeOptionalTable(supabase, {
+      channelName: `realtime-deal-activities-${orgId}`,
+      table: "deal_activities",
+      event: "INSERT",
+      filter: `org_id=eq.${orgId}`,
+      onChange: () => invalidatePipelinePulse(),
+    });
+
     return () => {
       supabase.removeChannel(channel);
       supabase.removeChannel(smsChannel);
       supabase.removeChannel(approvalsChannel);
+      dealActivitiesCleanup();
     };
   }, [orgId, queryClient]);
 
